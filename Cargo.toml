@@ -3,4 +3,5 @@ resolver = "3"
 members = [
     "crates/rouchdb-core",
     "crates/rouchdb-adapter-memory",
+    "crates/rouchdb-changes",
 ]
