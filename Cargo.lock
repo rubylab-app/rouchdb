@@ -825,6 +825,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rouchdb"
+version = "0.1.0"
+dependencies = [
+ "rouchdb-adapter-http",
+ "rouchdb-adapter-memory",
+ "rouchdb-adapter-redb",
+ "rouchdb-changes",
+ "rouchdb-core",
+ "rouchdb-query",
+ "rouchdb-replication",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rouchdb-adapter-http"
 version = "0.1.0"
 dependencies = [
