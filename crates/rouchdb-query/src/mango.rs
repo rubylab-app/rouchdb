@@ -274,6 +274,20 @@ fn match_operator(
                 false
             }
         }),
+        "$not" => {
+            // Field-level $not: negate the sub-condition applied to this field's value
+            if let Some(ops) = operand.as_object() {
+                for (sub_op, sub_operand) in ops {
+                    if match_operator(field_value, sub_op, sub_operand) {
+                        return false;
+                    }
+                }
+                true
+            } else {
+                // Implicit $eq negation
+                !match_operator(field_value, "$eq", operand)
+            }
+        }
         "$mod" => {
             if let Some(arr) = operand.as_array() {
                 if arr.len() == 2 {

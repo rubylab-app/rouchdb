@@ -427,7 +427,7 @@ impl Adapter for HttpAdapter {
         };
 
         let resp = self.client
-            .post(&self.url("_bulk_get"))
+            .post(&self.url("_bulk_get?revs=true"))
             .json(&request)
             .send()
             .await
