@@ -14,8 +14,8 @@ use rouchdb_core::document::*;
 use rouchdb_core::error::{Result, RouchError};
 use rouchdb_core::merge::{collect_conflicts, is_deleted, merge_tree, winning_rev};
 use rouchdb_core::rev_tree::{
-    build_path_from_revs, collect_leaves, rev_exists, NodeOpts, RevNode, RevPath, RevStatus,
-    RevTree,
+    build_path_from_revs, collect_leaves, find_rev_ancestry, rev_exists, NodeOpts, RevNode,
+    RevPath, RevStatus, RevTree,
 };
 
 const DEFAULT_REV_LIMIT: u64 = 1000;
@@ -629,10 +629,24 @@ impl Adapter for RedbAdapter {
                             _ => serde_json::Map::new(),
                         };
                         obj.insert("_id".into(), serde_json::Value::String(item.id.clone()));
-                        obj.insert("_rev".into(), serde_json::Value::String(rev_str));
+                        obj.insert("_rev".into(), serde_json::Value::String(rev_str.clone()));
                         if rd.deleted {
                             obj.insert("_deleted".into(), serde_json::Value::Bool(true));
                         }
+
+                        // Include _revisions for replication
+                        if let Ok((pos, ref hash)) = parse_rev(&rev_str) {
+                            if let Some(ancestry) = find_rev_ancestry(&tree, pos, hash) {
+                                obj.insert(
+                                    "_revisions".into(),
+                                    serde_json::json!({
+                                        "start": pos,
+                                        "ids": ancestry
+                                    }),
+                                );
+                            }
+                        }
+
                         bulk_docs.push(BulkGetDoc {
                             ok: Some(serde_json::Value::Object(obj)),
                             error: None,
@@ -904,7 +918,7 @@ fn process_doc_replication(
     rev_table: &mut redb::Table<&str, &[u8]>,
     changes_table: &mut redb::Table<u64, &[u8]>,
     meta: &mut MetaRecord,
-    doc: Document,
+    mut doc: Document,
 ) -> Result<DocResult> {
     let doc_id = doc.id.clone();
     let rev = match &doc.rev {
@@ -930,15 +944,41 @@ fn process_doc_replication(
         .map(|r| serialized_to_rev_tree(&r.rev_tree))
         .unwrap_or_default();
 
-    let new_path = RevPath {
-        pos: rev.pos,
-        tree: RevNode {
-            hash: rev.hash.clone(),
-            status: RevStatus::Available,
-            opts: NodeOpts { deleted: doc.deleted },
-            children: vec![],
-        },
+    // Build the revision path — use _revisions ancestry if available
+    let new_path = if let Some(revisions) = doc.data.get("_revisions") {
+        let start = revisions["start"].as_u64().unwrap_or(rev.pos);
+        let ids: Vec<String> = revisions["ids"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![rev.hash.clone()]);
+
+        build_path_from_revs(
+            start,
+            &ids,
+            NodeOpts { deleted: doc.deleted },
+            RevStatus::Available,
+        )
+    } else {
+        // Fallback: single-node path (no ancestry available)
+        RevPath {
+            pos: rev.pos,
+            tree: RevNode {
+                hash: rev.hash.clone(),
+                status: RevStatus::Available,
+                opts: NodeOpts { deleted: doc.deleted },
+                children: vec![],
+            },
+        }
     };
+
+    // Strip _revisions from data before storing
+    if let serde_json::Value::Object(ref mut map) = doc.data {
+        map.remove("_revisions");
+    }
 
     let (merged_tree, _) = merge_tree(&existing_tree, &new_path, DEFAULT_REV_LIMIT);
 

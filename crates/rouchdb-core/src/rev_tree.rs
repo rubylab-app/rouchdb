@@ -199,6 +199,44 @@ pub fn build_path_from_revs(
 }
 
 // ---------------------------------------------------------------------------
+// Ancestry lookup (for replication — provides _revisions data)
+// ---------------------------------------------------------------------------
+
+/// Find the revision ancestry chain for a specific revision in the tree.
+///
+/// Returns hashes from leaf to root: `[target_hash, parent_hash, grandparent_hash, ...]`
+/// or `None` if the revision is not found in the tree.
+pub fn find_rev_ancestry(tree: &RevTree, target_pos: u64, target_hash: &str) -> Option<Vec<String>> {
+    for path in tree {
+        if let Some(chain) = find_chain_in_node(&path.tree, path.pos, target_pos, target_hash) {
+            return Some(chain);
+        }
+    }
+    None
+}
+
+fn find_chain_in_node(
+    node: &RevNode,
+    current_pos: u64,
+    target_pos: u64,
+    target_hash: &str,
+) -> Option<Vec<String>> {
+    if current_pos == target_pos && node.hash == target_hash {
+        return Some(vec![node.hash.clone()]);
+    }
+
+    for child in &node.children {
+        if let Some(mut chain) = find_chain_in_node(child, current_pos + 1, target_pos, target_hash)
+        {
+            chain.push(node.hash.clone());
+            return Some(chain);
+        }
+    }
+
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -277,6 +315,25 @@ mod tests {
         assert_eq!(paths[0].0, 1); // root pos
         assert_eq!(paths[0].1.len(), 3); // a, b, c
         assert_eq!(paths[1].1.len(), 3); // a, b, d
+    }
+
+    #[test]
+    fn find_rev_ancestry_linear_chain() {
+        // 1-a -> 2-b -> 3-c
+        let tree = vec![RevPath {
+            pos: 1,
+            tree: node("a", vec![node("b", vec![leaf("c")])]),
+        }];
+        let ancestry = find_rev_ancestry(&tree, 3, "c").unwrap();
+        assert_eq!(ancestry, vec!["c", "b", "a"]);
+
+        let ancestry = find_rev_ancestry(&tree, 2, "b").unwrap();
+        assert_eq!(ancestry, vec!["b", "a"]);
+
+        let ancestry = find_rev_ancestry(&tree, 1, "a").unwrap();
+        assert_eq!(ancestry, vec!["a"]);
+
+        assert!(find_rev_ancestry(&tree, 3, "z").is_none());
     }
 
     #[test]
