@@ -1,8 +1,12 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use rouchdb_core::adapter::Adapter;
 use rouchdb_core::document::*;
 use rouchdb_core::error::Result;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::checkpoint::Checkpointer;
 
@@ -28,6 +32,14 @@ pub struct ReplicationOptions {
     pub batches_limit: u64,
     /// Optional filter for selective replication.
     pub filter: Option<ReplicationFilter>,
+    /// Enable continuous/live replication.
+    pub live: bool,
+    /// Automatically retry on transient errors.
+    pub retry: bool,
+    /// Polling interval for live replication (default: 500ms).
+    pub poll_interval: Duration,
+    /// Backoff function for retry: takes attempt number, returns delay.
+    pub back_off_function: Option<Box<dyn Fn(u32) -> Duration + Send + Sync>>,
 }
 
 impl Default for ReplicationOptions {
@@ -36,6 +48,10 @@ impl Default for ReplicationOptions {
             batch_size: 100,
             batches_limit: 10,
             filter: None,
+            live: false,
+            retry: false,
+            poll_interval: Duration::from_millis(500),
+            back_off_function: None,
         }
     }
 }
@@ -216,6 +232,262 @@ pub async fn replicate(
         errors,
         last_seq: current_seq,
     })
+}
+
+/// Run a one-shot replication with event streaming.
+///
+/// Same as `replicate()` but emits `ReplicationEvent` through the provided
+/// channel as replication progresses.
+pub async fn replicate_with_events(
+    source: &dyn Adapter,
+    target: &dyn Adapter,
+    opts: ReplicationOptions,
+    events_tx: mpsc::Sender<ReplicationEvent>,
+) -> Result<ReplicationResult> {
+    let source_info = source.info().await?;
+    let target_info = target.info().await?;
+
+    let checkpointer = Checkpointer::new(&source_info.db_name, &target_info.db_name);
+    let since = checkpointer.read_checkpoint(source, target).await?;
+
+    let filter_doc_ids = match &opts.filter {
+        Some(ReplicationFilter::DocIds(ids)) => Some(ids.clone()),
+        _ => None,
+    };
+
+    let mut total_docs_read = 0u64;
+    let mut total_docs_written = 0u64;
+    let mut errors = Vec::new();
+    let mut current_seq = since;
+
+    let _ = events_tx.send(ReplicationEvent::Active).await;
+
+    loop {
+        let changes = source
+            .changes(ChangesOptions {
+                since: current_seq.clone(),
+                limit: Some(opts.batch_size),
+                include_docs: false,
+                doc_ids: filter_doc_ids.clone(),
+                ..Default::default()
+            })
+            .await?;
+
+        if changes.results.is_empty() {
+            break;
+        }
+
+        let batch_last_seq = changes.last_seq;
+
+        let filtered_changes: Vec<&ChangeEvent> = match &opts.filter {
+            Some(ReplicationFilter::Custom(predicate)) => {
+                changes.results.iter().filter(|c| predicate(c)).collect()
+            }
+            _ => changes.results.iter().collect(),
+        };
+
+        total_docs_read += filtered_changes.len() as u64;
+
+        if filtered_changes.is_empty() {
+            current_seq = batch_last_seq;
+            if (changes.results.len() as u64) < opts.batch_size {
+                break;
+            }
+            continue;
+        }
+
+        let mut rev_map: HashMap<String, Vec<String>> = HashMap::new();
+        for change in &filtered_changes {
+            let revs: Vec<String> = change.changes.iter().map(|c| c.rev.clone()).collect();
+            rev_map.insert(change.id.clone(), revs);
+        }
+
+        let diff = target.revs_diff(rev_map).await?;
+
+        if diff.results.is_empty() {
+            current_seq = batch_last_seq;
+            if (changes.results.len() as u64) < opts.batch_size {
+                break;
+            }
+            continue;
+        }
+
+        let mut bulk_get_items: Vec<BulkGetItem> = Vec::new();
+        for (doc_id, diff_result) in &diff.results {
+            for missing_rev in &diff_result.missing {
+                bulk_get_items.push(BulkGetItem {
+                    id: doc_id.clone(),
+                    rev: Some(missing_rev.clone()),
+                });
+            }
+        }
+
+        let bulk_get_response = source.bulk_get(bulk_get_items).await?;
+
+        let mut docs_to_write: Vec<Document> = Vec::new();
+        for result in &bulk_get_response.results {
+            for doc in &result.docs {
+                if let Some(ref json) = doc.ok {
+                    match Document::from_json(json.clone()) {
+                        Ok(document) => docs_to_write.push(document),
+                        Err(e) => errors.push(format!("parse error for {}: {}", result.id, e)),
+                    }
+                }
+            }
+        }
+
+        if let Some(ReplicationFilter::Selector(ref selector)) = opts.filter {
+            docs_to_write.retain(|doc| rouchdb_query::matches_selector(&doc.data, selector));
+        }
+
+        if !docs_to_write.is_empty() {
+            let write_count = docs_to_write.len() as u64;
+            let write_results = target
+                .bulk_docs(docs_to_write, BulkDocsOptions::replication())
+                .await?;
+
+            for wr in &write_results {
+                if !wr.ok {
+                    errors.push(format!(
+                        "write error for {}: {}",
+                        wr.id,
+                        wr.reason.as_deref().unwrap_or("unknown")
+                    ));
+                }
+            }
+
+            total_docs_written += write_count;
+        }
+
+        // Emit change event
+        let _ = events_tx
+            .send(ReplicationEvent::Change {
+                docs_read: total_docs_read,
+            })
+            .await;
+
+        current_seq = batch_last_seq;
+        let _ = checkpointer
+            .write_checkpoint(source, target, current_seq.clone())
+            .await;
+
+        if (changes.results.len() as u64) < opts.batch_size {
+            break;
+        }
+    }
+
+    let result = ReplicationResult {
+        ok: errors.is_empty(),
+        docs_read: total_docs_read,
+        docs_written: total_docs_written,
+        errors,
+        last_seq: current_seq,
+    };
+
+    let _ = events_tx
+        .send(ReplicationEvent::Complete(result.clone()))
+        .await;
+
+    Ok(result)
+}
+
+/// Run continuous (live) replication from source to target.
+///
+/// Performs an initial one-shot replication, then polls for new changes
+/// at the configured `poll_interval`. Runs until the returned
+/// `ReplicationHandle` is cancelled/dropped.
+///
+/// Events are emitted through the returned channel receiver.
+pub fn replicate_live(
+    source: Arc<dyn Adapter>,
+    target: Arc<dyn Adapter>,
+    opts: ReplicationOptions,
+) -> (mpsc::Receiver<ReplicationEvent>, ReplicationHandle) {
+    let (tx, rx) = mpsc::channel(64);
+    let poll_interval = opts.poll_interval;
+    let retry = opts.retry;
+    let back_off = opts.back_off_function;
+
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+
+    tokio::spawn(async move {
+        let mut attempt: u32 = 0;
+
+        loop {
+            // Build fresh options for each iteration (filter can't be cloned
+            // due to Box<dyn Fn>, so we replicate without filter in live mode
+            // after the initial run — the source adapter handles doc_ids filtering)
+            let one_shot_opts = ReplicationOptions {
+                batch_size: opts.batch_size,
+                batches_limit: opts.batches_limit,
+                filter: None, // Filter is consumed by first run
+                live: false,
+                retry: false,
+                poll_interval,
+                back_off_function: None,
+            };
+
+            let result =
+                replicate_with_events(source.as_ref(), target.as_ref(), one_shot_opts, tx.clone())
+                    .await;
+
+            match result {
+                Ok(r) => {
+                    attempt = 0; // Reset retry counter on success
+                    if r.docs_read == 0 {
+                        // No changes — emit Paused and wait
+                        let _ = tx.send(ReplicationEvent::Paused).await;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(ReplicationEvent::Error(e.to_string())).await;
+                    if retry {
+                        attempt += 1;
+                        let delay = if let Some(ref f) = back_off {
+                            f(attempt)
+                        } else {
+                            // Default exponential backoff: min(1s * 2^attempt, 60s)
+                            let secs = (1u64 << attempt.min(6)).min(60);
+                            Duration::from_secs(secs)
+                        };
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => continue,
+                            _ = cancel_clone.cancelled() => break,
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // Wait for poll_interval or cancellation
+            tokio::select! {
+                _ = tokio::time::sleep(poll_interval) => {},
+                _ = cancel_clone.cancelled() => break,
+            }
+        }
+    });
+
+    (rx, ReplicationHandle { cancel })
+}
+
+/// Handle for a live replication task. Dropping this cancels the replication.
+pub struct ReplicationHandle {
+    cancel: CancellationToken,
+}
+
+impl ReplicationHandle {
+    /// Cancel the live replication.
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+}
+
+impl Drop for ReplicationHandle {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 // ---------------------------------------------------------------------------

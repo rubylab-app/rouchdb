@@ -5,7 +5,7 @@ mod common;
 use std::collections::HashMap;
 
 use common::{delete_remote_db, fresh_remote_db};
-use rouchdb::{Database, FindOptions, SortField};
+use rouchdb::{Database, FindOptions, IndexDefinition, SortField};
 
 #[tokio::test]
 #[ignore]
@@ -530,6 +530,192 @@ async fn mango_empty_selector_matches_all() {
         .await
         .unwrap();
     assert_eq!(result.docs.len(), 3);
+
+    delete_remote_db(&url).await;
+}
+
+// =========================================================================
+// Mango indexes
+// =========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn mango_create_index_and_query() {
+    let url = fresh_remote_db("mango_idx").await;
+    let remote = Database::http(&url);
+    let local = Database::memory("local");
+
+    remote
+        .put("a", serde_json::json!({"name": "Alice", "age": 30}))
+        .await
+        .unwrap();
+    remote
+        .put("b", serde_json::json!({"name": "Bob", "age": 25}))
+        .await
+        .unwrap();
+    remote
+        .put("c", serde_json::json!({"name": "Charlie", "age": 35}))
+        .await
+        .unwrap();
+    remote
+        .put("d", serde_json::json!({"name": "Diana", "age": 28}))
+        .await
+        .unwrap();
+
+    local.replicate_from(&remote).await.unwrap();
+
+    // Create an index on "age"
+    let idx_result = local
+        .create_index(IndexDefinition {
+            name: String::new(),
+            fields: vec![SortField::Simple("age".into())],
+            ddoc: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(idx_result.result, "created");
+    assert_eq!(idx_result.name, "idx-age");
+
+    // Query using the index
+    let found = local
+        .find(FindOptions {
+            selector: serde_json::json!({"age": {"$gte": 30}}),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(found.docs.len(), 2);
+
+    // Check that we can get indexes
+    let indexes = local.get_indexes().await;
+    assert_eq!(indexes.len(), 1);
+    assert_eq!(indexes[0].name, "idx-age");
+
+    // Creating again returns "exists"
+    let idx_result2 = local
+        .create_index(IndexDefinition {
+            name: "idx-age".into(),
+            fields: vec![SortField::Simple("age".into())],
+            ddoc: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(idx_result2.result, "exists");
+
+    // Delete the index
+    local.delete_index("idx-age").await.unwrap();
+    let indexes = local.get_indexes().await;
+    assert!(indexes.is_empty());
+
+    // Deleting nonexistent returns error
+    assert!(local.delete_index("nonexistent").await.is_err());
+
+    delete_remote_db(&url).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn mango_index_with_sort_and_limit() {
+    let url = fresh_remote_db("mango_idx_sort").await;
+    let remote = Database::http(&url);
+    let local = Database::memory("local");
+
+    for i in 0..20 {
+        remote
+            .put(
+                &format!("doc{:02}", i),
+                serde_json::json!({"score": i * 5, "label": format!("item{}", i)}),
+            )
+            .await
+            .unwrap();
+    }
+
+    local.replicate_from(&remote).await.unwrap();
+
+    // Create index on "score"
+    local
+        .create_index(IndexDefinition {
+            name: String::new(),
+            fields: vec![SortField::Simple("score".into())],
+            ddoc: None,
+        })
+        .await
+        .unwrap();
+
+    // Query with sort, skip, limit using the index
+    let found = local
+        .find(FindOptions {
+            selector: serde_json::json!({"score": {"$gte": 50}}),
+            sort: Some(vec![SortField::Simple("score".into())]),
+            skip: Some(2),
+            limit: Some(3),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(found.docs.len(), 3);
+    // After skipping the first 2 matches (score=50, score=55), we get score=60,65,70
+    assert_eq!(found.docs[0]["score"], 60);
+    assert_eq!(found.docs[1]["score"], 65);
+    assert_eq!(found.docs[2]["score"], 70);
+
+    delete_remote_db(&url).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn mango_multi_field_index() {
+    let url = fresh_remote_db("mango_idx_multi").await;
+    let remote = Database::http(&url);
+    let local = Database::memory("local");
+
+    remote
+        .put(
+            "a",
+            serde_json::json!({"type": "invoice", "amount": 100, "status": "paid"}),
+        )
+        .await
+        .unwrap();
+    remote
+        .put(
+            "b",
+            serde_json::json!({"type": "invoice", "amount": 200, "status": "pending"}),
+        )
+        .await
+        .unwrap();
+    remote
+        .put(
+            "c",
+            serde_json::json!({"type": "receipt", "amount": 150, "status": "paid"}),
+        )
+        .await
+        .unwrap();
+
+    local.replicate_from(&remote).await.unwrap();
+
+    // Create index on ("type", "amount")
+    local
+        .create_index(IndexDefinition {
+            name: "idx-type-amount".into(),
+            fields: vec![
+                SortField::Simple("type".into()),
+                SortField::Simple("amount".into()),
+            ],
+            ddoc: None,
+        })
+        .await
+        .unwrap();
+
+    // Query that hits the first field of the index
+    let found = local
+        .find(FindOptions {
+            selector: serde_json::json!({"type": "invoice"}),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(found.docs.len(), 2);
 
     delete_remote_db(&url).await;
 }

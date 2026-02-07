@@ -41,6 +41,7 @@ These methods correspond to CouchDB's core document API. See the [Core Types Ref
 | `info` | `async fn info(&self)` | `Result<DbInfo>` | Get database metadata: name, document count, and current update sequence. |
 | `get` | `async fn get(&self, id: &str)` | `Result<Document>` | Retrieve a document by its `_id`. Returns `RouchError::NotFound` if the document does not exist or has been deleted. |
 | `get_with_opts` | `async fn get_with_opts(&self, id: &str, opts: GetOptions)` | `Result<Document>` | Retrieve a document with options: specific revision, conflict info, all open revisions, or full revision history. |
+| `post` | `async fn post(&self, data: serde_json::Value)` | `Result<DocResult>` | Create a new document with an auto-generated UUID v4 as the ID. Equivalent to PouchDB's `db.post()`. |
 | `put` | `async fn put(&self, id: &str, data: serde_json::Value)` | `Result<DocResult>` | Create a new document. If a document with the same `_id` already exists and has no previous revision, this creates it; otherwise it may conflict. |
 | `update` | `async fn update(&self, id: &str, rev: &str, data: serde_json::Value)` | `Result<DocResult>` | Update an existing document. You must provide the current `_rev` string. Returns `RouchError::Conflict` if the rev does not match. |
 | `remove` | `async fn remove(&self, id: &str, rev: &str)` | `Result<DocResult>` | Delete a document by marking it as deleted. Requires the current `_rev`. The document remains in the database as a deletion tombstone. |
@@ -51,7 +52,11 @@ These methods correspond to CouchDB's core document API. See the [Core Types Ref
 ### Examples
 
 ```rust
-// Put and get
+// Post (auto-generated ID)
+let result = db.post(json!({"name": "Alice", "age": 30})).await?;
+println!("Generated ID: {}", result.id);
+
+// Put (explicit ID)
 let result = db.put("user:alice", json!({"name": "Alice", "age": 30})).await?;
 let doc = db.get("user:alice").await?;
 
@@ -78,11 +83,31 @@ let response = db.all_docs(AllDocsOptions {
 
 ---
 
+## Attachment Operations
+
+| Method | Signature | Return Type | Description |
+|--------|-----------|-------------|-------------|
+| `remove_attachment` | `async fn remove_attachment(&self, doc_id: &str, att_id: &str, rev: &str)` | `Result<DocResult>` | Remove an attachment from a document. Creates a new revision with the attachment removed. Equivalent to PouchDB's `db.removeAttachment()`. |
+
+### Example
+
+```rust
+// Put and get attachment via adapter
+let att_result = db.adapter()
+    .put_attachment("doc1", "photo.jpg", &rev, data, "image/jpeg")
+    .await?;
+
+// Remove the attachment
+let rm = db.remove_attachment("doc1", "photo.jpg", &att_result.rev.unwrap()).await?;
+```
+
+---
+
 ## Query Operations
 
 | Method | Signature | Return Type | Description |
 |--------|-----------|-------------|-------------|
-| `find` | `async fn find(&self, opts: FindOptions)` | `Result<FindResponse>` | Run a Mango find query with selectors, field projection, sorting, and pagination. See [`FindOptions`](core-types.md). |
+| `find` | `async fn find(&self, opts: FindOptions)` | `Result<FindResponse>` | Run a Mango find query with selectors, field projection, sorting, and pagination. If a matching index exists, it will be used. See [`FindOptions`](core-types.md). |
 
 ### Example
 
@@ -102,6 +127,42 @@ for doc in &result.docs {
 
 ---
 
+## Index Operations
+
+| Method | Signature | Return Type | Description |
+|--------|-----------|-------------|-------------|
+| `create_index` | `async fn create_index(&self, def: IndexDefinition)` | `Result<CreateIndexResponse>` | Create a Mango index for faster queries. The index is built immediately by scanning all documents. Returns `"created"` or `"exists"`. |
+| `get_indexes` | `async fn get_indexes(&self)` | `Vec<IndexInfo>` | List all indexes defined on this database. |
+| `delete_index` | `async fn delete_index(&self, name: &str)` | `Result<()>` | Delete an index by name. Returns `NotFound` if the index does not exist. |
+
+### Example
+
+```rust
+use rouchdb::{IndexDefinition, SortField};
+
+// Create an index on the "age" field
+let result = db.create_index(IndexDefinition {
+    name: String::new(), // auto-generated as "idx-age"
+    fields: vec![SortField::Simple("age".into())],
+    ddoc: None,
+}).await?;
+println!("Index: {} ({})", result.name, result.result);
+
+// Queries on "age" now use the index instead of a full scan
+let found = db.find(FindOptions {
+    selector: json!({"age": {"$gte": 21}}),
+    ..Default::default()
+}).await?;
+
+// List indexes
+let indexes = db.get_indexes().await;
+
+// Delete an index
+db.delete_index("idx-age").await?;
+```
+
+---
+
 ## Replication
 
 All replication methods implement the CouchDB replication protocol: checkpoint reading, changes feed, revision diff, bulk document fetch, and checkpoint saving. See the [Replication chapter](../guide/replication.md) for a conceptual overview.
@@ -111,6 +172,8 @@ All replication methods implement the CouchDB replication protocol: checkpoint r
 | `replicate_to` | `async fn replicate_to(&self, target: &Database)` | `Result<ReplicationResult>` | One-shot push replication from this database to the target. Uses default options (batch size 100). |
 | `replicate_from` | `async fn replicate_from(&self, source: &Database)` | `Result<ReplicationResult>` | One-shot pull replication from the source into this database. |
 | `replicate_to_with_opts` | `async fn replicate_to_with_opts(&self, target: &Database, opts: ReplicationOptions)` | `Result<ReplicationResult>` | Push replication with custom `ReplicationOptions` (batch size, batches limit). |
+| `replicate_to_with_events` | `async fn replicate_to_with_events(&self, target: &Database, opts: ReplicationOptions)` | `Result<(ReplicationResult, Receiver<ReplicationEvent>)>` | Push replication with event streaming. Returns the result and a channel receiver for progress events. |
+| `replicate_to_live` | `fn replicate_to_live(&self, target: &Database, opts: ReplicationOptions)` | `(Receiver<ReplicationEvent>, ReplicationHandle)` | Start continuous (live) replication. Returns an event receiver and a handle to cancel. Dropping the handle also cancels. |
 | `sync` | `async fn sync(&self, other: &Database)` | `Result<(ReplicationResult, ReplicationResult)>` | Bidirectional sync: pushes to `other`, then pulls from `other`. Returns a tuple of `(push_result, pull_result)`. |
 
 ### ReplicationOptions
@@ -120,6 +183,10 @@ All replication methods implement the CouchDB replication protocol: checkpoint r
 | `batch_size` | `u64` | `100` | Number of documents to process per batch. |
 | `batches_limit` | `u64` | `10` | Maximum number of batches to buffer. |
 | `filter` | `Option<ReplicationFilter>` | `None` | Optional filter for selective replication. |
+| `live` | `bool` | `false` | Enable continuous replication (used with `replicate_to_live`). |
+| `retry` | `bool` | `false` | Automatically retry on failure (live mode). |
+| `poll_interval` | `Duration` | `500ms` | How often to poll for new changes in live mode. |
+| `back_off_function` | `Option<Box<dyn Fn(u32) -> Duration>>` | `None` | Custom backoff function for retries. Receives retry count, returns delay. |
 
 ### ReplicationFilter
 

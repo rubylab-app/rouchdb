@@ -3,7 +3,9 @@
 mod common;
 
 use common::{delete_remote_db, fresh_remote_db};
-use rouchdb::{ChangesOptions, Database, ReplicationFilter, ReplicationOptions};
+use rouchdb::{
+    ChangesOptions, Database, ReplicationEvent, ReplicationFilter, ReplicationOptions,
+};
 
 // =========================================================================
 // Basic replication (local ↔ remote)
@@ -866,6 +868,234 @@ async fn replicate_filtered_selector_from_couchdb() {
     assert_eq!(doc.data["amount"], 100);
 
     assert!(local.get("user1").await.is_err());
+
+    delete_remote_db(&url).await;
+}
+
+// =========================================================================
+// Replication with event streaming
+// =========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn replicate_to_couchdb_with_events() {
+    let url = fresh_remote_db("repl_events").await;
+    let local = Database::memory("local");
+    let remote = Database::http(&url);
+
+    for i in 0..5 {
+        local
+            .put(&format!("doc{}", i), serde_json::json!({"i": i}))
+            .await
+            .unwrap();
+    }
+
+    let (result, mut rx) = local
+        .replicate_to_with_events(&remote, ReplicationOptions::default())
+        .await
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.docs_written, 5);
+
+    // Collect all events
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+
+    // Should have at least Active and Complete events
+    assert!(events.iter().any(|e| matches!(e, ReplicationEvent::Active)));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ReplicationEvent::Complete(_)))
+    );
+
+    // Verify data actually arrived
+    let info = remote.info().await.unwrap();
+    assert_eq!(info.doc_count, 5);
+
+    delete_remote_db(&url).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn replicate_events_include_change_progress() {
+    let url = fresh_remote_db("repl_evt_prog").await;
+    let local = Database::memory("local");
+    let remote = Database::http(&url);
+
+    for i in 0..10 {
+        local
+            .put(&format!("doc{:02}", i), serde_json::json!({"i": i}))
+            .await
+            .unwrap();
+    }
+
+    let (result, mut rx) = local
+        .replicate_to_with_events(
+            &remote,
+            ReplicationOptions {
+                batch_size: 5,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.docs_written, 10);
+
+    let mut change_events = 0;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, ReplicationEvent::Change { .. }) {
+            change_events += 1;
+        }
+    }
+
+    // With batch_size=5 and 10 docs, should have at least 2 Change events
+    assert!(change_events >= 2, "got {} change events", change_events);
+
+    delete_remote_db(&url).await;
+}
+
+// =========================================================================
+// Live replication
+// =========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn live_replicate_to_couchdb() {
+    let url = fresh_remote_db("live_repl").await;
+    let local = Database::memory("local");
+    let remote = Database::http(&url);
+
+    // Add initial docs
+    local
+        .put("doc1", serde_json::json!({"v": 1}))
+        .await
+        .unwrap();
+    local
+        .put("doc2", serde_json::json!({"v": 2}))
+        .await
+        .unwrap();
+
+    let (mut rx, handle) = local.replicate_to_live(
+        &remote,
+        ReplicationOptions {
+            poll_interval: std::time::Duration::from_millis(200),
+            live: true,
+            ..Default::default()
+        },
+    );
+
+    // Wait for the initial batch to complete
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(5));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Some(ReplicationEvent::Complete(r)) if r.docs_written > 0 => break,
+                    Some(ReplicationEvent::Paused) => {
+                        if remote.get("doc1").await.is_ok() {
+                            break;
+                        }
+                    }
+                    None => break,
+                    _ => {}
+                }
+            }
+            _ = &mut timeout => {
+                panic!("live replication timed out waiting for initial sync");
+            }
+        }
+    }
+
+    // Verify docs arrived
+    let doc = remote.get("doc1").await.unwrap();
+    assert_eq!(doc.data["v"], 1);
+
+    let info = remote.info().await.unwrap();
+    assert!(info.doc_count >= 2);
+
+    // Cancel live replication
+    handle.cancel();
+
+    delete_remote_db(&url).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn live_replicate_picks_up_new_docs() {
+    let url = fresh_remote_db("live_new").await;
+    let local = Database::memory("local");
+    let remote = Database::http(&url);
+
+    // Start live replication with no initial data
+    let (mut rx, handle) = local.replicate_to_live(
+        &remote,
+        ReplicationOptions {
+            poll_interval: std::time::Duration::from_millis(100),
+            live: true,
+            ..Default::default()
+        },
+    );
+
+    // Wait for initial paused (empty database)
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(2));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Some(ReplicationEvent::Paused | ReplicationEvent::Complete(_)) => break,
+                    None => break,
+                    _ => {}
+                }
+            }
+            _ = &mut timeout => break,
+        }
+    }
+
+    // Now add a document — live replication should pick it up
+    local
+        .put("late_doc", serde_json::json!({"arrived": "late"}))
+        .await
+        .unwrap();
+
+    // Wait for it to replicate
+    let timeout2 = tokio::time::sleep(std::time::Duration::from_secs(5));
+    tokio::pin!(timeout2);
+    let mut replicated = false;
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Some(ReplicationEvent::Complete(r)) if r.docs_written > 0 => {
+                        replicated = true;
+                        break;
+                    }
+                    Some(ReplicationEvent::Paused) => {
+                        if remote.get("late_doc").await.is_ok() {
+                            replicated = true;
+                            break;
+                        }
+                    }
+                    None => break,
+                    _ => {}
+                }
+            }
+            _ = &mut timeout2 => break,
+        }
+    }
+
+    handle.cancel();
+
+    assert!(replicated, "late_doc was not replicated by live replication");
+    let doc = remote.get("late_doc").await.unwrap();
+    assert_eq!(doc.data["arrived"], "late");
 
     delete_remote_db(&url).await;
 }

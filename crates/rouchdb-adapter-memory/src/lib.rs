@@ -642,6 +642,40 @@ impl Adapter for MemoryAdapter {
         )))
     }
 
+    async fn remove_attachment(&self, doc_id: &str, att_id: &str, rev: &str) -> Result<DocResult> {
+        let _ = att_id; // attachment tracking is simplified in memory adapter
+        let mut inner = self.inner.write().await;
+
+        let stored = inner
+            .docs
+            .get(doc_id)
+            .ok_or_else(|| RouchError::NotFound(doc_id.to_string()))?;
+
+        let winner = winning_rev(&stored.rev_tree)
+            .ok_or_else(|| RouchError::NotFound(doc_id.to_string()))?;
+        if winner.to_string() != rev {
+            return Err(RouchError::Conflict);
+        }
+
+        let doc_data = stored
+            .rev_data
+            .get(rev)
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+        // Create a new revision (attachment removal is a document update)
+        let doc = Document {
+            id: doc_id.to_string(),
+            rev: Some(winner.clone()),
+            deleted: false,
+            data: doc_data,
+            attachments: HashMap::new(),
+        };
+
+        let result = process_doc_new_edits(&mut inner, doc);
+        Ok(result)
+    }
+
     async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
         let inner = self.inner.read().await;
         inner

@@ -14,6 +14,151 @@ use rouchdb_core::collation::collate;
 use rouchdb_core::document::AllDocsOptions;
 use rouchdb_core::error::Result;
 
+/// Definition of a Mango index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexDefinition {
+    /// Index name (auto-generated if not provided).
+    pub name: String,
+    /// Fields to index, in order.
+    pub fields: Vec<SortField>,
+    /// Optional design document name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ddoc: Option<String>,
+}
+
+/// Information about an existing index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexInfo {
+    /// Index name.
+    pub name: String,
+    /// Design document ID (if any).
+    pub ddoc: Option<String>,
+    /// Indexed fields.
+    pub def: IndexFields,
+}
+
+/// The fields portion of an index definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexFields {
+    pub fields: Vec<SortField>,
+}
+
+/// Result of creating an index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateIndexResponse {
+    /// `"created"` or `"exists"`.
+    pub result: String,
+    /// Index name.
+    pub name: String,
+}
+
+/// A built in-memory index: sorted entries of (composite_key, doc_id).
+#[derive(Debug, Clone)]
+pub struct BuiltIndex {
+    pub def: IndexDefinition,
+    pub entries: Vec<(Vec<serde_json::Value>, String)>,
+}
+
+impl BuiltIndex {
+    /// Find doc IDs matching a simple equality/range selector on the indexed fields.
+    pub fn find_matching(&self, selector: &serde_json::Value) -> Vec<String> {
+        if self.def.fields.is_empty() {
+            return Vec::new();
+        }
+
+        // Extract the first indexed field and its conditions
+        let (first_field, _) = self.def.fields[0].field_and_direction();
+
+        if let Some(conditions) = selector.get(first_field) {
+            match conditions {
+                serde_json::Value::Object(ops) => {
+                    // Range query: use binary search
+                    self.entries
+                        .iter()
+                        .filter(|(key, _)| {
+                            if key.is_empty() {
+                                return false;
+                            }
+                            let val = &key[0];
+                            for (op, operand) in ops {
+                                let matches = match op.as_str() {
+                                    "$eq" => collate(val, operand) == std::cmp::Ordering::Equal,
+                                    "$gt" => collate(val, operand) == std::cmp::Ordering::Greater,
+                                    "$gte" => collate(val, operand) != std::cmp::Ordering::Less,
+                                    "$lt" => collate(val, operand) == std::cmp::Ordering::Less,
+                                    "$lte" => collate(val, operand) != std::cmp::Ordering::Greater,
+                                    _ => true, // Unknown op, don't filter
+                                };
+                                if !matches {
+                                    return false;
+                                }
+                            }
+                            true
+                        })
+                        .map(|(_, id)| id.clone())
+                        .collect()
+                }
+                // Implicit $eq
+                other => self
+                    .entries
+                    .iter()
+                    .filter(|(key, _)| {
+                        !key.is_empty() && collate(&key[0], other) == std::cmp::Ordering::Equal
+                    })
+                    .map(|(_, id)| id.clone())
+                    .collect(),
+            }
+        } else {
+            // Selector doesn't use the indexed field, can't use index
+            self.entries.iter().map(|(_, id)| id.clone()).collect()
+        }
+    }
+}
+
+/// Build an index from all documents in an adapter.
+pub async fn build_index(adapter: &dyn Adapter, def: &IndexDefinition) -> Result<BuiltIndex> {
+    let all = adapter
+        .all_docs(AllDocsOptions {
+            include_docs: true,
+            ..AllDocsOptions::new()
+        })
+        .await?;
+
+    let mut entries: Vec<(Vec<serde_json::Value>, String)> = Vec::new();
+
+    for row in &all.rows {
+        if let Some(ref doc_json) = row.doc {
+            let key: Vec<serde_json::Value> = def
+                .fields
+                .iter()
+                .map(|sf| {
+                    let (field, _) = sf.field_and_direction();
+                    get_nested_field(doc_json, field)
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect();
+            entries.push((key, row.id.clone()));
+        }
+    }
+
+    // Sort by composite key
+    entries.sort_by(|(a, _), (b, _)| {
+        for (va, vb) in a.iter().zip(b.iter()) {
+            let cmp = collate(va, vb);
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+
+    Ok(BuiltIndex {
+        def: def.clone(),
+        entries,
+    })
+}
+
 /// Options for a Mango find query.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FindOptions {
@@ -44,7 +189,7 @@ pub enum SortField {
 }
 
 impl SortField {
-    fn field_and_direction(&self) -> (&str, SortDirection) {
+    pub fn field_and_direction(&self) -> (&str, SortDirection) {
         match self {
             SortField::Simple(f) => (f.as_str(), SortDirection::Asc),
             SortField::WithDirection(map) => {
@@ -61,7 +206,7 @@ impl SortField {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum SortDirection {
+pub enum SortDirection {
     Asc,
     Desc,
 }

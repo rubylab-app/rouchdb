@@ -758,6 +758,17 @@ impl Adapter for RedbAdapter {
         ))
     }
 
+    async fn remove_attachment(
+        &self,
+        _doc_id: &str,
+        _att_id: &str,
+        _rev: &str,
+    ) -> Result<DocResult> {
+        Err(RouchError::BadRequest(
+            "attachments not yet implemented for redb".into(),
+        ))
+    }
+
     async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
         let read_txn = db_err!(self.db.begin_read())?;
         let table = db_err!(read_txn.open_table(LOCAL_TABLE))?;

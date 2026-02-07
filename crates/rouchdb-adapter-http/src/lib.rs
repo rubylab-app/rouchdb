@@ -568,6 +568,35 @@ impl Adapter for HttpAdapter {
         Ok(bytes.to_vec())
     }
 
+    async fn remove_attachment(&self, doc_id: &str, att_id: &str, rev: &str) -> Result<DocResult> {
+        let url = format!(
+            "{}/{}?rev={}",
+            self.url(&urlencoded(doc_id)),
+            urlencoded(att_id),
+            rev
+        );
+
+        let resp = self
+            .client
+            .delete(&url)
+            .send()
+            .await
+            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+        let resp = self.check_error(resp).await?;
+        let result: CouchDbPutResponse = resp
+            .json()
+            .await
+            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+
+        Ok(DocResult {
+            ok: result.ok.unwrap_or(true),
+            id: result.id,
+            rev: Some(result.rev),
+            error: None,
+            reason: None,
+        })
+    }
+
     async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
         let url = self.url(&format!("_local/{}", urlencoded(id)));
         let resp = self

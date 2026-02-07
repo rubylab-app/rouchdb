@@ -107,9 +107,13 @@ let result = local.replicate_to_with_opts(&remote, ReplicationOptions {
 use rouchdb::ReplicationOptions;
 
 let opts = ReplicationOptions {
-    batch_size: 100,   // documents per batch (default: 100)
-    batches_limit: 10, // max batches to buffer (default: 10)
-    filter: None,      // optional filter (default: None)
+    batch_size: 100,                                   // documents per batch (default: 100)
+    batches_limit: 10,                                 // max batches to buffer (default: 10)
+    filter: None,                                      // optional filter (default: None)
+    live: false,                                       // continuous mode (default: false)
+    retry: false,                                      // auto-retry on failure (default: false)
+    poll_interval: std::time::Duration::from_millis(500), // live mode poll interval
+    back_off_function: None,                           // custom backoff for retries
     ..Default::default()
 };
 ```
@@ -119,6 +123,10 @@ let opts = ReplicationOptions {
 | `batch_size` | 100 | Number of documents to process in each replication batch. Smaller values mean more frequent checkpoints. |
 | `batches_limit` | 10 | Maximum number of batches to buffer. Controls memory usage for large replications. |
 | `filter` | `None` | Optional `ReplicationFilter` for selective replication. See [Filtered Replication](#filtered-replication). |
+| `live` | `false` | Enable continuous replication that keeps running and picks up new changes. |
+| `retry` | `false` | Automatically retry on network or transient errors (live mode). |
+| `poll_interval` | 500ms | How frequently to poll for new changes in live mode. |
+| `back_off_function` | `None` | Custom backoff function for retries. Receives retry count, returns delay. |
 
 ## Filtered Replication
 
@@ -243,17 +251,100 @@ println!("Incremental: {} docs written", r2.docs_written); // 1
 
 ## Replication Events
 
-The `ReplicationEvent` enum is available for progress tracking:
+Use `replicate_to_with_events()` to receive progress events during replication:
 
 ```rust
 use rouchdb::ReplicationEvent;
 
-// ReplicationEvent variants:
-// ReplicationEvent::Change { docs_read }  -- progress update
-// ReplicationEvent::Paused                -- waiting for more changes
-// ReplicationEvent::Active                -- replication resumed
-// ReplicationEvent::Complete(result)      -- replication finished
-// ReplicationEvent::Error(message)        -- an error occurred
+let (result, mut rx) = local.replicate_to_with_events(
+    &remote,
+    ReplicationOptions::default(),
+).await?;
+
+// Drain events after replication completes
+while let Ok(event) = rx.try_recv() {
+    match event {
+        ReplicationEvent::Active => println!("Replication started"),
+        ReplicationEvent::Change { docs_read } => {
+            println!("Progress: {} docs read", docs_read);
+        }
+        ReplicationEvent::Complete(result) => {
+            println!("Done: {} written", result.docs_written);
+        }
+        ReplicationEvent::Error(msg) => println!("Error: {}", msg),
+        ReplicationEvent::Paused => println!("Waiting for changes..."),
+    }
+}
+```
+
+### Event Variants
+
+| Variant | Description |
+|---------|-------------|
+| `Active` | Replication has started or resumed processing. |
+| `Change { docs_read }` | A batch of changes was processed. |
+| `Paused` | Waiting for more changes (live mode). |
+| `Complete(ReplicationResult)` | Replication finished (one-shot or one cycle in live mode). |
+| `Error(String)` | An error occurred during replication. |
+
+## Live (Continuous) Replication
+
+Live replication keeps running in the background, continuously polling for new changes and replicating them. This is the equivalent of PouchDB's `{ live: true }` option.
+
+```rust
+use rouchdb::{ReplicationOptions, ReplicationEvent};
+
+let (mut rx, handle) = local.replicate_to_live(&remote, ReplicationOptions {
+    live: true,
+    poll_interval: std::time::Duration::from_millis(500),
+    retry: true,
+    ..Default::default()
+});
+
+// Process events in a loop
+tokio::spawn(async move {
+    while let Some(event) = rx.recv().await {
+        match event {
+            ReplicationEvent::Complete(r) => {
+                println!("Batch done: {} docs written", r.docs_written);
+            }
+            ReplicationEvent::Paused => {
+                println!("Up to date, waiting for new changes...");
+            }
+            ReplicationEvent::Error(msg) => {
+                eprintln!("Replication error: {}", msg);
+            }
+            _ => {}
+        }
+    }
+});
+
+// ... later, when you want to stop:
+handle.cancel();
+```
+
+### ReplicationHandle
+
+The `ReplicationHandle` returned by `replicate_to_live()` controls the background replication:
+
+- **`handle.cancel()`** -- Stops the replication gracefully.
+- **Dropping the handle** also cancels the replication (via `Drop` implementation).
+
+### Retry and Backoff
+
+When `retry: true` is set, live replication will automatically retry after transient errors. You can customize the backoff strategy:
+
+```rust
+let (rx, handle) = local.replicate_to_live(&remote, ReplicationOptions {
+    live: true,
+    retry: true,
+    back_off_function: Some(Box::new(|retry_count| {
+        // Exponential backoff: 1s, 2s, 4s, 8s, max 30s
+        let delay = std::cmp::min(1000 * 2u64.pow(retry_count), 30_000);
+        std::time::Duration::from_millis(delay)
+    })),
+    ..Default::default()
+});
 ```
 
 ## Complete Example: Local-to-CouchDB Sync

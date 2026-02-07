@@ -242,6 +242,10 @@ pub struct ReplicationOptions {
     pub batch_size: u64,                   // default: 100
     pub batches_limit: u64,                // default: 10
     pub filter: Option<ReplicationFilter>, // default: None
+    pub live: bool,                        // default: false
+    pub retry: bool,                       // default: false
+    pub poll_interval: Duration,           // default: 500ms
+    pub back_off_function: Option<Box<dyn Fn(u32) -> Duration + Send + Sync>>,
 }
 ```
 
@@ -253,6 +257,11 @@ pub struct ReplicationOptions {
   `Custom(Box<dyn Fn(&ChangeEvent) -> bool>)`. When `DocIds` is used,
   filtering happens at the changes feed level. `Selector` filters after
   `bulk_get`. `Custom` filters after fetching changes.
+- `live` -- enable continuous replication mode.
+- `retry` -- automatically retry on transient errors in live mode.
+- `poll_interval` -- how often to poll for new changes in live mode.
+- `back_off_function` -- custom backoff for retries; receives retry count,
+  returns delay duration.
 
 ## Result
 
@@ -305,6 +314,62 @@ First replication:   0 -----> 50  (processes 50 changes)
 Second replication: 50 -----> 53  (processes only 3 new changes)
                               ^ checkpoint updated
 ```
+
+## Live (Continuous) Replication
+
+The `replicate_live()` function extends the one-shot protocol into a
+continuous loop:
+
+```
+ ┌─────────────────────────────────────────────────┐
+ │              Live Replication Loop               │
+ │                                                  │
+ │  ┌──────────────┐                                │
+ │  │  One-shot    │──(changes found)──→ emit       │
+ │  │  replicate() │       Complete event           │
+ │  └──────┬───────┘                                │
+ │         │                                        │
+ │    (no changes)                                  │
+ │         │                                        │
+ │    emit Paused                                   │
+ │         │                                        │
+ │    sleep(poll_interval)                          │
+ │         │                                        │
+ │    ┌────▼────┐                                   │
+ │    │cancelled?│──yes──→ stop                     │
+ │    └────┬────┘                                   │
+ │         │ no                                     │
+ │         └───────→ loop back                      │
+ └─────────────────────────────────────────────────┘
+```
+
+Key implementation details:
+
+- **`CancellationToken`** from `tokio_util` controls the loop. The caller
+  receives a `ReplicationHandle` that wraps the token. Calling
+  `handle.cancel()` or dropping the handle stops the loop.
+- **Event channel:** A `tokio::sync::mpsc::Sender<ReplicationEvent>`
+  streams progress events (`Active`, `Change`, `Complete`, `Paused`,
+  `Error`) to the caller.
+- **Retry with backoff:** When `retry: true` and an error occurs, the loop
+  sleeps for `back_off_function(retry_count)` before retrying. The retry
+  counter resets after a successful cycle.
+- **Poll interval:** Between successful cycles where no changes were found,
+  the loop sleeps for `poll_interval` before checking again.
+
+## Event Streaming
+
+The `replicate_with_events()` function is a one-shot replication that emits
+events through an `mpsc` channel as it progresses:
+
+- **`Active`** -- emitted when replication starts.
+- **`Change { docs_read }`** -- emitted after each batch of changes is
+  written to the target.
+- **`Complete(ReplicationResult)`** -- emitted when replication finishes.
+- **`Error(String)`** -- emitted on per-document errors (non-fatal).
+
+This enables UI progress tracking, logging, and monitoring without blocking
+the replication process.
 
 ## Bidirectional Sync
 

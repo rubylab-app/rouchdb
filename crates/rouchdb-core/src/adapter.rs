@@ -73,6 +73,11 @@ pub trait Adapter: Send + Sync {
         opts: GetAttachmentOptions,
     ) -> Result<Vec<u8>>;
 
+    /// Remove an attachment from a document.
+    ///
+    /// Creates a new revision of the document with the attachment removed.
+    async fn remove_attachment(&self, doc_id: &str, att_id: &str, rev: &str) -> Result<DocResult>;
+
     /// Retrieve a local document (not replicated, used for checkpoints).
     async fn get_local(&self, id: &str) -> Result<serde_json::Value>;
 
