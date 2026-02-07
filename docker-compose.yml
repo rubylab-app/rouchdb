@@ -1,0 +1,13 @@
+services:
+  couchdb:
+    image: couchdb:3
+    ports:
+      - "15984:5984"
+    environment:
+      COUCHDB_USER: admin
+      COUCHDB_PASSWORD: password
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5984/_up"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
