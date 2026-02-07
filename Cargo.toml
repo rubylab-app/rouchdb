@@ -7,4 +7,5 @@ members = [
     "crates/rouchdb-adapter-redb",
     "crates/rouchdb-adapter-http",
     "crates/rouchdb-replication",
+    "crates/rouchdb-query",
 ]
