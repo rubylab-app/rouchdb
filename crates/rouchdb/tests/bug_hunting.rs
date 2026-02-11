@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use rouchdb::{
     AllDocsOptions, BulkDocsOptions, ChangesOptions, ChangesStreamOptions, Database,
-    DesignDocument, Document, FindOptions, Plugin, Result, Revision,
-    SecurityDocument, SecurityGroup, SortField, ViewDef, ViewEngine, ViewQueryOptions, query_view,
+    DesignDocument, Document, FindOptions, Plugin, Result, Revision, SecurityDocument,
+    SecurityGroup, SortField, ViewDef, ViewEngine, ViewQueryOptions, query_view,
 };
 
 // =========================================================================
@@ -99,18 +99,13 @@ async fn partition_all_docs_enforces_boundaries() {
 #[tokio::test]
 async fn partition_empty_name() {
     let db = Database::memory("test");
-    db.put(":doc1", serde_json::json!({"v": 1}))
-        .await
-        .unwrap();
+    db.put(":doc1", serde_json::json!({"v": 1})).await.unwrap();
     db.put("normal_doc", serde_json::json!({"v": 2}))
         .await
         .unwrap();
 
     let partition = db.partition("");
-    let result = partition
-        .all_docs(AllDocsOptions::new())
-        .await
-        .unwrap();
+    let result = partition.all_docs(AllDocsOptions::new()).await.unwrap();
 
     // Empty partition name creates ":" prefix
     // This should only match docs starting with ":"
@@ -313,7 +308,11 @@ async fn view_descending_with_key_range() {
     .await
     .unwrap();
 
-    assert_eq!(results.rows.len(), 5, "Descending range 7..=3 should have 5 rows");
+    assert_eq!(
+        results.rows.len(),
+        5,
+        "Descending range 7..=3 should have 5 rows"
+    );
 
     // Verify order is descending
     let keys: Vec<i64> = results
@@ -422,8 +421,7 @@ async fn plugin_before_write_called_on_update() {
             "write-count"
         }
         async fn before_write(&self, _docs: &mut Vec<Document>) -> Result<()> {
-            self.0
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }
@@ -452,8 +450,7 @@ async fn plugin_before_write_called_on_remove() {
             "write-count"
         }
         async fn before_write(&self, _docs: &mut Vec<Document>) -> Result<()> {
-            self.0
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }
@@ -472,12 +469,8 @@ async fn plugin_before_write_called_on_remove() {
 #[tokio::test]
 async fn changes_selector_advances_last_seq_even_when_all_filtered() {
     let db = Database::memory("test");
-    db.put("a", serde_json::json!({"type": "x"}))
-        .await
-        .unwrap();
-    db.put("b", serde_json::json!({"type": "x"}))
-        .await
-        .unwrap();
+    db.put("a", serde_json::json!({"type": "x"})).await.unwrap();
+    db.put("b", serde_json::json!({"type": "x"})).await.unwrap();
 
     // Selector matches nothing — but last_seq should still advance
     let changes = db
@@ -657,10 +650,7 @@ async fn design_doc_full_roundtrip() {
     assert_eq!(retrieved.language, Some("javascript".into()));
 
     // Verify individual fields survived the roundtrip
-    assert_eq!(
-        retrieved.views["by_type"].reduce,
-        Some("_count".into())
-    );
+    assert_eq!(retrieved.views["by_type"].reduce, Some("_count".into()));
     assert_eq!(retrieved.views["by_name"].reduce, None);
 }
 

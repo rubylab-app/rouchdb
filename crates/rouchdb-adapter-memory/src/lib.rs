@@ -1127,12 +1127,7 @@ fn prune_leaf_from_tree(tree: &mut RevTree, target_pos: u64, target_hash: &str) 
 
 /// Recursively remove a matching leaf node from the subtree.
 /// Returns true if the node at this level should be removed (it matched and was a leaf).
-fn prune_leaf_from_node(
-    node: &mut RevNode,
-    current_pos: u64,
-    target_pos: u64,
-    target_hash: &str,
-) {
+fn prune_leaf_from_node(node: &mut RevNode, current_pos: u64, target_pos: u64, target_hash: &str) {
     // Remove matching children that are leaves
     node.children.retain(|child| {
         let child_pos = current_pos + 1;

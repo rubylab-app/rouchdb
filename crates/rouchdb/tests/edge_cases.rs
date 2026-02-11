@@ -4,15 +4,14 @@
 //! changes feed boundaries, and more.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rouchdb::{
     AllDocsOptions, BulkDocsOptions, ChangesOptions, ChangesStreamOptions, Database,
     DesignDocument, DocResult, Document, FindOptions, Plugin, ReduceFn, ReplicationFilter,
-    ReplicationOptions, Result, RouchError, SortField, ViewQueryOptions,
-    query_view,
+    ReplicationOptions, Result, RouchError, SortField, ViewQueryOptions, query_view,
 };
 
 // =========================================================================
@@ -85,10 +84,7 @@ async fn concurrent_updates_same_doc_produces_conflicts() {
     );
 
     // At least one should succeed
-    let success_count = [&r1, &r2]
-        .iter()
-        .filter(|r| r.is_ok())
-        .count();
+    let success_count = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
     assert!(success_count >= 1, "At least one update should succeed");
 }
 
@@ -139,9 +135,7 @@ impl Plugin for RejectDesignPlugin {
     async fn before_write(&self, docs: &mut Vec<Document>) -> Result<()> {
         for doc in docs.iter() {
             if doc.id.starts_with("_design/") {
-                return Err(RouchError::Forbidden(
-                    "Design docs not allowed".into(),
-                ));
+                return Err(RouchError::Forbidden("Design docs not allowed".into()));
             }
         }
         Ok(())
@@ -191,8 +185,7 @@ impl Plugin for WriteCounter {
     }
 
     async fn after_write(&self, results: &[DocResult]) -> Result<()> {
-        self.count
-            .fetch_add(results.len() as u64, Ordering::SeqCst);
+        self.count.fetch_add(results.len() as u64, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -288,7 +281,11 @@ async fn partition_with_colon_in_name() {
     // Partition "a" should get all docs starting with "a:"
     let partition = db.partition("a");
     let result = partition.all_docs(AllDocsOptions::new()).await.unwrap();
-    assert_eq!(result.rows.len(), 3, "All 'a:*' docs should be in partition");
+    assert_eq!(
+        result.rows.len(),
+        3,
+        "All 'a:*' docs should be in partition"
+    );
 }
 
 // =========================================================================
@@ -328,12 +325,9 @@ async fn partition_find_with_conflicting_id_selector() {
 async fn index_returns_correct_results_after_delete() {
     let db = Database::memory("test");
 
-    db.put(
-        "alice",
-        serde_json::json!({"name": "Alice", "age": 30}),
-    )
-    .await
-    .unwrap();
+    db.put("alice", serde_json::json!({"name": "Alice", "age": 30}))
+        .await
+        .unwrap();
     let bob_result = db
         .put("bob", serde_json::json!({"name": "Bob", "age": 25}))
         .await
@@ -400,9 +394,13 @@ async fn index_updates_on_field_value_change() {
     assert_eq!(found.docs.len(), 1);
 
     // Update to "complete"
-    db.update("doc1", &r.rev.unwrap(), serde_json::json!({"status": "complete", "v": 2}))
-        .await
-        .unwrap();
+    db.update(
+        "doc1",
+        &r.rev.unwrap(),
+        serde_json::json!({"status": "complete", "v": 2}),
+    )
+    .await
+    .unwrap();
 
     // Should NOT find "pending" anymore
     let found = db
@@ -412,7 +410,11 @@ async fn index_updates_on_field_value_change() {
         })
         .await
         .unwrap();
-    assert_eq!(found.docs.len(), 0, "Old status should not appear in results");
+    assert_eq!(
+        found.docs.len(),
+        0,
+        "Old status should not appear in results"
+    );
 
     // Should find "complete"
     let found = db
@@ -443,7 +445,11 @@ async fn changes_since_future_sequence_returns_empty() {
         .await
         .unwrap();
 
-    assert_eq!(changes.results.len(), 0, "Future seq should return no results");
+    assert_eq!(
+        changes.results.len(),
+        0,
+        "Future seq should return no results"
+    );
 }
 
 // =========================================================================
@@ -454,18 +460,12 @@ async fn changes_since_future_sequence_returns_empty() {
 async fn unicode_field_names_in_find() {
     let db = Database::memory("test");
 
-    db.put(
-        "doc1",
-        serde_json::json!({"名前": "Alice", "年齢": 30}),
-    )
-    .await
-    .unwrap();
-    db.put(
-        "doc2",
-        serde_json::json!({"名前": "Bob", "年齢": 25}),
-    )
-    .await
-    .unwrap();
+    db.put("doc1", serde_json::json!({"名前": "Alice", "年齢": 30}))
+        .await
+        .unwrap();
+    db.put("doc2", serde_json::json!({"名前": "Bob", "年齢": 25}))
+        .await
+        .unwrap();
 
     let result = db
         .find(FindOptions {
@@ -483,9 +483,12 @@ async fn unicode_field_names_in_find() {
 async fn emoji_in_field_names_and_values() {
     let db = Database::memory("test");
 
-    db.put("doc1", serde_json::json!({"status_emoji": "✅", "likes": "👍👍"}))
-        .await
-        .unwrap();
+    db.put(
+        "doc1",
+        serde_json::json!({"status_emoji": "✅", "likes": "👍👍"}),
+    )
+    .await
+    .unwrap();
 
     let doc = db.get("doc1").await.unwrap();
     assert_eq!(doc.data["status_emoji"], "✅");
@@ -516,10 +519,7 @@ async fn field_names_with_dots_and_colons() {
 async fn remove_attachment_with_wrong_rev() {
     let db = Database::memory("test");
 
-    let r = db
-        .put("doc1", serde_json::json!({"v": 1}))
-        .await
-        .unwrap();
+    let r = db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
     let rev = r.rev.unwrap();
 
     // Put an attachment
@@ -557,7 +557,10 @@ async fn replication_filter_empty_doc_ids() {
         .unwrap();
 
     assert!(result.ok);
-    assert_eq!(result.docs_written, 0, "Empty filter should replicate nothing");
+    assert_eq!(
+        result.docs_written, 0,
+        "Empty filter should replicate nothing"
+    );
 }
 
 #[tokio::test]
@@ -672,9 +675,9 @@ async fn live_changes_events_cancel_stops_stream() {
     // After cancel, channel should eventually close
     let result = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
     match result {
-        Ok(None) => {} // Closed — good
+        Ok(None) => {}    // Closed — good
         Ok(Some(_)) => {} // Buffered — OK
-        Err(_) => {} // Timeout — OK, stopping
+        Err(_) => {}      // Timeout — OK, stopping
     }
 }
 
@@ -704,9 +707,12 @@ async fn post_generates_distinct_ids() {
 async fn explain_with_multiple_indexes() {
     let db = Database::memory("test");
 
-    db.put("doc1", serde_json::json!({"name": "A", "age": 1, "city": "NYC"}))
-        .await
-        .unwrap();
+    db.put(
+        "doc1",
+        serde_json::json!({"name": "A", "age": 1, "city": "NYC"}),
+    )
+    .await
+    .unwrap();
 
     db.create_index(rouchdb::IndexDefinition {
         name: String::new(),
@@ -752,8 +758,12 @@ async fn sync_three_times_no_duplication() {
     let a = Database::memory("a");
     let b = Database::memory("b");
 
-    a.put("doc1", serde_json::json!({"from": "a"})).await.unwrap();
-    b.put("doc2", serde_json::json!({"from": "b"})).await.unwrap();
+    a.put("doc1", serde_json::json!({"from": "a"}))
+        .await
+        .unwrap();
+    b.put("doc2", serde_json::json!({"from": "b"}))
+        .await
+        .unwrap();
 
     for _ in 0..3 {
         let (push, pull) = a.sync(&b).await.unwrap();
@@ -774,12 +784,18 @@ async fn changes_selector_on_deleted_doc() {
     let db = Database::memory("test");
 
     let r = db
-        .put("user1", serde_json::json!({"type": "user", "name": "Alice"}))
+        .put(
+            "user1",
+            serde_json::json!({"type": "user", "name": "Alice"}),
+        )
         .await
         .unwrap();
-    db.put("inv1", serde_json::json!({"type": "invoice", "amount": 100}))
-        .await
-        .unwrap();
+    db.put(
+        "inv1",
+        serde_json::json!({"type": "invoice", "amount": 100}),
+    )
+    .await
+    .unwrap();
 
     // Delete user1
     db.remove("user1", &r.rev.unwrap()).await.unwrap();
@@ -897,7 +913,10 @@ async fn design_doc_update_requires_rev() {
     };
 
     let result = db.put_design(ddoc2).await.unwrap();
-    assert!(!result.ok, "Updating design doc without rev should conflict");
+    assert!(
+        !result.ok,
+        "Updating design doc without rev should conflict"
+    );
 }
 
 // =========================================================================
