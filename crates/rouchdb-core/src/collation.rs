@@ -47,7 +47,9 @@ pub fn collate(a: &Value, b: &Value) -> Ordering {
         (Value::Number(a), Value::Number(b)) => {
             let fa = a.as_f64().unwrap_or(0.0);
             let fb = b.as_f64().unwrap_or(0.0);
-            fa.partial_cmp(&fb).unwrap_or(Ordering::Equal)
+            // total_cmp gives a well-defined ordering for all f64 values
+            // including NaN (which shouldn't appear in JSON but be safe)
+            fa.total_cmp(&fb)
         }
         (Value::String(a), Value::String(b)) => a.cmp(b),
         (Value::Array(a), Value::Array(b)) => {
@@ -152,6 +154,20 @@ fn encode_value(v: &Value, out: &mut String) {
 /// - Zero: `1`
 /// - Positive numbers: `2` + magnitude (zero-padded to 3 digits) + mantissa
 fn encode_number(n: f64, out: &mut String) {
+    if n.is_nan() {
+        out.push('0'); // Sort NaN before all real numbers
+        return;
+    }
+    if n == f64::NEG_INFINITY {
+        out.push('0');
+        out.push_str("00000");
+        return;
+    }
+    if n == f64::INFINITY {
+        out.push('2');
+        out.push_str("99999");
+        return;
+    }
     if n == 0.0 {
         out.push('1');
         return;

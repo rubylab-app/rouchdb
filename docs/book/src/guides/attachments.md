@@ -4,7 +4,7 @@ RouchDB supports binary attachments on documents, following the CouchDB attachme
 
 ## Overview
 
-Attachments are accessed through the adapter directly, not through the high-level `Database` methods. Use `db.adapter()` to get a reference to the underlying adapter, then call `put_attachment` and `get_attachment`.
+Attachments are accessed through the `Database` methods `put_attachment`, `get_attachment`, `get_attachment_with_opts`, and `remove_attachment`.
 
 ## Storing an Attachment
 
@@ -23,7 +23,7 @@ let rev = result.rev.unwrap();
 // Attach a binary file
 let image_bytes: Vec<u8> = std::fs::read("sunset.jpg")?;
 
-let att_result = db.adapter().put_attachment(
+let att_result = db.put_attachment(
     "photo:1",       // document ID
     "sunset.jpg",    // attachment name
     &rev,            // current document revision
@@ -65,7 +65,7 @@ Use `get_attachment` to read the raw bytes of an attachment:
 ```rust
 use rouchdb::GetAttachmentOptions;
 
-let bytes = db.adapter().get_attachment(
+let bytes = db.get_attachment_with_opts(
     "photo:1",
     "sunset.jpg",
     GetAttachmentOptions::default(),
@@ -183,6 +183,51 @@ When converting a document to JSON with `doc.to_json()`, attachments appear unde
 ```
 
 When creating documents from JSON using `Document::from_json()`, the `_attachments` field is automatically parsed into the `attachments` `HashMap`.
+
+## Inline Base64 Attachments
+
+When creating documents from JSON (e.g., from CouchDB responses or imported data), attachments can be included inline as Base64-encoded strings under the `_attachments` key:
+
+```json
+{
+    "_id": "photo:1",
+    "title": "Sunset",
+    "_attachments": {
+        "image.txt": {
+            "content_type": "text/plain",
+            "data": "SGVsbG8gV29ybGQ="
+        }
+    }
+}
+```
+
+When `Document::from_json()` encounters a `data` field as a Base64 string, it automatically decodes it into the `AttachmentMeta.data` field as `Vec<u8>`. This is compatible with CouchDB's inline attachment format.
+
+```rust
+let json = serde_json::json!({
+    "_id": "doc1",
+    "_attachments": {
+        "note.txt": {
+            "content_type": "text/plain",
+            "data": "SGVsbG8gV29ybGQ="
+        }
+    }
+});
+
+let doc = Document::from_json(json)?;
+let att = &doc.attachments["note.txt"];
+assert_eq!(att.data.as_ref().unwrap(), b"Hello World");
+assert_eq!(att.content_type, "text/plain");
+```
+
+## Removing an Attachment
+
+Use `remove_attachment()` to remove an attachment from a document, creating a new revision:
+
+```rust
+let result = db.remove_attachment("photo:1", "sunset.jpg", &rev).await?;
+// The document now has one fewer attachment
+```
 
 ## Attachments and Replication
 

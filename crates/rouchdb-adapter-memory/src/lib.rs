@@ -144,7 +144,7 @@ impl Adapter for MemoryAdapter {
             .ok_or_else(|| RouchError::NotFound(id.to_string()))?;
 
         // Determine which revision to return
-        let target_rev = if let Some(ref rev_str) = opts.rev {
+        let mut target_rev = if let Some(ref rev_str) = opts.rev {
             rev_str.clone()
         } else {
             // Use the winning revision
@@ -152,6 +152,15 @@ impl Adapter for MemoryAdapter {
                 .ok_or_else(|| RouchError::NotFound(id.to_string()))?;
             winner.to_string()
         };
+
+        // latest: if requested rev isn't a leaf, return the latest leaf instead
+        if opts.latest && opts.rev.is_some() {
+            let leaves = collect_leaves(&stored.rev_tree);
+            let is_leaf = leaves.iter().any(|l| l.rev_string() == target_rev);
+            if !is_leaf && let Some(leaf) = leaves.first() {
+                target_rev = leaf.rev_string();
+            }
+        }
 
         // Get the data for this revision
         let data = stored
@@ -196,6 +205,39 @@ impl Adapter for MemoryAdapter {
                         serde_json::Value::Array(conflict_list),
                     );
                 }
+            }
+        }
+
+        // Add revs_info if requested
+        if opts.revs_info {
+            use rouchdb_core::rev_tree::traverse_rev_tree;
+            let mut revs_info = Vec::new();
+            traverse_rev_tree(&stored.rev_tree, |node_pos, node, _root_pos| {
+                let rev_str = format!("{}-{}", node_pos, node.hash);
+                let status = if node.opts.deleted {
+                    "deleted"
+                } else {
+                    match node.status {
+                        rouchdb_core::rev_tree::RevStatus::Available => "available",
+                        rouchdb_core::rev_tree::RevStatus::Missing => "missing",
+                    }
+                };
+                revs_info.push(RevInfo {
+                    rev: rev_str,
+                    status: status.to_string(),
+                });
+            });
+            // Sort by pos descending (newest first)
+            revs_info.sort_by(|a, b| {
+                let a_pos: u64 = a.rev.split('-').next().unwrap_or("0").parse().unwrap_or(0);
+                let b_pos: u64 = b.rev.split('-').next().unwrap_or("0").parse().unwrap_or(0);
+                b_pos.cmp(&a_pos)
+            });
+            if let serde_json::Value::Object(ref mut map) = doc.data {
+                map.insert(
+                    "_revs_info".to_string(),
+                    serde_json::to_value(&revs_info).unwrap(),
+                );
             }
         }
 
@@ -289,6 +331,20 @@ impl Adapter for MemoryAdapter {
                         };
                         obj.insert("_id".into(), serde_json::Value::String(key.clone()));
                         obj.insert("_rev".into(), serde_json::Value::String(rev_str));
+                        // Include conflicts if requested
+                        if opts.conflicts {
+                            let conflicts = collect_conflicts(&stored.rev_tree);
+                            if !conflicts.is_empty() {
+                                let conflict_list: Vec<serde_json::Value> = conflicts
+                                    .iter()
+                                    .map(|c| serde_json::Value::String(c.to_string()))
+                                    .collect();
+                                obj.insert(
+                                    "_conflicts".to_string(),
+                                    serde_json::Value::Array(conflict_list),
+                                );
+                            }
+                        }
                         serde_json::Value::Object(obj)
                     })
                 } else {
@@ -321,10 +377,17 @@ impl Adapter for MemoryAdapter {
             rows.truncate(limit as usize);
         }
 
+        let update_seq = if opts.update_seq {
+            Some(Seq::Num(inner.update_seq))
+        } else {
+            None
+        };
+
         Ok(AllDocsResponse {
             total_rows,
             offset: opts.skip,
             rows,
+            update_seq,
         })
     }
 
@@ -381,12 +444,46 @@ impl Adapter for MemoryAdapter {
                 None
             };
 
+            // Build changes list based on style
+            let changes_list = if opts.style == ChangesStyle::AllDocs {
+                if let Some(s) = stored {
+                    collect_leaves(&s.rev_tree)
+                        .iter()
+                        .filter(|l| !s.rev_deleted.get(&l.rev_string()).copied().unwrap_or(false))
+                        .map(|l| ChangeRev {
+                            rev: l.rev_string(),
+                        })
+                        .collect()
+                } else {
+                    vec![ChangeRev { rev: rev_str }]
+                }
+            } else {
+                vec![ChangeRev { rev: rev_str }]
+            };
+
+            // Collect conflicts if requested
+            let conflicts = if opts.conflicts {
+                stored
+                    .map(|s| {
+                        let c = collect_conflicts(&s.rev_tree);
+                        if c.is_empty() {
+                            None
+                        } else {
+                            Some(c.iter().map(|r| r.to_string()).collect())
+                        }
+                    })
+                    .unwrap_or(None)
+            } else {
+                None
+            };
+
             results.push(ChangeEvent {
                 seq: Seq::Num(*seq),
                 id: doc_id.clone(),
-                changes: vec![ChangeRev { rev: rev_str }],
+                changes: changes_list,
                 deleted: *deleted,
                 doc,
+                conflicts,
             });
 
             if let Some(limit) = opts.limit
@@ -725,6 +822,68 @@ impl Adapter for MemoryAdapter {
         inner.update_seq = 0;
         Ok(())
     }
+
+    async fn purge(&self, req: HashMap<String, Vec<String>>) -> Result<PurgeResponse> {
+        let mut inner = self.inner.write().await;
+        let mut purged = HashMap::new();
+        let mut docs_to_remove = Vec::new();
+
+        for (doc_id, revs) in req {
+            let mut purged_revs = Vec::new();
+            if let Some(stored) = inner.docs.get_mut(&doc_id) {
+                for rev_str in &revs {
+                    if stored.rev_data.remove(rev_str).is_some() {
+                        stored.rev_deleted.remove(rev_str);
+                        purged_revs.push(rev_str.clone());
+
+                        // Also prune the revision from the rev_tree so that
+                        // winning_rev(), collect_conflicts(), and replication
+                        // don't reference purged revisions.
+                        if let Some((pos, hash)) = rev_str.split_once('-')
+                            && let Ok(pos) = pos.parse::<u64>()
+                        {
+                            prune_leaf_from_tree(&mut stored.rev_tree, pos, hash);
+                        }
+                    }
+                }
+                // Remove empty rev_tree paths after pruning
+                stored.rev_tree.retain(|p| !is_tree_empty(&p.tree));
+
+                if stored.rev_data.is_empty() {
+                    docs_to_remove.push((doc_id.clone(), stored.seq));
+                }
+            }
+            if !purged_revs.is_empty() {
+                purged.insert(doc_id, purged_revs);
+            }
+        }
+
+        for (doc_id, seq) in docs_to_remove {
+            inner.changes.remove(&seq);
+            inner.docs.remove(&doc_id);
+        }
+
+        Ok(PurgeResponse {
+            purge_seq: Some(inner.update_seq),
+            purged,
+        })
+    }
+
+    async fn get_security(&self) -> Result<SecurityDocument> {
+        let inner = self.inner.read().await;
+        match inner.local_docs.get("_security") {
+            Some(val) => serde_json::from_value(val.clone())
+                .map_err(|e| RouchError::DatabaseError(e.to_string())),
+            None => Ok(SecurityDocument::default()),
+        }
+    }
+
+    async fn put_security(&self, doc: SecurityDocument) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        let val = serde_json::to_value(&doc)?;
+        inner.local_docs.insert("_security".to_string(), val);
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -950,6 +1109,46 @@ fn process_doc_replication(inner: &mut Inner, mut doc: Document) -> DocResult {
         error: None,
         reason: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rev-tree pruning helpers for purge
+// ---------------------------------------------------------------------------
+
+use rouchdb_core::rev_tree::RevNode;
+
+/// Remove a specific leaf node from the rev tree. If the node at (pos, hash)
+/// is a leaf (no children), it's removed from its parent's children list.
+fn prune_leaf_from_tree(tree: &mut RevTree, target_pos: u64, target_hash: &str) {
+    for path in tree.iter_mut() {
+        prune_leaf_from_node(&mut path.tree, path.pos, target_pos, target_hash);
+    }
+}
+
+/// Recursively remove a matching leaf node from the subtree.
+/// Returns true if the node at this level should be removed (it matched and was a leaf).
+fn prune_leaf_from_node(
+    node: &mut RevNode,
+    current_pos: u64,
+    target_pos: u64,
+    target_hash: &str,
+) {
+    // Remove matching children that are leaves
+    node.children.retain(|child| {
+        let child_pos = current_pos + 1;
+        !(child_pos == target_pos && child.hash == target_hash && child.children.is_empty())
+    });
+
+    // Recurse into remaining children
+    for child in node.children.iter_mut() {
+        prune_leaf_from_node(child, current_pos + 1, target_pos, target_hash);
+    }
+}
+
+/// Check if a rev tree node is effectively empty (no children and no useful data).
+/// Used to clean up orphaned root paths after leaf pruning.
+fn is_tree_empty(node: &RevNode) -> bool {
+    node.children.is_empty() && node.hash.is_empty()
 }
 
 // ---------------------------------------------------------------------------

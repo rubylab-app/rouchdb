@@ -19,7 +19,7 @@ rustc --version
 cargo --version
 ```
 
-The workspace uses resolver version 3, so you need Rust 1.84 or later.
+The workspace uses edition 2024 and resolver version 3, so you need Rust 1.85 or later.
 
 ### Docker (for integration tests)
 

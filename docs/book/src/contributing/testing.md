@@ -12,7 +12,7 @@ Unit tests are defined as `#[cfg(test)]` modules inside each crate's source file
 cargo test
 ```
 
-This runs every unit test across all 8 workspace crates.
+This runs every unit test across all 9 workspace crates.
 
 ### Running Tests for a Single Crate
 
@@ -30,7 +30,7 @@ cargo test -p rouchdb-core winning_rev_simple
 
 ## Integration Tests
 
-Integration tests live in `crates/rouchdb/tests/couchdb_integration.rs`. They verify RouchDB against a real CouchDB server to ensure protocol compliance and end-to-end correctness.
+Integration tests live in `crates/rouchdb/tests/` across multiple test files (`http_crud.rs`, `replication.rs`, `changes_feed.rs`, `mango_queries.rs`, etc.). They verify RouchDB against a real CouchDB server to ensure protocol compliance and end-to-end correctness.
 
 ### Prerequisites
 
@@ -53,13 +53,13 @@ The default connection URL is `http://admin:password@localhost:15984`.
 All integration tests are marked `#[ignore]` so they are skipped during `cargo test`. Run them with:
 
 ```bash
-cargo test -p rouchdb --test couchdb_integration -- --ignored
+cargo test -p rouchdb --test '*' -- --ignored
 ```
 
 To run a single integration test by name:
 
 ```bash
-cargo test -p rouchdb --test couchdb_integration http_put_and_get -- --ignored
+cargo test -p rouchdb --test http_crud http_put_and_get -- --ignored
 ```
 
 ### Custom CouchDB URL
@@ -68,7 +68,7 @@ To point tests at a different CouchDB instance, set the `COUCHDB_URL` environmen
 
 ```bash
 COUCHDB_URL="http://user:pass@myhost:5984" \
-  cargo test -p rouchdb --test couchdb_integration -- --ignored
+  cargo test -p rouchdb --test '*' -- --ignored
 ```
 
 ## Writing New Unit Tests
@@ -143,7 +143,7 @@ mod tests {
 
 ## Writing New Integration Tests
 
-Integration tests go in `crates/rouchdb/tests/couchdb_integration.rs`. They test the high-level `Database` API against a real CouchDB instance.
+Integration tests go in `crates/rouchdb/tests/` as separate test files. They test the high-level `Database` API against a real CouchDB instance.
 
 ### Structure of an Integration Test
 
@@ -224,7 +224,7 @@ Integration tests with a real CouchDB instance catch issues that in-memory tests
 
 ### Helper Functions in Integration Tests
 
-The integration test file provides two helpers:
+The integration test files share three common helpers:
 
 - `couchdb_url()` -- Returns the CouchDB base URL, respecting the `COUCHDB_URL` environment variable.
 - `fresh_remote_db(prefix)` -- Creates a new CouchDB database with a UUID-based name and returns its URL.
@@ -240,7 +240,7 @@ cargo test
 
 # Stage 2: Integration tests (CouchDB required)
 docker compose up -d --wait
-cargo test -p rouchdb --test couchdb_integration -- --ignored
+cargo test -p rouchdb --test '*' -- --ignored
 docker compose down
 ```
 

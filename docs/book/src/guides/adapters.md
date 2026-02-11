@@ -163,6 +163,13 @@ impl Adapter for MyAdapter {
         opts: GetAttachmentOptions,
     ) -> Result<Vec<u8>> { todo!() }
 
+    async fn remove_attachment(
+        &self,
+        doc_id: &str,
+        att_id: &str,
+        rev: &str,
+    ) -> Result<DocResult> { todo!() }
+
     async fn get_local(&self, id: &str) -> Result<serde_json::Value> { todo!() }
 
     async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> { todo!() }
@@ -172,6 +179,9 @@ impl Adapter for MyAdapter {
     async fn compact(&self) -> Result<()> { todo!() }
 
     async fn destroy(&self) -> Result<()> { todo!() }
+
+    // close, purge, get_security, put_security have default implementations
+    // Override them if your adapter needs custom behavior.
 }
 ```
 

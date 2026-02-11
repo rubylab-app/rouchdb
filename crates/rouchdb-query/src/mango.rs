@@ -52,6 +52,25 @@ pub struct CreateIndexResponse {
     pub name: String,
 }
 
+/// Response from `explain()` describing how a query would be executed.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExplainResponse {
+    pub dbname: String,
+    pub index: ExplainIndex,
+    pub selector: serde_json::Value,
+    pub fields: Option<Vec<String>>,
+}
+
+/// Description of the index used by a query.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExplainIndex {
+    pub ddoc: Option<String>,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub index_type: String,
+    pub def: IndexFields,
+}
+
 /// A built in-memory index: sorted entries of (composite_key, doc_id).
 #[derive(Debug, Clone)]
 pub struct BuiltIndex {

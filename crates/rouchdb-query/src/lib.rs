@@ -11,7 +11,10 @@ pub mod mango;
 pub mod mapreduce;
 
 pub use mango::{
-    BuiltIndex, CreateIndexResponse, FindOptions, FindResponse, IndexDefinition, IndexFields,
-    IndexInfo, SortDirection, SortField, build_index, find, matches_selector,
+    BuiltIndex, CreateIndexResponse, ExplainIndex, ExplainResponse, FindOptions, FindResponse,
+    IndexDefinition, IndexFields, IndexInfo, SortDirection, SortField, build_index, find,
+    matches_selector,
 };
-pub use mapreduce::{EmittedRow, ReduceFn, ViewQueryOptions, ViewResult, ViewRow, query_view};
+pub use mapreduce::{
+    EmittedRow, ReduceFn, StaleOption, ViewQueryOptions, ViewResult, ViewRow, query_view,
+};

@@ -37,14 +37,15 @@ mdbook serve docs/book
 ### Crate Dependency Graph
 
 ```
-rouchdb                 ← umbrella: Database struct + re-exports
+rouchdb                 ← umbrella: Database struct + re-exports + Plugin trait
 ├── rouchdb-core        ← traits, types, rev tree, merge, collation, errors
 ├── rouchdb-adapter-memory  → core
 ├── rouchdb-adapter-redb    → core         (persistent storage via redb)
-├── rouchdb-adapter-http    → core         (CouchDB REST client via reqwest)
-├── rouchdb-changes         → core         (changes feed + live streaming)
-├── rouchdb-replication     → core, changes (CouchDB replication protocol)
-└── rouchdb-query           → core         (Mango selectors + map/reduce)
+├── rouchdb-adapter-http    → core         (CouchDB REST client via reqwest + auth)
+├── rouchdb-changes         → core         (changes feed + live streaming + events)
+├── rouchdb-replication     → core, query  (CouchDB replication protocol)
+├── rouchdb-query           → core         (Mango selectors + map/reduce)
+└── rouchdb-views           → core         (design documents + view engine)
 ```
 
 ### The Adapter Trait (`rouchdb-core/src/adapter.rs`)
@@ -67,11 +68,11 @@ All documents are `serde_json::Value` (dynamic JSON). `Document` struct holds `i
 
 - **Edition 2024**, resolver 3, stable Rust (no nightly features)
 - Workspace-level `version` in root `Cargo.toml` — crate versions must stay in sync
-- Internal dependency versions must match workspace version (e.g., `rouchdb-core = { path = "../rouchdb-core", version = "0.1.1" }`)
+- Internal dependency versions must match workspace version (e.g., `rouchdb-core = { path = "../rouchdb-core", version = "0.2.0" }`)
 - All async via Tokio; tests use `#[tokio::test]`
 - Integration tests are `#[ignore]` — they need CouchDB at `http://admin:password@localhost:15984` (override with `COUCHDB_URL` env var)
 - `MemoryAdapter` is the go-to for fast unit testing
 
 ## Publishing
 
-All 8 crates must be published to crates.io in dependency order: core → adapter-memory, changes, adapter-redb, adapter-http → query, replication → rouchdb (umbrella).
+All 9 crates must be published to crates.io in dependency order: core → adapter-memory, changes, adapter-redb, adapter-http → query, views, replication → rouchdb (umbrella).

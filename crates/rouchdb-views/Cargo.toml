@@ -1,6 +1,6 @@
 [package]
-name = "rouchdb-adapter-http"
-description = "CouchDB HTTP client adapter for RouchDB"
+name = "rouchdb-views"
+description = "Design documents and persistent views for RouchDB"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,8 +11,9 @@ categories.workspace = true
 
 [dependencies]
 rouchdb-core = { path = "../rouchdb-core", version = "0.2.0" }
-async-trait = "0.1"
-percent-encoding = "2"
-reqwest = { version = "0.12", features = ["json", "cookies"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+rouchdb-adapter-memory = { path = "../rouchdb-adapter-memory", version = "0.2.0" }

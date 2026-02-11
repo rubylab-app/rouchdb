@@ -17,6 +17,9 @@
 - [Conflict Resolution](./guides/conflict-resolution.md)
 - [Adapters](./guides/adapters.md)
 - [Attachments](./guides/attachments.md)
+- [Design Documents & Views](./guides/design-documents.md)
+- [Plugins](./guides/plugins.md)
+- [Partitioned Databases](./guides/partitions.md)
 
 # Reference
 

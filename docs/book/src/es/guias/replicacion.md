@@ -67,10 +67,12 @@ let result = local.replicate_to_with_opts(&remote, ReplicationOptions {
 | `batch_size` | `u64` | `100` | Numero de cambios a procesar por iteracion |
 | `batches_limit` | `u64` | `10` | Maximo numero de lotes a buffear |
 | `filter` | `Option<ReplicationFilter>` | `None` | Filtro opcional para replicacion selectiva |
+| `since` | `Option<Seq>` | `None` | Secuencia inicial (en vez de leer checkpoint) |
+| `checkpoint` | `bool` | `true` | Deshabilitar con `false` para no guardar/leer checkpoints |
 | `live` | `bool` | `false` | Habilitar replicacion continua |
 | `retry` | `bool` | `false` | Reintentar automaticamente en caso de error |
 | `poll_interval` | `Duration` | `500ms` | Intervalo de sondeo en modo continuo |
-| `back_off_function` | `Option<Box<dyn Fn(u32) -> Duration>>` | `None` | Funcion de backoff para reintentos |
+| `back_off_function` | `Option<Box<dyn Fn(u32) -> Duration + Send + Sync>>` | `None` | Funcion de backoff para reintentos |
 
 ## Replicacion filtrada
 
@@ -93,7 +95,7 @@ let result = local.replicate_to_with_opts(&remote, ReplicationOptions {
 
 // Por closure personalizado
 let result = local.replicate_to_with_opts(&remote, ReplicationOptions {
-    filter: Some(ReplicationFilter::Custom(Box::new(|change| {
+    filter: Some(ReplicationFilter::Custom(std::sync::Arc::new(|change| {
         change.id.starts_with("public:")
     }))),
     ..Default::default()

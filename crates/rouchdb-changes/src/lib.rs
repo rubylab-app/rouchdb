@@ -12,7 +12,28 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use rouchdb_core::adapter::Adapter;
-use rouchdb_core::document::{ChangeEvent, ChangesOptions, Seq};
+use rouchdb_core::document::{ChangeEvent, ChangesOptions, ChangesStyle, Seq};
+
+/// A filter function for changes events.
+pub type ChangesFilter = Arc<dyn Fn(&ChangeEvent) -> bool + Send + Sync>;
+
+/// Lifecycle events emitted by a live changes stream.
+///
+/// Mirrors PouchDB's changes event model: `change`, `complete`, `error`,
+/// `paused`, and `active`.
+#[derive(Debug, Clone)]
+pub enum ChangesEvent {
+    /// A document changed.
+    Change(ChangeEvent),
+    /// The stream completed (limit reached or non-live mode ended).
+    Complete { last_seq: Seq },
+    /// An error occurred while fetching changes.
+    Error(String),
+    /// The stream is caught up and waiting for new changes.
+    Paused,
+    /// The stream resumed fetching after being paused.
+    Active,
+}
 use rouchdb_core::error::Result;
 
 /// A notification that a change occurred, sent through the broadcast channel.
@@ -68,7 +89,7 @@ impl ChangeReceiver {
 }
 
 /// Configuration for a changes stream.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ChangesStreamOptions {
     pub since: Seq,
     pub live: bool,
@@ -76,8 +97,18 @@ pub struct ChangesStreamOptions {
     pub doc_ids: Option<Vec<String>>,
     pub selector: Option<serde_json::Value>,
     pub limit: Option<u64>,
+    /// Include conflicting revisions per change event.
+    pub conflicts: bool,
+    /// Changes style: `MainOnly` (default) or `AllDocs`.
+    pub style: ChangesStyle,
+    /// A filter function applied post-fetch to each change event.
+    pub filter: Option<ChangesFilter>,
     /// Polling interval for live mode when no broadcast channel is available.
     pub poll_interval: Duration,
+    /// How long to keep the connection open before closing in live mode.
+    pub timeout: Option<Duration>,
+    /// Interval for heartbeat signals in live mode (prevents connection timeout).
+    pub heartbeat: Option<Duration>,
 }
 
 impl Default for ChangesStreamOptions {
@@ -89,8 +120,32 @@ impl Default for ChangesStreamOptions {
             doc_ids: None,
             selector: None,
             limit: None,
+            conflicts: false,
+            style: ChangesStyle::default(),
+            filter: None,
             poll_interval: Duration::from_millis(500),
+            timeout: None,
+            heartbeat: None,
         }
+    }
+}
+
+impl std::fmt::Debug for ChangesStreamOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChangesStreamOptions")
+            .field("since", &self.since)
+            .field("live", &self.live)
+            .field("include_docs", &self.include_docs)
+            .field("doc_ids", &self.doc_ids)
+            .field("selector", &self.selector)
+            .field("limit", &self.limit)
+            .field("conflicts", &self.conflicts)
+            .field("style", &self.style)
+            .field("filter", &self.filter.as_ref().map(|_| "<fn>"))
+            .field("poll_interval", &self.poll_interval)
+            .field("timeout", &self.timeout)
+            .field("heartbeat", &self.heartbeat)
+            .finish()
     }
 }
 
@@ -99,6 +154,7 @@ pub async fn get_changes(
     adapter: &dyn Adapter,
     opts: ChangesStreamOptions,
 ) -> Result<Vec<ChangeEvent>> {
+    let filter = opts.filter.clone();
     let changes_opts = ChangesOptions {
         since: opts.since,
         limit: opts.limit,
@@ -106,11 +162,18 @@ pub async fn get_changes(
         include_docs: opts.include_docs,
         live: false,
         doc_ids: opts.doc_ids,
-        selector: None,
+        conflicts: opts.conflicts,
+        style: opts.style,
+        ..Default::default()
     };
 
     let response = adapter.changes(changes_opts).await?;
-    Ok(response.results)
+    let results = if let Some(f) = filter {
+        response.results.into_iter().filter(|e| f(e)).collect()
+    } else {
+        response.results
+    };
+    Ok(results)
 }
 
 /// A live changes stream that yields change events as they happen.
@@ -167,7 +230,9 @@ impl LiveChangesStream {
             include_docs: self.opts.include_docs,
             live: false,
             doc_ids: self.opts.doc_ids.clone(),
-            selector: None,
+            conflicts: self.opts.conflicts,
+            style: self.opts.style.clone(),
+            ..Default::default()
         };
 
         let response = self.adapter.changes(changes_opts).await?;
@@ -219,13 +284,37 @@ impl LiveChangesStream {
                     };
                 }
                 LiveStreamState::Waiting => {
-                    // Wait for a notification or poll
-                    if let Some(ref mut receiver) = self.receiver {
-                        // Wait for broadcast notification
-                        receiver.recv().await.as_ref()?;
+                    // Wait for a notification or poll, with optional timeout
+                    let wait_result = if let Some(ref mut receiver) = self.receiver {
+                        if let Some(timeout_dur) = self.opts.timeout {
+                            match tokio::time::timeout(timeout_dur, receiver.recv()).await {
+                                Ok(Some(_)) => true,
+                                Ok(None) => return None, // Channel closed
+                                Err(_) => return None,   // Timeout elapsed
+                            }
+                        } else {
+                            receiver.recv().await.as_ref().is_some()
+                        }
                     } else {
                         // No broadcast channel, poll with interval
-                        tokio::time::sleep(self.opts.poll_interval).await;
+                        if let Some(timeout_dur) = self.opts.timeout {
+                            match tokio::time::timeout(
+                                timeout_dur,
+                                tokio::time::sleep(self.opts.poll_interval),
+                            )
+                            .await
+                            {
+                                Ok(()) => true,
+                                Err(_) => return None, // Timeout elapsed
+                            }
+                        } else {
+                            tokio::time::sleep(self.opts.poll_interval).await;
+                            true
+                        }
+                    };
+
+                    if !wait_result {
+                        return None;
                     }
 
                     // Fetch new changes
@@ -275,6 +364,7 @@ pub fn live_changes(
     let (tx, rx) = mpsc::channel(64);
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
+    let filter = opts.filter.clone();
 
     tokio::spawn(async move {
         let mut stream =
@@ -285,6 +375,12 @@ pub fn live_changes(
                 change = stream.next_change() => {
                     match change {
                         Some(event) => {
+                            // Apply filter if set
+                            if let Some(ref f) = filter
+                                && !f(&event)
+                            {
+                                continue;
+                            }
                             if tx.send(event).await.is_err() {
                                 break; // Receiver dropped
                             }
@@ -293,6 +389,79 @@ pub fn live_changes(
                     }
                 }
                 _ = cancel_clone.cancelled() => break,
+            }
+        }
+    });
+
+    (rx, ChangesHandle { cancel })
+}
+
+/// Start a live changes stream that emits lifecycle events.
+///
+/// Like `live_changes()` but wraps each event in a `ChangesEvent` enum
+/// that includes `Active`, `Paused`, `Complete`, and `Error` lifecycle events
+/// alongside the actual `Change` events.
+pub fn live_changes_events(
+    adapter: Arc<dyn Adapter>,
+    opts: ChangesStreamOptions,
+) -> (mpsc::Receiver<ChangesEvent>, ChangesHandle) {
+    let (tx, rx) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let filter = opts.filter.clone();
+
+    tokio::spawn(async move {
+        let mut stream =
+            LiveChangesStream::new(adapter, None, ChangesStreamOptions { live: true, ..opts });
+
+        let mut was_paused = false;
+
+        loop {
+            tokio::select! {
+                change = stream.next_change() => {
+                    match change {
+                        Some(event) => {
+                            // Emit Active if we were paused
+                            if was_paused {
+                                was_paused = false;
+                                let _ = tx.send(ChangesEvent::Active).await;
+                            }
+
+                            // Apply filter if set
+                            if let Some(ref f) = filter
+                                && !f(&event)
+                            {
+                                continue;
+                            }
+
+                            if tx.send(ChangesEvent::Change(event)).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => {
+                            // Stream ended
+                            let _ = tx.send(ChangesEvent::Complete {
+                                last_seq: stream.last_seq.clone(),
+                            }).await;
+                            break;
+                        }
+                    }
+                }
+                _ = cancel_clone.cancelled() => {
+                    let _ = tx.send(ChangesEvent::Complete {
+                        last_seq: stream.last_seq.clone(),
+                    }).await;
+                    break;
+                },
+            }
+
+            // If the buffer is exhausted and we're in waiting state, emit Paused
+            if stream.buffer_idx >= stream.buffer.len()
+                && matches!(stream.state, LiveStreamState::Waiting)
+                && !was_paused
+            {
+                was_paused = true;
+                let _ = tx.send(ChangesEvent::Paused).await;
             }
         }
     });

@@ -30,30 +30,30 @@ Serde when desired.
                       +------------------+
                       |     rouchdb      |  (umbrella: re-exports everything)
                       +------------------+
-                       /    |    |     \
-                      /     |    |      \
-          +-----------+ +--------+ +----------+ +-----------+
-          | adapter-  | | changes| | replica- | |   query   |
-          |   redb    | |        | |   tion   | |           |
-          +-----------+ +--------+ +----------+ +-----------+
-          |  adapter- |      |          |  \          |
-          |  memory   |      |          |   +----+    |
-          +-----------+      |          |        |    |
-          |  adapter- |      |          |        |    |
-          |   http    |      |          |        |    |
-          +-----------+      |          |        |    |
-                \            |         /         |   /
-                 \           |        /          |  /
-                  +----------+-------+-----------+-+
-                  |            rouchdb-core         |
-                  +---------------------------------+
+                     /  |    |    |    \   \
+                    /   |    |    |     \   \
+          +-----------+ +--------+ +----------+ +-----------+ +--------+
+          | adapter-  | | changes| | replica- | |   query   | | views  |
+          |   redb    | |        | |   tion   | |           | |        |
+          +-----------+ +--------+ +----------+ +-----------+ +--------+
+          |  adapter- |      |        |   \         |           |
+          |  memory   |      |        |    +-----+  |           |
+          +-----------+      |        |          |  |           |
+          |  adapter- |      |        |          |  |           |
+          |   http    |      |        |          |  |           |
+          +-----------+      |        |          |  |           |
+                \            |       /          /  /           /
+                 \           |      /          /  /           /
+                  +----------+-----+----------+--+-----------+
+                  |               rouchdb-core                 |
+                  +--------------------------------------------+
 ```
 
 All arrows point downward. Every crate ultimately depends on `rouchdb-core`.
-The `rouchdb` umbrella crate depends on all other seven crates and re-exports
+The `rouchdb` umbrella crate depends on all other eight crates and re-exports
 their public APIs.
 
-## The Eight Crates
+## The Nine Crates
 
 ### 1. `rouchdb-core`
 
@@ -73,7 +73,7 @@ The foundation. Contains:
   lexicographic encoding of JSON values for ordered storage.
 - **Error types** -- `RouchError` enum with `thiserror`.
 
-External dependencies: `async-trait`, `serde`, `serde_json`, `md-5`, `uuid`,
+External dependencies: `async-trait`, `base64`, `serde`, `serde_json`,
 `thiserror`.
 
 ### 2. `rouchdb-adapter-memory`
@@ -92,7 +92,7 @@ document metadata, revision data, the changes log, local documents,
 attachments, and global metadata.
 
 Dependencies: `rouchdb-core`, `redb`, `tokio`, `serde`, `serde_json`, `md-5`,
-`uuid`, `base64`.
+`uuid`.
 
 See [Storage Layer](storage-layer.md) for full table schema documentation.
 
@@ -102,7 +102,8 @@ A remote `Adapter` that talks to a CouchDB (or CouchDB-compatible) server over
 HTTP using `reqwest`. Translates each `Adapter` method into the corresponding
 CouchDB REST endpoint.
 
-Dependencies: `rouchdb-core`, `reqwest`, `serde`, `serde_json`.
+Dependencies: `rouchdb-core`, `reqwest` (with `json` and `cookies` features),
+`percent-encoding`, `serde`, `serde_json`.
 
 ### 5. `rouchdb-changes`
 
@@ -110,7 +111,7 @@ Implements the live/continuous changes feed. Wraps an `Adapter`'s one-shot
 `changes()` call in a Tokio stream that polls for new changes, emitting
 `ChangeEvent` items as they arrive.
 
-Dependencies: `rouchdb-core`, `tokio`, `tokio-stream`.
+Dependencies: `rouchdb-core`, `tokio`, `tokio-util`, `serde_json`.
 
 ### 6. `rouchdb-replication`
 
@@ -118,7 +119,7 @@ Implements the CouchDB replication protocol: reading and writing checkpoints,
 computing revision diffs, fetching missing documents, and writing them to the
 target with `new_edits=false`.
 
-Dependencies: `rouchdb-core`, `rouchdb-changes`, `tokio`, `serde`,
+Dependencies: `rouchdb-core`, `rouchdb-query`, `tokio`, `tokio-util`, `serde`,
 `serde_json`, `md-5`, `uuid`.
 
 See [Replication Protocol](replication-protocol.md) for a step-by-step
@@ -132,12 +133,20 @@ CouchDB collation order.
 
 Dependencies: `rouchdb-core`, `regex`, `serde`, `serde_json`.
 
-### 8. `rouchdb` (umbrella)
+### 8. `rouchdb-views`
 
-The crate users add to their `Cargo.toml`. Re-exports types from all seven
+Design documents and the persistent view engine. Stores `DesignDocument`
+structs (with views, filters, validate_doc_update) and provides `ViewEngine`
+for incrementally-updated Rust-native map/reduce indexes.
+
+Dependencies: `rouchdb-core`, `serde`, `serde_json`.
+
+### 9. `rouchdb` (umbrella)
+
+The crate users add to their `Cargo.toml`. Re-exports types from all eight
 inner crates so consumers do not need to depend on individual sub-crates.
 
-Dependencies: all of the above, plus `serde_json`.
+Dependencies: all of the above, plus `serde_json`, `uuid`, `async-trait`.
 
 ## Data Flow: Writing a Document
 

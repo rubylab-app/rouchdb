@@ -20,8 +20,17 @@ pub enum ReplicationFilter {
 
     /// Replicate documents passing a custom predicate.
     /// Receives the ChangeEvent (id, deleted, seq).
-    #[allow(clippy::type_complexity)]
-    Custom(Box<dyn Fn(&ChangeEvent) -> bool + Send + Sync>),
+    Custom(Arc<dyn Fn(&ChangeEvent) -> bool + Send + Sync>),
+}
+
+impl Clone for ReplicationFilter {
+    fn clone(&self) -> Self {
+        match self {
+            Self::DocIds(ids) => Self::DocIds(ids.clone()),
+            Self::Selector(sel) => Self::Selector(sel.clone()),
+            Self::Custom(f) => Self::Custom(Arc::clone(f)),
+        }
+    }
 }
 
 /// Replication configuration.
@@ -40,6 +49,11 @@ pub struct ReplicationOptions {
     pub poll_interval: Duration,
     /// Backoff function for retry: takes attempt number, returns delay.
     pub back_off_function: Option<Box<dyn Fn(u32) -> Duration + Send + Sync>>,
+    /// Override the starting sequence (skip checkpoint lookup).
+    pub since: Option<Seq>,
+    /// Whether to save/read checkpoints (default: true).
+    /// Set to false to always replicate from scratch.
+    pub checkpoint: bool,
 }
 
 impl Default for ReplicationOptions {
@@ -52,6 +66,8 @@ impl Default for ReplicationOptions {
             retry: false,
             poll_interval: Duration::from_millis(500),
             back_off_function: None,
+            since: None,
+            checkpoint: true,
         }
     }
 }
@@ -95,8 +111,14 @@ pub async fn replicate(
 
     let checkpointer = Checkpointer::new(&source_info.db_name, &target_info.db_name);
 
-    // Step 1: Read checkpoint
-    let since = checkpointer.read_checkpoint(source, target).await?;
+    // Step 1: Read checkpoint (or use override)
+    let since = if let Some(ref override_since) = opts.since {
+        override_since.clone()
+    } else if opts.checkpoint {
+        checkpointer.read_checkpoint(source, target).await?
+    } else {
+        Seq::default()
+    };
 
     // Extract doc_ids from filter (for ChangesOptions)
     let filter_doc_ids = match &opts.filter {
@@ -213,11 +235,13 @@ pub async fn replicate(
             total_docs_written += write_count;
         }
 
-        // Step 6: Save checkpoint
+        // Step 6: Save checkpoint (if enabled)
         current_seq = batch_last_seq;
-        let _ = checkpointer
-            .write_checkpoint(source, target, current_seq.clone())
-            .await;
+        if opts.checkpoint {
+            let _ = checkpointer
+                .write_checkpoint(source, target, current_seq.clone())
+                .await;
+        }
 
         // Check if we got fewer results than batch_size (last batch)
         if (changes.results.len() as u64) < opts.batch_size {
@@ -248,7 +272,14 @@ pub async fn replicate_with_events(
     let target_info = target.info().await?;
 
     let checkpointer = Checkpointer::new(&source_info.db_name, &target_info.db_name);
-    let since = checkpointer.read_checkpoint(source, target).await?;
+
+    let since = if let Some(ref override_since) = opts.since {
+        override_since.clone()
+    } else if opts.checkpoint {
+        checkpointer.read_checkpoint(source, target).await?
+    } else {
+        Seq::default()
+    };
 
     let filter_doc_ids = match &opts.filter {
         Some(ReplicationFilter::DocIds(ids)) => Some(ids.clone()),
@@ -367,9 +398,11 @@ pub async fn replicate_with_events(
             .await;
 
         current_seq = batch_last_seq;
-        let _ = checkpointer
-            .write_checkpoint(source, target, current_seq.clone())
-            .await;
+        if opts.checkpoint {
+            let _ = checkpointer
+                .write_checkpoint(source, target, current_seq.clone())
+                .await;
+        }
 
         if (changes.results.len() as u64) < opts.batch_size {
             break;
@@ -415,17 +448,18 @@ pub fn replicate_live(
         let mut attempt: u32 = 0;
 
         loop {
-            // Build fresh options for each iteration (filter can't be cloned
-            // due to Box<dyn Fn>, so we replicate without filter in live mode
-            // after the initial run — the source adapter handles doc_ids filtering)
+            // Clone the filter for each iteration so Selector and Custom
+            // filters remain active across the entire live replication.
             let one_shot_opts = ReplicationOptions {
                 batch_size: opts.batch_size,
                 batches_limit: opts.batches_limit,
-                filter: None, // Filter is consumed by first run
+                filter: opts.filter.clone(),
                 live: false,
                 retry: false,
                 poll_interval,
                 back_off_function: None,
+                since: None,
+                checkpoint: opts.checkpoint,
             };
 
             let result =
@@ -782,7 +816,7 @@ mod tests {
             &source,
             &target,
             ReplicationOptions {
-                filter: Some(ReplicationFilter::Custom(Box::new(|change| {
+                filter: Some(ReplicationFilter::Custom(Arc::new(|change| {
                     change.id.starts_with("public:")
                 }))),
                 ..Default::default()

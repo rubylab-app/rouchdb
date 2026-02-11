@@ -242,6 +242,8 @@ pub struct ReplicationOptions {
     pub batch_size: u64,                   // default: 100
     pub batches_limit: u64,                // default: 10
     pub filter: Option<ReplicationFilter>, // default: None
+    pub since: Option<Seq>,                // default: None (use checkpoint)
+    pub checkpoint: bool,                  // default: true
     pub live: bool,                        // default: false
     pub retry: bool,                       // default: false
     pub poll_interval: Duration,           // default: 500ms
@@ -254,7 +256,7 @@ pub struct ReplicationOptions {
   future pipelining).
 - `filter` -- optional filter for selective replication. Supports
   `DocIds(Vec<String>)`, `Selector(serde_json::Value)`, or
-  `Custom(Box<dyn Fn(&ChangeEvent) -> bool>)`. When `DocIds` is used,
+  `Custom(Arc<dyn Fn(&ChangeEvent) -> bool + Send + Sync>)`. When `DocIds` is used,
   filtering happens at the changes feed level. `Selector` filters after
   `bulk_get`. `Custom` filters after fetching changes.
 - `live` -- enable continuous replication mode.

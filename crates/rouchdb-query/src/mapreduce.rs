@@ -37,6 +37,8 @@ pub enum ReduceFn {
 pub struct ViewQueryOptions {
     /// Only return rows with this exact key.
     pub key: Option<serde_json::Value>,
+    /// Return rows matching any of these keys, in the given order.
+    pub keys: Option<Vec<serde_json::Value>>,
     /// Start of key range (inclusive).
     pub start_key: Option<serde_json::Value>,
     /// End of key range (inclusive by default).
@@ -57,6 +59,20 @@ pub struct ViewQueryOptions {
     pub group: bool,
     /// Group to this many array elements of the key.
     pub group_level: Option<u64>,
+    /// Use stale index without rebuilding.
+    pub stale: StaleOption,
+}
+
+/// Controls whether the index is rebuilt before querying.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum StaleOption {
+    /// Always rebuild the index before querying (default).
+    #[default]
+    False,
+    /// Use the index as-is, do not rebuild.
+    Ok,
+    /// Use the index as-is, then rebuild in the background.
+    UpdateAfter,
 }
 
 impl ViewQueryOptions {
@@ -131,8 +147,20 @@ pub async fn query_view(
         emitted.reverse();
     }
 
-    // Filter by key range
-    let emitted = filter_by_range(emitted, &opts);
+    // Filter by keys (multi-key lookup) or by key range
+    let emitted = if let Some(ref keys) = opts.keys {
+        let mut ordered_rows = Vec::new();
+        for search_key in keys {
+            for row in &emitted {
+                if collate(&row.key, search_key) == Ordering::Equal {
+                    ordered_rows.push(row.clone());
+                }
+            }
+        }
+        ordered_rows
+    } else {
+        filter_by_range(emitted, &opts)
+    };
 
     let total_rows = emitted.len() as u64;
 

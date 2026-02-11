@@ -483,10 +483,18 @@ impl Adapter for RedbAdapter {
             rows.truncate(limit as usize);
         }
 
+        let update_seq = if opts.update_seq {
+            let meta = self.read_meta()?;
+            Some(Seq::Num(meta.update_seq))
+        } else {
+            None
+        };
+
         Ok(AllDocsResponse {
             total_rows,
             offset: opts.skip,
             rows,
+            update_seq,
         })
     }
 
@@ -554,12 +562,52 @@ impl Adapter for RedbAdapter {
                 None
             };
 
+            // Build changes list based on style
+            let changes_list = if opts.style == ChangesStyle::AllDocs {
+                // Fetch all leaf revisions for AllDocs style
+                if let Some(guard) = db_err!(doc_table.get(change.doc_id.as_str()))? {
+                    let record: DocRecord = serde_json::from_slice(guard.value())?;
+                    let tree = serialized_to_rev_tree(&record.rev_tree);
+                    collect_leaves(&tree)
+                        .iter()
+                        .map(|l| ChangeRev {
+                            rev: l.rev_string(),
+                        })
+                        .collect()
+                } else {
+                    vec![ChangeRev {
+                        rev: rev_str.clone(),
+                    }]
+                }
+            } else {
+                vec![ChangeRev { rev: rev_str }]
+            };
+
+            // Collect conflicts if requested
+            let conflicts = if opts.conflicts {
+                if let Some(guard) = db_err!(doc_table.get(change.doc_id.as_str()))? {
+                    let record: DocRecord = serde_json::from_slice(guard.value())?;
+                    let tree = serialized_to_rev_tree(&record.rev_tree);
+                    let c = collect_conflicts(&tree);
+                    if c.is_empty() {
+                        None
+                    } else {
+                        Some(c.iter().map(|r| r.to_string()).collect())
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             results.push(ChangeEvent {
                 seq: Seq::Num(*seq),
                 id: change.doc_id.clone(),
-                changes: vec![ChangeRev { rev: rev_str }],
+                changes: changes_list,
                 deleted: change.deleted,
                 doc,
+                conflicts,
             });
 
             if let Some(limit) = opts.limit
@@ -810,37 +858,22 @@ impl Adapter for RedbAdapter {
     async fn destroy(&self) -> Result<()> {
         let _lock = self.write_lock.write().await;
         let write_txn = db_err!(self.db.begin_write())?;
-        {
-            let mut doc_table = db_err!(write_txn.open_table(DOC_TABLE))?;
-            // Drain all entries
-            while let Some(entry) = db_err!(doc_table.pop_last())? {
-                let _ = entry;
-            }
-        }
-        {
-            let mut rev_table = db_err!(write_txn.open_table(REV_DATA_TABLE))?;
-            while let Some(entry) = db_err!(rev_table.pop_last())? {
-                let _ = entry;
-            }
-        }
-        {
-            let mut changes_table = db_err!(write_txn.open_table(CHANGES_TABLE))?;
-            while let Some(entry) = db_err!(changes_table.pop_last())? {
-                let _ = entry;
-            }
-        }
-        {
-            let mut local_table = db_err!(write_txn.open_table(LOCAL_TABLE))?;
-            while let Some(entry) = db_err!(local_table.pop_last())? {
-                let _ = entry;
-            }
-        }
-        {
-            let mut att_table = db_err!(write_txn.open_table(ATTACHMENT_TABLE))?;
-            while let Some(entry) = db_err!(att_table.pop_last())? {
-                let _ = entry;
-            }
-        }
+
+        // Delete all tables in O(1) instead of draining entries one by one.
+        let _ = db_err!(write_txn.delete_table(DOC_TABLE))?;
+        let _ = db_err!(write_txn.delete_table(REV_DATA_TABLE))?;
+        let _ = db_err!(write_txn.delete_table(CHANGES_TABLE))?;
+        let _ = db_err!(write_txn.delete_table(LOCAL_TABLE))?;
+        let _ = db_err!(write_txn.delete_table(ATTACHMENT_TABLE))?;
+
+        // Recreate empty tables so subsequent operations don't fail.
+        db_err!(write_txn.open_table(DOC_TABLE))?;
+        db_err!(write_txn.open_table(REV_DATA_TABLE))?;
+        db_err!(write_txn.open_table(CHANGES_TABLE))?;
+        db_err!(write_txn.open_table(LOCAL_TABLE))?;
+        db_err!(write_txn.open_table(ATTACHMENT_TABLE))?;
+
+        // Reset metadata
         {
             let mut meta_table = db_err!(write_txn.open_table(META_TABLE))?;
             let record = MetaRecord {
@@ -850,6 +883,7 @@ impl Adapter for RedbAdapter {
             let bytes = serde_json::to_vec(&record)?;
             db_err!(meta_table.insert("meta", bytes.as_slice()))?;
         }
+
         db_err!(write_txn.commit())?;
         Ok(())
     }

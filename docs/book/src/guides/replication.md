@@ -123,6 +123,8 @@ let opts = ReplicationOptions {
 | `batch_size` | 100 | Number of documents to process in each replication batch. Smaller values mean more frequent checkpoints. |
 | `batches_limit` | 10 | Maximum number of batches to buffer. Controls memory usage for large replications. |
 | `filter` | `None` | Optional `ReplicationFilter` for selective replication. See [Filtered Replication](#filtered-replication). |
+| `since` | `None` | Override the starting sequence instead of reading from checkpoint. Useful for replaying changes from a known point. |
+| `checkpoint` | `true` | Set to `false` to disable checkpoint saving. Each replication will start from the beginning (or `since`). |
 | `live` | `false` | Enable continuous replication that keeps running and picks up new changes. |
 | `retry` | `false` | Automatically retry on network or transient errors (live mode). |
 | `poll_interval` | 500ms | How frequently to poll for new changes in live mode. |
@@ -172,7 +174,7 @@ Pass a Rust closure that receives each `ChangeEvent` and returns `true` to repli
 use rouchdb::{ReplicationOptions, ReplicationFilter};
 
 let result = local.replicate_to_with_opts(&remote, ReplicationOptions {
-    filter: Some(ReplicationFilter::Custom(Box::new(|change| {
+    filter: Some(ReplicationFilter::Custom(std::sync::Arc::new(|change| {
         change.id.starts_with("public:")
     }))),
     ..Default::default()

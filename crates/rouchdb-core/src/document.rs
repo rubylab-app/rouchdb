@@ -119,10 +119,45 @@ impl Document {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let attachments: HashMap<String, AttachmentMeta> = obj
-            .remove("_attachments")
-            .map(|v| serde_json::from_value(v).unwrap_or_default())
-            .unwrap_or_default();
+        let mut attachments: HashMap<String, AttachmentMeta> = HashMap::new();
+        if let Some(att_val) = obj.remove("_attachments")
+            && let Some(att_obj) = att_val.as_object()
+        {
+            for (name, meta) in att_obj {
+                // Strip inline Base64 `data` string before serde parsing
+                // (serde expects Vec<u8> as an array, not a string).
+                let mut meta_for_parse = meta.clone();
+                let inline_b64 = if let Some(obj) = meta_for_parse.as_object_mut() {
+                    match obj.remove("data") {
+                        Some(serde_json::Value::String(s)) => Some(s),
+                        Some(other) => {
+                            obj.insert("data".to_string(), other);
+                            None
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+
+                if let Ok(mut att) = serde_json::from_value::<AttachmentMeta>(meta_for_parse) {
+                    // Decode inline Base64 data if present
+                    if att.data.is_none()
+                        && let Some(ref data_str) = inline_b64
+                    {
+                        use base64::Engine;
+                        if let Ok(bytes) =
+                            base64::engine::general_purpose::STANDARD.decode(data_str)
+                        {
+                            att.length = bytes.len() as u64;
+                            att.data = Some(bytes);
+                            att.stub = false;
+                        }
+                    }
+                    attachments.insert(name.clone(), att);
+                }
+            }
+        }
 
         Ok(Document {
             id,
@@ -150,11 +185,10 @@ impl Document {
             obj.insert("_deleted".into(), serde_json::Value::Bool(true));
         }
 
-        if !self.attachments.is_empty() {
-            obj.insert(
-                "_attachments".into(),
-                serde_json::to_value(&self.attachments).unwrap(),
-            );
+        if !self.attachments.is_empty()
+            && let Ok(att_json) = serde_json::to_value(&self.attachments)
+        {
+            obj.insert("_attachments".into(), att_json);
         }
 
         serde_json::Value::Object(obj)
@@ -187,6 +221,19 @@ pub struct GetOptions {
     pub open_revs: Option<OpenRevs>,
     /// Include full revision history.
     pub revs: bool,
+    /// Include full revision info with status (available/missing/deleted).
+    pub revs_info: bool,
+    /// If rev is specified and not a leaf, return the latest leaf instead.
+    pub latest: bool,
+    /// Include inline Base64 attachment data.
+    pub attachments: bool,
+}
+
+/// Revision info entry returned when `revs_info` is requested.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevInfo {
+    pub rev: String,
+    pub status: String, // "available", "missing", "deleted"
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +286,10 @@ pub struct AllDocsOptions {
     pub skip: u64,
     pub limit: Option<u64>,
     pub inclusive_end: bool,
+    /// Include `_conflicts` for each document (requires `include_docs`).
+    pub conflicts: bool,
+    /// Include `update_seq` in the response.
+    pub update_seq: bool,
 }
 
 impl AllDocsOptions {
@@ -271,6 +322,8 @@ pub struct AllDocsResponse {
     pub total_rows: u64,
     pub offset: u64,
     pub rows: Vec<AllDocsRow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_seq: Option<Seq>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,6 +346,21 @@ pub struct ChangesOptions {
     pub live: bool,
     pub doc_ids: Option<Vec<String>>,
     pub selector: Option<serde_json::Value>,
+    /// Include conflicting revisions per change event.
+    pub conflicts: bool,
+    /// Changes style: `MainOnly` (default) returns only winning rev,
+    /// `AllDocs` returns all leaf revisions.
+    pub style: ChangesStyle,
+}
+
+/// Controls which revisions appear in each change event.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ChangesStyle {
+    /// Default: only the winning revision.
+    #[default]
+    MainOnly,
+    /// All non-deleted leaf revisions.
+    AllDocs,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,6 +372,9 @@ pub struct ChangeEvent {
     pub deleted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doc: Option<serde_json::Value>,
+    /// Conflicting revisions (when `conflicts: true` requested).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflicts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,6 +498,36 @@ impl std::fmt::Display for Seq {
             Seq::Str(s) => write!(f, "{}", s),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Purge types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurgeResponse {
+    pub purge_seq: Option<u64>,
+    pub purged: HashMap<String, Vec<String>>,
+}
+
+// ---------------------------------------------------------------------------
+// Security document
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SecurityDocument {
+    #[serde(default)]
+    pub admins: SecurityGroup,
+    #[serde(default)]
+    pub members: SecurityGroup,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SecurityGroup {
+    #[serde(default)]
+    pub names: Vec<String>,
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

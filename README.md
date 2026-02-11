@@ -17,8 +17,11 @@ RouchDB is the Rust equivalent of [PouchDB](https://pouchdb.com/) — it stores 
 - **Conflict resolution** — deterministic winner selection, conflicts preserved for application-level resolution
 - **Mango queries** — `$eq`, `$gt`, `$regex`, `$elemMatch`, and more
 - **Map/reduce views** — with built-in `_sum`, `_count`, `_stats` reducers
-- **Changes feed** — one-shot and live streaming
-- **Attachments** — binary data stored alongside documents
+- **Changes feed** — one-shot, live streaming, selector/filter/doc_ids filtering
+- **Attachments** — binary data stored alongside documents, inline Base64 support
+- **Design documents & views** — Rust-native ViewEngine with map/reduce
+- **Plugin system** — before_write, after_write, on_destroy hooks
+- **Partitioned databases** — scoped queries by ID prefix
 - **Pure Rust** — no C dependencies (redb instead of LevelDB/SQLite)
 
 ## Quick Start
@@ -82,7 +85,7 @@ let result = db.find(FindOptions {
         "age": {"$gte": 21},
         "city": {"$in": ["NYC", "LA"]}
     }),
-    sort: Some(vec![rouchdb::SortField::Asc("age".into())]),
+    sort: Some(vec![rouchdb::SortField::Simple("age".into())]),
     limit: Some(10),
     ..Default::default()
 }).await?;
@@ -132,7 +135,7 @@ All backends implement the same `Adapter` trait — swap storage without changin
 
 ## Crate Structure
 
-RouchDB is a workspace of 8 crates:
+RouchDB is a workspace of 9 crates:
 
 | Crate | Description |
 |-------|-------------|
@@ -140,10 +143,11 @@ RouchDB is a workspace of 8 crates:
 | `rouchdb-core` | Traits, types, revision tree, merge algorithm, collation |
 | `rouchdb-adapter-memory` | In-memory storage adapter |
 | `rouchdb-adapter-redb` | Persistent storage via [redb](https://crates.io/crates/redb) |
-| `rouchdb-adapter-http` | CouchDB HTTP client adapter |
+| `rouchdb-adapter-http` | CouchDB HTTP client adapter with cookie auth |
 | `rouchdb-changes` | Changes feed and live streaming |
 | `rouchdb-replication` | CouchDB replication protocol |
 | `rouchdb-query` | Mango queries and map/reduce views |
+| `rouchdb-views` | Design documents and persistent view engine |
 
 ## Documentation
 

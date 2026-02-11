@@ -1,6 +1,6 @@
 # Crate Guide
 
-RouchDB is structured as a Cargo workspace with 8 crates. This guide helps you figure out where to add new code.
+RouchDB is structured as a Cargo workspace with 9 crates. This guide helps you figure out where to add new code.
 
 ## Where Do I Add Code?
 
@@ -15,6 +15,9 @@ Is it a new storage backend?
 
 Is it a change to how queries work (Mango selectors, map/reduce)?
   --> rouchdb-query
+
+Is it a change to design documents or the persistent view engine?
+  --> rouchdb-views
 
 Is it a change to the replication protocol or checkpointing?
   --> rouchdb-replication
@@ -97,13 +100,20 @@ The foundation crate. Everything else depends on it.
 - `src/mapreduce.rs` -- Map/reduce view execution (`query_view`). Takes a map function, optional reduce function, and query options.
 - `src/lib.rs` -- Re-exports: `find`, `FindOptions`, `FindResponse`, `ViewQueryOptions`, `ViewResult`, `ReduceFn`, `SortField`.
 
+### `rouchdb-views`
+
+**Responsibility:** Design documents and the persistent view engine.
+
+**Key files:**
+- `src/lib.rs` -- `DesignDocument` struct (with views, filters, validate_doc_update) and `ViewEngine` for persistent map/reduce indexes.
+
 ### `rouchdb`
 
 **Responsibility:** The umbrella crate that end users depend on. Provides the high-level `Database` struct and re-exports types from all other crates.
 
 **Key files:**
 - `src/lib.rs` -- `Database` struct with user-friendly methods (`put`, `get`, `update`, `remove`, `replicate_to`, `replicate_from`, `find`, `all_docs`, `changes`). Wraps any `Adapter` behind an `Arc<dyn Adapter>`.
-- `tests/couchdb_integration.rs` -- Integration tests against a real CouchDB instance.
+- `tests/*.rs` -- Integration tests against a real CouchDB instance (multiple test files: `replication.rs`, `http_crud.rs`, `changes_feed.rs`, etc.).
 
 ## Adding an Adapter
 
@@ -139,8 +149,9 @@ rouchdb (umbrella)
   |-- rouchdb-adapter-redb     --> rouchdb-core
   |-- rouchdb-adapter-http     --> rouchdb-core
   |-- rouchdb-changes          --> rouchdb-core
-  |-- rouchdb-replication      --> rouchdb-core
   |-- rouchdb-query            --> rouchdb-core
+  |-- rouchdb-views            --> rouchdb-core
+  |-- rouchdb-replication      --> rouchdb-core, rouchdb-query
 ```
 
 All crates depend on `rouchdb-core`. The umbrella `rouchdb` crate depends on all of them and re-exports their public APIs.

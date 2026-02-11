@@ -44,23 +44,47 @@ pub use rouchdb_core::merge::{is_deleted, winning_rev};
 
 // Re-export adapters
 pub use rouchdb_adapter_http::HttpAdapter;
+pub use rouchdb_adapter_http::auth::{AuthClient, Session, UserContext};
 pub use rouchdb_adapter_memory::MemoryAdapter;
 pub use rouchdb_adapter_redb::RedbAdapter;
 
 // Re-export subsystems
 pub use rouchdb_changes::{
-    ChangeReceiver, ChangeSender, ChangesHandle, ChangesStreamOptions, LiveChangesStream,
-    live_changes,
+    ChangeReceiver, ChangeSender, ChangesEvent, ChangesFilter, ChangesHandle, ChangesStreamOptions,
+    LiveChangesStream, live_changes, live_changes_events,
 };
 pub use rouchdb_query::{
-    BuiltIndex, CreateIndexResponse, FindOptions, FindResponse, IndexDefinition, IndexFields,
-    IndexInfo, ReduceFn, SortField, ViewQueryOptions, ViewResult, build_index, find,
-    matches_selector, query_view,
+    BuiltIndex, CreateIndexResponse, ExplainIndex, ExplainResponse, FindOptions, FindResponse,
+    IndexDefinition, IndexFields, IndexInfo, ReduceFn, SortField, StaleOption, ViewQueryOptions,
+    ViewResult, build_index, find, matches_selector, query_view,
 };
+pub use rouchdb_views::{DesignDocument, PersistentViewIndex, ViewDef, ViewEngine};
+
 pub use rouchdb_replication::{
     ReplicationEvent, ReplicationFilter, ReplicationHandle, ReplicationOptions, ReplicationResult,
     replicate, replicate_live, replicate_with_events,
 };
+
+/// Plugin trait for extending Database behavior.
+///
+/// Plugins receive lifecycle hooks during database operations.
+#[async_trait::async_trait]
+pub trait Plugin: Send + Sync {
+    /// The plugin name.
+    fn name(&self) -> &str;
+    /// Called before documents are written.
+    async fn before_write(&self, _docs: &mut Vec<Document>) -> Result<()> {
+        Ok(())
+    }
+    /// Called after documents are written.
+    async fn after_write(&self, _results: &[DocResult]) -> Result<()> {
+        Ok(())
+    }
+    /// Called when the database is destroyed.
+    async fn on_destroy(&self) -> Result<()> {
+        Ok(())
+    }
+}
 
 /// A high-level database handle that wraps any adapter implementation.
 ///
@@ -68,6 +92,7 @@ pub use rouchdb_replication::{
 pub struct Database {
     adapter: Arc<dyn Adapter>,
     indexes: Arc<RwLock<HashMap<String, BuiltIndex>>>,
+    plugins: Vec<Arc<dyn Plugin>>,
 }
 
 impl Database {
@@ -76,6 +101,7 @@ impl Database {
         Self {
             adapter: Arc::new(MemoryAdapter::new(name)),
             indexes: Arc::new(RwLock::new(HashMap::new())),
+            plugins: Vec::new(),
         }
     }
 
@@ -85,6 +111,7 @@ impl Database {
         Ok(Self {
             adapter: Arc::new(adapter),
             indexes: Arc::new(RwLock::new(HashMap::new())),
+            plugins: Vec::new(),
         })
     }
 
@@ -93,6 +120,18 @@ impl Database {
         Self {
             adapter: Arc::new(HttpAdapter::new(url)),
             indexes: Arc::new(RwLock::new(HashMap::new())),
+            plugins: Vec::new(),
+        }
+    }
+
+    /// Connect to a remote CouchDB instance using an authenticated client.
+    ///
+    /// The `AuthClient` should have been logged in via `auth.login()` first.
+    pub fn http_with_auth(url: &str, auth: &AuthClient) -> Self {
+        Self {
+            adapter: Arc::new(HttpAdapter::with_auth_client(url, auth)),
+            indexes: Arc::new(RwLock::new(HashMap::new())),
+            plugins: Vec::new(),
         }
     }
 
@@ -101,7 +140,14 @@ impl Database {
         Self {
             adapter,
             indexes: Arc::new(RwLock::new(HashMap::new())),
+            plugins: Vec::new(),
         }
+    }
+
+    /// Add a plugin to this database.
+    pub fn with_plugin(mut self, plugin: Arc<dyn Plugin>) -> Self {
+        self.plugins.push(plugin);
+        self
     }
 
     /// Get a reference to the underlying adapter.
@@ -143,6 +189,9 @@ impl Database {
     /// If it does exist, you must provide the current `_rev` in `opts_rev`
     /// to avoid conflicts.
     pub async fn put(&self, id: &str, data: serde_json::Value) -> Result<DocResult> {
+        if id.is_empty() {
+            return Err(RouchError::MissingId);
+        }
         let doc = Document {
             id: id.to_string(),
             rev: None,
@@ -150,15 +199,15 @@ impl Database {
             data,
             attachments: HashMap::new(),
         };
-        let mut results = self
-            .adapter
-            .bulk_docs(vec![doc], BulkDocsOptions::new())
-            .await?;
+        let mut results = self.bulk_docs(vec![doc], BulkDocsOptions::new()).await?;
         Ok(results.remove(0))
     }
 
     /// Update an existing document (requires providing the current rev).
     pub async fn update(&self, id: &str, rev: &str, data: serde_json::Value) -> Result<DocResult> {
+        if id.is_empty() {
+            return Err(RouchError::MissingId);
+        }
         let revision: Revision = rev.parse()?;
         let doc = Document {
             id: id.to_string(),
@@ -167,15 +216,15 @@ impl Database {
             data,
             attachments: HashMap::new(),
         };
-        let mut results = self
-            .adapter
-            .bulk_docs(vec![doc], BulkDocsOptions::new())
-            .await?;
+        let mut results = self.bulk_docs(vec![doc], BulkDocsOptions::new()).await?;
         Ok(results.remove(0))
     }
 
     /// Delete a document (requires the current rev).
     pub async fn remove(&self, id: &str, rev: &str) -> Result<DocResult> {
+        if id.is_empty() {
+            return Err(RouchError::MissingId);
+        }
         let revision: Revision = rev.parse()?;
         let doc = Document {
             id: id.to_string(),
@@ -184,20 +233,24 @@ impl Database {
             data: serde_json::json!({}),
             attachments: HashMap::new(),
         };
-        let mut results = self
-            .adapter
-            .bulk_docs(vec![doc], BulkDocsOptions::new())
-            .await?;
+        let mut results = self.bulk_docs(vec![doc], BulkDocsOptions::new()).await?;
         Ok(results.remove(0))
     }
 
     /// Write multiple documents at once.
     pub async fn bulk_docs(
         &self,
-        docs: Vec<Document>,
+        mut docs: Vec<Document>,
         opts: BulkDocsOptions,
     ) -> Result<Vec<DocResult>> {
-        self.adapter.bulk_docs(docs, opts).await
+        for plugin in &self.plugins {
+            plugin.before_write(&mut docs).await?;
+        }
+        let results = self.adapter.bulk_docs(docs, opts).await?;
+        for plugin in &self.plugins {
+            plugin.after_write(&results).await?;
+        }
+        Ok(results)
     }
 
     /// Query all documents.
@@ -246,8 +299,7 @@ impl Database {
         &self,
         opts: ChangesStreamOptions,
     ) -> (tokio::sync::mpsc::Receiver<ChangeEvent>, ChangesHandle) {
-        if opts.selector.is_some() {
-            let selector = opts.selector.clone().unwrap();
+        if let Some(selector) = opts.selector.clone() {
             let user_wants_docs = opts.include_docs;
             let inner_opts = ChangesStreamOptions {
                 include_docs: true, // Need docs for selector evaluation
@@ -282,9 +334,92 @@ impl Database {
         }
     }
 
+    /// Start a live changes feed with lifecycle events.
+    ///
+    /// Like `live_changes()` but returns `ChangesEvent` which includes
+    /// `Active`, `Paused`, `Complete`, and `Error` in addition to `Change`.
+    pub fn live_changes_events(
+        &self,
+        opts: ChangesStreamOptions,
+    ) -> (tokio::sync::mpsc::Receiver<ChangesEvent>, ChangesHandle) {
+        if let Some(selector) = opts.selector.clone() {
+            let user_wants_docs = opts.include_docs;
+            let inner_opts = ChangesStreamOptions {
+                include_docs: true,
+                selector: None,
+                ..opts
+            };
+            let (inner_rx, handle) = live_changes_events(self.adapter.clone(), inner_opts);
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+            tokio::spawn(async move {
+                let mut inner_rx = inner_rx;
+                while let Some(event) = inner_rx.recv().await {
+                    let forward = match &event {
+                        ChangesEvent::Change(ce) => {
+                            let matches = ce
+                                .doc
+                                .as_ref()
+                                .is_some_and(|d| matches_selector(d, &selector));
+                            if !matches {
+                                continue;
+                            }
+                            if !user_wants_docs {
+                                let mut ce = ce.clone();
+                                ce.doc = None;
+                                ChangesEvent::Change(ce)
+                            } else {
+                                event
+                            }
+                        }
+                        _ => event, // Pass through lifecycle events
+                    };
+                    if tx.send(forward).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            (rx, handle)
+        } else {
+            live_changes_events(self.adapter.clone(), opts)
+        }
+    }
+
     // -----------------------------------------------------------------
     // Attachment operations
     // -----------------------------------------------------------------
+
+    /// Store an attachment on a document.
+    pub async fn put_attachment(
+        &self,
+        doc_id: &str,
+        att_id: &str,
+        rev: &str,
+        data: Vec<u8>,
+        content_type: &str,
+    ) -> Result<DocResult> {
+        self.adapter
+            .put_attachment(doc_id, att_id, rev, data, content_type)
+            .await
+    }
+
+    /// Retrieve raw attachment data.
+    pub async fn get_attachment(&self, doc_id: &str, att_id: &str) -> Result<Vec<u8>> {
+        self.adapter
+            .get_attachment(doc_id, att_id, GetAttachmentOptions::default())
+            .await
+    }
+
+    /// Retrieve raw attachment data with options.
+    pub async fn get_attachment_with_opts(
+        &self,
+        doc_id: &str,
+        att_id: &str,
+        opts: GetAttachmentOptions,
+    ) -> Result<Vec<u8>> {
+        self.adapter.get_attachment(doc_id, att_id, opts).await
+    }
 
     /// Remove an attachment from a document.
     ///
@@ -309,19 +444,27 @@ impl Database {
     /// documents.
     pub async fn find(&self, opts: FindOptions) -> Result<FindResponse> {
         // Check if we have a usable index
-        let indexes = self.indexes.read().await;
-        let usable_index = indexes.values().find(|idx| {
-            // An index is usable if its first field is referenced in the selector
-            if idx.def.fields.is_empty() {
-                return false;
-            }
-            let (first_field, _) = idx.def.fields[0].field_and_direction();
-            opts.selector.get(first_field).is_some()
-        });
+        let mut indexes = self.indexes.write().await;
 
-        if let Some(index) = usable_index {
-            // Use the index to get candidate doc IDs
-            let candidate_ids = index.find_matching(&opts.selector);
+        // Find the name of a usable index (if any)
+        let usable_name = indexes
+            .iter()
+            .find(|(_, idx)| {
+                if idx.def.fields.is_empty() {
+                    return false;
+                }
+                let (first_field, _) = idx.def.fields[0].field_and_direction();
+                opts.selector.get(first_field).is_some()
+            })
+            .map(|(name, _)| name.clone());
+
+        if let Some(name) = usable_name {
+            // Rebuild the index lazily to pick up any document changes
+            let def = indexes[&name].def.clone();
+            let rebuilt = build_index(self.adapter.as_ref(), &def).await?;
+            indexes.insert(name.clone(), rebuilt);
+
+            let candidate_ids = indexes[&name].find_matching(&opts.selector);
             drop(indexes);
 
             // Fetch only the candidate docs
@@ -471,12 +614,102 @@ impl Database {
         result
     }
 
+    /// Explain how a query would be executed without running it.
+    ///
+    /// Returns which index would be used and the query plan.
+    pub async fn explain(&self, opts: FindOptions) -> ExplainResponse {
+        let indexes = self.indexes.read().await;
+        let usable = indexes.values().find(|idx| {
+            if idx.def.fields.is_empty() {
+                return false;
+            }
+            let (first_field, _) = idx.def.fields[0].field_and_direction();
+            opts.selector.get(first_field).is_some()
+        });
+
+        let dbname = self.info().await.map(|i| i.db_name).unwrap_or_default();
+
+        if let Some(index) = usable {
+            ExplainResponse {
+                dbname,
+                index: ExplainIndex {
+                    ddoc: index.def.ddoc.clone(),
+                    name: index.def.name.clone(),
+                    index_type: "json".into(),
+                    def: IndexFields {
+                        fields: index.def.fields.clone(),
+                    },
+                },
+                selector: opts.selector,
+                fields: opts.fields,
+            }
+        } else {
+            ExplainResponse {
+                dbname,
+                index: ExplainIndex {
+                    ddoc: None,
+                    name: "_all_docs".into(),
+                    index_type: "special".into(),
+                    def: IndexFields { fields: vec![] },
+                },
+                selector: opts.selector,
+                fields: opts.fields,
+            }
+        }
+    }
+
     /// Delete an index by name.
     pub async fn delete_index(&self, name: &str) -> Result<()> {
         let mut indexes = self.indexes.write().await;
         indexes
             .remove(name)
             .ok_or_else(|| RouchError::NotFound(format!("index {}", name)))?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Design document operations
+    // -----------------------------------------------------------------
+
+    /// Store a design document.
+    pub async fn put_design(&self, ddoc: DesignDocument) -> Result<DocResult> {
+        let json = ddoc.to_json();
+        let doc = Document::from_json(json)?;
+        let mut results = self.bulk_docs(vec![doc], BulkDocsOptions::new()).await?;
+        Ok(results.remove(0))
+    }
+
+    /// Retrieve a design document by name.
+    ///
+    /// Accepts either `"myapp"` or `"_design/myapp"`.
+    pub async fn get_design(&self, name: &str) -> Result<DesignDocument> {
+        let id = if name.starts_with("_design/") {
+            name.to_string()
+        } else {
+            format!("_design/{}", name)
+        };
+        let doc = self.adapter.get(&id, GetOptions::default()).await?;
+        DesignDocument::from_json(doc.to_json())
+    }
+
+    /// Delete a design document.
+    pub async fn delete_design(&self, name: &str, rev: &str) -> Result<DocResult> {
+        let id = if name.starts_with("_design/") {
+            name.to_string()
+        } else {
+            format!("_design/{}", name)
+        };
+        self.remove(&id, rev).await
+    }
+
+    /// Remove orphaned view indexes.
+    ///
+    /// Scans all design documents and removes any cached indexes
+    /// that no longer have a corresponding design document view.
+    pub async fn view_cleanup(&self) -> Result<()> {
+        // This is a no-op in the base implementation since we don't
+        // store persistent view indexes in the Database struct itself.
+        // The ViewEngine handles its own cleanup.
         Ok(())
     }
 
@@ -558,6 +791,11 @@ impl Database {
     // Other operations
     // -----------------------------------------------------------------
 
+    /// Close the database and release resources.
+    pub async fn close(&self) -> Result<()> {
+        self.adapter.close().await
+    }
+
     /// Compact the database.
     pub async fn compact(&self) -> Result<()> {
         self.adapter.compact().await
@@ -565,7 +803,113 @@ impl Database {
 
     /// Destroy the database and all its data.
     pub async fn destroy(&self) -> Result<()> {
+        for plugin in &self.plugins {
+            plugin.on_destroy().await?;
+        }
         self.adapter.destroy().await
+    }
+
+    /// Permanently remove document revisions.
+    ///
+    /// Unlike `remove()`, purged revisions are completely erased and will not
+    /// be replicated to other databases.
+    pub async fn purge(&self, doc_id: &str, revs: Vec<String>) -> Result<PurgeResponse> {
+        let mut req = HashMap::new();
+        req.insert(doc_id.to_string(), revs);
+        self.adapter.purge(req).await
+    }
+
+    /// Get the security document for this database.
+    pub async fn get_security(&self) -> Result<SecurityDocument> {
+        self.adapter.get_security().await
+    }
+
+    /// Set the security document for this database.
+    pub async fn put_security(&self, doc: SecurityDocument) -> Result<()> {
+        self.adapter.put_security(doc).await
+    }
+}
+
+/// A partitioned view of a database.
+///
+/// Scopes queries to documents whose `_id` starts with `"{partition}:"`.
+pub struct Partition<'a> {
+    db: &'a Database,
+    name: String,
+}
+
+impl Database {
+    /// Get a partitioned view of this database.
+    ///
+    /// All queries on the returned `Partition` are scoped to documents
+    /// whose ID starts with `"{name}:"`.
+    pub fn partition(&self, name: &str) -> Partition<'_> {
+        Partition {
+            db: self,
+            name: name.to_string(),
+        }
+    }
+}
+
+/// Escape regex metacharacters in a string for safe use in a regex pattern.
+fn regex_escape(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len() * 2);
+    for c in s.chars() {
+        if matches!(
+            c,
+            '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '\\' | '|' | '^' | '$'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
+impl Partition<'_> {
+    /// Query all documents in this partition.
+    pub async fn all_docs(&self, mut opts: AllDocsOptions) -> Result<AllDocsResponse> {
+        let prefix = format!("{}:", self.name);
+        let end = format!("{}:\u{ffff}", self.name);
+        if opts.start_key.is_none() {
+            opts.start_key = Some(prefix);
+        }
+        if opts.end_key.is_none() {
+            opts.end_key = Some(end);
+        }
+        self.db.all_docs(opts).await
+    }
+
+    /// Run a Mango find query scoped to this partition.
+    pub async fn find(&self, mut opts: FindOptions) -> Result<FindResponse> {
+        let escaped = regex_escape(&self.name);
+        let partition_filter = serde_json::json!({"_id": {"$regex": format!("^{}:", escaped)}});
+        opts.selector = serde_json::json!({"$and": [opts.selector, partition_filter]});
+        self.db.find(opts).await
+    }
+
+    /// Get a document by ID within this partition.
+    ///
+    /// Automatically prepends the partition prefix if not present.
+    pub async fn get(&self, id: &str) -> Result<Document> {
+        let full_id = if id.starts_with(&format!("{}:", self.name)) {
+            id.to_string()
+        } else {
+            format!("{}:{}", self.name, id)
+        };
+        self.db.get(&full_id).await
+    }
+
+    /// Put a document within this partition.
+    ///
+    /// Automatically prepends the partition prefix if not present.
+    pub async fn put(&self, id: &str, data: serde_json::Value) -> Result<DocResult> {
+        let full_id = if id.starts_with(&format!("{}:", self.name)) {
+            id.to_string()
+        } else {
+            format!("{}:{}", self.name, id)
+        };
+        self.db.put(&full_id, data).await
     }
 }
 

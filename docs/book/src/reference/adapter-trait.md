@@ -52,6 +52,13 @@ pub trait Adapter: Send + Sync {
         opts: GetAttachmentOptions,
     ) -> Result<Vec<u8>>;
 
+    async fn remove_attachment(
+        &self,
+        doc_id: &str,
+        att_id: &str,
+        rev: &str,
+    ) -> Result<DocResult>;
+
     async fn get_local(&self, id: &str) -> Result<serde_json::Value>;
 
     async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()>;
@@ -61,6 +68,19 @@ pub trait Adapter: Send + Sync {
     async fn compact(&self) -> Result<()>;
 
     async fn destroy(&self) -> Result<()>;
+
+    // Methods with default implementations:
+
+    async fn close(&self) -> Result<()> { Ok(()) }
+
+    async fn purge(
+        &self,
+        req: HashMap<String, Vec<String>>,
+    ) -> Result<PurgeResponse> { /* default: error */ }
+
+    async fn get_security(&self) -> Result<SecurityDocument> { /* default: empty */ }
+
+    async fn put_security(&self, doc: SecurityDocument) -> Result<()> { /* default: no-op */ }
 }
 ```
 
@@ -187,6 +207,7 @@ This distinction is critical for correct replication behavior. When documents ar
 |--------|-----------|-------------|
 | `put_attachment` | `async fn put_attachment(&self, doc_id: &str, att_id: &str, rev: &str, data: Vec<u8>, content_type: &str) -> Result<DocResult>` | Store binary attachment data on a document. |
 | `get_attachment` | `async fn get_attachment(&self, doc_id: &str, att_id: &str, opts: GetAttachmentOptions) -> Result<Vec<u8>>` | Retrieve raw binary attachment data. |
+| `remove_attachment` | `async fn remove_attachment(&self, doc_id: &str, att_id: &str, rev: &str) -> Result<DocResult>` | Remove an attachment from a document. Creates a new revision. |
 
 **`put_attachment` behavior contract:**
 
@@ -249,8 +270,12 @@ This is why local documents are excluded from replication -- each side maintains
 |--------|-----------|-------------|
 | `compact` | `async fn compact(&self) -> Result<()>` | Remove old (non-leaf) revisions and clean up unreferenced attachment data. |
 | `destroy` | `async fn destroy(&self) -> Result<()>` | Destroy the database and all its data. After calling this, the adapter should not be used. |
+| `close` | `async fn close(&self) -> Result<()>` | Release resources (default: no-op). |
+| `purge` | `async fn purge(&self, req: HashMap<String, Vec<String>>) -> Result<PurgeResponse>` | Permanently remove specific revisions. Purged revisions do not replicate. Default returns an error. |
+| `get_security` | `async fn get_security(&self) -> Result<SecurityDocument>` | Get the database security document (default: empty document). |
+| `put_security` | `async fn put_security(&self, doc: SecurityDocument) -> Result<()>` | Set the database security document (default: no-op). |
 
-**When they are called:** `compact` is called by `Database::compact`, typically as a periodic maintenance task. `destroy` is called by `Database::destroy` when the user wants to permanently delete the database.
+**When they are called:** `compact` is called by `Database::compact`, typically as a periodic maintenance task. `destroy` is called by `Database::destroy` when the user wants to permanently delete the database. `close`, `purge`, `get_security`, and `put_security` have default implementations so existing adapters don't need to implement them.
 
 ---
 

@@ -186,7 +186,7 @@ This is the data that populates the `_revisions` field in `bulk_get` responses.
 ### `build_path_from_revs`
 
 Constructs a single-path `RevPath` from an array of revision hashes. The
-input is oldest-first: `[oldest_hash, ..., newest_hash]`. The leaf gets
+input is newest-first (leaf-first): `[newest_hash, ..., oldest_hash]`. The leaf gets
 `RevStatus::Available`; all ancestors get `RevStatus::Missing`. This is how
 incoming revisions from replication are turned into a structure that can be
 merged.

@@ -106,7 +106,7 @@ use rouchdb::{Database, ChangesOptions, Seq};
 
 async fn example(db: &Database) -> rouchdb::Result<()> {
     let changes = db.changes(ChangesOptions {
-        since: Seq::Numeric(0), // from the beginning
+        since: Seq::Num(0), // from the beginning
         include_docs: true,
         ..Default::default()
     }).await?;

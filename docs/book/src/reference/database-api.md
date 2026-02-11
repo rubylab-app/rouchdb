@@ -15,6 +15,7 @@ use rouchdb::Database;
 | `memory` | `fn memory(name: &str) -> Self` | Create an in-memory database. Data is lost when the `Database` is dropped. Useful for testing. |
 | `open` | `fn open(path: impl AsRef<Path>, name: &str) -> Result<Self>` | Open or create a persistent database backed by [redb](https://github.com/cberner/redb). Returns an error if the file cannot be opened or created. |
 | `http` | `fn http(url: &str) -> Self` | Connect to a remote CouchDB-compatible server. The URL should include the database name (e.g., `http://localhost:5984/mydb`). |
+| `http_with_auth` | `fn http_with_auth(url: &str, auth: &AuthClient) -> Self` | Connect to CouchDB with cookie authentication. The `AuthClient` must have been logged in via `auth.login()` first. |
 | `from_adapter` | `fn from_adapter(adapter: Arc<dyn Adapter>) -> Self` | Create a `Database` from any custom adapter implementation. Use this when you need to provide your own storage backend. |
 
 ### Examples
@@ -87,15 +88,19 @@ let response = db.all_docs(AllDocsOptions {
 
 | Method | Signature | Return Type | Description |
 |--------|-----------|-------------|-------------|
-| `remove_attachment` | `async fn remove_attachment(&self, doc_id: &str, att_id: &str, rev: &str)` | `Result<DocResult>` | Remove an attachment from a document. Creates a new revision with the attachment removed. Equivalent to PouchDB's `db.removeAttachment()`. |
+| `put_attachment` | `async fn put_attachment(&self, doc_id: &str, att_id: &str, rev: &str, data: Vec<u8>, content_type: &str)` | `Result<DocResult>` | Add or replace an attachment on a document. Creates a new revision. |
+| `get_attachment` | `async fn get_attachment(&self, doc_id: &str, att_id: &str)` | `Result<Vec<u8>>` | Retrieve raw attachment bytes using the current revision. |
+| `get_attachment_with_opts` | `async fn get_attachment_with_opts(&self, doc_id: &str, att_id: &str, opts: GetAttachmentOptions)` | `Result<Vec<u8>>` | Retrieve raw attachment bytes with options (e.g., specific revision). |
+| `remove_attachment` | `async fn remove_attachment(&self, doc_id: &str, att_id: &str, rev: &str)` | `Result<DocResult>` | Remove an attachment from a document. Creates a new revision with the attachment removed. |
 
 ### Example
 
 ```rust
-// Put and get attachment via adapter
-let att_result = db.adapter()
-    .put_attachment("doc1", "photo.jpg", &rev, data, "image/jpeg")
-    .await?;
+// Put attachment
+let att_result = db.put_attachment("doc1", "photo.jpg", &rev, data, "image/jpeg").await?;
+
+// Get attachment
+let bytes = db.get_attachment("doc1", "photo.jpg").await?;
 
 // Remove the attachment
 let rm = db.remove_attachment("doc1", "photo.jpg", &att_result.rev.unwrap()).await?;
@@ -165,7 +170,7 @@ db.delete_index("idx-age").await?;
 
 ## Replication
 
-All replication methods implement the CouchDB replication protocol: checkpoint reading, changes feed, revision diff, bulk document fetch, and checkpoint saving. See the [Replication chapter](../guide/replication.md) for a conceptual overview.
+All replication methods implement the CouchDB replication protocol: checkpoint reading, changes feed, revision diff, bulk document fetch, and checkpoint saving. See the [Replication chapter](../guides/replication.md) for a conceptual overview.
 
 | Method | Signature | Return Type | Description |
 |--------|-----------|-------------|-------------|
@@ -183,6 +188,8 @@ All replication methods implement the CouchDB replication protocol: checkpoint r
 | `batch_size` | `u64` | `100` | Number of documents to process per batch. |
 | `batches_limit` | `u64` | `10` | Maximum number of batches to buffer. |
 | `filter` | `Option<ReplicationFilter>` | `None` | Optional filter for selective replication. |
+| `since` | `Option<Seq>` | `None` | Override the starting sequence. Skips checkpoint and starts from this sequence. |
+| `checkpoint` | `bool` | `true` | Set to `false` to disable checkpoint saving/reading. |
 | `live` | `bool` | `false` | Enable continuous replication (used with `replicate_to_live`). |
 | `retry` | `bool` | `false` | Automatically retry on failure (live mode). |
 | `poll_interval` | `Duration` | `500ms` | How often to poll for new changes in live mode. |
@@ -194,7 +201,7 @@ All replication methods implement the CouchDB replication protocol: checkpoint r
 |---------|-------------|
 | `DocIds(Vec<String>)` | Replicate only the listed document IDs. Filtering at the changes feed level (most efficient). |
 | `Selector(serde_json::Value)` | Replicate documents matching a Mango selector. Evaluated after fetching documents. |
-| `Custom(Box<dyn Fn(&ChangeEvent) -> bool + Send + Sync>)` | Replicate documents passing a custom predicate applied to each change event. |
+| `Custom(Arc<dyn Fn(&ChangeEvent) -> bool + Send + Sync>)` | Replicate documents passing a custom predicate applied to each change event. |
 
 ### ReplicationResult
 
@@ -222,11 +229,85 @@ let (push, pull) = local.sync(&remote).await?;
 
 ---
 
+## Query Planning
+
+| Method | Signature | Return Type | Description |
+|--------|-----------|-------------|-------------|
+| `explain` | `async fn explain(&self, opts: FindOptions)` | `ExplainResponse` | Analyze a Mango query and return which index would be used, without executing the query. Useful for optimizing queries. |
+
+### Example
+
+```rust
+let explanation = db.explain(FindOptions {
+    selector: serde_json::json!({"age": {"$gt": 20}}),
+    ..Default::default()
+}).await;
+
+println!("Index: {} ({})", explanation.index.name, explanation.index.index_type);
+```
+
+---
+
+## Design Document Operations
+
+| Method | Signature | Return Type | Description |
+|--------|-----------|-------------|-------------|
+| `put_design` | `async fn put_design(&self, ddoc: DesignDocument)` | `Result<DocResult>` | Create or update a design document. |
+| `get_design` | `async fn get_design(&self, name: &str)` | `Result<DesignDocument>` | Retrieve a design document by short name (without `_design/` prefix). |
+| `delete_design` | `async fn delete_design(&self, name: &str, rev: &str)` | `Result<DocResult>` | Delete a design document. |
+| `view_cleanup` | `async fn view_cleanup(&self)` | `Result<()>` | Remove unused view indexes. |
+
+See the [Design Documents & Views](../guides/design-documents.md) guide for details.
+
+---
+
+## Security
+
+| Method | Signature | Return Type | Description |
+|--------|-----------|-------------|-------------|
+| `get_security` | `async fn get_security(&self)` | `Result<SecurityDocument>` | Retrieve the database security document (admins and members). |
+| `put_security` | `async fn put_security(&self, doc: SecurityDocument)` | `Result<()>` | Update the database security document. |
+
+---
+
+## Changes Feed (Event-Based)
+
+| Method | Signature | Return Type | Description |
+|--------|-----------|-------------|-------------|
+| `live_changes` | `fn live_changes(&self, opts: ChangesStreamOptions)` | `(Receiver<ChangeEvent>, ChangesHandle)` | Start a live changes stream returning raw change events. |
+| `live_changes_events` | `fn live_changes_events(&self, opts: ChangesStreamOptions)` | `(Receiver<ChangesEvent>, ChangesHandle)` | Start a live changes stream returning lifecycle events (Active, Paused, Complete, Error, Change). |
+
+See the [Changes Feed](../guides/changes-feed.md) guide for details.
+
+---
+
+## Partitioned Queries
+
+| Method | Signature | Return Type | Description |
+|--------|-----------|-------------|-------------|
+| `partition` | `fn partition(&self, name: &str)` | `Partition<'_>` | Create a partitioned view scoped to documents with ID prefix `"{name}:"`. |
+
+The returned `Partition` supports `get()`, `put()`, `all_docs()`, and `find()`. See the [Partitioned Databases](../guides/partitions.md) guide.
+
+---
+
+## Plugin System
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `with_plugin` | `fn with_plugin(self, plugin: Arc<dyn Plugin>) -> Self` | Register a plugin that hooks into the document lifecycle. Consumes and returns `self` (builder pattern). |
+
+See the [Plugins](../guides/plugins.md) guide for details.
+
+---
+
 ## Maintenance
 
 | Method | Signature | Return Type | Description |
 |--------|-----------|-------------|-------------|
+| `close` | `async fn close(&self)` | `Result<()>` | Close the database connection. No-op for HTTP adapter. |
 | `compact` | `async fn compact(&self)` | `Result<()>` | Compact the database: removes old revisions and cleans up unreferenced attachment data. |
+| `purge` | `async fn purge(&self, id: &str, revs: Vec<String>)` | `Result<PurgeResponse>` | Permanently remove specific revisions of a document. Unlike `remove()`, purged revisions do not replicate. |
 | `destroy` | `async fn destroy(&self)` | `Result<()>` | Destroy the database and all its data. This is irreversible. |
 
 ---

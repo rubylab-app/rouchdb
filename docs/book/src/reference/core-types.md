@@ -260,6 +260,9 @@ pub struct GetOptions {
     pub conflicts: bool,
     pub open_revs: Option<OpenRevs>,
     pub revs: bool,
+    pub revs_info: bool,
+    pub latest: bool,
+    pub attachments: bool,
 }
 ```
 
@@ -269,6 +272,9 @@ pub struct GetOptions {
 | `conflicts` | `bool` | `false` | Include conflicting revisions in the response. |
 | `open_revs` | `Option<OpenRevs>` | `None` | Return all open (leaf) revisions. |
 | `revs` | `bool` | `false` | Include full revision history. |
+| `revs_info` | `bool` | `false` | Include revision info with status (`available`, `missing`, `deleted`) for each revision. |
+| `latest` | `bool` | `false` | If `rev` is specified and is not a leaf, return the latest leaf revision instead. |
+| `attachments` | `bool` | `false` | Include inline Base64 attachment data in the response. |
 
 #### OpenRevs
 
@@ -324,6 +330,8 @@ pub struct AllDocsOptions {
     pub skip: u64,
     pub limit: Option<u64>,
     pub inclusive_end: bool,
+    pub conflicts: bool,
+    pub update_seq: bool,
 }
 ```
 
@@ -338,6 +346,8 @@ pub struct AllDocsOptions {
 | `skip` | `u64` | `0` | Number of rows to skip before returning results. |
 | `limit` | `Option<u64>` | `None` | Maximum number of rows to return. |
 | `inclusive_end` | `bool` | `true` (via `AllDocsOptions::new()`) | Whether the `end_key` is included in the range. |
+| `conflicts` | `bool` | `false` | Include `_conflicts` for each document (requires `include_docs`). |
+| `update_seq` | `bool` | `false` | Include the current `update_seq` in the response. |
 
 **Note:** Use `AllDocsOptions::new()` instead of `Default::default()` to get `inclusive_end: true`, which matches CouchDB's default behavior.
 
@@ -355,6 +365,9 @@ pub struct ChangesOptions {
     pub include_docs: bool,
     pub live: bool,
     pub doc_ids: Option<Vec<String>>,
+    pub selector: Option<serde_json::Value>,
+    pub conflicts: bool,
+    pub style: ChangesStyle,
 }
 ```
 
@@ -366,6 +379,9 @@ pub struct ChangesOptions {
 | `include_docs` | `bool` | `false` | Include the full document body in each change event. |
 | `live` | `bool` | `false` | Enable continuous (live) changes feed. |
 | `doc_ids` | `Option<Vec<String>>` | `None` | Filter changes to only these document IDs. |
+| `selector` | `Option<serde_json::Value>` | `None` | Mango selector to filter changes. Only changes matching the selector are returned. |
+| `conflicts` | `bool` | `false` | Include conflicting revisions per change event. |
+| `style` | `ChangesStyle` | `MainOnly` | `MainOnly` returns only the winning revision; `AllDocs` returns all leaf revisions. |
 
 ---
 
@@ -414,6 +430,7 @@ Options for map/reduce view queries (from `rouchdb-query`).
 ```rust
 pub struct ViewQueryOptions {
     pub key: Option<serde_json::Value>,
+    pub keys: Option<Vec<serde_json::Value>>,
     pub start_key: Option<serde_json::Value>,
     pub end_key: Option<serde_json::Value>,
     pub inclusive_end: bool,
@@ -424,12 +441,14 @@ pub struct ViewQueryOptions {
     pub reduce: bool,
     pub group: bool,
     pub group_level: Option<u64>,
+    pub stale: StaleOption,
 }
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `key` | `Option<serde_json::Value>` | `None` | Return only rows with this exact key. |
+| `keys` | `Option<Vec<serde_json::Value>>` | `None` | Return only rows matching any of these keys, in the given order. |
 | `start_key` | `Option<serde_json::Value>` | `None` | Start of key range (inclusive). |
 | `end_key` | `Option<serde_json::Value>` | `None` | End of key range (inclusive by default). |
 | `inclusive_end` | `bool` | `true` (via `ViewQueryOptions::new()`) | Whether the `end_key` is included in the range. |
@@ -440,6 +459,7 @@ pub struct ViewQueryOptions {
 | `reduce` | `bool` | `false` | Whether to run the reduce function. |
 | `group` | `bool` | `false` | Group results by key (requires `reduce: true`). |
 | `group_level` | `Option<u64>` | `None` | Group to this many array elements of the key (requires `reduce: true`). |
+| `stale` | `StaleOption` | `False` | `False` rebuilds the index before querying (default). `Ok` uses a potentially stale index. `UpdateAfter` returns stale results then rebuilds. |
 
 ---
 
@@ -468,6 +488,7 @@ pub struct AllDocsResponse {
     pub total_rows: u64,
     pub offset: u64,
     pub rows: Vec<AllDocsRow>,
+    pub update_seq: Option<Seq>,
 }
 ```
 
@@ -476,6 +497,7 @@ pub struct AllDocsResponse {
 | `total_rows` | `u64` | Total number of non-deleted documents in the database. |
 | `offset` | `u64` | Number of rows skipped. |
 | `rows` | `Vec<AllDocsRow>` | The result rows. |
+| `update_seq` | `Option<Seq>` | The current update sequence, present when `update_seq: true` was requested. |
 
 ### AllDocsRow
 
@@ -534,6 +556,7 @@ pub struct ChangeEvent {
     pub changes: Vec<ChangeRev>,
     pub deleted: bool,
     pub doc: Option<serde_json::Value>,
+    pub conflicts: Option<Vec<String>>,
 }
 ```
 
@@ -544,6 +567,7 @@ pub struct ChangeEvent {
 | `changes` | `Vec<ChangeRev>` | List of changed revision strings. |
 | `deleted` | `bool` | `true` if the document was deleted. Defaults to `false`. |
 | `doc` | `Option<serde_json::Value>` | Full document body, present only when `include_docs` is `true`. |
+| `conflicts` | `Option<Vec<String>>` | Conflicting revisions, present when `conflicts: true` was requested. |
 
 ### ChangeRev
 

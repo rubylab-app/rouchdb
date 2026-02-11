@@ -93,4 +93,30 @@ pub trait Adapter: Send + Sync {
 
     /// Destroy the database and all its data.
     async fn destroy(&self) -> Result<()>;
+
+    /// Close the database, releasing any held resources.
+    /// Default implementation is a no-op.
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Purge (permanently remove) document revisions.
+    async fn purge(
+        &self,
+        _req: HashMap<String, Vec<String>>,
+    ) -> Result<crate::document::PurgeResponse> {
+        Err(crate::error::RouchError::BadRequest(
+            "purge not supported".into(),
+        ))
+    }
+
+    /// Get the security document for this database.
+    async fn get_security(&self) -> Result<crate::document::SecurityDocument> {
+        Ok(crate::document::SecurityDocument::default())
+    }
+
+    /// Set the security document for this database.
+    async fn put_security(&self, _doc: crate::document::SecurityDocument) -> Result<()> {
+        Ok(())
+    }
 }

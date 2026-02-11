@@ -64,14 +64,13 @@ impl Checkpointer {
         let doc = self.build_checkpoint_doc(last_seq);
         let json = serde_json::to_value(&doc)?;
 
-        // Write to both, but don't fail if one side fails
+        // Write to both sides — fail if either side fails to keep them in sync
         let source_result = source.put_local(&self.replication_id, json.clone()).await;
         let target_result = target.put_local(&self.replication_id, json).await;
 
-        // If both fail, return the error
         match (source_result, target_result) {
-            (Err(e), Err(_)) => Err(e),
-            _ => Ok(()),
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e), _) | (_, Err(e)) => Err(e),
         }
     }
 

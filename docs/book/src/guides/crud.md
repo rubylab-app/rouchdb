@@ -178,6 +178,8 @@ for row in &response.rows {
 - `key` -- fetch a single key.
 - `keys` -- fetch a specific set of keys.
 - `include_docs` -- embed full document bodies in results.
+- `conflicts` -- include conflict information for each document.
+- `update_seq` -- include the database update sequence in the response.
 - `descending` -- reverse the sort order.
 - `skip` -- number of rows to skip.
 - `limit` -- maximum number of rows.

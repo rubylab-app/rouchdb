@@ -10,9 +10,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-rouchdb-core = { path = "../rouchdb-core", version = "0.1.1" }
+rouchdb-core = { path = "../rouchdb-core", version = "0.2.0" }
 async-trait = "0.1"
-base64 = "0.22"
 md-5 = "0.10"
 redb = "2"
 serde = { version = "1", features = ["derive"] }

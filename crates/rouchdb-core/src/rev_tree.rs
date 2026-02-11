@@ -168,9 +168,20 @@ pub fn build_path_from_revs(
     opts: NodeOpts,
     status: RevStatus,
 ) -> RevPath {
-    assert!(!revs.is_empty());
+    if revs.is_empty() {
+        // Return a degenerate single-node path rather than panicking.
+        return RevPath {
+            pos,
+            tree: RevNode {
+                hash: String::new(),
+                status,
+                opts,
+                children: vec![],
+            },
+        };
+    }
     let len = revs.len() as u64;
-    let root_pos = pos - len + 1;
+    let root_pos = pos.saturating_sub(len.saturating_sub(1));
 
     // Build from leaf to root
     let mut node: Option<RevNode> = None;
@@ -195,7 +206,7 @@ pub fn build_path_from_revs(
 
     RevPath {
         pos: root_pos,
-        tree: node.unwrap(),
+        tree: node.expect("node must exist after building from non-empty revs"),
     }
 }
 

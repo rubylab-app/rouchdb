@@ -38,6 +38,7 @@ Pick exactly what you need:
 | `rouchdb-changes` | Changes feed (one-shot and live streaming) |
 | `rouchdb-replication` | CouchDB replication protocol |
 | `rouchdb-query` | Mango selectors and map/reduce views |
+| `rouchdb-views` | Design documents and persistent view engine |
 | `rouchdb` | Umbrella crate — re-exports everything above |
 
 ## Async Runtime
