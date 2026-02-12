@@ -68,7 +68,7 @@ All documents are `serde_json::Value` (dynamic JSON). `Document` struct holds `i
 
 - **Edition 2024**, resolver 3, stable Rust (no nightly features)
 - Workspace-level `version` in root `Cargo.toml` — crate versions must stay in sync
-- Internal dependency versions must match workspace version (e.g., `rouchdb-core = { path = "../rouchdb-core", version = "0.2.0" }`)
+- Internal dependency versions must match workspace version (e.g., `rouchdb-core = { path = "../rouchdb-core", version = "0.2.1" }`)
 - All async via Tokio; tests use `#[tokio::test]`
 - Integration tests are `#[ignore]` — they need CouchDB at `http://admin:password@localhost:15984` (override with `COUCHDB_URL` env var)
 - `MemoryAdapter` is the go-to for fast unit testing

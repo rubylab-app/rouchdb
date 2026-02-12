@@ -8,9 +8,10 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
+readme.workspace = true
 
 [dependencies]
-rouchdb-core = { path = "../rouchdb-core", version = "0.2.0" }
+rouchdb-core = { path = "../rouchdb-core", version = "0.2.1" }
 async-trait = "0.1"
 md-5 = "0.10"
 redb = "2"
