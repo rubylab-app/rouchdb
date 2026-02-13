@@ -1,0 +1,30 @@
+[package]
+name = "rouchdb-cli"
+description = "Command-line tool for inspecting and querying RouchDB redb databases"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+publish = false
+
+[[bin]]
+name = "rouchdb"
+path = "src/main.rs"
+
+[dependencies]
+rouchdb = { path = "../rouchdb" }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+rouchdb = { path = "../rouchdb" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
