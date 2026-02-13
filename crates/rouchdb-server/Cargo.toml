@@ -1,0 +1,25 @@
+[package]
+name = "rouchdb-server"
+description = "CouchDB-compatible HTTP server for RouchDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "rouchdb-server"
+path = "src/main.rs"
+
+[dependencies]
+rouchdb = { path = "../rouchdb", version = "0.3.0" }
+rouchdb-core = { path = "../rouchdb-core", version = "0.3.0" }
+clap = { version = "4", features = ["derive"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+rust-embed = "8"
+mime_guess = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+uuid = { version = "1", features = ["v4"] }
