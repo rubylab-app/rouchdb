@@ -53,7 +53,7 @@ All arrows point downward. Every crate ultimately depends on `rouchdb-core`.
 The `rouchdb` umbrella crate depends on all other eight crates and re-exports
 their public APIs.
 
-## The Nine Crates
+## The Crates
 
 ### 1. `rouchdb-core`
 
@@ -147,6 +147,24 @@ The crate users add to their `Cargo.toml`. Re-exports types from all eight
 inner crates so consumers do not need to depend on individual sub-crates.
 
 Dependencies: all of the above, plus `serde_json`, `uuid`, `async-trait`.
+
+### 10. `rouchdb-server`
+
+A CouchDB-compatible HTTP server built on [Axum](https://github.com/tokio-rs/axum).
+Wraps an `Arc<Database>` and exposes REST endpoints that Fauxton, PouchDB, or
+any CouchDB client can connect to. Serves the Fauxton web dashboard via
+`rust-embed` for embedded static files.
+
+Dependencies: `rouchdb`, `rouchdb-core`, `axum`, `tower-http`, `rust-embed`,
+`clap`, `serde`, `serde_json`, `tokio`, `uuid`.
+
+### 11. `rouchdb-cli`
+
+A command-line tool for inspecting and querying redb database files. Provides
+subcommands for `info`, `get`, `all-docs`, `find`, `changes`, `dump`,
+`replicate`, and `compact`.
+
+Dependencies: `rouchdb`, `clap`, `serde_json`, `tokio`.
 
 ## Data Flow: Writing a Document
 

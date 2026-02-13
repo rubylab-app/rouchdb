@@ -70,6 +70,15 @@ struct SerializedRevNode {
 struct RevDataRecord {
     data: serde_json::Value,
     deleted: bool,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    attachments: HashMap<String, AttachmentRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct AttachmentRecord {
+    content_type: String,
+    digest: String,
+    length: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -240,6 +249,19 @@ fn generate_rev_hash(
     let serialized = serde_json::to_string(doc_data).unwrap_or_default();
     hasher.update(serialized.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn attachment_key(doc_id: &str, att_id: &str) -> String {
+    format!("{}\0{}", doc_id, att_id)
+}
+
+fn compute_attachment_digest(data: &[u8]) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(data);
+    let hash = hasher.finalize();
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(hash);
+    format!("md5-{}", b64)
 }
 
 fn parse_rev(rev_str: &str) -> Result<(u64, String)> {
@@ -783,38 +805,251 @@ impl Adapter for RedbAdapter {
 
     async fn put_attachment(
         &self,
-        _doc_id: &str,
-        _att_id: &str,
-        _rev: &str,
-        _data: Vec<u8>,
-        _content_type: &str,
+        doc_id: &str,
+        att_id: &str,
+        rev: &str,
+        data: Vec<u8>,
+        content_type: &str,
     ) -> Result<DocResult> {
-        // TODO: implement attachment support
-        Err(RouchError::BadRequest(
-            "attachments not yet implemented for redb".into(),
-        ))
+        let digest = compute_attachment_digest(&data);
+        let length = data.len() as u64;
+        let _lock = self.write_lock.write().await;
+        let write_txn = db_err!(self.db.begin_write())?;
+
+        let result = {
+            // Store the raw attachment data
+            let mut att_table = db_err!(write_txn.open_table(ATTACHMENT_TABLE))?;
+            let att_key = attachment_key(doc_id, att_id);
+            db_err!(att_table.insert(att_key.as_str(), data.as_slice()))?;
+
+            // Load existing doc and verify rev
+            let mut doc_table = db_err!(write_txn.open_table(DOC_TABLE))?;
+            let mut rev_table = db_err!(write_txn.open_table(REV_DATA_TABLE))?;
+            let mut changes_table = db_err!(write_txn.open_table(CHANGES_TABLE))?;
+
+            let existing_record: Option<DocRecord> = {
+                let existing = db_err!(doc_table.get(doc_id))?;
+                existing
+                    .as_ref()
+                    .and_then(|g| serde_json::from_slice(g.value()).ok())
+            };
+
+            let record = existing_record.ok_or_else(|| RouchError::NotFound(doc_id.to_string()))?;
+            let tree = serialized_to_rev_tree(&record.rev_tree);
+            let winner =
+                winning_rev(&tree).ok_or_else(|| RouchError::NotFound(doc_id.to_string()))?;
+            if winner.to_string() != rev {
+                return Err(RouchError::Conflict);
+            }
+
+            // Load current rev data to preserve existing attachments
+            let rev_key = rev_data_key(doc_id, rev);
+            let rd: RevDataRecord = db_err!(rev_table.get(rev_key.as_str()))?
+                .map(|g| serde_json::from_slice(g.value()).unwrap())
+                .unwrap_or(RevDataRecord {
+                    data: serde_json::Value::Object(serde_json::Map::new()),
+                    deleted: false,
+                    attachments: HashMap::new(),
+                });
+
+            // Build updated attachment map
+            let mut attachments = rd.attachments;
+            attachments.insert(
+                att_id.to_string(),
+                AttachmentRecord {
+                    content_type: content_type.to_string(),
+                    digest,
+                    length,
+                },
+            );
+
+            // Build a Document and process as normal edit
+            let doc = Document {
+                id: doc_id.to_string(),
+                rev: Some(winner),
+                deleted: false,
+                data: rd.data,
+                attachments: attachments
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            AttachmentMeta {
+                                content_type: v.content_type.clone(),
+                                digest: v.digest.clone(),
+                                length: v.length,
+                                stub: true,
+                                data: None,
+                            },
+                        )
+                    })
+                    .collect(),
+            };
+
+            let mut meta = {
+                let meta_table = db_err!(write_txn.open_table(META_TABLE))?;
+                let guard = db_err!(meta_table.get("meta"))?.unwrap();
+                serde_json::from_slice::<MetaRecord>(guard.value())?
+            };
+
+            let result = process_doc_new_edits_with_attachments(
+                &mut doc_table,
+                &mut rev_table,
+                &mut changes_table,
+                &mut meta,
+                doc,
+                attachments,
+            )?;
+
+            // Save updated metadata
+            {
+                let mut meta_table = db_err!(write_txn.open_table(META_TABLE))?;
+                let meta_bytes = serde_json::to_vec(&meta)?;
+                db_err!(meta_table.insert("meta", meta_bytes.as_slice()))?;
+            }
+
+            result
+        };
+
+        db_err!(write_txn.commit())?;
+        Ok(result)
     }
 
     async fn get_attachment(
         &self,
-        _doc_id: &str,
-        _att_id: &str,
-        _opts: GetAttachmentOptions,
+        doc_id: &str,
+        att_id: &str,
+        opts: GetAttachmentOptions,
     ) -> Result<Vec<u8>> {
-        Err(RouchError::BadRequest(
-            "attachments not yet implemented for redb".into(),
-        ))
+        let read_txn = db_err!(self.db.begin_read())?;
+
+        // Verify the document and revision exist, and the attachment is tracked
+        let doc_table = db_err!(read_txn.open_table(DOC_TABLE))?;
+        let rev_table = db_err!(read_txn.open_table(REV_DATA_TABLE))?;
+
+        let record: DocRecord = db_err!(doc_table.get(doc_id))?
+            .map(|g| serde_json::from_slice(g.value()).unwrap())
+            .ok_or_else(|| RouchError::NotFound(doc_id.to_string()))?;
+
+        let tree = serialized_to_rev_tree(&record.rev_tree);
+        let rev_str = if let Some(ref rev) = opts.rev {
+            rev.clone()
+        } else {
+            winning_rev(&tree)
+                .ok_or_else(|| RouchError::NotFound(doc_id.to_string()))?
+                .to_string()
+        };
+
+        // Check that the attachment exists in this revision's metadata
+        let rev_key = rev_data_key(doc_id, &rev_str);
+        let rd: RevDataRecord = db_err!(rev_table.get(rev_key.as_str()))?
+            .map(|g| serde_json::from_slice(g.value()).unwrap())
+            .ok_or_else(|| RouchError::NotFound(format!("attachment {}/{}", doc_id, att_id)))?;
+
+        if !rd.attachments.contains_key(att_id) {
+            return Err(RouchError::NotFound(format!(
+                "attachment {}/{}",
+                doc_id, att_id
+            )));
+        }
+
+        // Fetch raw bytes
+        let att_table = db_err!(read_txn.open_table(ATTACHMENT_TABLE))?;
+        let att_key = attachment_key(doc_id, att_id);
+        let guard = db_err!(att_table.get(att_key.as_str()))?
+            .ok_or_else(|| RouchError::NotFound(format!("attachment {}/{}", doc_id, att_id)))?;
+
+        Ok(guard.value().to_vec())
     }
 
-    async fn remove_attachment(
-        &self,
-        _doc_id: &str,
-        _att_id: &str,
-        _rev: &str,
-    ) -> Result<DocResult> {
-        Err(RouchError::BadRequest(
-            "attachments not yet implemented for redb".into(),
-        ))
+    async fn remove_attachment(&self, doc_id: &str, att_id: &str, rev: &str) -> Result<DocResult> {
+        let _lock = self.write_lock.write().await;
+        let write_txn = db_err!(self.db.begin_write())?;
+
+        let result = {
+            let mut doc_table = db_err!(write_txn.open_table(DOC_TABLE))?;
+            let mut rev_table = db_err!(write_txn.open_table(REV_DATA_TABLE))?;
+            let mut changes_table = db_err!(write_txn.open_table(CHANGES_TABLE))?;
+            let mut att_table = db_err!(write_txn.open_table(ATTACHMENT_TABLE))?;
+
+            // Load existing doc and verify rev
+            let record: DocRecord = db_err!(doc_table.get(doc_id))?
+                .map(|g| serde_json::from_slice(g.value()).unwrap())
+                .ok_or_else(|| RouchError::NotFound(doc_id.to_string()))?;
+
+            let tree = serialized_to_rev_tree(&record.rev_tree);
+            let winner =
+                winning_rev(&tree).ok_or_else(|| RouchError::NotFound(doc_id.to_string()))?;
+            if winner.to_string() != rev {
+                return Err(RouchError::Conflict);
+            }
+
+            // Load current rev data
+            let rev_key = rev_data_key(doc_id, rev);
+            let rd: RevDataRecord = db_err!(rev_table.get(rev_key.as_str()))?
+                .map(|g| serde_json::from_slice(g.value()).unwrap())
+                .unwrap_or(RevDataRecord {
+                    data: serde_json::Value::Object(serde_json::Map::new()),
+                    deleted: false,
+                    attachments: HashMap::new(),
+                });
+
+            // Remove attachment from metadata and storage
+            let mut attachments = rd.attachments;
+            attachments.remove(att_id);
+
+            let att_key = attachment_key(doc_id, att_id);
+            let _ = db_err!(att_table.remove(att_key.as_str()));
+
+            // Create a new revision without the attachment
+            let doc = Document {
+                id: doc_id.to_string(),
+                rev: Some(winner),
+                deleted: false,
+                data: rd.data,
+                attachments: attachments
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            AttachmentMeta {
+                                content_type: v.content_type.clone(),
+                                digest: v.digest.clone(),
+                                length: v.length,
+                                stub: true,
+                                data: None,
+                            },
+                        )
+                    })
+                    .collect(),
+            };
+
+            let mut meta = {
+                let meta_table = db_err!(write_txn.open_table(META_TABLE))?;
+                let guard = db_err!(meta_table.get("meta"))?.unwrap();
+                serde_json::from_slice::<MetaRecord>(guard.value())?
+            };
+
+            let result = process_doc_new_edits_with_attachments(
+                &mut doc_table,
+                &mut rev_table,
+                &mut changes_table,
+                &mut meta,
+                doc,
+                attachments,
+            )?;
+
+            {
+                let mut meta_table = db_err!(write_txn.open_table(META_TABLE))?;
+                let meta_bytes = serde_json::to_vec(&meta)?;
+                db_err!(meta_table.insert("meta", meta_bytes.as_slice()))?;
+            }
+
+            result
+        };
+
+        db_err!(write_txn.commit())?;
+        Ok(result)
     }
 
     async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
@@ -1015,12 +1250,97 @@ fn process_doc_new_edits(
     let rd = RevDataRecord {
         data: doc.data,
         deleted: doc.deleted,
+        attachments: HashMap::new(),
     };
     let rev_bytes = serde_json::to_vec(&rd)?;
     let key = rev_data_key(&doc_id, &new_rev_str);
     db_err!(rev_table.insert(key.as_str(), rev_bytes.as_slice()))?;
 
     // Save change
+    let change = ChangeRecord {
+        doc_id: doc_id.clone(),
+        deleted: doc.deleted,
+    };
+    let change_bytes = serde_json::to_vec(&change)?;
+    db_err!(changes_table.insert(seq, change_bytes.as_slice()))?;
+
+    Ok(DocResult {
+        ok: true,
+        id: doc_id,
+        rev: Some(new_rev_str),
+        error: None,
+        reason: None,
+    })
+}
+
+/// Like `process_doc_new_edits` but also stores attachment metadata in the rev data.
+fn process_doc_new_edits_with_attachments(
+    doc_table: &mut redb::Table<&str, &[u8]>,
+    rev_table: &mut redb::Table<&str, &[u8]>,
+    changes_table: &mut redb::Table<u64, &[u8]>,
+    meta: &mut MetaRecord,
+    doc: Document,
+    attachments: HashMap<String, AttachmentRecord>,
+) -> Result<DocResult> {
+    let doc_id = doc.id.clone();
+
+    let existing_record: Option<DocRecord> = {
+        let existing = db_err!(doc_table.get(doc_id.as_str()))?;
+        existing
+            .as_ref()
+            .and_then(|g| serde_json::from_slice(g.value()).ok())
+    };
+
+    let existing_tree = existing_record
+        .as_ref()
+        .map(|r| serialized_to_rev_tree(&r.rev_tree))
+        .unwrap_or_default();
+
+    // Generate new revision
+    let new_pos = doc.rev.as_ref().map(|r| r.pos + 1).unwrap_or(1);
+    let prev_rev_str = doc.rev.as_ref().map(|r| r.to_string());
+    let new_hash = generate_rev_hash(&doc.data, doc.deleted, prev_rev_str.as_deref());
+    let new_rev_str = format!("{}-{}", new_pos, new_hash);
+
+    let mut rev_hashes = vec![new_hash.clone()];
+    if let Some(ref prev) = doc.rev {
+        rev_hashes.push(prev.hash.clone());
+    }
+    let new_path = build_path_from_revs(
+        new_pos,
+        &rev_hashes,
+        NodeOpts {
+            deleted: doc.deleted,
+        },
+        RevStatus::Available,
+    );
+
+    let (merged_tree, _) = merge_tree(&existing_tree, &new_path, DEFAULT_REV_LIMIT);
+
+    meta.update_seq += 1;
+    let seq = meta.update_seq;
+
+    if let Some(ref record) = existing_record {
+        let _ = db_err!(changes_table.remove(record.seq));
+    }
+
+    let new_record = DocRecord {
+        rev_tree: rev_tree_to_serialized(&merged_tree),
+        seq,
+    };
+    let doc_bytes = serde_json::to_vec(&new_record)?;
+    db_err!(doc_table.insert(doc_id.as_str(), doc_bytes.as_slice()))?;
+
+    // Save rev data with attachment metadata
+    let rd = RevDataRecord {
+        data: doc.data,
+        deleted: doc.deleted,
+        attachments,
+    };
+    let rev_bytes = serde_json::to_vec(&rd)?;
+    let key = rev_data_key(&doc_id, &new_rev_str);
+    db_err!(rev_table.insert(key.as_str(), rev_bytes.as_slice()))?;
+
     let change = ChangeRecord {
         doc_id: doc_id.clone(),
         deleted: doc.deleted,
@@ -1133,6 +1453,7 @@ fn process_doc_replication(
     let rd = RevDataRecord {
         data: doc.data,
         deleted: doc.deleted,
+        attachments: HashMap::new(),
     };
     let rev_bytes = serde_json::to_vec(&rd)?;
     let key = rev_data_key(&doc_id, &rev_str);

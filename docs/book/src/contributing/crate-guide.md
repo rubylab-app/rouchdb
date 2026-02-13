@@ -1,6 +1,6 @@
 # Crate Guide
 
-RouchDB is structured as a Cargo workspace with 9 crates. This guide helps you figure out where to add new code.
+RouchDB is structured as a Cargo workspace with 11 crates. This guide helps you figure out where to add new code.
 
 ## Where Do I Add Code?
 
@@ -36,6 +36,12 @@ Is it a change to the in-memory storage implementation?
 
 Is it a change to the persistent redb storage implementation?
   --> rouchdb-adapter-redb
+
+Is it a change to the HTTP server or Fauxton integration?
+  --> rouchdb-server
+
+Is it a change to the CLI tool (rouchdb binary)?
+  --> rouchdb-cli
 ```
 
 ## Crate Descriptions
@@ -115,6 +121,25 @@ The foundation crate. Everything else depends on it.
 - `src/lib.rs` -- `Database` struct with user-friendly methods (`put`, `get`, `update`, `remove`, `replicate_to`, `replicate_from`, `find`, `all_docs`, `changes`). Wraps any `Adapter` behind an `Arc<dyn Adapter>`.
 - `tests/*.rs` -- Integration tests against a real CouchDB instance (multiple test files: `replication.rs`, `http_crud.rs`, `changes_feed.rs`, etc.).
 
+### `rouchdb-server`
+
+**Responsibility:** CouchDB-compatible HTTP server that wraps a `Database` instance behind an Axum web server. Serves the Fauxton web dashboard for browsing documents.
+
+**Key files:**
+- `src/lib.rs` -- Public API: `build_router()`, `start_server()`, `ServerConfig`.
+- `src/main.rs` -- Standalone binary entry point with clap CLI.
+- `src/state.rs` -- `AppState` shared across all route handlers.
+- `src/error.rs` -- Maps `RouchError` to CouchDB-style JSON error responses.
+- `src/routes/*.rs` -- Route handlers for each CouchDB endpoint (root, session, all_dbs, database, document, all_docs, bulk_docs, find, index, explain, compact, design, fauxton).
+- `fauxton/` -- Embedded Fauxton static files (downloaded via `scripts/download-fauxton.sh`, gitignored).
+
+### `rouchdb-cli`
+
+**Responsibility:** Command-line tool for inspecting and querying redb database files.
+
+**Key files:**
+- `src/main.rs` -- Clap-based CLI with subcommands: `info`, `get`, `all-docs`, `find`, `changes`, `dump`, `replicate`, `compact`.
+
 ## Adding an Adapter
 
 To add a new storage backend (e.g., SQLite, IndexedDB via wasm):
@@ -152,6 +177,9 @@ rouchdb (umbrella)
   |-- rouchdb-query            --> rouchdb-core
   |-- rouchdb-views            --> rouchdb-core
   |-- rouchdb-replication      --> rouchdb-core, rouchdb-query
+
+rouchdb-server --> rouchdb, rouchdb-core  (HTTP server + Fauxton)
+rouchdb-cli    --> rouchdb                (CLI tool)
 ```
 
-All crates depend on `rouchdb-core`. The umbrella `rouchdb` crate depends on all of them and re-exports their public APIs.
+All library crates depend on `rouchdb-core`. The umbrella `rouchdb` crate depends on all of them and re-exports their public APIs. The `rouchdb-server` and `rouchdb-cli` crates are standalone binaries that depend on the umbrella crate.

@@ -2,16 +2,82 @@
 
 Esta guia te lleva por las funcionalidades principales de RouchDB en 5 minutos.
 
-## Instalacion
+## Instalacion como libreria
 
 Agrega RouchDB a tu proyecto:
 
 ```toml
 [dependencies]
-rouchdb = "0.1"
+rouchdb = "0.3"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
+
+## Herramienta de linea de comandos
+
+RouchDB incluye un CLI para inspeccionar y consultar bases de datos redb:
+
+```bash
+cargo install --path crates/rouchdb-cli
+```
+
+Ejemplos de uso:
+
+```bash
+# Informacion de la base de datos
+rouchdb info mydb.redb
+
+# Obtener un documento por ID
+rouchdb get mydb.redb user:alice
+
+# Listar todos los documentos
+rouchdb all-docs mydb.redb --include-docs
+
+# Consulta Mango
+rouchdb find mydb.redb --selector '{"age": {"$gte": 30}}'
+
+# Exportar todos los documentos como JSON
+rouchdb dump mydb.redb --pretty
+
+# Crear o actualizar un documento
+rouchdb put mydb.redb user:alice '{"name":"Alice","age":30}'
+rouchdb put mydb.redb user:alice '{"name":"Alice","age":31}' --rev 1-abc
+
+# Upsert — obtiene el rev actual automaticamente, crea si no existe
+rouchdb put mydb.redb user:alice '{"name":"Alice","age":32}' --force
+
+# Crear un documento con ID auto-generado
+rouchdb post mydb.redb '{"name":"Bob","age":25}'
+
+# Eliminar un documento
+rouchdb delete mydb.redb user:alice --rev 2-def
+
+# Importar documentos desde un archivo JSON
+rouchdb import mydb.redb docs.json
+
+# Replicar a CouchDB
+rouchdb replicate mydb.redb http://admin:password@localhost:5984/mydb
+```
+
+## Servidor HTTP
+
+RouchDB incluye un servidor HTTP compatible con CouchDB con la interfaz web Fauxton:
+
+```bash
+# Instalar el servidor
+cargo install --path crates/rouchdb-server
+
+# Descargar Fauxton (opcional, para la interfaz web)
+bash scripts/download-fauxton.sh
+
+# Iniciar el servidor
+rouchdb-server mydb.redb --port 5984
+
+# Abrir Fauxton en el navegador
+open http://localhost:5984/_utils/
+```
+
+El servidor expone una API REST compatible con CouchDB — documentos, consultas, feed de cambios, attachments, seguridad, design docs y mas — asi que cualquier cliente CouchDB (Fauxton, PouchDB, curl) puede conectarse.
 
 ## Crear una base de datos
 

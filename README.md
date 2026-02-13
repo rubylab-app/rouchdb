@@ -2,7 +2,7 @@
 
 A local-first document database for Rust with CouchDB replication protocol support.
 
-RouchDB is the Rust equivalent of [PouchDB](https://pouchdb.com/) — it stores JSON documents locally and syncs bidirectionally with [CouchDB](https://couchdb.apache.org/) and compatible servers.
+RouchDB is the Rust equivalent of [PouchDB](https://pouchdb.com/) — it stores JSON documents locally and syncs bidirectionally with [CouchDB](https://couchdb.apache.org/) and compatible servers. Pure Rust, no C dependencies.
 
 [![Crates.io](https://img.shields.io/crates/v/rouchdb)](https://crates.io/crates/rouchdb)
 [![Docs](https://img.shields.io/docsrs/rouchdb)](https://docs.rs/rouchdb)
@@ -18,10 +18,12 @@ RouchDB is the Rust equivalent of [PouchDB](https://pouchdb.com/) — it stores 
 - **Mango queries** — `$eq`, `$gt`, `$regex`, `$elemMatch`, and more
 - **Map/reduce views** — with built-in `_sum`, `_count`, `_stats` reducers
 - **Changes feed** — one-shot, live streaming, selector/filter/doc_ids filtering
-- **Attachments** — binary data stored alongside documents, inline Base64 support
+- **Attachments** — binary data stored alongside documents (memory + redb backends)
 - **Design documents & views** — Rust-native ViewEngine with map/reduce
 - **Plugin system** — before_write, after_write, on_destroy hooks
 - **Partitioned databases** — scoped queries by ID prefix
+- **CouchDB-compatible HTTP server** — browse databases with Fauxton, use any CouchDB client
+- **CLI tool** — inspect, query, and modify redb databases from the terminal
 - **Pure Rust** — no C dependencies (redb instead of LevelDB/SQLite)
 
 ## Quick Start
@@ -30,7 +32,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rouchdb = "0.1"
+rouchdb = "0.3"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -123,6 +125,30 @@ local.replicate_from(&remote).await?;
 local.sync(&remote).await?;
 ```
 
+### Live Replication
+
+```rust
+use std::time::Duration;
+use rouchdb::{ReplicationOptions, ReplicationEvent};
+
+let (mut rx, handle) = local.replicate_to_live(&remote, ReplicationOptions {
+    poll_interval: Duration::from_secs(5),
+    retry: true,
+    ..Default::default()
+});
+
+while let Some(event) = rx.recv().await {
+    match event {
+        ReplicationEvent::Change { docs_read, .. } => println!("synced {docs_read} docs"),
+        ReplicationEvent::Paused => println!("up to date"),
+        ReplicationEvent::Error(msg) => eprintln!("error: {msg}"),
+        _ => {}
+    }
+}
+
+handle.cancel();
+```
+
 ## Storage Backends
 
 | Backend | Constructor | Use Case |
@@ -133,9 +159,79 @@ local.sync(&remote).await?;
 
 All backends implement the same `Adapter` trait — swap storage without changing application code.
 
+## HTTP Server & Fauxton
+
+RouchDB includes a CouchDB-compatible HTTP server with the Fauxton web dashboard:
+
+```bash
+# Install the server
+cargo install --path crates/rouchdb-server
+
+# Download Fauxton (optional, requires Node.js >= 10)
+bash scripts/download-fauxton.sh
+
+# Start the server
+rouchdb-server mydb.redb --port 5984
+
+# Open Fauxton in your browser
+open http://localhost:5984/_utils/
+```
+
+The server exposes 25+ CouchDB-compatible REST endpoints — documents, queries, changes feed, attachments, security, design docs, Mango indexes, and more — so any CouchDB client (Fauxton, PouchDB, curl) can connect to it.
+
+Options:
+
+```
+rouchdb-server <path.redb> [OPTIONS]
+
+Options:
+  -p, --port <PORT>        Port to listen on [default: 5984]
+      --host <HOST>        Host to bind to [default: 127.0.0.1]
+      --db-name <NAME>     Database name [default: filename without extension]
+```
+
+## CLI Tool
+
+A command-line tool for inspecting, querying, and modifying redb database files:
+
+```bash
+cargo install --path crates/rouchdb-cli
+```
+
+### Reading
+
+```bash
+rouchdb info mydb.redb                    # Database info
+rouchdb get mydb.redb user:alice          # Get document by ID
+rouchdb all-docs mydb.redb --include-docs # List all documents
+rouchdb find mydb.redb --selector '{"age": {"$gte": 30}}'  # Mango query
+rouchdb changes mydb.redb --include-docs  # Changes feed
+rouchdb dump mydb.redb --pretty           # Export all docs as JSON
+```
+
+### Writing
+
+```bash
+rouchdb put mydb.redb user:alice '{"name":"Alice","age":30}'              # Create
+rouchdb put mydb.redb user:alice '{"name":"Alice","age":31}' --rev 1-abc  # Update
+rouchdb put mydb.redb user:alice '{"name":"Alice","age":32}' --force      # Upsert (auto-fetches rev)
+rouchdb post mydb.redb '{"name":"Bob","age":25}'                       # Auto-ID
+rouchdb delete mydb.redb user:alice --rev 2-def                        # Delete
+rouchdb import mydb.redb docs.json                                     # Bulk import
+```
+
+### Operations
+
+```bash
+rouchdb replicate mydb.redb http://admin:password@localhost:5984/mydb  # Sync
+rouchdb compact mydb.redb                                              # Compact
+```
+
+Add `--pretty` (or `-p`) to any command for formatted JSON output.
+
 ## Crate Structure
 
-RouchDB is a workspace of 9 crates:
+RouchDB is a workspace of 11 crates:
 
 | Crate | Description |
 |-------|-------------|
@@ -148,6 +244,8 @@ RouchDB is a workspace of 9 crates:
 | `rouchdb-replication` | CouchDB replication protocol |
 | `rouchdb-query` | Mango queries and map/reduce views |
 | `rouchdb-views` | Design documents and persistent view engine |
+| `rouchdb-server` | CouchDB-compatible HTTP server with Fauxton |
+| `rouchdb-cli` | Command-line tool for database inspection and CRUD |
 
 ## Documentation
 

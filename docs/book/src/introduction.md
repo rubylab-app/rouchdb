@@ -18,6 +18,7 @@ RouchDB is the Rust equivalent of [PouchDB](https://pouchdb.com/) — it gives y
 - **Changes feed** — one-shot and live streaming of document mutations
 - **Replication** — push, pull, and bidirectional sync with CouchDB
 - **Conflict resolution** — deterministic winner algorithm, conflict detection utilities
+- **CouchDB-compatible HTTP server** — browse databases with Fauxton, connect any CouchDB client
 - **Pluggable storage** — in-memory, persistent (redb), or remote (HTTP)
 - **Pure Rust** — no C dependencies, compiles everywhere Rust does
 

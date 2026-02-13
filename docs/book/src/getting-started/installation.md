@@ -6,7 +6,7 @@ Add RouchDB to your project with all features:
 
 ```toml
 [dependencies]
-rouchdb = "0.1"
+rouchdb = "0.3"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -19,8 +19,8 @@ If you only need local storage without replication or HTTP:
 
 ```toml
 [dependencies]
-rouchdb-core = "0.1"
-rouchdb-adapter-redb = "0.1"
+rouchdb-core = "0.3"
+rouchdb-adapter-redb = "0.3"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -39,7 +39,100 @@ Pick exactly what you need:
 | `rouchdb-replication` | CouchDB replication protocol |
 | `rouchdb-query` | Mango selectors and map/reduce views |
 | `rouchdb-views` | Design documents and persistent view engine |
+| `rouchdb-server` | CouchDB-compatible HTTP server with Fauxton |
+| `rouchdb-cli` | CLI tool for inspecting databases |
 | `rouchdb` | Umbrella crate — re-exports everything above |
+
+## CLI Tool
+
+RouchDB includes a command-line tool for inspecting and querying redb database files. Install it from source:
+
+```bash
+cargo install --path crates/rouchdb-cli
+```
+
+This installs the `rouchdb` binary. Usage examples:
+
+```bash
+# Show database info
+rouchdb info mydb.redb
+
+# Get a document by ID
+rouchdb get mydb.redb user:alice
+
+# List all documents with their bodies
+rouchdb all-docs mydb.redb --include-docs
+
+# Query with a Mango selector
+rouchdb find mydb.redb --selector '{"age": {"$gte": 30}}'
+
+# View the changes feed
+rouchdb changes mydb.redb --include-docs
+
+# Export all documents as JSON
+rouchdb dump mydb.redb --pretty
+
+# Create or update a document
+rouchdb put mydb.redb user:alice '{"name":"Alice","age":30}'
+rouchdb put mydb.redb user:alice '{"name":"Alice","age":31}' --rev 1-abc
+
+# Upsert — auto-fetches the current rev, creates if missing
+rouchdb put mydb.redb user:alice '{"name":"Alice","age":32}' --force
+
+# Create a document with auto-generated ID
+rouchdb post mydb.redb '{"name":"Bob","age":25}'
+
+# Delete a document
+rouchdb delete mydb.redb user:alice --rev 2-def
+
+# Import documents from a JSON file
+rouchdb import mydb.redb docs.json
+
+# Replicate to CouchDB
+rouchdb replicate mydb.redb http://admin:password@localhost:5984/mydb
+
+# Compact the database
+rouchdb compact mydb.redb
+```
+
+Add `--pretty` (or `-p`) to any command for formatted JSON output.
+
+## HTTP Server
+
+RouchDB includes a CouchDB-compatible HTTP server that lets you browse databases with the Fauxton web UI or connect any CouchDB client. Install it from source:
+
+```bash
+cargo install --path crates/rouchdb-server
+```
+
+Download Fauxton (optional, for the web dashboard):
+
+```bash
+bash scripts/download-fauxton.sh
+```
+
+Start the server:
+
+```bash
+# Serve a redb database file
+rouchdb-server mydb.redb --port 5984
+
+# Open Fauxton in your browser
+open http://localhost:5984/_utils/
+```
+
+The server exposes CouchDB-compatible REST endpoints — documents, queries, changes feed, attachments, security, design docs, and more — so tools like PouchDB, curl, or any CouchDB client library can connect to it.
+
+Options:
+
+```bash
+rouchdb-server <path.redb> [OPTIONS]
+
+Options:
+  -p, --port <PORT>        Port to listen on [default: 5984]
+      --host <HOST>        Host to bind to [default: 127.0.0.1]
+      --db-name <NAME>     Database name [default: filename without extension]
+```
 
 ## Async Runtime
 

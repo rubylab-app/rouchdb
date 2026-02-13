@@ -6,6 +6,105 @@ This project follows [Semantic Versioning](https://semver.org/). Since we are pr
 
 ---
 
+## [0.3.0] — 2026-02-12
+
+### New Crates
+
+| Crate | Description |
+|-------|-------------|
+| `rouchdb-server` | CouchDB-compatible HTTP server with Fauxton web dashboard |
+| `rouchdb-cli` | Command-line tool for inspecting and querying redb databases |
+
+### New Features
+
+#### HTTP Server (`rouchdb-server`)
+
+A standalone CouchDB-compatible HTTP server built on Axum. Wraps any `.redb` database file and exposes it as a REST API that Fauxton, PouchDB, curl, or any CouchDB client can connect to.
+
+**Endpoints implemented:**
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | CouchDB welcome message (reports version 3.3.3 for Fauxton compatibility) |
+| `GET/POST/DELETE /_session` | Session management (no-auth mode: always admin) |
+| `GET /_all_dbs` | List databases (single-db mode) |
+| `GET /_uuids` | Generate UUIDs |
+| `GET /_active_tasks` | List running tasks |
+| `GET /_membership` | Cluster membership (single node) |
+| `GET /_utils/*` | Fauxton web dashboard (embedded static files via rust-embed) |
+| `GET/PUT/DELETE /{db}` | Database info, creation, and deletion |
+| `POST /{db}` | Create document with auto-generated ID |
+| `GET/PUT/DELETE /{db}/{docid}` | Document CRUD |
+| `GET/PUT/DELETE /{db}/{docid}/{attname}` | Attachment CRUD |
+| `GET/POST /{db}/_all_docs` | Query all documents |
+| `POST /{db}/_bulk_docs` | Bulk document writes |
+| `GET/POST /{db}/_changes` | Changes feed |
+| `POST /{db}/_find` | Mango queries |
+| `GET/POST /{db}/_index` | Create and list Mango indexes |
+| `DELETE /{db}/_index/{ddoc}/{type}/{name}` | Delete a Mango index |
+| `POST /{db}/_index/_bulk_delete` | Bulk delete indexes |
+| `POST /{db}/_explain` | Query execution plan |
+| `POST /{db}/_compact` | Database compaction |
+| `GET/PUT /{db}/_security` | Database permissions |
+| `GET/PUT/DELETE /{db}/_design/{ddoc}` | Design document CRUD |
+| `GET /{db}/_design/{ddoc}/_info` | Design document metadata |
+| `GET/POST /{db}/_design/{ddoc}/_view/{view}` | View queries (returns error — JS views not supported) |
+
+**Usage:**
+
+```bash
+# Install
+cargo install --path crates/rouchdb-server
+
+# Download Fauxton (optional)
+bash scripts/download-fauxton.sh
+
+# Start the server
+rouchdb-server mydb.redb --port 5984
+
+# Open Fauxton
+open http://localhost:5984/_utils/
+```
+
+#### CLI Tool (`rouchdb-cli`)
+
+A command-line tool for inspecting and querying redb database files without starting a server.
+
+**Read commands:** `info`, `get`, `all-docs`, `find`, `changes`, `dump`.
+**Write commands:** `put`, `post`, `delete`, `import`.
+**Operations:** `replicate`, `compact`.
+
+```bash
+cargo install --path crates/rouchdb-cli
+rouchdb info mydb.redb
+rouchdb get mydb.redb user:alice
+rouchdb find mydb.redb --selector '{"age": {"$gte": 30}}'
+rouchdb put mydb.redb user:alice '{"name":"Alice","age":30}'
+rouchdb post mydb.redb '{"name":"Bob"}'
+rouchdb delete mydb.redb user:alice --rev 1-abc
+rouchdb import mydb.redb docs.json
+```
+
+#### Redb Adapter — Attachment Support (`rouchdb-adapter-redb`)
+
+The redb adapter now supports `put_attachment`, `get_attachment`, and `remove_attachment`. Attachments are stored in a dedicated redb table with content-addressable keys and tracked per-revision in the document metadata.
+
+### Documentation
+
+- Added HTTP server section to README, installation guide, and Spanish docs
+- Updated crate guide with `rouchdb-server` and `rouchdb-cli` descriptions
+- Updated architecture overview with new crates
+- Updated CLAUDE.md dependency graph
+- Added `scripts/download-fauxton.sh` for building Fauxton from the official Apache couchdb-fauxton source
+
+---
+
+## [0.2.1] — 2026-02-08
+
+Patch release: add README to all crates for crates.io.
+
+---
+
 ## [0.2.0] — 2026-02-07
 
 Full PouchDB API parity release. This version adds every remaining PouchDB feature that was missing in 0.1.x, fixes several correctness bugs, and includes a new crate (`rouchdb-views`).
