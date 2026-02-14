@@ -11,7 +11,7 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
-rouchdb-core = { path = "../rouchdb-core", version = "0.3.1" }
+rouchdb-core = { path = "../rouchdb-core", version = "0.3.2" }
 async-trait = "0.1"
 percent-encoding = "2"
 reqwest = { version = "0.12", features = ["json", "cookies"] }

@@ -33,7 +33,7 @@ Docker is **not** required for building the project or running unit tests.
 ## Clone and Build
 
 ```bash
-git clone https://github.com/RubyLabApp/rouchdb.git
+git clone https://github.com/rubylab-app/rouchdb.git
 cd rouchdb
 cargo build
 ```

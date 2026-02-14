@@ -1199,7 +1199,7 @@ dependencies = [
 
 [[package]]
 name = "rouchdb"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -1220,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-adapter-http"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "percent-encoding",
@@ -1232,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-adapter-memory"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -1245,7 +1245,7 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-adapter-redb"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -1261,7 +1261,7 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-changes"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "rouchdb-adapter-memory",
  "rouchdb-core",
@@ -1272,7 +1272,7 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -1297,7 +1297,7 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-query"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "regex",
  "rouchdb-adapter-memory",
@@ -1309,7 +1309,7 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-replication"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "md-5",
  "rouchdb-adapter-memory",
@@ -1324,7 +1324,7 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-server"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axum",
  "clap",
@@ -1341,7 +1341,7 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-views"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "rouchdb-adapter-memory",
  "rouchdb-core",

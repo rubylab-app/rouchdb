@@ -12,8 +12,8 @@ name = "rouchdb-server"
 path = "src/main.rs"
 
 [dependencies]
-rouchdb = { path = "../rouchdb", version = "0.3.1" }
-rouchdb-core = { path = "../rouchdb-core", version = "0.3.1" }
+rouchdb = { path = "../rouchdb", version = "0.3.2" }
+rouchdb-core = { path = "../rouchdb-core", version = "0.3.2" }
 clap = { version = "4", features = ["derive"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }

@@ -11,10 +11,10 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
-rouchdb-core = { path = "../rouchdb-core", version = "0.3.1" }
+rouchdb-core = { path = "../rouchdb-core", version = "0.3.2" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-rouchdb-adapter-memory = { path = "../rouchdb-adapter-memory", version = "0.3.1" }
+rouchdb-adapter-memory = { path = "../rouchdb-adapter-memory", version = "0.3.2" }

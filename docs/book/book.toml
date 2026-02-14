@@ -11,4 +11,4 @@ build-dir = "book"
 [output.html]
 default-theme = "rust"
 preferred-dark-theme = "ayu"
-git-repository-url = "https://github.com/RubyLabApp/rouchdb"
+git-repository-url = "https://github.com/rubylab-app/rouchdb"

@@ -12,14 +12,14 @@ readme.workspace = true
 
 [dependencies]
 async-trait = "0.1"
-rouchdb-core = { path = "../rouchdb-core", version = "0.3.1" }
-rouchdb-adapter-memory = { path = "../rouchdb-adapter-memory", version = "0.3.1" }
-rouchdb-adapter-redb = { path = "../rouchdb-adapter-redb", version = "0.3.1" }
-rouchdb-adapter-http = { path = "../rouchdb-adapter-http", version = "0.3.1" }
-rouchdb-changes = { path = "../rouchdb-changes", version = "0.3.1" }
-rouchdb-replication = { path = "../rouchdb-replication", version = "0.3.1" }
-rouchdb-query = { path = "../rouchdb-query", version = "0.3.1" }
-rouchdb-views = { path = "../rouchdb-views", version = "0.3.1" }
+rouchdb-core = { path = "../rouchdb-core", version = "0.3.2" }
+rouchdb-adapter-memory = { path = "../rouchdb-adapter-memory", version = "0.3.2" }
+rouchdb-adapter-redb = { path = "../rouchdb-adapter-redb", version = "0.3.2" }
+rouchdb-adapter-http = { path = "../rouchdb-adapter-http", version = "0.3.2" }
+rouchdb-changes = { path = "../rouchdb-changes", version = "0.3.2" }
+rouchdb-replication = { path = "../rouchdb-replication", version = "0.3.2" }
+rouchdb-query = { path = "../rouchdb-query", version = "0.3.2" }
+rouchdb-views = { path = "../rouchdb-views", version = "0.3.2" }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["sync"] }

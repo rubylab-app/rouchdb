@@ -6,6 +6,23 @@ This project follows [Semantic Versioning](https://semver.org/). Since we are pr
 
 ---
 
+## [0.3.2] — 2026-02-13
+
+### Changes
+
+- Update repository URL from `github.com/RubyLabApp/rouchdb` to `github.com/rubylab-app/rouchdb` following organization rename
+
+---
+
+## [0.3.1] — 2026-02-12
+
+### Fixes
+
+- Add fauxton `.gitkeep` so the `fauxton/` directory exists in CI (rust-embed requires it)
+- Fix `cargo fmt` formatting in CLI and server session routes
+
+---
+
 ## [0.3.0] — 2026-02-12
 
 ### New Crates

@@ -6,7 +6,7 @@ RouchDB is the Rust equivalent of [PouchDB](https://pouchdb.com/) — it stores 
 
 [![Crates.io](https://img.shields.io/crates/v/rouchdb)](https://crates.io/crates/rouchdb)
 [![Docs](https://img.shields.io/docsrs/rouchdb)](https://docs.rs/rouchdb)
-[![CI](https://github.com/RubyLabApp/rouchdb/actions/workflows/ci.yml/badge.svg)](https://github.com/RubyLabApp/rouchdb/actions/workflows/ci.yml)
+[![CI](https://github.com/rubylab-app/rouchdb/actions/workflows/ci.yml/badge.svg)](https://github.com/rubylab-app/rouchdb/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ## Features

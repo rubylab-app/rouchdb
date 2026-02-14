@@ -15,11 +15,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/RubyLabApp/rouchdb"
-homepage = "https://github.com/RubyLabApp/rouchdb"
+repository = "https://github.com/rubylab-app/rouchdb"
+homepage = "https://github.com/rubylab-app/rouchdb"
 keywords = ["database", "couchdb", "pouchdb", "replication", "local-first"]
 categories = ["database", "data-structures"]
