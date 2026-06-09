@@ -6,6 +6,117 @@ This project follows [Semantic Versioning](https://semver.org/). Since we are pr
 
 ---
 
+## [0.4.0] — 2026-06-09
+
+Correctness release. A deep audit fixed **44 bugs** across every crate. There are no new features, but several fixes change observable behavior (HTTP status codes, replication checkpoints) or public type shapes — **read the migration guide before upgrading.**
+
+### Migration Guide (0.3.2 → 0.4.0)
+
+#### Breaking Changes — API
+
+1. **`ChangesEvent` has a new `Heartbeat` variant.** An exhaustive `match` without a wildcard arm will no longer compile. Add an arm:
+   ```rust
+   ChangesEvent::Heartbeat => { /* keep-alive tick; ignore or reset a timeout */ }
+   ```
+   Heartbeats are emitted by `live_changes_events` only when `ChangesStreamOptions.heartbeat` is set (the option was previously inert).
+
+2. **`DbInfo` has a new field `doc_del_count: u64`.** If you build it with struct-literal syntax, add the field or use `..Default::default()`. It now reports the real deleted-document count (was hardcoded to `0` in the server response).
+
+3. **`SecurityDocument` has a new field `extra: serde_json::Map<String, Value>`** — a `#[serde(flatten)]` catch-all so CouchDB's arbitrary `_security` fields round-trip instead of being dropped. Add `..Default::default()` to struct literals.
+
+4. **`CheckpointDoc` gained a `_rev` field and `Checkpointer::new` takes a third argument** (a filter fingerprint): `Checkpointer::new(source_id, target_id, filter_fingerprint)`. Only affects code that constructs these `rouchdb-replication` types directly.
+
+#### Breaking Changes — Behavior
+
+5. **Replication checkpoints are invalidated once.** The replication ID now incorporates the filter (and uses a revised hashing scheme), so the first replication after upgrading re-reads from sequence 0. This is a one-time, **idempotent** re-scan (no data loss or duplicates, thanks to `revs_diff`); subsequent runs resume normally from the new checkpoint.
+
+6. **HTTP server status codes now match CouchDB:**
+   - `PUT /{db}/{docid}` returns **409 Conflict** on a stale/missing `_rev` (was 201 Created).
+   - `DELETE /{db}/{docid}` returns **409 / 404** on conflict / not-found (was 200 OK).
+   - `PUT /{db}` returns **412 file_exists** when the database already exists (was 201).
+
+   Clients that treated the old (incorrect) codes as success must update their handling.
+
+7. **`PUT /{db}/{docid}` with `{"_deleted": true}` now deletes the document** (previously it silently created a new live revision).
+
+8. **`get(rev = X, latest = true)`** now returns the leaf of *X's own branch*, not the global winning leaf. Only affects conflicted documents.
+
+9. **An empty map/reduce now returns `{"rows": []}`** instead of one `{"key": null, "value": 0}` row (matches CouchDB). Code that indexes `rows[0]` unconditionally must guard for emptiness.
+
+10. **`Revision` parsing rejects an empty hash** (e.g. `"3-"`) with `InvalidRev`; such strings previously parsed successfully.
+
+11. **`put` / `update` / `remove` return `Err(DatabaseError)`** instead of panicking when a `before_write` plugin removes the document from the batch.
+
+### Bug Fixes
+
+**Core (revision tree, collation, model):**
+- Stemming stopped at the first conflict branch point, so `revs_limit` was never enforced on conflicted documents (unbounded rev-tree growth). It now prunes past branch points by re-rooting subtrees.
+- Collation lost precision on integers above 2⁵³, collapsing distinct values to `Equal` and breaking Mango `$eq`/range queries. Integers are now compared exactly.
+- Inline attachment data serialized as a JSON byte array instead of a base64 string (malformed CouchDB output).
+- `Revision::from_str` accepted a missing hash (`"{pos}-"`).
+
+**Memory adapter:**
+- `put_attachment` reported success but discarded the attachment — bytes were unrecoverable. Attachments are now persisted per revision and round-trip through `get_attachment` and replication.
+- `get(latest = true)` returned the global winner instead of the requested branch's leaf.
+- `style=all_docs` emitted an empty `changes` array for fully-deleted documents.
+- `changes` reported `last_seq = since` when every change was filtered out (endless re-scans).
+- `all_docs` `total_rows` reflected the filtered count instead of the database total.
+
+**Redb adapter:**
+- `all_docs` descending key-range used ascending comparisons, returning the wrong rows.
+- `all_docs` ignored `conflicts`, omitting `_conflicts` from included docs.
+- `changes` panicked on a single corrupt/undeserializable record (now propagates an error).
+- `info()` / `all_docs` read `update_seq` in a separate transaction from the document snapshot (TOCTOU); now a single read transaction.
+
+**HTTP adapter:**
+- `all_docs` ignored `key`, `keys`, and `inclusive_end`.
+- `startkey` / `endkey` / `key` / `open_revs` were spliced into the URL unencoded (broke on special characters and unicode).
+- Design-document ids were encoded as `_design%2Fx`, breaking routing; the prefix slash is now preserved.
+
+**Query (Mango + map/reduce):**
+- `$elemMatch` with an operator expression failed on arrays of scalars.
+- `skip` / `limit` were ignored on reduced/grouped output.
+- `group_level=0` did not collapse into a single global group.
+- Reduce over an empty result set returned a spurious zero row.
+
+**Views:**
+- Design documents containing a `views.lib` (CommonJS shared library) entry failed to parse.
+
+**Replication:**
+- Replication ID omitted the filter, so different filters shared a checkpoint (silent data loss).
+- Checkpoint `_local` doc was written without `_rev`, so every CouchDB checkpoint update after the first failed with 409.
+- Checkpoint history was reset to a single entry on every write, breaking cross-session resume.
+- `compare_checkpoints` compared opaque CouchDB sequences by numeric prefix; transient checkpoint read errors were swallowed as "no checkpoint."
+- The checkpoint advanced past documents that failed to parse or write (permanent data loss with no resume); `docs_written` counted failed writes.
+- Attachments were dropped during replication (now carried end-to-end between memory adapters).
+- Live replication emitted a `Complete` event on every poll iteration instead of once at the end.
+
+**Changes feed:**
+- `limit` counted pre-filter changes, so a filtered live feed delivered fewer than `limit` matches.
+- The `heartbeat` option was declared but never honored.
+
+**Umbrella (`Database`):**
+- Index-accelerated `find()` ignored dotted/nested sort fields (e.g. `address.city`).
+- `put` / `update` / `remove` panicked when a plugin dropped the document.
+
+**HTTP server:**
+- Wrong status codes on conflict/not-found and on existing-database `PUT` (see migration notes).
+- `since=now` mapped to `u64::MAX`, causing an integer overflow.
+- `PUT` ignored `_deleted` in the body.
+- Attachment downloads guessed the content type from the filename, discarding the stored `content_type`.
+- `doc_del_count` was hardcoded to `0`.
+- `PUT /{db}/_security` dropped any fields outside `admins`/`members`.
+
+**CLI:**
+- `import` exited `0` even when documents failed.
+- `put --force` swallowed non-`NotFound` errors from `get` and silently created instead of updating.
+
+### Tests
+
+- 366 unit tests passing (≈25 new regression tests); `clippy -D warnings` and `cargo fmt --check` clean.
+
+---
+
 ## [0.3.2] — 2026-02-13
 
 ### Changes
