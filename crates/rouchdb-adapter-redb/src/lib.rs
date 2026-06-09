@@ -218,22 +218,6 @@ impl RedbAdapter {
             write_lock: Arc::new(RwLock::new(())),
         })
     }
-
-    fn read_meta(&self) -> Result<MetaRecord> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
-        let table = read_txn
-            .open_table(META_TABLE)
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
-        let guard = table
-            .get("meta")
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))?
-            .ok_or_else(|| RouchError::DatabaseError("missing metadata".into()))?;
-        let meta: MetaRecord = serde_json::from_slice(guard.value())?;
-        Ok(meta)
-    }
 }
 
 fn generate_rev_hash(
@@ -283,17 +267,27 @@ macro_rules! db_err {
 #[async_trait]
 impl Adapter for RedbAdapter {
     async fn info(&self) -> Result<DbInfo> {
-        let meta = self.read_meta()?;
+        // Read metadata and document data from a SINGLE read transaction so
+        // update_seq and the doc snapshot reflect the same committed state.
         let read_txn = db_err!(self.db.begin_read())?;
+        let meta_table = db_err!(read_txn.open_table(META_TABLE))?;
+        let meta: MetaRecord = serde_json::from_slice(
+            db_err!(meta_table.get("meta"))?
+                .ok_or_else(|| RouchError::DatabaseError("missing metadata".into()))?
+                .value(),
+        )?;
         let table = db_err!(read_txn.open_table(DOC_TABLE))?;
 
         let mut doc_count = 0u64;
+        let mut doc_del_count = 0u64;
         let iter = db_err!(table.iter())?;
         for entry in iter {
             let entry = db_err!(entry)?;
             let record: DocRecord = serde_json::from_slice(entry.1.value())?;
             let tree = serialized_to_rev_tree(&record.rev_tree);
-            if !is_deleted(&tree) {
+            if is_deleted(&tree) {
+                doc_del_count += 1;
+            } else {
                 doc_count += 1;
             }
         }
@@ -301,6 +295,7 @@ impl Adapter for RedbAdapter {
         Ok(DbInfo {
             db_name: self.name.clone(),
             doc_count,
+            doc_del_count,
             update_seq: Seq::Num(meta.update_seq),
         })
     }
@@ -326,11 +321,15 @@ impl Adapter for RedbAdapter {
         let key = rev_data_key(id, &target_rev);
         let rev_guard = db_err!(rev_table.get(key.as_str()))?;
 
-        let (data, deleted) = if let Some(guard) = rev_guard {
+        let (data, deleted, att_records) = if let Some(guard) = rev_guard {
             let rd: RevDataRecord = serde_json::from_slice(guard.value())?;
-            (rd.data, rd.deleted)
+            (rd.data, rd.deleted, rd.attachments)
         } else {
-            (serde_json::Value::Object(serde_json::Map::new()), false)
+            (
+                serde_json::Value::Object(serde_json::Map::new()),
+                false,
+                HashMap::new(),
+            )
         };
 
         if deleted && opts.rev.is_none() {
@@ -346,6 +345,21 @@ impl Adapter for RedbAdapter {
             data,
             attachments: HashMap::new(),
         };
+
+        // Surface stored attachment metadata (content type, digest, length) so
+        // callers can read it without a separate attachment fetch.
+        for (name, rec) in att_records {
+            doc.attachments.insert(
+                name,
+                AttachmentMeta {
+                    content_type: rec.content_type,
+                    digest: rec.digest,
+                    length: rec.length,
+                    stub: true,
+                    data: None,
+                },
+            );
+        }
 
         if opts.conflicts {
             let conflicts = collect_conflicts(&tree);
@@ -416,6 +430,7 @@ impl Adapter for RedbAdapter {
         let rev_table = db_err!(read_txn.open_table(REV_DATA_TABLE))?;
 
         let mut rows = Vec::new();
+        let mut total_count = 0u64;
 
         let iter = db_err!(doc_table.iter())?;
         for entry in iter {
@@ -430,23 +445,34 @@ impl Adapter for RedbAdapter {
             };
             let deleted = is_deleted(&tree);
 
+            // total_rows is the count of non-deleted documents in the whole
+            // database, independent of any range / key / skip / limit filters.
+            if !deleted {
+                total_count += 1;
+            }
+
             if deleted && opts.keys.is_none() {
                 continue;
             }
 
-            // Apply key range filters
+            // Apply key range filters (descending flips startkey/endkey meaning)
             if opts.keys.is_none() && opts.key.is_none() {
                 if let Some(ref start) = opts.start_key
-                    && doc_id.as_str() < start.as_str()
+                    && ((!opts.descending && doc_id.as_str() < start.as_str())
+                        || (opts.descending && doc_id.as_str() > start.as_str()))
                 {
                     continue;
                 }
                 if let Some(ref end) = opts.end_key {
                     if opts.inclusive_end {
-                        if doc_id.as_str() > end.as_str() {
+                        if (!opts.descending && doc_id.as_str() > end.as_str())
+                            || (opts.descending && doc_id.as_str() < end.as_str())
+                        {
                             continue;
                         }
-                    } else if doc_id.as_str() >= end.as_str() {
+                    } else if (!opts.descending && doc_id.as_str() >= end.as_str())
+                        || (opts.descending && doc_id.as_str() <= end.as_str())
+                    {
                         continue;
                     }
                 }
@@ -467,16 +493,34 @@ impl Adapter for RedbAdapter {
             let doc_json = if opts.include_docs && !deleted {
                 let rev_str = winner.to_string();
                 let key = rev_data_key(&doc_id, &rev_str);
-                db_err!(rev_table.get(key.as_str()))?.map(|guard| {
-                    let rd: RevDataRecord = serde_json::from_slice(guard.value()).unwrap();
-                    let mut obj = match rd.data {
-                        serde_json::Value::Object(m) => m,
-                        _ => serde_json::Map::new(),
-                    };
-                    obj.insert("_id".into(), serde_json::Value::String(doc_id.clone()));
-                    obj.insert("_rev".into(), serde_json::Value::String(rev_str));
-                    serde_json::Value::Object(obj)
-                })
+                match db_err!(rev_table.get(key.as_str()))? {
+                    Some(guard) => {
+                        let rd: RevDataRecord = serde_json::from_slice(guard.value())?;
+                        let mut obj = match rd.data {
+                            serde_json::Value::Object(m) => m,
+                            _ => serde_json::Map::new(),
+                        };
+                        obj.insert("_id".into(), serde_json::Value::String(doc_id.clone()));
+                        obj.insert("_rev".into(), serde_json::Value::String(rev_str));
+                        // Embed _conflicts when requested, matching the memory
+                        // adapter and CouchDB.
+                        if opts.conflicts {
+                            let conflicts = collect_conflicts(&tree);
+                            if !conflicts.is_empty() {
+                                let conflict_list: Vec<serde_json::Value> = conflicts
+                                    .iter()
+                                    .map(|c| serde_json::Value::String(c.to_string()))
+                                    .collect();
+                                obj.insert(
+                                    "_conflicts".into(),
+                                    serde_json::Value::Array(conflict_list),
+                                );
+                            }
+                        }
+                        Some(serde_json::Value::Object(obj))
+                    }
+                    None => None,
+                }
             } else {
                 None
             };
@@ -496,7 +540,7 @@ impl Adapter for RedbAdapter {
             rows.reverse();
         }
 
-        let total_rows = rows.len() as u64;
+        let total_rows = total_count;
         let skip = opts.skip as usize;
         if skip > 0 {
             rows = rows.into_iter().skip(skip).collect();
@@ -505,8 +549,15 @@ impl Adapter for RedbAdapter {
             rows.truncate(limit as usize);
         }
 
+        // Read update_seq from the SAME read transaction as the doc snapshot
+        // to avoid a TOCTOU inconsistency with a concurrent committed write.
         let update_seq = if opts.update_seq {
-            let meta = self.read_meta()?;
+            let meta_table = db_err!(read_txn.open_table(META_TABLE))?;
+            let meta: MetaRecord = serde_json::from_slice(
+                db_err!(meta_table.get("meta"))?
+                    .ok_or_else(|| RouchError::DatabaseError("missing metadata".into()))?
+                    .value(),
+            )?;
             Some(Seq::Num(meta.update_seq))
         } else {
             None
@@ -528,18 +579,20 @@ impl Adapter for RedbAdapter {
 
         let mut results = Vec::new();
 
-        let start = opts.since.as_num() + 1;
+        let start = opts.since.as_num().saturating_add(1);
         let iter = db_err!(changes_table.range(start..))?;
 
-        let entries: Vec<_> = iter
+        // Propagate deserialization errors instead of panicking on a corrupt
+        // or truncated change record.
+        let entries: Vec<(u64, ChangeRecord)> = iter
             .filter_map(|e| e.ok())
             .map(|e| {
-                (
+                Ok((
                     e.0.value(),
-                    serde_json::from_slice::<ChangeRecord>(e.1.value()).unwrap(),
-                )
+                    serde_json::from_slice::<ChangeRecord>(e.1.value())?,
+                ))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let iter: Box<dyn Iterator<Item = &(u64, ChangeRecord)>> = if opts.descending {
             Box::new(entries.iter().rev())
@@ -547,7 +600,13 @@ impl Adapter for RedbAdapter {
             Box::new(entries.iter())
         };
 
+        // Highest sequence inspected, so last_seq advances past a fully
+        // filtered range instead of sticking at `since`.
+        let mut max_scanned: Option<u64> = None;
+
         for (seq, change) in iter {
+            max_scanned = Some(max_scanned.map_or(*seq, |m| m.max(*seq)));
+
             if let Some(ref doc_ids) = opts.doc_ids
                 && !doc_ids.contains(&change.doc_id)
             {
@@ -564,22 +623,25 @@ impl Adapter for RedbAdapter {
 
             let doc = if opts.include_docs && !rev_str.is_empty() {
                 let key = rev_data_key(&change.doc_id, &rev_str);
-                db_err!(rev_table.get(key.as_str()))?.map(|guard| {
-                    let rd: RevDataRecord = serde_json::from_slice(guard.value()).unwrap();
-                    let mut obj = match rd.data {
-                        serde_json::Value::Object(m) => m,
-                        _ => serde_json::Map::new(),
-                    };
-                    obj.insert(
-                        "_id".into(),
-                        serde_json::Value::String(change.doc_id.clone()),
-                    );
-                    obj.insert("_rev".into(), serde_json::Value::String(rev_str.clone()));
-                    if change.deleted {
-                        obj.insert("_deleted".into(), serde_json::Value::Bool(true));
+                match db_err!(rev_table.get(key.as_str()))? {
+                    Some(guard) => {
+                        let rd: RevDataRecord = serde_json::from_slice(guard.value())?;
+                        let mut obj = match rd.data {
+                            serde_json::Value::Object(m) => m,
+                            _ => serde_json::Map::new(),
+                        };
+                        obj.insert(
+                            "_id".into(),
+                            serde_json::Value::String(change.doc_id.clone()),
+                        );
+                        obj.insert("_rev".into(), serde_json::Value::String(rev_str.clone()));
+                        if change.deleted {
+                            obj.insert("_deleted".into(), serde_json::Value::Bool(true));
+                        }
+                        Some(serde_json::Value::Object(obj))
                     }
-                    serde_json::Value::Object(obj)
-                })
+                    None => None,
+                }
             } else {
                 None
             };
@@ -642,6 +704,7 @@ impl Adapter for RedbAdapter {
         let last_seq = results
             .last()
             .map(|r| r.seq.clone())
+            .or_else(|| max_scanned.map(Seq::Num))
             .unwrap_or(opts.since.clone());
 
         Ok(ChangesResponse { results, last_seq })
@@ -1564,6 +1627,74 @@ mod tests {
             .await
             .unwrap();
         assert!(!r3[0].ok);
+    }
+
+    #[tokio::test]
+    async fn all_docs_descending_with_range() {
+        let (_dir, db) = temp_db();
+        for name in ["a", "b", "c", "d"] {
+            db.bulk_docs(
+                vec![Document {
+                    id: name.into(),
+                    rev: None,
+                    deleted: false,
+                    data: serde_json::json!({}),
+                    attachments: HashMap::new(),
+                }],
+                BulkDocsOptions::new(),
+            )
+            .await
+            .unwrap();
+        }
+
+        // descending flips startkey/endkey: startkey="c" is the upper bound,
+        // endkey="b" the lower bound -> expect ["c", "b"].
+        let opts = AllDocsOptions {
+            descending: true,
+            start_key: Some("c".into()),
+            end_key: Some("b".into()),
+            ..AllDocsOptions::new()
+        };
+        let result = db.all_docs(opts).await.unwrap();
+        let ids: Vec<&str> = result.rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["c", "b"]);
+        assert_eq!(result.total_rows, 4);
+    }
+
+    #[tokio::test]
+    async fn all_docs_includes_conflicts() {
+        let (_dir, db) = temp_db();
+        // Two conflicting leaves on the same document via replication.
+        for hash in ["bbb", "ccc"] {
+            let mut data = serde_json::json!({ "v": hash });
+            data.as_object_mut().unwrap().insert(
+                "_revisions".into(),
+                serde_json::json!({"start": 2, "ids": [hash, "aaa"]}),
+            );
+            db.bulk_docs(
+                vec![Document {
+                    id: "doc1".into(),
+                    rev: Some(Revision::new(2, hash.into())),
+                    deleted: false,
+                    data,
+                    attachments: HashMap::new(),
+                }],
+                BulkDocsOptions::replication(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let opts = AllDocsOptions {
+            include_docs: true,
+            conflicts: true,
+            ..AllDocsOptions::new()
+        };
+        let result = db.all_docs(opts).await.unwrap();
+        let doc = result.rows[0].doc.as_ref().unwrap();
+        let conflicts = doc["_conflicts"].as_array().expect("_conflicts present");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0], "2-bbb"); // loser (ccc wins by higher hash)
     }
 
     #[tokio::test]

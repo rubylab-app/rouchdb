@@ -461,10 +461,13 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
             let effective_rev = if rev.is_some() {
                 rev
             } else if force {
-                db.get(&doc_id)
-                    .await
-                    .ok()
-                    .and_then(|doc| doc.rev.map(|r| r.to_string()))
+                // Only a genuinely missing document should fall through to a
+                // create; surface any other error instead of silently creating.
+                match db.get(&doc_id).await {
+                    Ok(doc) => doc.rev.map(|r| r.to_string()),
+                    Err(rouchdb::RouchError::NotFound(_)) => None,
+                    Err(e) => return Err(e),
+                }
             } else {
                 None
             };
@@ -592,6 +595,16 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
                 }),
                 cli.pretty,
             );
+
+            // Exit non-zero if any document failed, like the other write
+            // commands (put/post/delete).
+            if !errors.is_empty() {
+                return Err(rouchdb::RouchError::BadRequest(format!(
+                    "{} of {} documents failed to import",
+                    errors.len(),
+                    docs.len()
+                )));
+            }
         }
     }
 

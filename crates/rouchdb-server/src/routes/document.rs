@@ -68,6 +68,13 @@ pub async fn put_doc(
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     validate_db(&db, &state)?;
 
+    // Honor a `_deleted: true` body (CouchDB delete-via-PUT).
+    let is_deleted = body
+        .as_object()
+        .and_then(|o| o.get("_deleted"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     // Get _rev from query param or body
     let rev = query.rev.or_else(|| {
         body.as_object()
@@ -76,7 +83,14 @@ pub async fn put_doc(
             .map(String::from)
     });
 
-    let result = if let Some(rev_str) = rev {
+    let result = if is_deleted {
+        let rev_str = rev.ok_or_else(|| {
+            AppError(rouchdb_core::error::RouchError::BadRequest(
+                "Missing _rev for delete".to_string(),
+            ))
+        })?;
+        state.db.remove(&docid, &rev_str).await?
+    } else if let Some(rev_str) = rev {
         // Strip _id and _rev from body data
         if let Some(obj) = body.as_object_mut() {
             obj.remove("_id");
@@ -91,6 +105,18 @@ pub async fn put_doc(
         }
         state.db.put(&docid, body).await?
     };
+
+    // A failed write returns Ok(DocResult { ok: false, .. }); map it to the
+    // correct HTTP status (409/404/400) instead of reporting 201 Created.
+    if !result.ok {
+        return Err(AppError(match result.error.as_deref() {
+            Some("conflict") => rouchdb_core::error::RouchError::Conflict,
+            Some("not_found") => rouchdb_core::error::RouchError::NotFound(result.id),
+            _ => rouchdb_core::error::RouchError::BadRequest(
+                result.reason.unwrap_or_else(|| "write failed".to_string()),
+            ),
+        }));
+    }
 
     Ok((
         StatusCode::CREATED,
@@ -117,6 +143,14 @@ pub async fn delete_doc(
     })?;
 
     let result = state.db.remove(&docid, &rev).await?;
+    if !result.ok {
+        return Err(AppError(match result.error.as_deref() {
+            Some("not_found") => rouchdb_core::error::RouchError::NotFound(
+                result.reason.unwrap_or_else(|| "missing".to_string()),
+            ),
+            _ => rouchdb_core::error::RouchError::Conflict,
+        }));
+    }
     Ok(Json(serde_json::json!({
         "ok": result.ok,
         "id": result.id,

@@ -199,8 +199,8 @@ impl Database {
             data,
             attachments: HashMap::new(),
         };
-        let mut results = self.bulk_docs(vec![doc], BulkDocsOptions::new()).await?;
-        Ok(results.remove(0))
+        let results = self.bulk_docs(vec![doc], BulkDocsOptions::new()).await?;
+        first_result(results)
     }
 
     /// Update an existing document (requires providing the current rev).
@@ -216,8 +216,8 @@ impl Database {
             data,
             attachments: HashMap::new(),
         };
-        let mut results = self.bulk_docs(vec![doc], BulkDocsOptions::new()).await?;
-        Ok(results.remove(0))
+        let results = self.bulk_docs(vec![doc], BulkDocsOptions::new()).await?;
+        first_result(results)
     }
 
     /// Delete a document (requires the current rev).
@@ -233,8 +233,8 @@ impl Database {
             data: serde_json::json!({}),
             attachments: HashMap::new(),
         };
-        let mut results = self.bulk_docs(vec![doc], BulkDocsOptions::new()).await?;
-        Ok(results.remove(0))
+        let results = self.bulk_docs(vec![doc], BulkDocsOptions::new()).await?;
+        first_result(results)
     }
 
     /// Write multiple documents at once.
@@ -301,27 +301,36 @@ impl Database {
     ) -> (tokio::sync::mpsc::Receiver<ChangeEvent>, ChangesHandle) {
         if let Some(selector) = opts.selector.clone() {
             let user_wants_docs = opts.include_docs;
+            // Push the selector into the stream's filter so `limit` counts only
+            // matching changes (composing with any pre-existing filter).
+            let existing = opts.filter.clone();
+            let filter: ChangesFilter = Arc::new(move |e: &ChangeEvent| {
+                if let Some(ref ex) = existing
+                    && !ex(e)
+                {
+                    return false;
+                }
+                e.doc
+                    .as_ref()
+                    .is_some_and(|d| matches_selector(d, &selector))
+            });
             let inner_opts = ChangesStreamOptions {
                 include_docs: true, // Need docs for selector evaluation
                 selector: None,
+                filter: Some(filter),
                 ..opts
             };
             let (inner_rx, handle) = live_changes(self.adapter.clone(), inner_opts);
-            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            if user_wants_docs {
+                return (inner_rx, handle);
+            }
 
+            // Strip docs the user did not request.
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
             tokio::spawn(async move {
                 let mut inner_rx = inner_rx;
                 while let Some(mut event) = inner_rx.recv().await {
-                    let matches = event
-                        .doc
-                        .as_ref()
-                        .is_some_and(|d| matches_selector(d, &selector));
-                    if !matches {
-                        continue;
-                    }
-                    if !user_wants_docs {
-                        event.doc = None;
-                    }
+                    event.doc = None;
                     if tx.send(event).await.is_err() {
                         break;
                     }
@@ -344,35 +353,41 @@ impl Database {
     ) -> (tokio::sync::mpsc::Receiver<ChangesEvent>, ChangesHandle) {
         if let Some(selector) = opts.selector.clone() {
             let user_wants_docs = opts.include_docs;
+            // Push the selector into the stream's filter so `limit` counts only
+            // matching changes (composing with any pre-existing filter).
+            let existing = opts.filter.clone();
+            let filter: ChangesFilter = Arc::new(move |e: &ChangeEvent| {
+                if let Some(ref ex) = existing
+                    && !ex(e)
+                {
+                    return false;
+                }
+                e.doc
+                    .as_ref()
+                    .is_some_and(|d| matches_selector(d, &selector))
+            });
             let inner_opts = ChangesStreamOptions {
                 include_docs: true,
                 selector: None,
+                filter: Some(filter),
                 ..opts
             };
             let (inner_rx, handle) = live_changes_events(self.adapter.clone(), inner_opts);
-            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            if user_wants_docs {
+                return (inner_rx, handle);
+            }
 
+            // Strip docs the user did not request from Change events.
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
             tokio::spawn(async move {
                 let mut inner_rx = inner_rx;
                 while let Some(event) = inner_rx.recv().await {
-                    let forward = match &event {
-                        ChangesEvent::Change(ce) => {
-                            let matches = ce
-                                .doc
-                                .as_ref()
-                                .is_some_and(|d| matches_selector(d, &selector));
-                            if !matches {
-                                continue;
-                            }
-                            if !user_wants_docs {
-                                let mut ce = ce.clone();
-                                ce.doc = None;
-                                ChangesEvent::Change(ce)
-                            } else {
-                                event
-                            }
+                    let forward = match event {
+                        ChangesEvent::Change(mut ce) => {
+                            ce.doc = None;
+                            ChangesEvent::Change(ce)
                         }
-                        _ => event, // Pass through lifecycle events
+                        other => other,
                     };
                     if tx.send(forward).await.is_err() {
                         break;
@@ -493,8 +508,12 @@ impl Database {
                     use rouchdb_query::SortDirection;
                     for sf in sort_fields {
                         let (field, direction) = sf.field_and_direction();
-                        let va = a.get(field).unwrap_or(&serde_json::Value::Null);
-                        let vb = b.get(field).unwrap_or(&serde_json::Value::Null);
+                        // Resolve dotted/nested paths (e.g. "address.city")
+                        // identically to the full-scan path in mango::find.
+                        let va = rouchdb_query::get_nested_field(a, field)
+                            .unwrap_or(&serde_json::Value::Null);
+                        let vb = rouchdb_query::get_nested_field(b, field)
+                            .unwrap_or(&serde_json::Value::Null);
                         let cmp = collate(va, vb);
                         let cmp = if direction == SortDirection::Desc {
                             cmp.reverse()
@@ -849,6 +868,17 @@ impl Database {
             name: name.to_string(),
         }
     }
+}
+
+/// Extract the single `DocResult` from a one-document `bulk_docs` call.
+///
+/// Returns an error instead of panicking when no result is produced — e.g. a
+/// `before_write` plugin dropped the document, or a custom adapter returned
+/// fewer results than documents.
+fn first_result(results: Vec<DocResult>) -> Result<DocResult> {
+    results.into_iter().next().ok_or_else(|| {
+        RouchError::DatabaseError("bulk_docs returned no result for the written document".into())
+    })
 }
 
 /// Escape regex metacharacters in a string for safe use in a regex pattern.
@@ -1466,5 +1496,74 @@ mod tests {
 
         let info = db.info().await.unwrap();
         assert_eq!(info.doc_count, 0);
+    }
+
+    struct DropAllPlugin;
+
+    #[async_trait::async_trait]
+    impl Plugin for DropAllPlugin {
+        fn name(&self) -> &str {
+            "drop-all"
+        }
+        async fn before_write(&self, docs: &mut Vec<Document>) -> Result<()> {
+            docs.clear(); // simulate a plugin that vetoes the write
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn put_returns_error_when_plugin_drops_document() {
+        let db = Database::memory("test").with_plugin(Arc::new(DropAllPlugin));
+        // Must return an error rather than panicking on an empty results vec.
+        let result = db.put("doc1", serde_json::json!({"v": 1})).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn indexed_find_sorts_on_nested_field() {
+        let db = Database::memory("test");
+        db.put(
+            "a",
+            serde_json::json!({"category": "x", "address": {"city": "Zurich"}}),
+        )
+        .await
+        .unwrap();
+        db.put(
+            "b",
+            serde_json::json!({"category": "x", "address": {"city": "Amsterdam"}}),
+        )
+        .await
+        .unwrap();
+        db.put(
+            "c",
+            serde_json::json!({"category": "x", "address": {"city": "Madrid"}}),
+        )
+        .await
+        .unwrap();
+
+        // Index on "category" so the index-accelerated find() path is taken.
+        db.create_index(IndexDefinition {
+            name: String::new(),
+            fields: vec![SortField::Simple("category".into())],
+            ddoc: None,
+        })
+        .await
+        .unwrap();
+
+        let result = db
+            .find(FindOptions {
+                selector: serde_json::json!({"category": "x"}),
+                sort: Some(vec![SortField::Simple("address.city".into())]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let cities: Vec<&str> = result
+            .docs
+            .iter()
+            .map(|d| d["address"]["city"].as_str().unwrap())
+            .collect();
+        assert_eq!(cities, vec!["Amsterdam", "Madrid", "Zurich"]);
     }
 }

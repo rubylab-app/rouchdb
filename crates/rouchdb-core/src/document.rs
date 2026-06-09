@@ -43,6 +43,9 @@ impl FromStr for Revision {
         let pos: u64 = pos_str
             .parse()
             .map_err(|_| RouchError::InvalidRev(s.to_string()))?;
+        if hash.is_empty() {
+            return Err(RouchError::InvalidRev(s.to_string()));
+        }
         Ok(Revision {
             pos,
             hash: hash.to_string(),
@@ -185,10 +188,26 @@ impl Document {
             obj.insert("_deleted".into(), serde_json::Value::Bool(true));
         }
 
-        if !self.attachments.is_empty()
-            && let Ok(att_json) = serde_json::to_value(&self.attachments)
-        {
-            obj.insert("_attachments".into(), att_json);
+        if !self.attachments.is_empty() {
+            use base64::Engine;
+            let mut att_map = serde_json::Map::new();
+            for (name, att) in &self.attachments {
+                if let Ok(serde_json::Value::Object(mut m)) = serde_json::to_value(att) {
+                    // Inline attachment bytes must be emitted as a CouchDB
+                    // base64 string, not serde's default numeric byte array.
+                    if let Some(bytes) = &att.data {
+                        m.insert(
+                            "data".into(),
+                            serde_json::Value::String(
+                                base64::engine::general_purpose::STANDARD.encode(bytes),
+                            ),
+                        );
+                        m.insert("stub".into(), serde_json::Value::Bool(false));
+                    }
+                    att_map.insert(name.clone(), serde_json::Value::Object(m));
+                }
+            }
+            obj.insert("_attachments".into(), serde_json::Value::Object(att_map));
         }
 
         serde_json::Value::Object(obj)
@@ -330,6 +349,8 @@ pub struct AllDocsResponse {
 pub struct DbInfo {
     pub db_name: String,
     pub doc_count: u64,
+    #[serde(default)]
+    pub doc_del_count: u64,
     pub update_seq: Seq,
 }
 
@@ -359,7 +380,7 @@ pub enum ChangesStyle {
     /// Default: only the winning revision.
     #[default]
     MainOnly,
-    /// All non-deleted leaf revisions.
+    /// All leaf revisions (including deleted ones), matching CouchDB.
     AllDocs,
 }
 
@@ -520,6 +541,10 @@ pub struct SecurityDocument {
     pub admins: SecurityGroup,
     #[serde(default)]
     pub members: SecurityGroup,
+    /// Arbitrary additional fields CouchDB permits in `_security` are preserved
+    /// so they round-trip instead of being silently dropped.
+    #[serde(flatten, default)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -569,6 +594,39 @@ mod tests {
     fn invalid_revision() {
         assert!("nope".parse::<Revision>().is_err());
         assert!("abc-123".parse::<Revision>().is_err());
+    }
+
+    #[test]
+    fn revision_rejects_empty_hash() {
+        // "{pos}-" with no hash is malformed and must be rejected.
+        assert!("3-".parse::<Revision>().is_err());
+        assert!("1-".parse::<Revision>().is_err());
+    }
+
+    #[test]
+    fn to_json_inline_attachment_is_base64() {
+        let mut attachments = HashMap::new();
+        attachments.insert(
+            "hi.txt".into(),
+            AttachmentMeta {
+                content_type: "text/plain".into(),
+                digest: "md5-abc".into(),
+                length: 3,
+                stub: false,
+                data: Some(b"hi!".to_vec()),
+            },
+        );
+        let doc = Document {
+            id: "doc1".into(),
+            rev: None,
+            deleted: false,
+            data: serde_json::json!({}),
+            attachments,
+        };
+        let json = doc.to_json();
+        // CouchDB requires inline data as a base64 string, not a byte array.
+        assert_eq!(json["_attachments"]["hi.txt"]["data"], "aGkh");
+        assert_eq!(json["_attachments"]["hi.txt"]["stub"], false);
     }
 
     #[test]

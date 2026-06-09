@@ -168,8 +168,15 @@ pub async fn query_view(
     if opts.reduce
         && let Some(reduce) = reduce_fn
     {
-        let rows = if opts.group || opts.group_level.is_some() {
+        // group_level == Some(0) means a single global group (no grouping),
+        // matching CouchDB where group_level overrides group.
+        let grouped = opts.group_level.map(|l| l > 0).unwrap_or(opts.group);
+        let rows = if grouped {
             group_reduce(&emitted, reduce, opts.group_level)
+        } else if emitted.is_empty() {
+            // An empty reduce yields no rows (CouchDB returns {"rows":[]}),
+            // not a spurious zero row.
+            Vec::new()
         } else {
             let keys: Vec<serde_json::Value> = emitted.iter().map(|r| r.key.clone()).collect();
             let values: Vec<serde_json::Value> = emitted.iter().map(|r| r.value.clone()).collect();
@@ -182,9 +189,18 @@ pub async fn query_view(
             }]
         };
 
+        // Apply skip/limit to the reduced/grouped rows as well.
+        let reduced_total = rows.len() as u64;
+        let skip = opts.skip as usize;
+        let rows: Vec<ViewRow> = rows
+            .into_iter()
+            .skip(skip)
+            .take(opts.limit.unwrap_or(u64::MAX) as usize)
+            .collect();
+
         return Ok(ViewResult {
-            total_rows: rows.len() as u64,
-            offset: 0,
+            total_rows: reduced_total,
+            offset: opts.skip,
             rows,
         });
     }
@@ -409,6 +425,56 @@ mod tests {
         assert_eq!(result.rows[0].key, "Alice");
         assert_eq!(result.rows[1].key, "Bob");
         assert_eq!(result.rows[2].key, "Charlie");
+    }
+
+    #[tokio::test]
+    async fn reduce_group_level_zero_is_global() {
+        let db = setup_db().await;
+        let result = query_view(
+            &db,
+            &|doc| {
+                let city = doc.get("city").cloned().unwrap_or(serde_json::Value::Null);
+                vec![(city, serde_json::json!(1))]
+            },
+            Some(&ReduceFn::Count),
+            ViewQueryOptions {
+                reduce: true,
+                group_level: Some(0),
+                ..ViewQueryOptions::new()
+            },
+        )
+        .await
+        .unwrap();
+        // group_level=0 collapses everything into one global group.
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].value, serde_json::json!(3));
+    }
+
+    #[tokio::test]
+    async fn reduce_grouped_honors_skip_and_limit() {
+        let db = setup_db().await;
+        let result = query_view(
+            &db,
+            &|doc| {
+                let city = doc.get("city").cloned().unwrap_or(serde_json::Value::Null);
+                vec![(city, serde_json::json!(1))]
+            },
+            Some(&ReduceFn::Count),
+            ViewQueryOptions {
+                reduce: true,
+                group: true,
+                skip: 1,
+                limit: Some(1),
+                ..ViewQueryOptions::new()
+            },
+        )
+        .await
+        .unwrap();
+        // Groups sorted by key: "LA"(1), "NYC"(2). skip 1 -> NYC; limit 1.
+        assert_eq!(result.total_rows, 2);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].key, "NYC");
+        assert_eq!(result.rows[0].value, serde_json::json!(2));
     }
 
     #[tokio::test]
