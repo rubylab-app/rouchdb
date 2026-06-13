@@ -1337,12 +1337,10 @@ mod tests {
                                 break;
                             }
                         }
-                        Some(ReplicationEvent::Paused) => {
-                            // No changes, check if doc was replicated
-                            if remote.get("doc1").await.is_ok() {
-                                got_complete = true;
-                                break;
-                            }
+                        // No changes — check whether the doc was replicated.
+                        Some(ReplicationEvent::Paused) if remote.get("doc1").await.is_ok() => {
+                            got_complete = true;
+                            break;
                         }
                         None => break,
                         _ => {}

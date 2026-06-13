@@ -1248,16 +1248,16 @@ fn process_doc_new_edits(
                     });
                 }
             }
-            (None, Some(_)) => {
-                if !is_deleted(&tree) {
-                    return Ok(DocResult {
-                        ok: false,
-                        id: doc_id,
-                        rev: None,
-                        error: Some("conflict".into()),
-                        reason: Some("Document update conflict".into()),
-                    });
-                }
+            // Creating a doc that already exists and is not deleted is a
+            // conflict; a deleted winner falls through and may be re-created.
+            (None, Some(_)) if !is_deleted(&tree) => {
+                return Ok(DocResult {
+                    ok: false,
+                    id: doc_id,
+                    rev: None,
+                    error: Some("conflict".into()),
+                    reason: Some("Document update conflict".into()),
+                });
             }
             _ => {}
         }
