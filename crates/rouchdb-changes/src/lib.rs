@@ -33,6 +33,8 @@ pub enum ChangesEvent {
     Paused,
     /// The stream resumed fetching after being paused.
     Active,
+    /// A periodic keep-alive emitted while waiting, per the `heartbeat` option.
+    Heartbeat,
 }
 use rouchdb_core::error::Result;
 
@@ -155,9 +157,12 @@ pub async fn get_changes(
     opts: ChangesStreamOptions,
 ) -> Result<Vec<ChangeEvent>> {
     let filter = opts.filter.clone();
+    let limit = opts.limit;
     let changes_opts = ChangesOptions {
         since: opts.since,
-        limit: opts.limit,
+        // With a filter, the limit applies to POST-filter results, so don't
+        // let the adapter cap the fetch by limit (it would under-deliver).
+        limit: if filter.is_some() { None } else { opts.limit },
         descending: false,
         include_docs: opts.include_docs,
         live: false,
@@ -168,11 +173,14 @@ pub async fn get_changes(
     };
 
     let response = adapter.changes(changes_opts).await?;
-    let results = if let Some(f) = filter {
+    let mut results = if let Some(f) = filter {
         response.results.into_iter().filter(|e| f(e)).collect()
     } else {
         response.results
     };
+    if let Some(l) = limit {
+        results.truncate(l as usize);
+    }
     Ok(results)
 }
 
@@ -273,6 +281,13 @@ impl LiveChangesStream {
                     if self.buffer_idx < self.buffer.len() {
                         let event = self.buffer[self.buffer_idx].clone();
                         self.buffer_idx += 1;
+                        // Apply the user filter here so `limit` (and `count`)
+                        // reflect emitted, not merely scanned, events.
+                        if let Some(ref f) = self.opts.filter
+                            && !f(&event)
+                        {
+                            continue;
+                        }
                         self.count += 1;
                         return Some(event);
                     }
@@ -364,9 +379,10 @@ pub fn live_changes(
     let (tx, rx) = mpsc::channel(64);
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
-    let filter = opts.filter.clone();
 
     tokio::spawn(async move {
+        // The user filter is applied inside the stream so `limit` counts only
+        // emitted (post-filter) events.
         let mut stream =
             LiveChangesStream::new(adapter, None, ChangesStreamOptions { live: true, ..opts });
 
@@ -375,12 +391,6 @@ pub fn live_changes(
                 change = stream.next_change() => {
                     match change {
                         Some(event) => {
-                            // Apply filter if set
-                            if let Some(ref f) = filter
-                                && !f(&event)
-                            {
-                                continue;
-                            }
                             if tx.send(event).await.is_err() {
                                 break; // Receiver dropped
                             }
@@ -408,13 +418,21 @@ pub fn live_changes_events(
     let (tx, rx) = mpsc::channel(64);
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
-    let filter = opts.filter.clone();
+    let heartbeat_dur = opts.heartbeat;
 
     tokio::spawn(async move {
+        // The user filter is applied inside the stream so `limit` counts only
+        // emitted (post-filter) events.
         let mut stream =
             LiveChangesStream::new(adapter, None, ChangesStreamOptions { live: true, ..opts });
 
         let mut was_paused = false;
+        // Optional keep-alive ticker; first tick is one interval from now.
+        let mut heartbeat = heartbeat_dur.map(|d| {
+            let mut i = tokio::time::interval_at(tokio::time::Instant::now() + d, d);
+            i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            i
+        });
 
         loop {
             tokio::select! {
@@ -425,13 +443,6 @@ pub fn live_changes_events(
                             if was_paused {
                                 was_paused = false;
                                 let _ = tx.send(ChangesEvent::Active).await;
-                            }
-
-                            // Apply filter if set
-                            if let Some(ref f) = filter
-                                && !f(&event)
-                            {
-                                continue;
                             }
 
                             if tx.send(ChangesEvent::Change(event)).await.is_err() {
@@ -446,6 +457,12 @@ pub fn live_changes_events(
                             break;
                         }
                     }
+                }
+                _ = async { heartbeat.as_mut().unwrap().tick().await }, if heartbeat.is_some() => {
+                    if tx.send(ChangesEvent::Heartbeat).await.is_err() {
+                        break;
+                    }
+                    continue;
                 }
                 _ = cancel_clone.cancelled() => {
                     let _ = tx.send(ChangesEvent::Complete {
@@ -631,6 +648,39 @@ mod tests {
         assert_eq!(event.id, "b");
 
         handle.cancel();
+    }
+
+    #[tokio::test]
+    async fn limit_counts_post_filter_events() {
+        // 5 docs; a filter that only accepts even-indexed ids; limit 2.
+        // The limit must yield 2 MATCHING events, not stop after scanning 2.
+        let (db, _sender) = setup().await;
+        for i in 0..6 {
+            put_doc(db.as_ref(), &format!("d{}", i), serde_json::json!({"i": i})).await;
+        }
+
+        let filter: ChangesFilter = Arc::new(|e: &ChangeEvent| {
+            // accept d0, d2, d4 (ids ending in an even digit)
+            e.id.trim_start_matches('d')
+                .parse::<u64>()
+                .map(|n| n % 2 == 0)
+                .unwrap_or(false)
+        });
+
+        let events = get_changes(
+            db.as_ref(),
+            ChangesStreamOptions {
+                limit: Some(2),
+                filter: Some(filter),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].id, "d0");
+        assert_eq!(events[1].id, "d2");
     }
 
     #[tokio::test]

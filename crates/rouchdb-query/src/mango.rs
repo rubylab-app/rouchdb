@@ -342,6 +342,24 @@ fn match_condition(doc: &serde_json::Value, key: &str, condition: &serde_json::V
     }
 }
 
+/// Match a single `$elemMatch` array element against the operand.
+///
+/// CouchDB allows the operand to be either an operator expression applied
+/// directly to the element (e.g. `{"$gt": 80}` over `[50, 85, 60]`), a
+/// sub-document selector (e.g. `{"subject": "math"}` over array-of-objects),
+/// or a bare scalar (implicit `$eq`).
+fn elem_matches(elem: &serde_json::Value, operand: &serde_json::Value) -> bool {
+    if let Some(map) = operand.as_object() {
+        if !map.is_empty() && map.keys().all(|k| k.starts_with('$')) {
+            return map
+                .iter()
+                .all(|(op, sub)| match_operator(Some(elem), op, sub));
+        }
+        return matches_selector(elem, operand);
+    }
+    match_operator(Some(elem), "$eq", operand)
+}
+
 fn match_operator(
     field_value: Option<&serde_json::Value>,
     op: &str,
@@ -430,7 +448,7 @@ fn match_operator(
         }
         "$elemMatch" => field_value.is_some_and(|v| {
             if let Some(arr) = v.as_array() {
-                arr.iter().any(|elem| matches_selector(elem, operand))
+                arr.iter().any(|elem| elem_matches(elem, operand))
             } else {
                 false
             }
@@ -500,7 +518,10 @@ fn match_nor(doc: &serde_json::Value, condition: &serde_json::Value) -> bool {
 }
 
 /// Get a nested field from a JSON value using dot notation.
-fn get_nested_field<'a>(doc: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+pub fn get_nested_field<'a>(
+    doc: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
     let mut current = doc;
     for part in path.split('.') {
         match current.get(part) {
@@ -555,6 +576,40 @@ mod tests {
 
     fn doc(json: serde_json::Value) -> serde_json::Value {
         json
+    }
+
+    #[test]
+    fn elem_match_operator_on_scalar_array() {
+        let d = doc(serde_json::json!({"scores": [50, 85, 60]}));
+        // Operator expression applied directly to each element.
+        assert!(matches_selector(
+            &d,
+            &serde_json::json!({"scores": {"$elemMatch": {"$gt": 80}}})
+        ));
+        assert!(!matches_selector(
+            &d,
+            &serde_json::json!({"scores": {"$elemMatch": {"$gt": 90}}})
+        ));
+        // Bare scalar operand -> implicit $eq against each element.
+        assert!(matches_selector(
+            &d,
+            &serde_json::json!({"scores": {"$elemMatch": 85}})
+        ));
+    }
+
+    #[test]
+    fn elem_match_subdocument_array() {
+        let d = doc(serde_json::json!({
+            "items": [{"subject": "math", "score": 90}, {"subject": "art", "score": 70}]
+        }));
+        assert!(matches_selector(
+            &d,
+            &serde_json::json!({"items": {"$elemMatch": {"subject": "math"}}})
+        ));
+        assert!(!matches_selector(
+            &d,
+            &serde_json::json!({"items": {"$elemMatch": {"subject": "history"}}})
+        ));
     }
 
     // --- Basic matching ---

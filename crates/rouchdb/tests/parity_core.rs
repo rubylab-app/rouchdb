@@ -364,6 +364,7 @@ async fn security_document_put_and_get() {
             names: vec!["user1".into(), "user2".into()],
             roles: vec!["readers".into()],
         },
+        ..Default::default()
     };
 
     db.put_security(sec).await.unwrap();

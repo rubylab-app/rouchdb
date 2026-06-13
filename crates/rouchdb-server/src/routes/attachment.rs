@@ -30,10 +30,24 @@ pub async fn get_attachment(
 
     let data = state.db.get_attachment(&docid, &attname).await?;
 
-    // Try to guess content type from the attachment name
-    let content_type = mime_guess::from_path(&attname)
-        .first_or_octet_stream()
-        .to_string();
+    // Prefer the content type stored with the attachment; fall back to a guess
+    // from the name only when it is unavailable.
+    let content_type = state
+        .db
+        .get(&docid)
+        .await
+        .ok()
+        .and_then(|doc| {
+            doc.attachments
+                .get(&attname)
+                .map(|m| m.content_type.clone())
+        })
+        .filter(|ct| !ct.is_empty())
+        .unwrap_or_else(|| {
+            mime_guess::from_path(&attname)
+                .first_or_octet_stream()
+                .to_string()
+        });
 
     Ok((StatusCode::OK, [("content-type", content_type)], data).into_response())
 }

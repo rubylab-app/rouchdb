@@ -325,69 +325,133 @@ pub fn collect_conflicts(tree: &RevTree) -> Vec<Revision> {
 // Stemming (pruning old revisions)
 // ---------------------------------------------------------------------------
 
+/// Maximum number of edges from `node` to its deepest descendant leaf.
+fn max_depth(node: &RevNode) -> u64 {
+    if node.children.is_empty() {
+        return 0;
+    }
+    node.children
+        .iter()
+        .map(|c| 1 + max_depth(c))
+        .max()
+        .unwrap_or(0)
+}
+
 /// Prune revisions beyond `depth` from each leaf. Returns the list of
 /// revision hashes that were removed.
+///
+/// Stemming is applied per branch: when a branch point sits above the cut
+/// line, the common ancestor is dropped and each child subtree is re-rooted
+/// into its own `RevPath`, mirroring `pouchdb-merge`. This is why a `RevTree`
+/// is a list of roots.
 pub fn stem(tree: &mut RevTree, depth: u64) -> Vec<String> {
     let mut stemmed = Vec::new();
-
-    for path in tree.iter_mut() {
-        let s = stem_path(path, depth);
-        stemmed.extend(s);
+    let mut new_roots: RevTree = Vec::new();
+    for path in tree.drain(..) {
+        new_roots.extend(stem_path(path, depth, &mut stemmed));
     }
-
     // Remove any paths that became empty
-    tree.retain(|p| !is_empty_node(&p.tree));
-
+    new_roots.retain(|p| !is_empty_node(&p.tree));
+    *tree = new_roots;
     stemmed
 }
 
-/// Stem a single path, adjusting `pos` if the root gets pruned.
-fn stem_path(path: &mut RevPath, depth: u64) -> Vec<String> {
-    let mut stemmed = Vec::new();
-
-    // Find the maximum depth of any leaf
-    fn max_depth(node: &RevNode) -> u64 {
-        if node.children.is_empty() {
-            return 0;
+/// Stem one rooted path, returning one or more re-rooted paths so every
+/// root-to-leaf chain keeps at most `depth` revisions.
+fn stem_path(path: RevPath, depth: u64, stemmed: &mut Vec<String>) -> Vec<RevPath> {
+    let mut pos = path.pos;
+    let mut node = path.tree;
+    loop {
+        if max_depth(&node) < depth {
+            // The deepest leaf is already within the limit — keep as-is.
+            return vec![RevPath { pos, tree: node }];
         }
-        node.children
-            .iter()
-            .map(|c| 1 + max_depth(c))
-            .max()
-            .unwrap_or(0)
-    }
-
-    let tree_depth = max_depth(&path.tree);
-
-    if tree_depth < depth {
-        return stemmed; // Nothing to stem
-    }
-
-    // We need to remove nodes from the root until the deepest path
-    // is at most `depth` long
-    let levels_to_remove = tree_depth - depth + 1;
-
-    for _ in 0..levels_to_remove {
-        if path.tree.children.len() <= 1 {
-            stemmed.push(path.tree.hash.clone());
-            if let Some(child) = path.tree.children.pop() {
-                path.tree = child;
-                path.pos += 1;
-            } else {
-                // Tree is now empty
-                break;
+        if node.children.len() <= 1 {
+            // Linear prefix: drop the root and descend into the only child.
+            stemmed.push(node.hash.clone());
+            match node.children.pop() {
+                Some(child) => {
+                    node = child;
+                    pos += 1;
+                }
+                None => return vec![], // Tree emptied
             }
         } else {
-            // Can't stem past a branch point
-            break;
+            // Branch point above the cut line: drop it and re-root each child,
+            // stemming each subtree independently.
+            stemmed.push(node.hash.clone());
+            let children = std::mem::take(&mut node.children);
+            let mut out = Vec::new();
+            for child in children {
+                out.extend(stem_path(
+                    RevPath {
+                        pos: pos + 1,
+                        tree: child,
+                    },
+                    depth,
+                    stemmed,
+                ));
+            }
+            return out;
         }
     }
-
-    stemmed
 }
 
 fn is_empty_node(node: &RevNode) -> bool {
     node.hash.is_empty() && node.children.is_empty()
+}
+
+/// Find the winning leaf revision that descends from `(pos, hash)`.
+///
+/// Used for `latest=true`: walk to the tip of the requested rev's branch.
+/// If the rev is itself a leaf it is returned; among multiple descendant
+/// leaves the deterministic winner (non-deleted > higher generation > higher
+/// hash) is chosen. Returns `None` if the rev is not present in the tree.
+pub fn latest_leaf(tree: &RevTree, pos: u64, hash: &str) -> Option<Revision> {
+    fn find_node<'a>(
+        node: &'a RevNode,
+        cur: u64,
+        tpos: u64,
+        thash: &str,
+    ) -> Option<(&'a RevNode, u64)> {
+        if cur == tpos && node.hash == thash {
+            return Some((node, cur));
+        }
+        for c in &node.children {
+            if let Some(found) = find_node(c, cur + 1, tpos, thash) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn collect(node: &RevNode, pos: u64, out: &mut Vec<(u64, String, bool)>) {
+        if node.children.is_empty() {
+            out.push((pos, node.hash.clone(), node.opts.deleted));
+        } else {
+            for c in &node.children {
+                collect(c, pos + 1, out);
+            }
+        }
+    }
+
+    for path in tree {
+        if let Some((node, node_pos)) = find_node(&path.tree, path.pos, pos, hash) {
+            let mut leaves: Vec<(u64, String, bool)> = Vec::new();
+            collect(node, node_pos, &mut leaves);
+            // Winner order: non-deleted first, then highest pos, then hash desc.
+            leaves.sort_by(|a, b| {
+                a.2.cmp(&b.2)
+                    .then_with(|| b.0.cmp(&a.0))
+                    .then_with(|| b.1.cmp(&a.1))
+            });
+            return leaves
+                .into_iter()
+                .next()
+                .map(|(p, h, _)| Revision::new(p, h));
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -688,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn stem_stops_at_branch_point() {
+    fn stem_splits_at_branch_point() {
         // 1-a -> 2-b -> 3-c
         //            -> 3-d
         let mut tree = vec![RevPath {
@@ -696,12 +760,53 @@ mod tests {
             tree: node("a", vec![node("b", vec![leaf("c"), leaf("d")])]),
         }];
 
-        // Even with depth=1, cannot stem past the branch point at 2-b
+        // depth=1 means each leaf keeps a single revision. The shared
+        // ancestors 1-a and 2-b are pruned and each leaf becomes its own root.
         let stemmed = stem(&mut tree, 1);
-        // Stemmed should remove at most 1-a (stop at branch)
-        // Actually, can stem 1-a since 2-b has multiple children
-        // but 2-b cannot be stemmed because it has >1 child
-        assert!(stemmed.len() <= 1);
+        assert_eq!(stemmed.len(), 2); // a and b removed
+        assert!(stemmed.contains(&"a".to_string()));
+        assert!(stemmed.contains(&"b".to_string()));
+
+        assert_eq!(tree.len(), 2); // two separate roots, one per leaf
+        let leaves = collect_leaves(&tree);
+        let hashes: Vec<&str> = leaves.iter().map(|l| l.hash.as_str()).collect();
+        assert!(hashes.contains(&"c"));
+        assert!(hashes.contains(&"d"));
+        assert!(leaves.iter().all(|l| l.pos == 3));
+    }
+
+    #[test]
+    fn stem_prunes_deep_branch_above_cut_line() {
+        // Regression: a conflict branch at generation 1 used to prevent any
+        // stemming, letting the deep branch grow without bound.
+        //   1-a -> 2-b (leaf)
+        //       -> 2-c -> 3-d -> 4-e -> 5-f
+        let mut tree = vec![RevPath {
+            pos: 1,
+            tree: node(
+                "a",
+                vec![
+                    leaf("b"),
+                    node("c", vec![node("d", vec![node("e", vec![leaf("f")])])]),
+                ],
+            ),
+        }];
+
+        let stemmed = stem(&mut tree, 2);
+        // a, c, d are pruned; each leaf keeps at most 2 revisions.
+        assert!(stemmed.contains(&"a".to_string()));
+        assert!(stemmed.contains(&"c".to_string()));
+        assert!(stemmed.contains(&"d".to_string()));
+
+        // Roots become [2-b] and [4-e -> 5-f].
+        assert_eq!(tree.len(), 2);
+        for path in &tree {
+            assert!(max_depth(&path.tree) < 2, "every chain must fit the limit");
+        }
+        // Winner is still 5-f (highest generation across roots).
+        let winner = winning_rev(&tree).unwrap();
+        assert_eq!(winner.pos, 5);
+        assert_eq!(winner.hash, "f");
     }
 
     #[test]
@@ -762,6 +867,36 @@ mod tests {
     fn latest_rev_on_empty_tree() {
         let tree: RevTree = vec![];
         assert!(latest_rev(&tree, 1, "a").is_none());
+    }
+
+    #[test]
+    fn latest_leaf_walks_linear_chain_to_tip() {
+        // 1-a -> 2-b -> 3-c : latest from an internal node returns the leaf.
+        let tree = simple_tree();
+        let rev = latest_leaf(&tree, 1, "a").unwrap();
+        assert_eq!(rev.pos, 3);
+        assert_eq!(rev.hash, "c");
+        // A leaf returns itself.
+        assert_eq!(latest_leaf(&tree, 3, "c").unwrap().hash, "c");
+    }
+
+    #[test]
+    fn latest_leaf_stays_on_requested_branch() {
+        // 1-a -> 2-b -> 3-c   (losing branch)
+        //     -> 2-z -> 3-d -> 4-e   (winning branch by generation)
+        let tree = vec![RevPath {
+            pos: 1,
+            tree: node(
+                "a",
+                vec![
+                    node("b", vec![leaf("c")]),
+                    node("z", vec![node("d", vec![leaf("e")])]),
+                ],
+            ),
+        }];
+        // Global winner is 4-e, but latest from 2-b must stay on its branch.
+        assert_eq!(latest_leaf(&tree, 2, "b").unwrap().to_string(), "3-c");
+        assert_eq!(latest_leaf(&tree, 2, "z").unwrap().to_string(), "4-e");
     }
 
     // --- merge edge cases ---

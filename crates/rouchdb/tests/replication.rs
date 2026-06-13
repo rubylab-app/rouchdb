@@ -996,11 +996,7 @@ async fn live_replicate_to_couchdb() {
             event = rx.recv() => {
                 match event {
                     Some(ReplicationEvent::Complete(r)) if r.docs_written > 0 => break,
-                    Some(ReplicationEvent::Paused) => {
-                        if remote.get("doc1").await.is_ok() {
-                            break;
-                        }
-                    }
+                    Some(ReplicationEvent::Paused) if remote.get("doc1").await.is_ok() => break,
                     None => break,
                     _ => {}
                 }
@@ -1075,11 +1071,9 @@ async fn live_replicate_picks_up_new_docs() {
                         replicated = true;
                         break;
                     }
-                    Some(ReplicationEvent::Paused) => {
-                        if remote.get("late_doc").await.is_ok() {
-                            replicated = true;
-                            break;
-                        }
+                    Some(ReplicationEvent::Paused) if remote.get("late_doc").await.is_ok() => {
+                        replicated = true;
+                        break;
                     }
                     None => break,
                     _ => {}

@@ -256,11 +256,9 @@ async fn live_replication_picks_up_new_docs() {
                         initial_done = true;
                         break;
                     }
-                    Some(ReplicationEvent::Paused) => {
-                        if target.get("doc1").await.is_ok() {
-                            initial_done = true;
-                            break;
-                        }
+                    Some(ReplicationEvent::Paused) if target.get("doc1").await.is_ok() => {
+                        initial_done = true;
+                        break;
                     }
                     None => break,
                     _ => {}

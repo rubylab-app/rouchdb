@@ -20,7 +20,7 @@ pub async fn get_db_info(
     Ok(Json(serde_json::json!({
         "db_name": info.db_name,
         "doc_count": info.doc_count,
-        "doc_del_count": 0,
+        "doc_del_count": info.doc_del_count,
         "update_seq": info.update_seq,
         "purge_seq": 0,
         "compact_running": false,
@@ -40,7 +40,11 @@ pub async fn get_db_info(
     })))
 }
 
-/// PUT /{db} — stub: returns 201 if name matches (already exists).
+/// PUT /{db} — create a database.
+///
+/// In single-db mode the database is created at startup, so a PUT for the
+/// matching name always targets an existing database: return 412 file_exists,
+/// matching CouchDB (201 Created is reserved for genuinely new databases).
 pub async fn put_db(
     State(state): State<AppState>,
     Path(db): Path<String>,
@@ -51,7 +55,9 @@ pub async fn put_db(
         )));
     }
 
-    Ok((StatusCode::CREATED, Json(serde_json::json!({"ok": true}))))
+    Err(AppError(rouchdb_core::error::RouchError::DatabaseExists(
+        db,
+    )))
 }
 
 /// DELETE /{db} — delete a database.

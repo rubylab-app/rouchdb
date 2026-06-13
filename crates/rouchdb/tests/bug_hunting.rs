@@ -764,6 +764,7 @@ async fn security_overwrite() {
             roles: vec![],
         },
         members: SecurityGroup::default(),
+        ..Default::default()
     };
     db.put_security(sec1).await.unwrap();
 
@@ -773,6 +774,7 @@ async fn security_overwrite() {
             roles: vec!["role1".into()],
         },
         members: SecurityGroup::default(),
+        ..Default::default()
     };
     db.put_security(sec2).await.unwrap();
 

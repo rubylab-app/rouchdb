@@ -647,9 +647,10 @@ async fn view_reduce_with_zero_emitted_rows() {
     .await
     .unwrap();
 
-    // Should handle empty reduce gracefully
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0].value, serde_json::json!(0));
+    // An empty reduce returns no rows (CouchDB returns {"rows":[]}), not a
+    // spurious zero row.
+    assert!(result.rows.is_empty());
+    assert_eq!(result.total_rows, 0);
 }
 
 // =========================================================================

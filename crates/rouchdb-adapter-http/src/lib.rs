@@ -23,6 +23,8 @@ use rouchdb_core::error::{Result, RouchError};
 struct CouchDbInfo {
     db_name: String,
     doc_count: u64,
+    #[serde(default)]
+    doc_del_count: u64,
     update_seq: serde_json::Value, // Can be integer or string depending on CouchDB version
 }
 
@@ -244,12 +246,13 @@ impl Adapter for HttpAdapter {
         Ok(DbInfo {
             db_name: info.db_name,
             doc_count: info.doc_count,
+            doc_del_count: info.doc_del_count,
             update_seq: parse_seq(&info.update_seq),
         })
     }
 
     async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
-        let mut url = self.url(&urlencoded(id));
+        let mut url = self.url(&encode_doc_id(id));
         let mut params = Vec::new();
 
         if let Some(ref rev) = opts.rev {
@@ -275,7 +278,7 @@ impl Adapter for HttpAdapter {
                 OpenRevs::All => params.push("open_revs=all".into()),
                 OpenRevs::Specific(revs) => {
                     let json = serde_json::to_string(revs).unwrap_or_default();
-                    params.push(format!("open_revs={}", json));
+                    params.push(format!("open_revs={}", urlencoded(&json)));
                 }
             }
         }
@@ -346,10 +349,16 @@ impl Adapter for HttpAdapter {
             params.push("descending=true".into());
         }
         if let Some(ref start) = opts.start_key {
-            params.push(format!("startkey=\"{}\"", start));
+            params.push(format!("startkey={}", encode_query_key(start)));
         }
         if let Some(ref end) = opts.end_key {
-            params.push(format!("endkey=\"{}\"", end));
+            params.push(format!("endkey={}", encode_query_key(end)));
+        }
+        if let Some(ref k) = opts.key {
+            params.push(format!("key={}", encode_query_key(k)));
+        }
+        if !opts.inclusive_end {
+            params.push("inclusive_end=false".into());
         }
         if let Some(limit) = opts.limit {
             params.push(format!("limit={}", limit));
@@ -369,12 +378,18 @@ impl Adapter for HttpAdapter {
             url = format!("{}?{}", url, params.join("&"));
         }
 
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+        // Multiple keys are sent via a POST body (CouchDB `_all_docs` keys
+        // form); everything else is a GET.
+        let resp = if let Some(ref keys) = opts.keys {
+            self.client
+                .post(&url)
+                .json(&serde_json::json!({ "keys": keys }))
+                .send()
+                .await
+        } else {
+            self.client.get(&url).send().await
+        }
+        .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
         let resp = self.check_error(resp).await?;
         let result: CouchDbAllDocsResponse = resp
             .json()
@@ -556,7 +571,7 @@ impl Adapter for HttpAdapter {
     ) -> Result<DocResult> {
         let url = format!(
             "{}/{}?rev={}",
-            self.url(&urlencoded(doc_id)),
+            self.url(&encode_doc_id(doc_id)),
             urlencoded(att_id),
             rev
         );
@@ -590,7 +605,11 @@ impl Adapter for HttpAdapter {
         att_id: &str,
         opts: GetAttachmentOptions,
     ) -> Result<Vec<u8>> {
-        let mut url = format!("{}/{}", self.url(&urlencoded(doc_id)), urlencoded(att_id));
+        let mut url = format!(
+            "{}/{}",
+            self.url(&encode_doc_id(doc_id)),
+            urlencoded(att_id)
+        );
         if let Some(ref rev) = opts.rev {
             url = format!("{}?rev={}", url, rev);
         }
@@ -613,7 +632,7 @@ impl Adapter for HttpAdapter {
     async fn remove_attachment(&self, doc_id: &str, att_id: &str, rev: &str) -> Result<DocResult> {
         let url = format!(
             "{}/{}?rev={}",
-            self.url(&urlencoded(doc_id)),
+            self.url(&encode_doc_id(doc_id)),
             urlencoded(att_id),
             rev
         );
@@ -767,4 +786,59 @@ fn urlencoded(s: &str) -> String {
         .remove(b'.')
         .remove(b'~');
     percent_encoding::percent_encode(s.as_bytes(), UNRESERVED).to_string()
+}
+
+/// Encode a document id for use in a CouchDB URL path.
+///
+/// Like PouchDB's `encodeDocId`, the `/` separating the `_design/` or
+/// `_local/` prefix from the rest of the id is kept literal so CouchDB routes
+/// design-doc (and `_local`) sub-resources correctly. Without this, an id like
+/// `_design/foo` would be encoded to `_design%2Ffoo` and mis-routed.
+fn encode_doc_id(id: &str) -> String {
+    if let Some(rest) = id.strip_prefix("_design/") {
+        format!("_design/{}", urlencoded(rest))
+    } else if let Some(rest) = id.strip_prefix("_local/") {
+        format!("_local/{}", urlencoded(rest))
+    } else {
+        urlencoded(id)
+    }
+}
+
+/// JSON-encode a key value and percent-encode it for safe use as a query
+/// parameter (handles `"`, `\`, control chars, `&`, `#`, spaces, unicode).
+fn encode_query_key(value: &str) -> String {
+    let json = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into());
+    urlencoded(&json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{encode_doc_id, encode_query_key, urlencoded};
+
+    #[test]
+    fn design_and_local_ids_keep_prefix_slash() {
+        // The slash after the _design/ or _local/ prefix must stay literal.
+        assert_eq!(encode_doc_id("_design/foo"), "_design/foo");
+        assert_eq!(encode_doc_id("_local/checkpoint"), "_local/checkpoint");
+        // But a slash inside the rest of the id is still encoded.
+        assert_eq!(encode_doc_id("_design/a/b"), "_design/a%2Fb");
+        // Plain ids: slashes and specials encoded as before.
+        assert_eq!(encode_doc_id("a/b"), "a%2Fb");
+        assert_eq!(encode_doc_id("user:alice"), urlencoded("user:alice"));
+    }
+
+    #[test]
+    fn query_keys_are_json_and_url_encoded() {
+        // A plain string becomes a JSON-quoted, percent-encoded value.
+        assert_eq!(encode_query_key("abc"), "%22abc%22");
+        // Special characters that would break a query string are escaped.
+        let encoded = encode_query_key("a&b=c #d");
+        assert!(!encoded.contains('&'));
+        assert!(!encoded.contains('#'));
+        assert!(!encoded.contains(' '));
+        // Unicode is percent-encoded, not spliced raw.
+        let uni = encode_query_key("\u{ffff}");
+        assert!(uni.starts_with("%22") && uni.ends_with("%22"));
+        assert!(uni.contains('%'));
+    }
 }

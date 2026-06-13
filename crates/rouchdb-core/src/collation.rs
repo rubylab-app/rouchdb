@@ -44,13 +44,7 @@ pub fn collate(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-        (Value::Number(a), Value::Number(b)) => {
-            let fa = a.as_f64().unwrap_or(0.0);
-            let fb = b.as_f64().unwrap_or(0.0);
-            // total_cmp gives a well-defined ordering for all f64 values
-            // including NaN (which shouldn't appear in JSON but be safe)
-            fa.total_cmp(&fb)
-        }
+        (Value::Number(a), Value::Number(b)) => compare_numbers(a, b),
         (Value::String(a), Value::String(b)) => a.cmp(b),
         (Value::Array(a), Value::Array(b)) => {
             // Element-by-element, shorter arrays sort first
@@ -84,6 +78,32 @@ pub fn collate(a: &Value, b: &Value) -> Ordering {
         }
         _ => Ordering::Equal, // Should be unreachable due to rank check
     }
+}
+
+/// Compare two JSON numbers without losing precision on large integers.
+///
+/// `serde_json::Number` can hold `u64`, `i64`, or `f64`. Converting straight
+/// to `f64` (as a naive implementation does) collapses integers larger than
+/// 2^53 onto the same float, making distinct values compare `Equal` and
+/// breaking Mango `$eq`/range queries. When both operands are integers we
+/// compare them exactly via `i128`; otherwise we fall back to `f64`.
+fn compare_numbers(a: &serde_json::Number, b: &serde_json::Number) -> Ordering {
+    fn as_i128(n: &serde_json::Number) -> Option<i128> {
+        if let Some(i) = n.as_i64() {
+            Some(i as i128)
+        } else {
+            n.as_u64().map(|u| u as i128)
+        }
+    }
+
+    if let (Some(ia), Some(ib)) = (as_i128(a), as_i128(b)) {
+        return ia.cmp(&ib);
+    }
+    let fa = a.as_f64().unwrap_or(0.0);
+    let fb = b.as_f64().unwrap_or(0.0);
+    // total_cmp gives a well-defined ordering for all f64 values including NaN
+    // (which shouldn't appear in JSON but be safe).
+    fa.total_cmp(&fb)
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +280,25 @@ mod tests {
         assert_eq!(collate(&json!(0), &json!(1)), Ordering::Less);
         assert_eq!(collate(&json!(1), &json!(2)), Ordering::Less);
         assert_eq!(collate(&json!(1.5), &json!(2)), Ordering::Less);
+    }
+
+    #[test]
+    fn large_integer_precision() {
+        // Distinct integers beyond f64's 2^53 exact range must not collapse
+        // to Equal (regression: naive as_f64 comparison loses precision).
+        let a = json!(9_007_199_254_740_992_i64); // 2^53
+        let b = json!(9_007_199_254_740_993_i64); // 2^53 + 1
+        assert_eq!(collate(&a, &b), Ordering::Less);
+        assert_eq!(collate(&b, &a), Ordering::Greater);
+        assert_eq!(collate(&a, &a), Ordering::Equal);
+
+        // u64 above i64::MAX vs a smaller value.
+        let big = json!(u64::MAX);
+        let small = json!(1_i64);
+        assert_eq!(collate(&small, &big), Ordering::Less);
+
+        // Mixed integer / float still orders correctly.
+        assert_eq!(collate(&json!(2_i64), &json!(1.5)), Ordering::Greater);
     }
 
     #[test]

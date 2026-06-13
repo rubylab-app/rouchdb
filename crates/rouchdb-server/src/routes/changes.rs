@@ -34,19 +34,22 @@ fn validate_db(db: &str, state: &AppState) -> Result<(), AppError> {
     Ok(())
 }
 
-fn parse_since(since: Option<String>) -> Seq {
+/// Resolve the `since` query value to a concrete sequence.
+///
+/// CouchDB's `since=now` means "the database's current update_seq", so resolve
+/// it against `info()` rather than fabricating `u64::MAX` (which would overflow
+/// the adapters' `since + 1` arithmetic).
+async fn resolve_since(state: &AppState, since: Option<String>) -> Result<Seq, AppError> {
     match since {
-        None => Seq::from(0u64),
+        None => Ok(Seq::from(0u64)),
         Some(s) => {
             if s == "now" {
-                // "now" means latest — use a very large number; the adapter
-                // will clamp to the actual last_seq.
-                Seq::from(u64::MAX)
+                Ok(state.db.info().await?.update_seq)
             } else if let Ok(n) = s.parse::<u64>() {
-                Seq::from(n)
+                Ok(Seq::from(n))
             } else {
                 // CouchDB string seqs — pass through
-                Seq::Str(s)
+                Ok(Seq::Str(s))
             }
         }
     }
@@ -66,7 +69,7 @@ pub async fn get_changes(
     };
 
     let opts = ChangesOptions {
-        since: parse_since(query.since),
+        since: resolve_since(&state, query.since).await?,
         limit: query.limit,
         descending: query.descending.unwrap_or(false),
         include_docs: query.include_docs.unwrap_or(false),
@@ -116,7 +119,7 @@ pub async fn post_changes(
         .or_else(|| body.get("since").and_then(|v| v.as_str()).map(String::from));
 
     let opts = ChangesOptions {
-        since: parse_since(since),
+        since: resolve_since(&state, since).await?,
         limit: query
             .limit
             .or_else(|| body.get("limit").and_then(|v| v.as_u64())),

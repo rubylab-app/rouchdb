@@ -92,6 +92,23 @@ pub enum ReplicationEvent {
     Error(String),
 }
 
+/// Build a stable fingerprint of the active filter for the replication ID,
+/// so filtered and unfiltered replications use distinct checkpoints.
+fn filter_fingerprint(filter: &Option<ReplicationFilter>) -> String {
+    match filter {
+        None => "nofilter".to_string(),
+        Some(ReplicationFilter::DocIds(ids)) => {
+            let mut sorted = ids.clone();
+            sorted.sort();
+            format!("docids:{}", sorted.join("\u{0}"))
+        }
+        Some(ReplicationFilter::Selector(sel)) => format!("selector:{}", sel),
+        // A custom closure cannot be fingerprinted deterministically; distinct
+        // custom filters between the same pair therefore share a checkpoint.
+        Some(ReplicationFilter::Custom(_)) => "custom".to_string(),
+    }
+}
+
 /// Run a one-shot replication from source to target.
 ///
 /// Implements the CouchDB replication protocol:
@@ -109,7 +126,11 @@ pub async fn replicate(
     let source_info = source.info().await?;
     let target_info = target.info().await?;
 
-    let checkpointer = Checkpointer::new(&source_info.db_name, &target_info.db_name);
+    let checkpointer = Checkpointer::new(
+        &source_info.db_name,
+        &target_info.db_name,
+        &filter_fingerprint(&opts.filter),
+    );
 
     // Step 1: Read checkpoint (or use override)
     let since = if let Some(ref override_since) = opts.since {
@@ -200,12 +221,16 @@ pub async fn replicate(
 
         // Step 5: Write to target with new_edits=false
         let mut docs_to_write: Vec<Document> = Vec::new();
+        let mut batch_failed = false;
         for result in &bulk_get_response.results {
             for doc in &result.docs {
                 if let Some(ref json) = doc.ok {
                     match Document::from_json(json.clone()) {
                         Ok(document) => docs_to_write.push(document),
-                        Err(e) => errors.push(format!("parse error for {}: {}", result.id, e)),
+                        Err(e) => {
+                            errors.push(format!("parse error for {}: {}", result.id, e));
+                            batch_failed = true;
+                        }
                     }
                 }
             }
@@ -217,7 +242,6 @@ pub async fn replicate(
         }
 
         if !docs_to_write.is_empty() {
-            let write_count = docs_to_write.len() as u64;
             let write_results = target
                 .bulk_docs(docs_to_write, BulkDocsOptions::replication())
                 .await?;
@@ -229,10 +253,19 @@ pub async fn replicate(
                         wr.id,
                         wr.reason.as_deref().unwrap_or("unknown")
                     ));
+                    batch_failed = true;
                 }
             }
 
-            total_docs_written += write_count;
+            // Count only docs that were actually persisted.
+            total_docs_written += write_results.iter().filter(|wr| wr.ok).count() as u64;
+        }
+
+        // Do not advance the checkpoint past a batch that had any parse or
+        // write failure; stop so the next run retries from the un-advanced
+        // sequence rather than silently losing those docs.
+        if batch_failed {
+            break;
         }
 
         // Step 6: Save checkpoint (if enabled)
@@ -268,10 +301,27 @@ pub async fn replicate_with_events(
     opts: ReplicationOptions,
     events_tx: mpsc::Sender<ReplicationEvent>,
 ) -> Result<ReplicationResult> {
+    replicate_with_events_inner(source, target, opts, events_tx, false).await
+}
+
+/// Inner driver shared by the one-shot and live paths. `suppress_complete`
+/// lets the live loop withhold the per-run `Complete` so only one terminal
+/// `Complete` is emitted when the whole live replication ends.
+async fn replicate_with_events_inner(
+    source: &dyn Adapter,
+    target: &dyn Adapter,
+    opts: ReplicationOptions,
+    events_tx: mpsc::Sender<ReplicationEvent>,
+    suppress_complete: bool,
+) -> Result<ReplicationResult> {
     let source_info = source.info().await?;
     let target_info = target.info().await?;
 
-    let checkpointer = Checkpointer::new(&source_info.db_name, &target_info.db_name);
+    let checkpointer = Checkpointer::new(
+        &source_info.db_name,
+        &target_info.db_name,
+        &filter_fingerprint(&opts.filter),
+    );
 
     let since = if let Some(ref override_since) = opts.since {
         override_since.clone()
@@ -356,12 +406,16 @@ pub async fn replicate_with_events(
         let bulk_get_response = source.bulk_get(bulk_get_items).await?;
 
         let mut docs_to_write: Vec<Document> = Vec::new();
+        let mut batch_failed = false;
         for result in &bulk_get_response.results {
             for doc in &result.docs {
                 if let Some(ref json) = doc.ok {
                     match Document::from_json(json.clone()) {
                         Ok(document) => docs_to_write.push(document),
-                        Err(e) => errors.push(format!("parse error for {}: {}", result.id, e)),
+                        Err(e) => {
+                            errors.push(format!("parse error for {}: {}", result.id, e));
+                            batch_failed = true;
+                        }
                     }
                 }
             }
@@ -372,7 +426,6 @@ pub async fn replicate_with_events(
         }
 
         if !docs_to_write.is_empty() {
-            let write_count = docs_to_write.len() as u64;
             let write_results = target
                 .bulk_docs(docs_to_write, BulkDocsOptions::replication())
                 .await?;
@@ -384,10 +437,11 @@ pub async fn replicate_with_events(
                         wr.id,
                         wr.reason.as_deref().unwrap_or("unknown")
                     ));
+                    batch_failed = true;
                 }
             }
 
-            total_docs_written += write_count;
+            total_docs_written += write_results.iter().filter(|wr| wr.ok).count() as u64;
         }
 
         // Emit change event
@@ -396,6 +450,11 @@ pub async fn replicate_with_events(
                 docs_read: total_docs_read,
             })
             .await;
+
+        // Do not advance past a batch with parse/write failures.
+        if batch_failed {
+            break;
+        }
 
         current_seq = batch_last_seq;
         if opts.checkpoint {
@@ -417,9 +476,11 @@ pub async fn replicate_with_events(
         last_seq: current_seq,
     };
 
-    let _ = events_tx
-        .send(ReplicationEvent::Complete(result.clone()))
-        .await;
+    if !suppress_complete {
+        let _ = events_tx
+            .send(ReplicationEvent::Complete(result.clone()))
+            .await;
+    }
 
     Ok(result)
 }
@@ -446,8 +507,11 @@ pub fn replicate_live(
 
     tokio::spawn(async move {
         let mut attempt: u32 = 0;
+        // Track the last successful result so a single terminal Complete can
+        // be emitted when the live loop finally exits.
+        let mut last_result: Option<ReplicationResult> = None;
 
-        loop {
+        'live: loop {
             // Clone the filter for each iteration so Selector and Custom
             // filters remain active across the entire live replication.
             let one_shot_opts = ReplicationOptions {
@@ -462,9 +526,15 @@ pub fn replicate_live(
                 checkpoint: opts.checkpoint,
             };
 
-            let result =
-                replicate_with_events(source.as_ref(), target.as_ref(), one_shot_opts, tx.clone())
-                    .await;
+            // Suppress the per-run Complete; the live loop emits one at the end.
+            let result = replicate_with_events_inner(
+                source.as_ref(),
+                target.as_ref(),
+                one_shot_opts,
+                tx.clone(),
+                true,
+            )
+            .await;
 
             match result {
                 Ok(r) => {
@@ -473,6 +543,7 @@ pub fn replicate_live(
                         // No changes — emit Paused and wait
                         let _ = tx.send(ReplicationEvent::Paused).await;
                     }
+                    last_result = Some(r);
                 }
                 Err(e) => {
                     let _ = tx.send(ReplicationEvent::Error(e.to_string())).await;
@@ -486,11 +557,11 @@ pub fn replicate_live(
                             Duration::from_secs(secs)
                         };
                         tokio::select! {
-                            _ = tokio::time::sleep(delay) => continue,
-                            _ = cancel_clone.cancelled() => break,
+                            _ = tokio::time::sleep(delay) => continue 'live,
+                            _ = cancel_clone.cancelled() => break 'live,
                         }
                     } else {
-                        break;
+                        break 'live;
                     }
                 }
             }
@@ -498,8 +569,13 @@ pub fn replicate_live(
             // Wait for poll_interval or cancellation
             tokio::select! {
                 _ = tokio::time::sleep(poll_interval) => {},
-                _ = cancel_clone.cancelled() => break,
+                _ = cancel_clone.cancelled() => break 'live,
             }
+        }
+
+        // Emit a single terminal Complete on exit.
+        if let Some(result) = last_result {
+            let _ = tx.send(ReplicationEvent::Complete(result)).await;
         }
     });
 
@@ -559,6 +635,44 @@ mod tests {
         assert!(result.ok);
         assert_eq!(result.docs_read, 0);
         assert_eq!(result.docs_written, 0);
+    }
+
+    #[tokio::test]
+    async fn replicate_carries_attachments() {
+        let source = MemoryAdapter::new("source");
+        let target = MemoryAdapter::new("target");
+
+        // Create a doc on the source and attach some bytes.
+        let r = source
+            .bulk_docs(
+                vec![Document {
+                    id: "doc1".into(),
+                    rev: None,
+                    deleted: false,
+                    data: serde_json::json!({"v": 1}),
+                    attachments: HashMap::new(),
+                }],
+                BulkDocsOptions::new(),
+            )
+            .await
+            .unwrap();
+        let rev1 = r[0].rev.clone().unwrap();
+        source
+            .put_attachment("doc1", "hi.txt", &rev1, b"hi!".to_vec(), "text/plain")
+            .await
+            .unwrap();
+
+        let result = replicate(&source, &target, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert!(result.ok);
+
+        // The attachment bytes must be retrievable on the target.
+        let bytes = target
+            .get_attachment("doc1", "hi.txt", GetAttachmentOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"hi!");
     }
 
     #[tokio::test]
