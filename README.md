@@ -249,7 +249,7 @@ RouchDB is a workspace of 11 crates:
 
 ## Documentation
 
-- [**Book**](https://rubylabapp.github.io/rouchdb/) — guides, reference, and architecture docs
+- [**Book**](https://rubylab-app.github.io/rouchdb/) — guides, reference, and architecture docs
 - [**API Docs**](https://docs.rs/rouchdb) — generated Rust docs
 
 ## Development
