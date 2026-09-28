@@ -1,0 +1,56 @@
+name: Benchmarks
+
+# Manual only: shared runners are noisy (expect +-10-20%), so use the results
+# for trends and before/after comparisons, not as a gate. CI only checks that
+# the benches build (`bench` job in ci.yml).
+on:
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: "Criterion filter (e.g. all_docs, find/redb, merge_tree); empty runs everything"
+        required: false
+        default: ""
+      docs:
+        description: "Documents per dataset (ROUCHDB_BENCH_N)"
+        required: false
+        default: "10000"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: Run benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run benchmarks
+        env:
+          FILTER: ${{ inputs.filter }}
+          ROUCHDB_BENCH_N: ${{ inputs.docs }}
+        run: |
+          args=(--noplot)
+          if [ -n "$FILTER" ]; then
+            args+=("$FILTER")
+          fi
+          cargo bench -p rouchdb-bench --locked -- "${args[@]}" | tee bench-output.txt
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-${{ github.sha }}
+          path: |
+            bench-output.txt
+            target/criterion
+          if-no-files-found: ignore

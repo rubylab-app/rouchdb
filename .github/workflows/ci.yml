@@ -6,9 +6,19 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
+# The blocking jobs use the toolchain pinned in rust-toolchain.toml, so a new
+# stable release cannot break CI with new lints. `rustup toolchain install`
+# without arguments installs exactly that toolchain and its components.
 jobs:
   check:
     name: Check & Lint
@@ -16,17 +26,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      - name: Install pinned toolchain
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Format check
         run: cargo fmt --all -- --check
 
+      - name: Docs use the current version
+        run: |
+          minor=$(sed -n 's/^version = "\([0-9]*\.[0-9]*\)\..*"/\1/p' Cargo.toml)
+          stale=$(grep -rnE 'rouchdb[a-z-]* = (\{ ?version = )?"[0-9]+\.[0-9]+' README.md docs/book/src \
+            | grep -vF "\"$minor\"" || true)
+          if [ -n "$stale" ]; then
+            echo "::error::README/book snippets must use rouchdb version $minor:"
+            echo "$stale"
+            exit 1
+          fi
+
+      # --all-targets also type-checks tests, examples and benches.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check TLS feature combinations
+        run: |
+          cargo check -p rouchdb --locked --no-default-features
+          cargo check -p rouchdb --locked --no-default-features --features native-tls
+          cargo check -p rouchdb --locked --no-default-features --features rustls-tls-native-roots
 
   test:
     name: Tests
@@ -34,9 +61,106 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned toolchain
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Run unit tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
+
+  couchdb:
+    name: CouchDB integration tests
+    runs-on: ubuntu-latest
+    services:
+      couchdb:
+        image: couchdb:3
+        ports:
+          - 15984:5984
+        env:
+          COUCHDB_USER: admin
+          COUCHDB_PASSWORD: password
+        options: >-
+          --health-cmd "curl -fs http://localhost:5984/_up"
+          --health-interval 3s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      COUCHDB_URL: http://admin:password@localhost:15984
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build tests
+        run: cargo test --workspace --locked --no-run
+
+      - name: Wait for CouchDB
+        run: curl -fsS --retry 30 --retry-delay 2 --retry-all-errors "$COUCHDB_URL/_up"
+
+      # The #[ignore]d tests are the ones that need a real CouchDB. The script
+      # skips tests marked #[ignore = "blocked on Fxx"] (known library bugs).
+      - name: Run ignored (CouchDB) tests
+        run: bash scripts/test-couchdb.sh --locked
+
+  bench:
+    name: Benchmarks (build only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Running them is manual: see the Benchmarks workflow (bench.yml).
+      - name: Build benchmarks
+        run: cargo bench --workspace --locked --no-run
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    env:
+      # Overrides rust-toolchain.toml. Keep in sync with `rust-version` in
+      # the root Cargo.toml.
+      RUSTUP_TOOLCHAIN: "1.88.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check on the minimum supported Rust version
+        run: cargo check --workspace --all-targets --all-features --locked
+
+  latest:
+    name: Clippy on ${{ matrix.toolchain }} (early warning)
+    runs-on: ubuntu-latest
+    # Non-blocking: reports lints from the next toolchains before the pin in
+    # rust-toolchain.toml is bumped.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, beta]
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
