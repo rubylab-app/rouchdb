@@ -20,6 +20,12 @@ pub enum ReplicationFilter {
 
     /// Replicate documents passing a custom predicate.
     /// Receives the ChangeEvent (id, deleted, seq).
+    ///
+    /// A closure cannot be fingerprinted, so two different predicates would
+    /// share one checkpoint and the second would silently skip everything
+    /// the first had already scanned. Checkpoints are therefore neither read
+    /// nor written for custom filters: each run scans from `since` (or the
+    /// start); documents the target already has are not transferred again.
     Custom(Arc<dyn Fn(&ChangeEvent) -> bool + Send + Sync>),
 }
 
@@ -105,8 +111,7 @@ fn filter_fingerprint(filter: &Option<ReplicationFilter>) -> String {
             format!("docids:{}", sorted.join("\u{0}"))
         }
         Some(ReplicationFilter::Selector(sel)) => format!("selector:{}", sel),
-        // A custom closure cannot be fingerprinted deterministically; distinct
-        // custom filters between the same pair therefore share a checkpoint.
+        // Never used for a checkpoint: see `ReplicationFilter::Custom`.
         Some(ReplicationFilter::Custom(_)) => "custom".to_string(),
     }
 }
@@ -243,9 +248,11 @@ async fn run_replication(
     since: Option<Seq>,
     events: Option<&mpsc::Sender<ReplicationEvent>>,
 ) -> Result<RunOutcome> {
+    let use_checkpoint =
+        opts.checkpoint && !matches!(opts.filter, Some(ReplicationFilter::Custom(_)));
     let since = if let Some(override_since) = since {
         override_since
-    } else if opts.checkpoint {
+    } else if use_checkpoint {
         checkpointer.read_checkpoint(source, target).await?
     } else {
         Seq::default()
@@ -419,7 +426,7 @@ async fn run_replication(
 
         // Step 6: Save checkpoint (if enabled)
         current_seq = batch_last_seq;
-        if opts.checkpoint {
+        if use_checkpoint {
             let _ = checkpointer
                 .write_checkpoint(source, target, current_seq.clone())
                 .await;
@@ -1019,6 +1026,45 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn custom_filters_do_not_share_a_checkpoint() {
+        let source = MemoryAdapter::new("source");
+        let target = MemoryAdapter::new("target");
+        put_doc(&source, "public:1", serde_json::json!({})).await;
+        put_doc(&source, "private:1", serde_json::json!({})).await;
+        let prefix_filter = |prefix: &'static str| {
+            Some(ReplicationFilter::Custom(Arc::new(
+                move |c: &ChangeEvent| c.id.starts_with(prefix),
+            )))
+        };
+
+        let r1 = replicate(
+            &source,
+            &target,
+            ReplicationOptions {
+                filter: prefix_filter("public:"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(r1.docs_written, 1);
+
+        // A different closure must not resume from the first one's checkpoint.
+        let r2 = replicate(
+            &source,
+            &target,
+            ReplicationOptions {
+                filter: prefix_filter("private:"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(r2.docs_written, 1);
+        assert!(target.get("private:1", GetOptions::default()).await.is_ok());
     }
 
     #[tokio::test]
