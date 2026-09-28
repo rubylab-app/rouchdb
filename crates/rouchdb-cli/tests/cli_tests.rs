@@ -2895,9 +2895,45 @@ async fn dump_to_closed_pipe_exits_cleanly() {
     let mut head = [0u8; 100];
     stdout.read_exact(&mut head).unwrap();
     drop(stdout);
+    assert!(
+        head.starts_with(br#"[{"_id":"doc00000","#),
+        "{}",
+        String::from_utf8_lossy(&head)
+    );
 
+    // A reader that goes away is not an error: nothing is reported.
     let output = child.wait_with_output().unwrap();
     let stderr = stderr_str(&output);
-    assert!(!stderr.contains("panicked"), "stderr: {}", stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr);
+    assert_eq!(stderr, "");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn output_write_errors_other_than_broken_pipe_fail() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    // ~4000 docs of ~280 bytes: far more than a socket buffer holds.
+    let (_dir, db_path) = setup_bulk_db(4000, 256).await;
+    // A non-blocking stdout whose reader is still there but never reads:
+    // once the buffer is full, writing fails with WouldBlock. Unlike a
+    // closed pipe, that is an error the user has to hear about, since the
+    // output is incomplete.
+    let (reader, writer) = UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rouchdb"))
+        .args(["all-docs", path_str(&db_path), "--include-docs"])
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .output()
+        .unwrap();
+    drop(reader);
+
+    let stderr = stderr_str(&output);
+    assert_eq!(output.status.code(), Some(1), "stderr: {}", stderr);
+    assert!(
+        stderr.starts_with("Error writing output: ") && stderr.lines().count() == 1,
+        "stderr: {}",
+        stderr
+    );
 }
