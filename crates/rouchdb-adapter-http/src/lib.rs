@@ -1054,12 +1054,23 @@ mod tests {
     /// Serve one canned raw HTTP `response` to every connection; returns the
     /// server's base URL.
     pub(crate) async fn stub_server(response: String) -> String {
+        recording_stub_server(response).await.0
+    }
+
+    /// Like [`stub_server`], also recording each request line
+    /// (`"PUT /path HTTP/1.1"`).
+    pub(crate) async fn recording_stub_server(
+        response: String,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let response = response.clone();
+                let recorded = recorded.clone();
                 tokio::spawn(async move {
                     // Read the request head and body before answering.
                     let mut req = Vec::new();
@@ -1083,6 +1094,8 @@ mod tests {
                                 })
                                 .unwrap_or(0);
                             if req.len() >= end + 4 + len {
+                                let line = text.lines().next().unwrap_or_default();
+                                recorded.lock().unwrap().push(line.to_string());
                                 break;
                             }
                         }
@@ -1092,7 +1105,7 @@ mod tests {
                 });
             }
         });
-        format!("http://{}", addr)
+        (format!("http://{}", addr), requests)
     }
 
     /// A raw JSON response with the given status line.

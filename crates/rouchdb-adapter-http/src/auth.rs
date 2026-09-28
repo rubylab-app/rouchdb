@@ -97,8 +97,9 @@ impl AuthClient {
 
     /// Create a new user in the `_users` database.
     pub async fn sign_up(&self, username: &str, password: &str, roles: Vec<String>) -> Result<()> {
+        let user_id = format!("org.couchdb.user:{}", username);
         let user_doc = serde_json::json!({
-            "_id": format!("org.couchdb.user:{}", username),
+            "_id": user_id,
             "name": username,
             "password": password,
             "roles": roles,
@@ -107,10 +108,7 @@ impl AuthClient {
 
         let resp = self
             .client
-            .put(format!(
-                "{}/_users/org.couchdb.user:{}",
-                self.server_url, username
-            ))
+            .put(user_doc_url(&self.server_url, &user_id))
             .json(&user_doc)
             .send()
             .await
@@ -118,5 +116,35 @@ impl AuthClient {
         crate::check_response(resp).await?;
 
         Ok(())
+    }
+}
+
+/// URL of a `_users` document. The id is percent-encoded so a name with `/`,
+/// `#`, `?` or spaces cannot address another resource.
+fn user_doc_url(server_url: &str, user_id: &str) -> String {
+    format!("{}/_users/{}", server_url, crate::urlencoded(user_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuthClient;
+    use crate::tests::{json_response, recording_stub_server};
+
+    #[tokio::test]
+    async fn sign_up_escapes_the_user_id() {
+        let (url, requests) = recording_stub_server(json_response(
+            "201 Created",
+            r#"{"ok":true,"id":"org.couchdb.user:x","rev":"1-a"}"#,
+        ))
+        .await;
+        let auth = AuthClient::new(&url);
+        auth.sign_up("bob/evil#x?y z", "pw", vec![]).await.unwrap();
+
+        // One request, for the whole id, not an attachment of
+        // `org.couchdb.user:bob` with the rest cut off as a fragment.
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec!["PUT /_users/org.couchdb.user%3Abob%2Fevil%23x%3Fy%20z HTTP/1.1"]
+        );
     }
 }
