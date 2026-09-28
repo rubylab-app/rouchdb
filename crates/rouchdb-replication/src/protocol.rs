@@ -279,6 +279,7 @@ async fn run_replication(
     // Last sequence stored in (or read from) the checkpoint.
     let mut checkpointed_seq = current_seq.clone();
     let mut failed = false;
+    let mut checkpoint_failed = false;
 
     emit(events, ReplicationEvent::Active).await;
 
@@ -443,9 +444,15 @@ async fn run_replication(
         // Step 6: Save checkpoint (if enabled)
         current_seq = batch_last_seq;
         if use_checkpoint {
-            let _ = checkpointer
+            if let Err(e) = checkpointer
                 .write_checkpoint(source, target, current_seq.clone())
-                .await;
+                .await
+            {
+                errors.push(format!("checkpoint write failed: {}", e));
+                failed = true;
+                checkpoint_failed = true;
+                break;
+            }
             checkpointed_seq = current_seq.clone();
         }
 
@@ -459,10 +466,15 @@ async fn run_replication(
     // target) are progress too: save it once so the next run does not
     // rescan them. After a failure `current_seq` still stops before the
     // failed batch, so this never skips anything.
-    if use_checkpoint && current_seq != checkpointed_seq {
-        let _ = checkpointer
+    if use_checkpoint
+        && !checkpoint_failed
+        && current_seq != checkpointed_seq
+        && let Err(e) = checkpointer
             .write_checkpoint(source, target, current_seq.clone())
-            .await;
+            .await
+    {
+        errors.push(format!("checkpoint write failed: {}", e));
+        failed = true;
     }
 
     let failure = failed.then(|| errors.join("; "));
@@ -609,6 +621,7 @@ impl Drop for ReplicationHandle {
 mod tests {
     use super::*;
     use rouchdb_adapter_memory::MemoryAdapter;
+    use rouchdb_core::error::RouchError;
 
     async fn put_doc(adapter: &dyn Adapter, id: &str, data: serde_json::Value) {
         let doc = Document {
@@ -1341,6 +1354,8 @@ mod tests {
         supersede_on_bulk_get: Option<String>,
         /// `bulk_docs` rejects this doc id with this error kind.
         write_error: Option<(String, String)>,
+        /// `put_local` fails with this error.
+        put_local_error: Option<fn() -> RouchError>,
     }
 
     struct Faulty {
@@ -1458,6 +1473,9 @@ mod tests {
             self.inner.get_local(id).await
         }
         async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
+            if let Some(error) = self.faults.lock().unwrap().put_local_error {
+                return Err(error());
+            }
             self.inner.put_local(id, doc).await
         }
         async fn remove_local(&self, id: &str) -> Result<()> {
@@ -1763,5 +1781,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(since, Seq::Num(5));
+    }
+
+    #[tokio::test]
+    async fn read_only_source_still_checkpoints() {
+        let inner = MemoryAdapter::new("source");
+        put_doc(&inner, "a", serde_json::json!({})).await;
+        put_doc(&inner, "b", serde_json::json!({})).await;
+        let source = Faulty::new(
+            inner,
+            Faults {
+                put_local_error: Some(|| RouchError::Forbidden("read only".into())),
+                ..Default::default()
+            },
+        );
+        let target = MemoryAdapter::new("target");
+
+        let r1 = replicate(&source, &target, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert!(r1.ok, "{:?}", r1.errors);
+        assert_eq!(r1.docs_read, 2);
+
+        // The target's checkpoint alone lets the next pull resume.
+        put_doc(&source.inner, "c", serde_json::json!({})).await;
+        let r2 = replicate(&source, &target, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert!(r2.ok, "{:?}", r2.errors);
+        assert_eq!(r2.docs_read, 1);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_write_errors_are_reported() {
+        let source = MemoryAdapter::new("source");
+        put_doc(&source, "a", serde_json::json!({})).await;
+        let target = Faulty::new(
+            MemoryAdapter::new("target"),
+            Faults {
+                put_local_error: Some(|| RouchError::DatabaseError("disk full".into())),
+                ..Default::default()
+            },
+        );
+
+        let result = replicate(&source, &target, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(result.errors[0].contains("disk full"));
     }
 }
