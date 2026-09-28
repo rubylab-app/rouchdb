@@ -1260,6 +1260,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recreate_deleted_doc_with_same_content() {
+        let db = new_db().await;
+
+        let doc = Document {
+            id: "doc1".into(),
+            rev: None,
+            deleted: false,
+            data: serde_json::json!({"name": "Alice"}),
+            attachments: HashMap::new(),
+        };
+        let results = db
+            .bulk_docs(vec![doc], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        let rev1: Revision = results[0].rev.clone().unwrap().parse().unwrap();
+
+        let del = Document {
+            id: "doc1".into(),
+            rev: Some(rev1),
+            deleted: true,
+            data: serde_json::json!({}),
+            attachments: HashMap::new(),
+        };
+        let results = db
+            .bulk_docs(vec![del], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        assert!(results[0].ok);
+
+        // Re-create with the identical content and no rev. The deterministic
+        // rev hash would reproduce rev 1 exactly, so the new edit must extend
+        // the tombstone instead of starting a fresh pos-1 branch.
+        let recreated = Document {
+            id: "doc1".into(),
+            rev: None,
+            deleted: false,
+            data: serde_json::json!({"name": "Alice"}),
+            attachments: HashMap::new(),
+        };
+        let results = db
+            .bulk_docs(vec![recreated], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        assert!(results[0].ok);
+        let rev3 = results[0].rev.clone().unwrap();
+        assert!(rev3.starts_with("3-"), "expected pos 3, got {rev3}");
+
+        let fetched = db.get("doc1", GetOptions::default()).await.unwrap();
+        assert_eq!(fetched.data["name"], "Alice");
+
+        let info = db.info().await.unwrap();
+        assert_eq!(info.doc_count, 1);
+    }
+
+    #[tokio::test]
     async fn all_docs() {
         let db = new_db().await;
 
