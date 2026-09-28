@@ -133,6 +133,15 @@ fn selector_view(doc: &Document) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
+/// Whether `new` is strictly later than `old`. Opaque CouchDB sequences are
+/// only comparable by their numeric prefix.
+fn seq_after(new: &Seq, old: &Seq) -> bool {
+    match (new, old) {
+        (Seq::Num(n), Seq::Num(o)) => n > o,
+        _ => new != old && new.as_num() >= old.as_num(),
+    }
+}
+
 /// Whether `rev` is still a leaf of document `id` on `adapter`.
 async fn is_leaf(adapter: &dyn Adapter, id: &str, rev: &str) -> Result<bool> {
     let changes = adapter
@@ -267,6 +276,8 @@ async fn run_replication(
     let mut total_docs_written = 0u64;
     let mut errors = Vec::new();
     let mut current_seq = since;
+    // Last sequence stored in (or read from) the checkpoint.
+    let mut checkpointed_seq = current_seq.clone();
     let mut failed = false;
 
     emit(events, ReplicationEvent::Active).await;
@@ -286,7 +297,12 @@ async fn run_replication(
             .await?;
 
         if changes.results.is_empty() {
-            break; // No more changes
+            // No more changes, though the feed may have moved past changes
+            // excluded by a doc_ids filter.
+            if seq_after(&changes.last_seq, &current_seq) {
+                current_seq = changes.last_seq;
+            }
+            break;
         }
 
         let batch_last_seq = changes.last_seq;
@@ -430,12 +446,23 @@ async fn run_replication(
             let _ = checkpointer
                 .write_checkpoint(source, target, current_seq.clone())
                 .await;
+            checkpointed_seq = current_seq.clone();
         }
 
         // Check if we got fewer results than batch_size (last batch)
         if (changes.results.len() as u64) < opts.batch_size {
             break;
         }
+    }
+
+    // Batches that needed no writes (filtered out, or already on the
+    // target) are progress too: save it once so the next run does not
+    // rescan them. After a failure `current_seq` still stops before the
+    // failed batch, so this never skips anything.
+    if use_checkpoint && current_seq != checkpointed_seq {
+        let _ = checkpointer
+            .write_checkpoint(source, target, current_seq.clone())
+            .await;
     }
 
     let failure = failed.then(|| errors.join("; "));
@@ -1683,5 +1710,58 @@ mod tests {
         assert!(wait_for(&mut rx, |e| matches!(e, ReplicationEvent::Paused)).await);
         handle.cancel();
         assert_eq!(target.info().await.unwrap().doc_count, 3);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_saved_after_already_synced_batches() {
+        let a = MemoryAdapter::new("a");
+        let b = MemoryAdapter::new("b");
+        for i in 0..10 {
+            put_doc(&a, &format!("d{i}"), serde_json::json!({})).await;
+        }
+        replicate(&a, &b, ReplicationOptions::default())
+            .await
+            .unwrap();
+        let opts = || ReplicationOptions {
+            batch_size: 3,
+            ..Default::default()
+        };
+
+        // B's feed only holds docs A already has: nothing is written...
+        let r1 = replicate(&b, &a, opts()).await.unwrap();
+        assert_eq!((r1.docs_read, r1.docs_written), (10, 0));
+        // ...but the progress is kept, so the next run does not rescan.
+        let r2 = replicate(&b, &a, opts()).await.unwrap();
+        assert_eq!(r2.docs_read, 0);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_saved_when_filter_matches_nothing() {
+        let source = MemoryAdapter::new("source");
+        let target = MemoryAdapter::new("target");
+        for i in 0..5 {
+            put_doc(&source, &format!("d{i}"), serde_json::json!({})).await;
+        }
+        let filter = Some(ReplicationFilter::DocIds(vec!["missing".into()]));
+
+        let result = replicate(
+            &source,
+            &target,
+            ReplicationOptions {
+                filter: filter.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(result.ok);
+        assert_eq!(result.last_seq, Seq::Num(5));
+
+        let checkpointer = new_checkpointer(&source, &target, &filter).await.unwrap();
+        let since = checkpointer
+            .read_checkpoint(&source, &target)
+            .await
+            .unwrap();
+        assert_eq!(since, Seq::Num(5));
     }
 }
