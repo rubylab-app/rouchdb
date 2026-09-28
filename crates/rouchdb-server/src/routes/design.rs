@@ -1,9 +1,10 @@
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use serde::Deserialize;
 
+use super::document::resolve_rev;
 use crate::error::AppError;
 use crate::state::AppState;
 
@@ -36,19 +37,24 @@ pub async fn get_design(
 pub async fn put_design(
     State(state): State<AppState>,
     Path((db, ddoc)): Path<(String, String)>,
+    Query(query): Query<DesignDeleteQuery>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     validate_db(&db, &state)?;
-    let body = serde_json::Value::Object(super::json_object_body(&body)?);
+    let mut obj = super::json_object_body(&body)?;
 
-    // Parse the body as a design document, injecting _id
-    let mut doc_json = body;
-    if let Some(obj) = doc_json.as_object_mut() {
-        obj.insert(
-            "_id".to_string(),
-            serde_json::Value::String(format!("_design/{ddoc}")),
-        );
+    // Parse the body as a design document, injecting _id and the revision
+    // from `?rev`, `_rev` or `If-Match`.
+    let body_rev = obj.get("_rev").and_then(|v| v.as_str()).map(String::from);
+    if let Some(rev) = resolve_rev(query.rev, body_rev, &headers)? {
+        obj.insert("_rev".to_string(), serde_json::Value::String(rev));
     }
+    obj.insert(
+        "_id".to_string(),
+        serde_json::Value::String(format!("_design/{ddoc}")),
+    );
+    let doc_json = serde_json::Value::Object(obj);
 
     let design = rouchdb::DesignDocument::from_json(doc_json).map_err(|_| {
         AppError(rouchdb_core::error::RouchError::BadRequest(
@@ -73,14 +79,13 @@ pub async fn delete_design(
     State(state): State<AppState>,
     Path((db, ddoc)): Path<(String, String)>,
     Query(query): Query<DesignDeleteQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
     validate_db(&db, &state)?;
 
-    let rev = query.rev.ok_or_else(|| {
-        AppError(rouchdb_core::error::RouchError::BadRequest(
-            "Missing rev parameter".to_string(),
-        ))
-    })?;
+    // Without any revision CouchDB reports a conflict.
+    let rev = resolve_rev(query.rev, None, &headers)?
+        .ok_or(AppError(rouchdb_core::error::RouchError::Conflict))?;
 
     let result = state.db.delete_design(&ddoc, &rev).await?;
     Ok(Json(serde_json::json!({
