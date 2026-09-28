@@ -289,30 +289,58 @@ impl Database {
     ///
     /// If `opts.selector` is set, changes are fetched with `include_docs: true`
     /// internally and filtered by the Mango selector. Only matching changes are
-    /// returned.
+    /// returned; `limit` counts matching changes, and when it is reached
+    /// `last_seq` is the sequence of the last change returned. An invalid
+    /// selector returns `BadRequest`.
     pub async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
-        if let Some(ref selector) = opts.selector {
-            let selector = selector.clone();
-            let user_wants_docs = opts.include_docs;
-            let mut fetch_opts = opts;
-            fetch_opts.include_docs = true;
-            fetch_opts.selector = None; // Don't pass to adapter
-            let mut response = self.adapter.changes(fetch_opts).await?;
-            response.results.retain(|event| {
-                event
-                    .doc
-                    .as_ref()
-                    .is_some_and(|d| matches_selector(d, &selector))
-            });
-            if !user_wants_docs {
-                for event in &mut response.results {
-                    event.doc = None;
+        let Some(ref selector) = opts.selector else {
+            return self.adapter.changes(opts).await;
+        };
+        let selector = CompiledSelector::new(selector)?;
+        let user_wants_docs = opts.include_docs;
+        let limit = opts.limit;
+        let since = opts.since.clone();
+        let mut fetch_opts = ChangesOptions {
+            include_docs: true,
+            selector: None, // Don't pass to adapter
+            ..opts
+        };
+        // The limit applies after filtering, so read in batches until it is
+        // reached (descending feeds cannot be resumed, so read them whole).
+        fetch_opts.limit = match limit {
+            Some(l) if !fetch_opts.descending => Some(l.max(SELECTOR_CHANGES_BATCH)),
+            _ => None,
+        };
+
+        let mut results = Vec::new();
+        let last_seq = loop {
+            let response = self.adapter.changes(fetch_opts.clone()).await?;
+            let fetched = response.results.len() as u64;
+            for event in response.results {
+                if limit.is_some_and(|l| results.len() as u64 >= l) {
+                    break;
+                }
+                if event.doc.as_ref().is_some_and(|d| selector.matches(d)) {
+                    results.push(event);
                 }
             }
-            Ok(response)
-        } else {
-            self.adapter.changes(opts).await
+            if limit.is_some_and(|l| results.len() as u64 >= l) {
+                break results
+                    .last()
+                    .map_or(since, |event: &ChangeEvent| event.seq.clone());
+            }
+            match fetch_opts.limit {
+                Some(batch) if fetched >= batch => fetch_opts.since = response.last_seq,
+                _ => break response.last_seq,
+            }
+        };
+
+        if !user_wants_docs {
+            for event in &mut results {
+                event.doc = None;
+            }
         }
+        Ok(ChangesResponse { results, last_seq })
     }
 
     /// Start a live (continuous) changes feed.
@@ -932,16 +960,35 @@ fn regex_escape(s: &str) -> String {
 
 impl Partition<'_> {
     /// Query all documents in this partition.
+    ///
+    /// Key ranges are clamped to the partition, and `key`/`keys` outside it
+    /// return no rows.
     pub async fn all_docs(&self, mut opts: AllDocsOptions) -> Result<AllDocsResponse> {
         let prefix = format!("{}:", self.name);
-        let end = format!("{}:\u{ffff}", self.name);
-        if opts.start_key.is_none() {
-            opts.start_key = Some(prefix);
+        // Every id of the partition sorts between these (byte order).
+        let first = prefix.clone();
+        let last = format!("{}:{}", self.name, char::MAX);
+
+        if let Some(ref mut keys) = opts.keys {
+            keys.retain(|k| k.starts_with(&prefix));
         }
-        if opts.end_key.is_none() {
-            opts.end_key = Some(end);
+        if opts.key.as_ref().is_some_and(|k| !k.starts_with(&prefix)) {
+            opts.key = None;
+            opts.keys = Some(Vec::new());
         }
-        self.db.all_docs(opts).await
+
+        // The start key is the upper bound when descending.
+        let (low, high) = if opts.descending {
+            (&mut opts.end_key, &mut opts.start_key)
+        } else {
+            (&mut opts.start_key, &mut opts.end_key)
+        };
+        *low = Some(low.take().map_or(first.clone(), |k| k.max(first)));
+        *high = Some(high.take().map_or(last.clone(), |k| k.min(last)));
+
+        let mut response = self.db.all_docs(opts).await?;
+        response.rows.retain(|row| row.id.starts_with(&prefix));
+        Ok(response)
     }
 
     /// Run a Mango find query scoped to this partition.
@@ -976,6 +1023,9 @@ impl Partition<'_> {
         self.db.put(&full_id, data).await
     }
 }
+
+/// Batch size for reading a changes feed filtered by a selector.
+const SELECTOR_CHANGES_BATCH: u64 = 500;
 
 /// Fields of a design document that `DesignDocument` models.
 const MODELED_DESIGN_FIELDS: [&str; 9] = [
@@ -1899,5 +1949,114 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(all.docs.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn changes_with_selector_applies_limit_after_filtering() {
+        // F58: limit counts matching changes, and last_seq is the seq of the
+        // last one returned.
+        let db = Database::memory("test");
+        for i in 0..10 {
+            db.put(&format!("b{i}"), serde_json::json!({"type": "b"}))
+                .await
+                .unwrap();
+        }
+        for i in 0..10 {
+            db.put(&format!("a{i}"), serde_json::json!({"type": "a"}))
+                .await
+                .unwrap();
+        }
+        let changes = db
+            .changes(ChangesOptions {
+                selector: Some(serde_json::json!({"type": "a"})),
+                limit: Some(5),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let ids: Vec<_> = changes.results.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["a0", "a1", "a2", "a3", "a4"]);
+        assert_eq!(changes.last_seq, Seq::Num(15));
+
+        // Continuing from last_seq returns the rest.
+        let rest = db
+            .changes(ChangesOptions {
+                since: changes.last_seq,
+                selector: Some(serde_json::json!({"type": "a"})),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rest.results.len(), 5);
+        assert_eq!(rest.last_seq, Seq::Num(20));
+
+        // Invalid selectors are rejected.
+        assert!(
+            db.changes(ChangesOptions {
+                selector: Some(serde_json::json!({"type": {"$regex": "["}})),
+                ..Default::default()
+            })
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn partition_all_docs_is_scoped_to_the_partition() {
+        // F60: descending, key/keys and astral ids stay inside the partition.
+        let db = Database::memory("test");
+        for id in [
+            "orders:1",
+            "users:1",
+            "users:2",
+            "users:\u{1F600}",
+            "usersx:1",
+        ] {
+            db.put(id, serde_json::json!({})).await.unwrap();
+        }
+        let users = db.partition("users");
+        let ids = |r: AllDocsResponse| r.rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+
+        let all = ids(users.all_docs(AllDocsOptions::new()).await.unwrap());
+        assert_eq!(all, ["users:1", "users:2", "users:\u{1F600}"]);
+
+        let desc = ids(users
+            .all_docs(AllDocsOptions {
+                descending: true,
+                ..AllDocsOptions::new()
+            })
+            .await
+            .unwrap());
+        assert_eq!(desc, ["users:\u{1F600}", "users:2", "users:1"]);
+
+        let keyed = ids(users
+            .all_docs(AllDocsOptions {
+                keys: Some(vec!["orders:1".into(), "users:2".into()]),
+                ..AllDocsOptions::new()
+            })
+            .await
+            .unwrap());
+        assert_eq!(keyed, ["users:2"]);
+
+        let foreign = ids(users
+            .all_docs(AllDocsOptions {
+                key: Some("orders:1".into()),
+                ..AllDocsOptions::new()
+            })
+            .await
+            .unwrap());
+        assert!(foreign.is_empty());
+
+        // A range reaching outside the partition is clamped to it.
+        let clamped = ids(users
+            .all_docs(AllDocsOptions {
+                start_key: Some("a".into()),
+                end_key: Some("users:1".into()),
+                ..AllDocsOptions::new()
+            })
+            .await
+            .unwrap());
+        assert_eq!(clamped, ["users:1"]);
     }
 }
