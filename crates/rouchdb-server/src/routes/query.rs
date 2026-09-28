@@ -1,9 +1,12 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use base64::Engine;
 use serde::Deserialize;
 
 use rouchdb::{FindOptions, IndexDefinition};
+use rouchdb_core::error::RouchError;
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -17,18 +20,67 @@ fn validate_db(db: &str, state: &AppState) -> Result<(), AppError> {
     Ok(())
 }
 
+/// CouchDB's `_find` limit when the request does not set one.
+const DEFAULT_FIND_LIMIT: u64 = 25;
+
+/// Bookmarks are opaque to clients; ours encode how many results of the
+/// (deterministically ordered) query were already returned.
+fn encode_bookmark(offset: u64) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{{\"skip\":{offset}}}"))
+}
+
+fn decode_bookmark(bookmark: &serde_json::Value) -> Option<u64> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(bookmark.as_str()?)
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value.get("skip")?.as_u64()
+}
+
 /// POST /{db}/_find — run a Mango query.
 pub async fn find(
     State(state): State<AppState>,
     Path(db): Path<String>,
-    Json(opts): Json<FindOptions>,
-) -> Result<Json<serde_json::Value>, AppError> {
+    Json(mut body): Json<serde_json::Value>,
+) -> Result<Response, AppError> {
     validate_db(&db, &state)?;
+
+    let offset = match body.as_object_mut().and_then(|o| o.remove("bookmark")) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(bookmark) => match decode_bookmark(&bookmark) {
+            Some(offset) => Some(offset),
+            None => {
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_bookmark",
+                        "reason": format!("Invalid bookmark value: {bookmark}"),
+                    })),
+                )
+                    .into_response());
+            }
+        },
+    };
+    let mut opts: FindOptions = serde_json::from_value(body)
+        .map_err(|e| AppError(RouchError::BadRequest(format!("invalid query: {e}"))))?;
+
+    // A bookmark resumes after the results already returned; `skip` applies
+    // on top of it, as in CouchDB.
+    let skip = offset.unwrap_or(0) + opts.skip.unwrap_or(0);
+    opts.skip = Some(skip);
+    opts.limit = Some(opts.limit.unwrap_or(DEFAULT_FIND_LIMIT));
+
     let response = state.db.find(opts).await?;
+    let bookmark = if response.docs.is_empty() && offset.is_none() {
+        "nil".to_string()
+    } else {
+        encode_bookmark(skip + response.docs.len() as u64)
+    };
     Ok(Json(serde_json::json!({
         "docs": response.docs,
-        "bookmark": "nil",
-    })))
+        "bookmark": bookmark,
+    }))
+    .into_response())
 }
 
 #[derive(Deserialize)]
