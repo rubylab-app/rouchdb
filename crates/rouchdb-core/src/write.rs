@@ -82,7 +82,7 @@ pub fn ok_result(id: &str, rev: &Revision) -> DocResult {
 }
 
 fn conflict(id: &str) -> DocResult {
-    error_result(id, "conflict", "Document update conflict")
+    error_result(id, "conflict", "Document update conflict.")
 }
 
 /// The revision a `new_edits=true` write builds on: the supplied `_rev`, or
