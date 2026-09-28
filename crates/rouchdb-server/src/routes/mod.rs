@@ -9,8 +9,10 @@ pub mod database;
 pub mod design;
 pub mod document;
 pub mod fauxton;
+pub mod local;
 pub mod membership;
 pub mod query;
+pub mod replication;
 pub mod root;
 pub mod security;
 pub mod session;
@@ -69,6 +71,16 @@ pub fn build_routes(state: AppState) -> Router {
         )
         .route("/{db}/_explain", post(query::explain))
         .route("/{db}/_compact", post(compact::compact))
+        // Replication protocol
+        .route("/{db}/_revs_diff", post(replication::revs_diff))
+        .route("/{db}/_bulk_get", post(replication::bulk_get))
+        .route("/{db}/_purge", post(replication::purge))
+        .route(
+            "/{db}/_local/{*docid}",
+            get(local::get_local)
+                .put(local::put_local)
+                .delete(local::delete_local),
+        )
         .route(
             "/{db}/_security",
             get(security::get_security).put(security::put_security),

@@ -3,7 +3,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
 
-use rouchdb::GetOptions;
+use rouchdb::{BulkGetItem, ChangesOptions, ChangesStyle, GetOptions};
+use rouchdb_core::error::RouchError;
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -21,6 +22,8 @@ pub struct GetDocQuery {
     pub latest: bool,
     #[serde(default)]
     pub attachments: bool,
+    /// `all`, or a JSON array of revisions.
+    pub open_revs: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -45,6 +48,10 @@ pub async fn get_doc(
 ) -> Result<Json<serde_json::Value>, AppError> {
     validate_db(&db, &state)?;
 
+    if let Some(open_revs) = query.open_revs.as_deref() {
+        return get_open_revs(&state, &docid, open_revs, &query).await;
+    }
+
     let opts = GetOptions {
         rev: query.rev,
         conflicts: query.conflicts,
@@ -57,6 +64,74 @@ pub async fn get_doc(
 
     let doc = state.db.get_with_opts(&docid, opts).await?;
     Ok(Json(doc.to_json()))
+}
+
+/// `GET /{db}/{docid}?open_revs=...` — the requested leaf revisions as a JSON
+/// array of `{"ok": doc}` / `{"missing": rev}` (the `Accept: application/json`
+/// form; multipart responses are not supported).
+async fn get_open_revs(
+    state: &AppState,
+    docid: &str,
+    open_revs: &str,
+    query: &GetDocQuery,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let revs: Vec<String> = if open_revs == "all" {
+        // Every leaf, including deleted ones, as listed by the changes feed.
+        let changes = state
+            .db
+            .changes(ChangesOptions {
+                doc_ids: Some(vec![docid.to_string()]),
+                style: ChangesStyle::AllDocs,
+                ..Default::default()
+            })
+            .await?;
+        let leaves: Vec<String> = changes
+            .results
+            .into_iter()
+            .filter(|c| c.id == docid)
+            .flat_map(|c| c.changes.into_iter().map(|r| r.rev))
+            .collect();
+        if leaves.is_empty() {
+            return Err(AppError(RouchError::NotFound("missing".into())));
+        }
+        leaves
+    } else {
+        let value: serde_json::Value = serde_json::from_str(open_revs)
+            .map_err(|_| AppError(RouchError::BadRequest("invalid UTF-8 JSON".into())))?;
+        value
+            .as_array()
+            .and_then(|a| {
+                a.iter()
+                    .map(|r| r.as_str().map(String::from))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .ok_or_else(|| {
+                AppError(RouchError::BadRequest(
+                    "open_revs must be \"all\" or a JSON array of revisions".into(),
+                ))
+            })?
+    };
+
+    let items = revs
+        .iter()
+        .map(|rev| BulkGetItem {
+            id: docid.to_string(),
+            rev: Some(rev.clone()),
+        })
+        .collect();
+    let response = state.db.adapter().bulk_get(items).await?;
+
+    let mut out = Vec::with_capacity(revs.len());
+    for (rev, result) in revs.iter().zip(response.results) {
+        match result.docs.into_iter().next().and_then(|d| d.ok) {
+            Some(mut doc) => {
+                super::replication::shape_doc(&mut doc, query.revs, query.attachments);
+                out.push(serde_json::json!({ "ok": doc }));
+            }
+            None => out.push(serde_json::json!({ "missing": rev })),
+        }
+    }
+    Ok(Json(serde_json::Value::Array(out)))
 }
 
 /// PUT /{db}/{docid} — create or update a document.
