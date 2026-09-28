@@ -145,3 +145,67 @@ async fn attachment_writes_reach_after_write() {
         .unwrap();
     assert_eq!(counter.0.load(Ordering::SeqCst), 3);
 }
+
+/// Stamps every written doc, like the TimestampPlugin in the docs.
+struct Stamp;
+
+#[async_trait::async_trait]
+impl Plugin for Stamp {
+    fn name(&self) -> &str {
+        "stamp"
+    }
+
+    async fn before_write(&self, docs: &mut Vec<Document>) -> Result<()> {
+        for doc in docs.iter_mut() {
+            doc.data["stamped"] = serde_json::json!(true);
+        }
+        Ok(())
+    }
+}
+
+/// Vetoes a write by dropping every document.
+struct DropAll;
+
+#[async_trait::async_trait]
+impl Plugin for DropAll {
+    fn name(&self) -> &str {
+        "drop-all"
+    }
+
+    async fn before_write(&self, docs: &mut Vec<Document>) -> Result<()> {
+        docs.clear();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn replicated_docs_keep_the_source_body() {
+    let source = Database::memory("source");
+    let rev = source
+        .put("d", serde_json::json!({"v": 1}))
+        .await
+        .unwrap()
+        .rev
+        .unwrap();
+    let target = Database::memory("target").with_plugin(Arc::new(Stamp));
+
+    target.replicate_from(&source).await.unwrap();
+
+    // Same revision id, so it must be the same body: a modified copy would
+    // never be repaired (revs_diff says the target already has it).
+    let doc = target.get("d").await.unwrap();
+    assert_eq!(doc.rev.unwrap().to_string(), rev);
+    assert_eq!(doc.data, serde_json::json!({"v": 1}));
+}
+
+#[tokio::test]
+async fn dropping_a_replicated_doc_denies_it() {
+    let source = Database::memory("source");
+    source.put("d", serde_json::json!({"v": 1})).await.unwrap();
+    let target = Database::memory("target").with_plugin(Arc::new(DropAll));
+
+    let result = target.replicate_from(&source).await.unwrap();
+    assert!(!result.ok);
+    assert_eq!(result.docs_written, 0);
+    assert!(target.get("d").await.is_err());
+}

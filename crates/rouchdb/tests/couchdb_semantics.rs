@@ -408,3 +408,45 @@ async fn cookie_login_against_couchdb() {
 
     delete_remote_db(&url).await;
 }
+
+// =========================================================================
+// Plugins on a CouchDB replication target (F59)
+// =========================================================================
+
+#[derive(Default)]
+struct CountWrites(std::sync::atomic::AtomicU64);
+
+#[async_trait::async_trait]
+impl rouchdb::Plugin for CountWrites {
+    fn name(&self) -> &str {
+        "count-writes"
+    }
+
+    async fn after_write(&self, results: &[rouchdb::DocResult]) -> rouchdb::Result<()> {
+        let ok = results.iter().filter(|r| r.ok).count() as u64;
+        self.0.fetch_add(ok, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn after_write_sees_docs_replicated_to_couchdb() {
+    let url = fresh_remote_db("plugin_push").await;
+    let counter = std::sync::Arc::new(CountWrites::default());
+    let remote = Database::http(&url).with_plugin(counter.clone());
+    let local = Database::memory("local");
+    for i in 0..3 {
+        local
+            .put(&format!("d{i}"), serde_json::json!({}))
+            .await
+            .unwrap();
+    }
+
+    // CouchDB answers new_edits=false writes with only the failures.
+    let result = local.replicate_to(&remote).await.unwrap();
+    assert!(result.ok, "{:?}", result.errors);
+    assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+    delete_remote_db(&url).await;
+}

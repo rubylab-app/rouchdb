@@ -76,10 +76,11 @@ pub trait Plugin: Send + Sync {
     /// Called before documents are written; may modify them or reject the
     /// write with an error.
     ///
-    /// For replicated documents it is called once per document: a document
-    /// rejected with `Forbidden`, `Unauthorized` or `BadRequest` is reported
-    /// as denied (like a CouchDB `validate_doc_update`) and the rest of the
-    /// batch is still written.
+    /// For replicated documents it acts like a CouchDB `validate_doc_update`:
+    /// it is called once per document, changes it makes are ignored (the
+    /// source's body is kept under the source's revision id), and a document
+    /// it drops or rejects with `Forbidden`, `Unauthorized` or `BadRequest`
+    /// is reported as denied while the rest of the batch is still written.
     async fn before_write(&self, _docs: &mut Vec<Document>) -> Result<()> {
         Ok(())
     }
@@ -133,24 +134,33 @@ impl Adapter for PluginAdapter {
     ) -> Result<Vec<DocResult>> {
         // Validate each doc on its own so one rejected doc is reported as
         // denied instead of failing (and forever blocking) the whole batch.
+        // Plugins only accept or reject replicated docs: the original body
+        // is written, since a changed body stored under the source's
+        // revision id would silently diverge from it for good.
         let mut accepted = Vec::with_capacity(docs.len());
         let mut denied = Vec::new();
         for doc in docs {
-            let id = doc.id.clone();
-            let mut one = vec![doc];
+            let mut probe = vec![doc.clone()];
             let mut outcome = Ok(());
             for plugin in &self.plugins {
-                outcome = plugin.before_write(&mut one).await;
+                outcome = plugin.before_write(&mut probe).await;
                 if outcome.is_err() {
+                    break;
+                }
+                if probe.is_empty() {
+                    outcome = Err(RouchError::Forbidden(format!(
+                        "dropped by plugin {}",
+                        plugin.name()
+                    )));
                     break;
                 }
             }
             match outcome {
-                Ok(()) => accepted.append(&mut one),
+                Ok(()) => accepted.push(doc),
                 Err(e) => match denial(&e) {
                     Some(kind) => denied.push(DocResult {
                         ok: false,
-                        id,
+                        id: doc.id,
                         rev: None,
                         error: Some(kind.to_string()),
                         reason: Some(e.to_string()),
@@ -160,11 +170,32 @@ impl Adapter for PluginAdapter {
             }
         }
 
+        let written: Vec<(String, Option<String>)> = accepted
+            .iter()
+            .map(|d| (d.id.clone(), d.rev.as_ref().map(|r| r.to_string())))
+            .collect();
         let mut results = if accepted.is_empty() {
             Vec::new()
         } else {
-            self.inner.bulk_docs(accepted, opts).await?
+            self.inner.bulk_docs(accepted, opts.clone()).await?
         };
+        // CouchDB answers new_edits=false writes with only the failures;
+        // report the rest as written so after_write sees every doc.
+        if !opts.new_edits && results.len() < written.len() {
+            let failed: std::collections::HashSet<String> =
+                results.iter().map(|r| r.id.clone()).collect();
+            for (id, rev) in written {
+                if !failed.contains(&id) {
+                    results.push(DocResult {
+                        ok: true,
+                        id,
+                        rev,
+                        error: None,
+                        reason: None,
+                    });
+                }
+            }
+        }
         for plugin in &self.plugins {
             plugin.after_write(&results).await?;
         }
