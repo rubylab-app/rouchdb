@@ -11,8 +11,8 @@
 use std::collections::HashMap;
 
 use rouchdb::{
-    AllDocsOptions, BulkDocsOptions, ChangesOptions, Database, Document, FindOptions, GetOptions,
-    IndexDefinition, Revision, SecurityDocument, SecurityGroup, SortField,
+    AllDocsOptions, AttachmentMeta, BulkDocsOptions, ChangesOptions, Database, Document,
+    FindOptions, GetOptions, IndexDefinition, Revision, SecurityDocument, SecurityGroup, SortField,
 };
 
 // =========================================================================
@@ -218,20 +218,24 @@ async fn all_docs_with_keys() {
 // Inline Base64 attachments
 // =========================================================================
 
-#[tokio::test]
-async fn inline_base64_attachment_decoding() {
-    use base64::Engine;
-    let data = b"Hello, World!";
-    let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+// Fixtures captured from CouchDB 3.5.1 for the document
+// `{"_id": "doc1", "name": "test"}` with the attachment `hello.bin`
+// (`application/octet-stream`, content "Hello, World!").
+const HELLO: &[u8] = b"Hello, World!";
+const HELLO_B64: &str = "SGVsbG8sIFdvcmxkIQ==";
+const HELLO_DIGEST: &str = "md5-ZajifYh5KDgxtmS9i38K1A==";
 
+/// What PouchDB and CouchDB clients send when writing an inline attachment:
+/// only `content_type` and base64 `data`; the server computes digest/length.
+#[tokio::test]
+#[ignore = "blocked on F03"]
+async fn inline_base64_attachment_decoding() {
     let json = serde_json::json!({
         "_id": "doc1",
         "_attachments": {
-            "hello.txt": {
-                "content_type": "text/plain",
-                "data": b64,
-                "digest": "md5-abc",
-                "length": 0
+            "hello.bin": {
+                "content_type": "application/octet-stream",
+                "data": HELLO_B64
             }
         },
         "name": "test"
@@ -241,21 +245,59 @@ async fn inline_base64_attachment_decoding() {
     assert_eq!(doc.id, "doc1");
     assert_eq!(doc.data["name"], "test");
 
-    let att = doc.attachments.get("hello.txt").unwrap();
-    assert_eq!(att.content_type, "text/plain");
-    assert_eq!(att.data.as_ref().unwrap(), data);
+    let att = doc
+        .attachments
+        .get("hello.bin")
+        .expect("inline attachment without digest/length was dropped");
+    assert_eq!(att.content_type, "application/octet-stream");
+    assert_eq!(att.data.as_deref(), Some(HELLO));
     assert_eq!(att.length, 13);
     assert!(!att.stub);
 }
 
+/// What CouchDB returns for `GET /db/doc1?attachments=true` (and inside
+/// `_bulk_get?attachments=true`): inline `data` plus `digest` and `revpos`,
+/// but no `length`.
+#[tokio::test]
+#[ignore = "blocked on F03"]
+async fn inline_attachment_as_returned_by_couchdb() {
+    let json = serde_json::json!({
+        "_id": "doc1",
+        "_rev": "1-d13178e2b436fa29621d6329b3a5f83b",
+        "name": "test",
+        "_attachments": {
+            "hello.bin": {
+                "content_type": "application/octet-stream",
+                "revpos": 1,
+                "digest": HELLO_DIGEST,
+                "data": HELLO_B64
+            }
+        }
+    });
+
+    let doc = Document::from_json(json).unwrap();
+    let att = doc
+        .attachments
+        .get("hello.bin")
+        .expect("inline attachment without length was dropped");
+    assert_eq!(att.digest, HELLO_DIGEST);
+    assert_eq!(att.data.as_deref(), Some(HELLO));
+    assert_eq!(att.length, 13);
+    assert!(!att.stub);
+}
+
+/// What CouchDB returns for a plain `GET /db/doc1`: an attachment stub.
 #[tokio::test]
 async fn inline_base64_attachment_missing_data_is_stub() {
     let json = serde_json::json!({
         "_id": "doc1",
+        "_rev": "1-d13178e2b436fa29621d6329b3a5f83b",
+        "name": "test",
         "_attachments": {
-            "hello.txt": {
-                "content_type": "text/plain",
-                "digest": "md5-abc",
+            "hello.bin": {
+                "content_type": "application/octet-stream",
+                "revpos": 1,
+                "digest": HELLO_DIGEST,
                 "length": 13,
                 "stub": true
             }
@@ -263,9 +305,52 @@ async fn inline_base64_attachment_missing_data_is_stub() {
     });
 
     let doc = Document::from_json(json).unwrap();
-    let att = doc.attachments.get("hello.txt").unwrap();
+    let att = doc.attachments.get("hello.bin").unwrap();
     assert!(att.stub);
     assert!(att.data.is_none());
+    assert_eq!(att.digest, HELLO_DIGEST);
+    assert_eq!(att.length, 13);
+}
+
+/// The inline shape emitted by `Document::to_json` (base64 `data` plus
+/// digest and length) must decode back to the same bytes.
+#[tokio::test]
+async fn inline_attachment_roundtrips_through_to_json() {
+    use base64::Engine;
+    // Sanity-check the captured fixture itself.
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD.encode(HELLO),
+        HELLO_B64
+    );
+
+    let mut attachments = HashMap::new();
+    attachments.insert(
+        "hello.bin".to_string(),
+        AttachmentMeta {
+            content_type: "application/octet-stream".into(),
+            digest: HELLO_DIGEST.into(),
+            length: HELLO.len() as u64,
+            stub: false,
+            data: Some(HELLO.to_vec()),
+        },
+    );
+    let doc = Document {
+        id: "doc1".into(),
+        rev: None,
+        deleted: false,
+        data: serde_json::json!({"name": "test"}),
+        attachments,
+    };
+
+    let json = doc.to_json();
+    assert_eq!(json["_attachments"]["hello.bin"]["data"], HELLO_B64);
+
+    let back = Document::from_json(json).unwrap();
+    let att = back.attachments.get("hello.bin").unwrap();
+    assert_eq!(att.data.as_deref(), Some(HELLO));
+    assert_eq!(att.digest, HELLO_DIGEST);
+    assert_eq!(att.length, 13);
+    assert!(!att.stub);
 }
 
 // =========================================================================

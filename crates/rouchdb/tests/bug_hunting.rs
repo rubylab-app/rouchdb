@@ -124,13 +124,17 @@ async fn partition_empty_name() {
 
 #[tokio::test]
 async fn document_roundtrip_preserves_attachments() {
+    // Attachment stub exactly as CouchDB 3.5.1 returns it from `GET /db/doc1`
+    // ("Hello, World!" stored as application/octet-stream).
     let json = serde_json::json!({
         "_id": "doc1",
+        "_rev": "1-d13178e2b436fa29621d6329b3a5f83b",
         "_attachments": {
             "file.txt": {
-                "content_type": "text/plain",
-                "digest": "md5-abc123",
-                "length": 5,
+                "content_type": "application/octet-stream",
+                "revpos": 1,
+                "digest": "md5-ZajifYh5KDgxtmS9i38K1A==",
+                "length": 13,
                 "stub": true
             }
         },
@@ -145,8 +149,12 @@ async fn document_roundtrip_preserves_attachments() {
     let json_out = doc.to_json();
     let doc2 = Document::from_json(json_out).unwrap();
     assert_eq!(doc2.attachments.len(), 1);
-    assert!(doc2.attachments.contains_key("file.txt"));
-    assert_eq!(doc2.attachments["file.txt"].content_type, "text/plain");
+    let att = &doc2.attachments["file.txt"];
+    assert_eq!(att.content_type, "application/octet-stream");
+    assert_eq!(att.digest, "md5-ZajifYh5KDgxtmS9i38K1A==");
+    assert_eq!(att.length, 13);
+    assert!(att.stub);
+    assert!(att.data.is_none());
 }
 
 #[tokio::test]
