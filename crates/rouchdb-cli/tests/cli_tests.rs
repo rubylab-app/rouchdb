@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Output;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -20,6 +21,29 @@ async fn setup_db(docs: &[(&str, serde_json::Value)]) -> (TempDir, PathBuf) {
 #[allow(deprecated)]
 fn rouchdb_cmd() -> Command {
     Command::cargo_bin("rouchdb").unwrap()
+}
+
+fn run(args: &[&str]) -> Output {
+    rouchdb_cmd().args(args).output().unwrap()
+}
+
+fn stdout_json(output: &Output) -> serde_json::Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout is not JSON ({}): {:?} / stderr: {}",
+            e,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+fn stderr_str(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn path_str(path: &Path) -> &str {
+    path.to_str().unwrap()
 }
 
 // ─── INFO ───────────────────────────────────────────────────────────────────
@@ -539,4 +563,321 @@ async fn compact_nonexistent_fails() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("Error"));
+}
+
+// ─── PUT / POST / DELETE ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn put_creates_document() {
+    let (_dir, db_path) = setup_db(&[]).await;
+    let p = path_str(&db_path);
+
+    let output = run(&["put", p, "doc1", r#"{"name":"Alice"}"#]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let v = stdout_json(&output);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["id"], "doc1");
+    assert!(v["rev"].as_str().unwrap().starts_with("1-"));
+
+    let doc = stdout_json(&run(&["get", p, "doc1"]));
+    assert_eq!(doc["name"], "Alice");
+}
+
+#[tokio::test]
+async fn put_updates_document_with_rev() {
+    let (_dir, db_path) = setup_db(&[]).await;
+    let p = path_str(&db_path);
+
+    let created = stdout_json(&run(&["put", p, "doc1", r#"{"v":1}"#]));
+    let rev1 = created["rev"].as_str().unwrap();
+
+    let output = run(&["put", p, "doc1", r#"{"v":2}"#, "--rev", rev1]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let v = stdout_json(&output);
+    assert!(v["rev"].as_str().unwrap().starts_with("2-"));
+
+    let doc = stdout_json(&run(&["get", p, "doc1"]));
+    assert_eq!(doc["v"], 2);
+}
+
+#[tokio::test]
+async fn put_existing_without_rev_is_a_conflict() {
+    let (_dir, db_path) = setup_db(&[("doc1", serde_json::json!({"v": 1}))]).await;
+    let p = path_str(&db_path);
+
+    let output = run(&["put", p, "doc1", r#"{"v":2}"#]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr_str(&output).contains("conflict"));
+
+    let doc = stdout_json(&run(&["get", p, "doc1"]));
+    assert_eq!(doc["v"], 1, "a rejected put must not change the doc");
+}
+
+#[tokio::test]
+async fn put_with_stale_rev_is_a_conflict() {
+    let (_dir, db_path) = setup_db(&[]).await;
+    let p = path_str(&db_path);
+
+    let rev1 = stdout_json(&run(&["put", p, "doc1", r#"{"v":1}"#]))["rev"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        run(&["put", p, "doc1", r#"{"v":2}"#, "--rev", &rev1])
+            .status
+            .success()
+    );
+
+    let output = run(&["put", p, "doc1", r#"{"v":3}"#, "--rev", &rev1]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr_str(&output).contains("conflict"));
+}
+
+#[tokio::test]
+async fn put_force_upserts_existing_document() {
+    let (_dir, db_path) = setup_db(&[("doc1", serde_json::json!({"v": 1}))]).await;
+    let p = path_str(&db_path);
+
+    let output = run(&["put", p, "doc1", r#"{"v":2}"#, "--force"]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert!(
+        stdout_json(&output)["rev"]
+            .as_str()
+            .unwrap()
+            .starts_with("2-")
+    );
+    assert_eq!(stdout_json(&run(&["get", p, "doc1"]))["v"], 2);
+}
+
+#[tokio::test]
+async fn put_force_creates_missing_document() {
+    let (_dir, db_path) = setup_db(&[]).await;
+    let p = path_str(&db_path);
+
+    let output = run(&["put", p, "doc1", r#"{"v":1}"#, "-f"]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert!(
+        stdout_json(&output)["rev"]
+            .as_str()
+            .unwrap()
+            .starts_with("1-")
+    );
+}
+
+#[tokio::test]
+async fn put_invalid_json_fails() {
+    let (_dir, db_path) = setup_db(&[]).await;
+    let output = run(&["put", path_str(&db_path), "doc1", "{not json"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr_str(&output).contains("invalid JSON body"));
+}
+
+#[tokio::test]
+async fn post_generates_id() {
+    let (_dir, db_path) = setup_db(&[]).await;
+    let p = path_str(&db_path);
+
+    let output = run(&["post", p, r#"{"name":"Bob"}"#]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let v = stdout_json(&output);
+    assert_eq!(v["ok"], true);
+    let id = v["id"].as_str().unwrap();
+    assert!(!id.is_empty());
+
+    assert_eq!(stdout_json(&run(&["get", p, id]))["name"], "Bob");
+}
+
+#[tokio::test]
+async fn delete_removes_document() {
+    let (_dir, db_path) = setup_db(&[]).await;
+    let p = path_str(&db_path);
+
+    let rev = stdout_json(&run(&["put", p, "doc1", r#"{"v":1}"#]))["rev"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let output = run(&["delete", p, "doc1", "--rev", &rev]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let v = stdout_json(&output);
+    assert_eq!(v["ok"], true);
+    assert!(v["rev"].as_str().unwrap().starts_with("2-"));
+
+    let get = run(&["get", p, "doc1"]);
+    assert_eq!(get.status.code(), Some(1));
+    assert!(stderr_str(&get).contains("not found"));
+}
+
+#[tokio::test]
+async fn delete_with_wrong_rev_fails() {
+    let (_dir, db_path) = setup_db(&[("doc1", serde_json::json!({"v": 1}))]).await;
+    let p = path_str(&db_path);
+
+    let output = run(&[
+        "delete",
+        p,
+        "doc1",
+        "--rev",
+        "1-00000000000000000000000000000000",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr_str(&output).contains("conflict"));
+    assert!(run(&["get", p, "doc1"]).status.success());
+
+    let output = run(&["delete", p, "doc1", "--rev", "garbage"]);
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[tokio::test]
+async fn put_after_delete_recreates_document() {
+    let (_dir, db_path) = setup_db(&[]).await;
+    let p = path_str(&db_path);
+
+    let rev = stdout_json(&run(&["put", p, "doc1", r#"{"v":1}"#]))["rev"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(run(&["delete", p, "doc1", "--rev", &rev]).status.success());
+
+    let output = run(&["put", p, "doc1", r#"{"v":2}"#]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(stdout_json(&output)["ok"], true);
+    assert_eq!(stdout_json(&run(&["get", p, "doc1"]))["v"], 2);
+
+    // --force on a deleted doc also recreates it.
+    let rev = stdout_json(&run(&["get", p, "doc1"]))["_rev"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(run(&["delete", p, "doc1", "--rev", &rev]).status.success());
+    let output = run(&["put", p, "doc1", r#"{"v":3}"#, "--force"]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(stdout_json(&run(&["get", p, "doc1"]))["v"], 3);
+}
+
+// ─── IMPORT ─────────────────────────────────────────────────────────────────
+
+fn write_json_file(dir: &Path, name: &str, value: &serde_json::Value) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn import_writes_documents() {
+    let (dir, db_path) = setup_db(&[]).await;
+    let p = path_str(&db_path);
+    let file = write_json_file(
+        dir.path(),
+        "docs.json",
+        &serde_json::json!([
+            {"_id": "a", "x": 1},
+            {"_id": "b", "_rev": "7-deadbeef", "x": 2}
+        ]),
+    );
+
+    let output = run(&["import", p, path_str(&file)]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let v = stdout_json(&output);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["imported"], 2);
+    assert_eq!(v["total"], 2);
+    assert_eq!(v["errors"], serde_json::json!([]));
+
+    let b = stdout_json(&run(&["get", p, "b"]));
+    assert_eq!(b["x"], 2);
+    assert!(b["_rev"].as_str().unwrap().starts_with("1-"));
+}
+
+#[tokio::test]
+async fn import_reports_docs_without_id() {
+    let (dir, db_path) = setup_db(&[]).await;
+    let p = path_str(&db_path);
+    let file = write_json_file(
+        dir.path(),
+        "docs.json",
+        &serde_json::json!([{"_id": "a", "x": 1}, {"x": 2}, {"_id": "", "x": 3}]),
+    );
+
+    let output = run(&["import", p, path_str(&file)]);
+    assert_eq!(output.status.code(), Some(1));
+    let v = stdout_json(&output);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["imported"], 1);
+    assert_eq!(v["total"], 3);
+    let errors = v["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 2, "{:?}", errors);
+    assert_eq!(errors[0]["error"], "missing _id field");
+    assert_eq!(errors[0]["doc"]["x"], 2);
+    assert!(stderr_str(&output).contains("2 of 3 documents failed"));
+
+    assert_eq!(stdout_json(&run(&["info", p]))["doc_count"], 1);
+}
+
+#[tokio::test]
+async fn import_reports_conflicts_per_id() {
+    let (dir, db_path) = setup_db(&[("existing", serde_json::json!({"v": 1}))]).await;
+    let p = path_str(&db_path);
+    let file = write_json_file(
+        dir.path(),
+        "docs.json",
+        &serde_json::json!([
+            {"_id": "existing", "v": 2},
+            {"_id": "new", "v": 1},
+            {"_id": "dup", "v": 1},
+            {"_id": "dup", "v": 2}
+        ]),
+    );
+
+    let output = run(&["import", p, path_str(&file)]);
+    assert_eq!(output.status.code(), Some(1));
+    let v = stdout_json(&output);
+    assert_eq!(v["imported"], 2);
+    assert_eq!(v["total"], 4);
+    let errors = v["errors"].as_array().unwrap();
+    let ids: Vec<&str> = errors.iter().map(|e| e["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["existing", "dup"]);
+    for e in errors {
+        assert!(e["error"].as_str().unwrap().contains("conflict"), "{:?}", e);
+    }
+
+    assert_eq!(stdout_json(&run(&["get", p, "existing"]))["v"], 1);
+    assert_eq!(stdout_json(&run(&["get", p, "dup"]))["v"], 1);
+}
+
+#[tokio::test]
+async fn import_recreates_deleted_document() {
+    let (dir, db_path) = setup_db(&[]).await;
+    let p = path_str(&db_path);
+    let rev = stdout_json(&run(&["put", p, "gone", r#"{"v":1}"#]))["rev"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(run(&["delete", p, "gone", "--rev", &rev]).status.success());
+
+    let file = write_json_file(
+        dir.path(),
+        "docs.json",
+        &serde_json::json!([{"_id": "gone", "v": 2}]),
+    );
+    let output = run(&["import", p, path_str(&file)]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(stdout_json(&output)["imported"], 1);
+    assert_eq!(stdout_json(&run(&["get", p, "gone"]))["v"], 2);
+}
+
+#[tokio::test]
+async fn import_invalid_file_fails() {
+    let (dir, db_path) = setup_db(&[]).await;
+    let p = path_str(&db_path);
+
+    let bad = dir.path().join("bad.json");
+    std::fs::write(&bad, "{not json").unwrap();
+    let output = run(&["import", p, path_str(&bad)]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr_str(&output).contains("invalid JSON"));
+
+    let missing = dir.path().join("missing.json");
+    let output = run(&["import", p, path_str(&missing)]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr_str(&output).contains("cannot read file"));
 }
