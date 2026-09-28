@@ -365,7 +365,10 @@ impl Database {
         &self,
         opts: ChangesStreamOptions,
     ) -> (tokio::sync::mpsc::Receiver<ChangeEvent>, ChangesHandle) {
-        if let Some(selector) = opts.selector.clone() {
+        if let Some(ref selector) = opts.selector {
+            // Compiled once for the whole stream; an invalid selector
+            // matches nothing.
+            let selector = CompiledSelector::new(selector).ok();
             let user_wants_docs = opts.include_docs;
             // Push the selector into the stream's filter so `limit` counts only
             // matching changes (composing with any pre-existing filter).
@@ -378,7 +381,7 @@ impl Database {
                 }
                 e.doc
                     .as_ref()
-                    .is_some_and(|d| matches_selector(d, &selector))
+                    .is_some_and(|d| selector.as_ref().is_some_and(|s| s.matches(d)))
             });
             let inner_opts = ChangesStreamOptions {
                 include_docs: true, // Need docs for selector evaluation
@@ -417,7 +420,10 @@ impl Database {
         &self,
         opts: ChangesStreamOptions,
     ) -> (tokio::sync::mpsc::Receiver<ChangesEvent>, ChangesHandle) {
-        if let Some(selector) = opts.selector.clone() {
+        if let Some(ref selector) = opts.selector {
+            // Compiled once for the whole stream; an invalid selector
+            // matches nothing.
+            let selector = CompiledSelector::new(selector).ok();
             let user_wants_docs = opts.include_docs;
             // Push the selector into the stream's filter so `limit` counts only
             // matching changes (composing with any pre-existing filter).
@@ -430,7 +436,7 @@ impl Database {
                 }
                 e.doc
                     .as_ref()
-                    .is_some_and(|d| matches_selector(d, &selector))
+                    .is_some_and(|d| selector.as_ref().is_some_and(|s| s.matches(d)))
             });
             let inner_opts = ChangesStreamOptions {
                 include_docs: true,
