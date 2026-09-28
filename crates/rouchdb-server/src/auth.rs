@@ -13,9 +13,6 @@ use crate::state::AppState;
 /// Name of the session cookie, matching CouchDB.
 pub const SESSION_COOKIE: &str = "AuthSession";
 
-/// Sessions that are not used for this long are forgotten.
-const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
-
 /// Admin credentials required by the server when authentication is enabled.
 #[derive(Clone)]
 pub struct AdminCredentials {
@@ -57,6 +54,8 @@ impl std::fmt::Debug for AdminCredentials {
 pub struct Auth {
     admin: AdminCredentials,
     sessions: Mutex<HashMap<String, Instant>>,
+    /// Sessions that are not used for this long are forgotten.
+    timeout: Duration,
 }
 
 /// Result of inspecting the credentials sent with a request.
@@ -71,11 +70,28 @@ pub enum AuthOutcome {
 }
 
 impl Auth {
+    /// Authentication with CouchDB's default session timeout (10 minutes).
     pub fn new(admin: AdminCredentials) -> Self {
+        Self::with_timeout(admin, crate::DEFAULT_SESSION_TIMEOUT)
+    }
+
+    /// Authentication whose cookie sessions expire after `timeout` without
+    /// use.
+    pub fn with_timeout(admin: AdminCredentials, timeout: Duration) -> Self {
         Self {
             admin,
             sessions: Mutex::new(HashMap::new()),
+            timeout,
         }
+    }
+
+    /// The `Set-Cookie` value for a session token. `Max-Age` is the session
+    /// timeout, rounded up to whole seconds (0 would delete the cookie).
+    pub fn session_cookie(&self, token: &str) -> String {
+        let max_age = self.timeout.as_secs() + u64::from(self.timeout.subsec_nanos() > 0);
+        format!(
+            "{SESSION_COOKIE}={token}; Version=1; Max-Age={max_age}; Path=/; HttpOnly; SameSite=Strict"
+        )
     }
 
     pub fn username(&self) -> &str {
@@ -106,7 +122,7 @@ impl Auth {
         let token = uuid::Uuid::new_v4().simple().to_string();
         let mut sessions = self.sessions.lock().unwrap();
         let now = Instant::now();
-        sessions.retain(|_, last_seen| now.duration_since(*last_seen) < SESSION_IDLE_TIMEOUT);
+        sessions.retain(|_, last_seen| now.duration_since(*last_seen) < self.timeout);
         sessions.insert(token.clone(), now);
         token
     }
@@ -122,7 +138,7 @@ impl Auth {
         let mut sessions = self.sessions.lock().unwrap();
         let now = Instant::now();
         match sessions.get_mut(token) {
-            Some(last_seen) if now.duration_since(*last_seen) < SESSION_IDLE_TIMEOUT => {
+            Some(last_seen) if now.duration_since(*last_seen) < self.timeout => {
                 *last_seen = now;
                 true
             }
@@ -179,20 +195,48 @@ fn is_public(method: &Method, path: &str) -> bool {
     }
 }
 
-/// Middleware: when admin credentials are configured, reject every
-/// non-public request that does not carry them (Basic auth or session cookie).
+/// Middleware: when admin credentials are configured, reject wrong Basic
+/// credentials on every endpoint (as CouchDB does, even on the public ones)
+/// and every non-public request that does not carry valid credentials
+/// (Basic auth or session cookie).
+///
+/// A request authenticated by its session cookie gets the cookie back with a
+/// fresh `Max-Age`, so an active session is not dropped by the browser.
 pub async fn require_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let Some(auth) = state.auth.as_deref() else {
         return next.run(req).await;
     };
-    if is_public(req.method(), req.uri().path()) {
-        return next.run(req).await;
+    let outcome = auth.authenticate(req.headers());
+    let path = req.uri().path();
+    match outcome {
+        AuthOutcome::BadCredentials => {
+            return unauthorized("Name or password is incorrect.");
+        }
+        AuthOutcome::Anonymous if is_public(req.method(), path) => return next.run(req).await,
+        // Server-level endpoints need a server admin; the others a database member.
+        AuthOutcome::Anonymous if path.starts_with("/_") => {
+            return unauthorized("You are not a server admin.");
+        }
+        AuthOutcome::Anonymous => {
+            return unauthorized("You are not authorized to access this db.");
+        }
+        AuthOutcome::Admin => {}
     }
-    match auth.authenticate(req.headers()) {
-        AuthOutcome::Admin => next.run(req).await,
-        AuthOutcome::BadCredentials => unauthorized("Name or password is incorrect."),
-        AuthOutcome::Anonymous => unauthorized("You are not authorized to access this db."),
+
+    // Basic credentials take precedence over the cookie in `authenticate`.
+    let session = if basic_credentials(req.headers()).is_none() {
+        session_token(req.headers())
+    } else {
+        None
+    };
+    let mut resp = next.run(req).await;
+    if let Some(token) = session
+        && !resp.headers().contains_key(header::SET_COOKIE)
+        && let Ok(cookie) = auth.session_cookie(&token).parse()
+    {
+        resp.headers_mut().insert(header::SET_COOKIE, cookie);
     }
+    resp
 }
 
 pub fn unauthorized(reason: &str) -> Response {

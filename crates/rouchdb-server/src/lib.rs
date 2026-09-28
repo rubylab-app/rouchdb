@@ -4,6 +4,7 @@ pub mod routes;
 pub mod state;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
@@ -37,10 +38,16 @@ pub struct ServerConfig {
     /// Largest accepted request body, in bytes (documents, `_bulk_docs`
     /// batches, attachments). Larger requests get a JSON 413.
     pub max_request_size: usize,
+    /// How long a `_session` cookie stays valid without being used; it is
+    /// also the cookie's `Max-Age`. Defaults to CouchDB's 10 minutes.
+    pub session_timeout: Duration,
 }
 
 /// Default request body limit: 64 MiB.
 pub const DEFAULT_MAX_REQUEST_SIZE: usize = 64 * 1024 * 1024;
+
+/// Default session timeout: 600 seconds, CouchDB's `[chttpd_auth] timeout`.
+pub const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -51,6 +58,7 @@ impl Default for ServerConfig {
             cors_origins: Vec::new(),
             admin: None,
             max_request_size: DEFAULT_MAX_REQUEST_SIZE,
+            session_timeout: DEFAULT_SESSION_TIMEOUT,
         }
     }
 }
@@ -111,7 +119,10 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
 
 /// Build the Axum router with all routes and middleware.
 pub fn build_router(db: Arc<Database>, config: &ServerConfig) -> Router {
-    let auth = config.admin.clone().map(|admin| Arc::new(Auth::new(admin)));
+    let auth = config
+        .admin
+        .clone()
+        .map(|admin| Arc::new(Auth::with_timeout(admin, config.session_timeout)));
     let state = AppState::new(db, config.db_name.clone(), auth);
 
     let router = routes::build_routes(state.clone())
