@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +33,14 @@ pub struct CheckpointHistory {
 pub struct Checkpointer {
     replication_id: String,
     session_id: String,
+    /// Set once the source refused a `_local` write (a read-only source):
+    /// from then on only the target's checkpoint is read and written.
+    read_only_source: AtomicBool,
+}
+
+/// Errors meaning the adapter will never accept the write.
+fn is_forbidden(e: &RouchError) -> bool {
+    matches!(e, RouchError::Forbidden(_) | RouchError::Unauthorized)
 }
 
 impl Checkpointer {
@@ -45,6 +55,7 @@ impl Checkpointer {
         Self {
             replication_id,
             session_id,
+            read_only_source: AtomicBool::new(false),
         }
     }
 
@@ -66,33 +77,63 @@ impl Checkpointer {
             }
         };
 
-        let source_cp = to_opt(self.read_from(source).await)?;
-        let target_cp = to_opt(self.read_from(target).await)?;
+        let Some(target_cp) = to_opt(self.read_from(target).await)? else {
+            return Ok(Seq::zero()); // never checkpointed on the target
+        };
+        if self.read_only_source.load(Ordering::Relaxed) {
+            return Ok(target_cp.last_seq);
+        }
 
-        match (source_cp, target_cp) {
-            (Some(s), Some(t)) => Ok(compare_checkpoints(&s, &t)),
-            _ => Ok(Seq::zero()), // at least one side has never been checkpointed
+        match to_opt(self.read_from(source).await)? {
+            Some(source_cp) => Ok(compare_checkpoints(&source_cp, &target_cp)),
+            None => {
+                // The target knows this replication but the source does not:
+                // either the source was replaced (start over) or it cannot
+                // store checkpoints at all. Probe with a write, as PouchDB
+                // does, and trust the target alone for a read-only source.
+                let probe = self.build_checkpoint_doc(Seq::zero(), Vec::new());
+                match source
+                    .put_local(&self.replication_id, serde_json::to_value(&probe)?)
+                    .await
+                {
+                    Err(e) if is_forbidden(&e) => {
+                        self.read_only_source.store(true, Ordering::Relaxed);
+                        Ok(target_cp.last_seq)
+                    }
+                    _ => Ok(Seq::zero()),
+                }
+            }
         }
     }
 
-    /// Write the checkpoint to both source and target.
+    /// Write the checkpoint to the target, then to the source. A source that
+    /// refuses the write (read-only) is remembered and skipped from then on.
     pub async fn write_checkpoint(
         &self,
         source: &dyn Adapter,
         target: &dyn Adapter,
         last_seq: Seq,
     ) -> Result<()> {
+        let read_only_source = self.read_only_source.load(Ordering::Relaxed);
+
         // Carry forward existing history so cross-session divergence recovery
         // works (each side keeps its own _rev, so write them independently).
         let prior_history = self
-            .read_from(source)
+            .read_from(if read_only_source { target } else { source })
             .await
             .map(|cp| cp.history)
             .unwrap_or_default();
 
-        self.write_one(source, last_seq.clone(), &prior_history)
+        self.write_one(target, last_seq.clone(), &prior_history)
             .await?;
-        self.write_one(target, last_seq, &prior_history).await?;
+        if !read_only_source {
+            match self.write_one(source, last_seq, &prior_history).await {
+                Err(e) if is_forbidden(&e) => {
+                    self.read_only_source.store(true, Ordering::Relaxed);
+                }
+                other => other?,
+            }
+        }
         Ok(())
     }
 

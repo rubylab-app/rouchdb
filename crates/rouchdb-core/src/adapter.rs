@@ -20,6 +20,14 @@ pub trait Adapter: Send + Sync {
     /// Get database information: name, document count, update sequence.
     async fn info(&self) -> Result<DbInfo>;
 
+    /// A stable identifier for this database, used to derive replication
+    /// ids so that replications with different peers never share a
+    /// checkpoint. Defaults to the database name; remote adapters should
+    /// include the server identity.
+    async fn id(&self) -> Result<String> {
+        Ok(self.info().await?.db_name)
+    }
+
     /// Retrieve a single document by ID.
     ///
     /// Supports fetching specific revisions, open revisions (all leaves),

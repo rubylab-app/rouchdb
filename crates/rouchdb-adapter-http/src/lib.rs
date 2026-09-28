@@ -6,9 +6,10 @@
 pub mod auth;
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize};
 
 use rouchdb_core::adapter::Adapter;
@@ -37,7 +38,6 @@ struct CouchDbPutResponse {
 
 #[derive(Debug, Deserialize)]
 struct CouchDbError {
-    #[allow(dead_code)]
     error: String,
     reason: String,
 }
@@ -122,6 +122,9 @@ struct CouchDbAllDocsResponse {
     // CouchDB sends `"offset": null` when `keys` are posted.
     offset: Option<u64>,
     rows: Vec<CouchDbAllDocsRow>,
+    /// Present when `update_seq=true` was requested.
+    #[serde(default)]
+    update_seq: Option<serde_json::Value>,
 }
 
 /// A row of `_all_docs`. When `keys` are posted, keys that do not exist come
@@ -145,10 +148,52 @@ struct CouchDbAllDocsRowValue {
 // HttpAdapter
 // ---------------------------------------------------------------------------
 
+/// Default time allowed to establish a connection.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default time a response may stay silent before the request fails.
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Options for [`HttpAdapter::with_options`].
+#[derive(Debug, Clone)]
+pub struct HttpAdapterOptions {
+    /// Do not create the remote database on first use (PouchDB's
+    /// `skip_setup`): operations on a missing database fail with NotFound.
+    pub skip_setup: bool,
+    /// Time allowed to establish a connection.
+    pub connect_timeout: Duration,
+    /// Time a response may stay silent (no bytes received) before the
+    /// request fails, so a stalled server cannot hang a replication forever.
+    /// It bounds inactivity, not the total duration of large transfers.
+    pub read_timeout: Duration,
+}
+
+impl Default for HttpAdapterOptions {
+    fn default() -> Self {
+        Self {
+            skip_setup: false,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            read_timeout: DEFAULT_READ_TIMEOUT,
+        }
+    }
+}
+
+/// The reqwest client builder used by default, with the given timeouts.
+pub(crate) fn client_builder(connect_timeout: Duration, read_timeout: Duration) -> ClientBuilder {
+    Client::builder()
+        .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
+}
+
 /// HTTP adapter that talks to a remote CouchDB instance.
+///
+/// Like PouchDB, the remote database is created on first use if it does not
+/// exist yet, unless [`HttpAdapterOptions::skip_setup`] is set.
 pub struct HttpAdapter {
     client: Client,
     base_url: String,
+    skip_setup: bool,
+    /// Set once the remote database is known to exist.
+    setup: tokio::sync::OnceCell<()>,
 }
 
 impl HttpAdapter {
@@ -157,17 +202,29 @@ impl HttpAdapter {
     /// The URL should include the database name, e.g.
     /// `http://localhost:5984/mydb` or `http://admin:password@localhost:5984/mydb`
     pub fn new(url: &str) -> Self {
-        let base_url = url.trim_end_matches('/').to_string();
-        Self {
-            client: Client::new(),
-            base_url,
-        }
+        Self::with_options(url, HttpAdapterOptions::default())
     }
 
-    /// Create a new HTTP adapter with a custom reqwest client.
+    /// Create a new HTTP adapter with explicit options.
+    pub fn with_options(url: &str, opts: HttpAdapterOptions) -> Self {
+        let client = client_builder(opts.connect_timeout, opts.read_timeout)
+            .build()
+            .unwrap_or_default();
+        let mut adapter = Self::with_client(url, client);
+        adapter.skip_setup = opts.skip_setup;
+        adapter
+    }
+
+    /// Create a new HTTP adapter with a custom reqwest client. The client's
+    /// own timeouts apply (reqwest has none by default).
     pub fn with_client(url: &str, client: Client) -> Self {
         let base_url = url.trim_end_matches('/').to_string();
-        Self { client, base_url }
+        Self {
+            client,
+            base_url,
+            skip_setup: false,
+            setup: tokio::sync::OnceCell::new(),
+        }
     }
 
     /// Create a new HTTP adapter using an authenticated client.
@@ -178,42 +235,80 @@ impl HttpAdapter {
         Self::with_client(url, auth.client().clone())
     }
 
+    /// Make sure the remote database exists, creating it when missing, as
+    /// PouchDB does. Runs once per adapter; a failure is retried next call.
+    async fn ensure_setup(&self) -> Result<()> {
+        if self.skip_setup {
+            return Ok(());
+        }
+        self.setup
+            .get_or_try_init(|| async {
+                let resp = self
+                    .client
+                    .get(&self.base_url)
+                    .send()
+                    .await
+                    .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+                if resp.status() != reqwest::StatusCode::NOT_FOUND {
+                    self.check_error(resp).await?;
+                    return Ok(());
+                }
+                let resp = self
+                    .client
+                    .put(&self.base_url)
+                    .send()
+                    .await
+                    .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+                // 412: created concurrently by someone else.
+                if resp.status() != reqwest::StatusCode::PRECONDITION_FAILED {
+                    self.check_error(resp).await?;
+                }
+                Ok(())
+            })
+            .await
+            .map(|_| ())
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}/{}", self.base_url, path.trim_start_matches('/'))
     }
 
     async fn check_error(&self, response: reqwest::Response) -> Result<reqwest::Response> {
-        let status = response.status();
-        if status.is_success() {
-            return Ok(response);
-        }
-
-        match status.as_u16() {
-            401 => Err(RouchError::Unauthorized),
-            403 => {
-                let body: CouchDbError = response.json().await.unwrap_or(CouchDbError {
-                    error: "forbidden".into(),
-                    reason: "access denied".into(),
-                });
-                Err(RouchError::Forbidden(body.reason))
-            }
-            404 => {
-                let body: CouchDbError = response.json().await.unwrap_or(CouchDbError {
-                    error: "not_found".into(),
-                    reason: "missing".into(),
-                });
-                Err(RouchError::NotFound(body.reason))
-            }
-            409 => Err(RouchError::Conflict),
-            _ => {
-                let body = response.text().await.unwrap_or_default();
-                Err(RouchError::DatabaseError(format!(
-                    "HTTP {}: {}",
-                    status, body
-                )))
-            }
-        }
+        check_response(response).await
     }
+}
+
+/// Map an unsuccessful CouchDB response to a `RouchError`, using the
+/// `{"error", "reason"}` body when there is one.
+pub(crate) async fn check_response(response: reqwest::Response) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+
+    let body = response.text().await.unwrap_or_default();
+    let couch = serde_json::from_str::<CouchDbError>(&body).ok();
+    let reason = |default: &str| {
+        couch
+            .as_ref()
+            .map(|e| e.reason.clone())
+            .unwrap_or_else(|| default.to_string())
+    };
+    Err(match status.as_u16() {
+        400 | 413 | 415 => RouchError::BadRequest(reason(&body)),
+        401 => RouchError::Unauthorized,
+        403 => RouchError::Forbidden(reason("access denied")),
+        404 => RouchError::NotFound(reason("missing")),
+        409 => RouchError::Conflict,
+        // 412 is "file_exists" on database creation, but also e.g.
+        // "missing_stub" for a document write.
+        412 => match couch {
+            Some(ref e) if e.error == "file_exists" => RouchError::DatabaseExists(e.reason.clone()),
+            Some(ref e) => RouchError::BadRequest(format!("{}: {}", e.error, e.reason)),
+            None => RouchError::BadRequest(body),
+        },
+        _ => RouchError::DatabaseError(format!("HTTP {}: {}", status, body)),
+    })
 }
 
 /// Parse a CouchDB sequence value (can be integer or string).
@@ -234,6 +329,7 @@ fn parse_seq(value: &serde_json::Value) -> Seq {
 #[async_trait]
 impl Adapter for HttpAdapter {
     async fn info(&self) -> Result<DbInfo> {
+        self.ensure_setup().await?;
         let resp = self
             .client
             .get(&self.base_url)
@@ -254,7 +350,34 @@ impl Adapter for HttpAdapter {
         })
     }
 
+    async fn id(&self) -> Result<String> {
+        // Like PouchDB: the server's uuid plus the database name, so every
+        // URL of the same database maps to one replication id (and same-named
+        // databases on different servers do not). A server that answers
+        // without a uuid gets the URL without credentials; an unreachable one
+        // is an error, so a fallback id is never used by mistake.
+        let (server, db) = self
+            .base_url
+            .rsplit_once('/')
+            .unwrap_or((self.base_url.as_str(), ""));
+        let resp = self
+            .client
+            .get(server)
+            .send()
+            .await
+            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+        let root: Option<serde_json::Value> = match resp.error_for_status() {
+            Ok(resp) => resp.json().await.ok(),
+            Err(_) => None,
+        };
+        Ok(match root.as_ref().and_then(|r| r.get("uuid")?.as_str()) {
+            Some(uuid) => format!("{}{}", uuid, db),
+            None => url_without_credentials(&self.base_url),
+        })
+    }
+
     async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
+        self.ensure_setup().await?;
         let mut url = self.url(&encode_doc_id(id));
         let mut params = Vec::new();
 
@@ -290,9 +413,11 @@ impl Adapter for HttpAdapter {
             url = format!("{}?{}", url, params.join("&"));
         }
 
+        // JSON explicitly: with open_revs CouchDB otherwise replies multipart.
         let resp = self
             .client
             .get(&url)
+            .header(reqwest::header::ACCEPT, "application/json")
             .send()
             .await
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
@@ -302,6 +427,9 @@ impl Adapter for HttpAdapter {
             .await
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
 
+        if opts.open_revs.is_some() {
+            return winning_open_rev(json, id);
+        }
         Document::from_json(json)
     }
 
@@ -310,6 +438,7 @@ impl Adapter for HttpAdapter {
         docs: Vec<Document>,
         opts: BulkDocsOptions,
     ) -> Result<Vec<DocResult>> {
+        self.ensure_setup().await?;
         let json_docs: Vec<serde_json::Value> = docs.iter().map(|d| d.to_json()).collect();
 
         let request = CouchDbBulkDocsRequest {
@@ -344,6 +473,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
+        self.ensure_setup().await?;
         let mut params = Vec::new();
         if opts.include_docs {
             params.push("include_docs=true".into());
@@ -419,13 +549,16 @@ impl Adapter for HttpAdapter {
                     })
                 })
                 .collect(),
-            update_seq: None, // TODO: parse from CouchDB response when update_seq=true
+            update_seq: result.update_seq.as_ref().map(parse_seq),
         })
     }
 
     async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
+        self.ensure_setup().await?;
         let mut params = vec![format!("since={}", opts.since.to_query_string())];
-        if opts.include_docs {
+        // CouchDB only reports conflicts inside included docs (`_conflicts`),
+        // so fetch the docs for them and drop them afterwards if unwanted.
+        if opts.include_docs || opts.conflicts {
             params.push("include_docs=true".into());
         }
         if opts.descending {
@@ -485,23 +618,35 @@ impl Adapter for HttpAdapter {
             results: result
                 .results
                 .into_iter()
-                .map(|r| ChangeEvent {
-                    seq: parse_seq(&r.seq),
-                    id: r.id,
-                    changes: r
-                        .changes
-                        .into_iter()
-                        .map(|c| ChangeRev { rev: c.rev })
-                        .collect(),
-                    deleted: r.deleted,
-                    doc: r.doc,
-                    conflicts: None, // CouchDB includes these inline in the doc
+                .map(|r| {
+                    let conflicts = if opts.conflicts {
+                        r.doc
+                            .as_ref()
+                            .and_then(|d| d.get("_conflicts"))
+                            .and_then(|c| serde_json::from_value::<Vec<String>>(c.clone()).ok())
+                            .filter(|c| !c.is_empty())
+                    } else {
+                        None
+                    };
+                    ChangeEvent {
+                        seq: parse_seq(&r.seq),
+                        id: r.id,
+                        changes: r
+                            .changes
+                            .into_iter()
+                            .map(|c| ChangeRev { rev: c.rev })
+                            .collect(),
+                        deleted: r.deleted,
+                        doc: if opts.include_docs { r.doc } else { None },
+                        conflicts,
+                    }
                 })
                 .collect(),
         })
     }
 
     async fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
+        self.ensure_setup().await?;
         let resp = self
             .client
             .post(self.url("_revs_diff"))
@@ -520,6 +665,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn bulk_get(&self, docs: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
+        self.ensure_setup().await?;
         let request = CouchDbBulkGetRequest {
             docs: docs
                 .into_iter()
@@ -530,9 +676,15 @@ impl Adapter for HttpAdapter {
                 .collect(),
         };
 
+        // Like PouchDB: inline the attachment bytes (without them a pulled
+        // doc only carries stubs and the data never reaches the target) and
+        // follow a superseded rev to its latest leaf. JSON is requested
+        // explicitly since attachments otherwise make CouchDB reply
+        // multipart.
         let resp = self
             .client
-            .post(self.url("_bulk_get?revs=true"))
+            .post(self.url("_bulk_get?revs=true&attachments=true&latest=true"))
+            .header(reqwest::header::ACCEPT, "application/json")
             .json(&request)
             .send()
             .await
@@ -554,7 +706,7 @@ impl Adapter for HttpAdapter {
                         .docs
                         .into_iter()
                         .map(|d| BulkGetDoc {
-                            ok: d.ok,
+                            ok: d.ok.map(fill_inline_attachment_lengths),
                             error: d.error.map(|e| BulkGetError {
                                 id: e.id,
                                 rev: e.rev,
@@ -576,6 +728,7 @@ impl Adapter for HttpAdapter {
         data: Vec<u8>,
         content_type: &str,
     ) -> Result<DocResult> {
+        self.ensure_setup().await?;
         let url = format!(
             "{}/{}?rev={}",
             self.url(&encode_doc_id(doc_id)),
@@ -612,6 +765,7 @@ impl Adapter for HttpAdapter {
         att_id: &str,
         opts: GetAttachmentOptions,
     ) -> Result<Vec<u8>> {
+        self.ensure_setup().await?;
         let mut url = format!(
             "{}/{}",
             self.url(&encode_doc_id(doc_id)),
@@ -637,6 +791,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn remove_attachment(&self, doc_id: &str, att_id: &str, rev: &str) -> Result<DocResult> {
+        self.ensure_setup().await?;
         let url = format!(
             "{}/{}?rev={}",
             self.url(&encode_doc_id(doc_id)),
@@ -666,6 +821,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
+        self.ensure_setup().await?;
         let url = self.url(&format!("_local/{}", urlencoded(id)));
         let resp = self
             .client
@@ -682,6 +838,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
+        self.ensure_setup().await?;
         let url = self.url(&format!("_local/{}", urlencoded(id)));
         let resp = self
             .client
@@ -695,6 +852,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn remove_local(&self, id: &str) -> Result<()> {
+        self.ensure_setup().await?;
         // Need to get the current rev first
         let doc = self.get_local(id).await?;
         let rev = doc["_rev"].as_str().unwrap_or("");
@@ -714,6 +872,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn compact(&self) -> Result<()> {
+        self.ensure_setup().await?;
         let resp = self
             .client
             .post(self.url("_compact"))
@@ -737,6 +896,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn purge(&self, req: HashMap<String, Vec<String>>) -> Result<PurgeResponse> {
+        self.ensure_setup().await?;
         let resp = self
             .client
             .post(self.url("_purge"))
@@ -753,6 +913,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn get_security(&self) -> Result<SecurityDocument> {
+        self.ensure_setup().await?;
         let resp = self
             .client
             .get(self.url("_security"))
@@ -768,6 +929,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn put_security(&self, doc: SecurityDocument) -> Result<()> {
+        self.ensure_setup().await?;
         let resp = self
             .client
             .put(self.url("_security"))
@@ -778,6 +940,60 @@ impl Adapter for HttpAdapter {
         self.check_error(resp).await?;
         Ok(())
     }
+}
+
+/// Pick the document to return from an `open_revs` reply
+/// (`[{"ok": doc} | {"missing": rev}]`): like the local adapters, `get`
+/// yields one document, the winner among the leaves found (non-deleted
+/// first, then highest revision).
+fn winning_open_rev(reply: serde_json::Value, id: &str) -> Result<Document> {
+    let entries = match reply {
+        serde_json::Value::Array(entries) => entries,
+        _ => {
+            return Err(RouchError::DatabaseError(
+                "unexpected open_revs response".into(),
+            ));
+        }
+    };
+    entries
+        .into_iter()
+        .filter_map(|mut entry| entry.get_mut("ok").map(serde_json::Value::take))
+        .map(Document::from_json)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .max_by(|a, b| (!a.deleted, &a.rev).cmp(&(!b.deleted, &b.rev)))
+        .ok_or_else(|| RouchError::NotFound(id.to_string()))
+}
+
+/// `url` with any `user:password@` removed.
+fn url_without_credentials(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        Err(_) => url.to_string(),
+    }
+}
+
+/// CouchDB omits `length` (and `stub`) on attachments inlined with
+/// `attachments=true`; fill in the decoded length so the attachment is not
+/// rejected as malformed when the document is parsed.
+fn fill_inline_attachment_lengths(mut doc: serde_json::Value) -> serde_json::Value {
+    if let Some(atts) = doc.get_mut("_attachments").and_then(|a| a.as_object_mut()) {
+        for meta in atts.values_mut() {
+            if let Some(meta) = meta.as_object_mut()
+                && !meta.contains_key("length")
+                && let Some(data) = meta.get("data").and_then(|d| d.as_str())
+            {
+                let padding = data.bytes().rev().take_while(|&b| b == b'=').count();
+                let length = (data.len() / 4 * 3).saturating_sub(padding);
+                meta.insert("length".into(), serde_json::json!(length));
+            }
+        }
+    }
+    doc
 }
 
 /// Percent-encode a CouchDB document or attachment ID for safe URL use.
@@ -820,7 +1036,11 @@ fn encode_query_key(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CouchDbAllDocsResponse, encode_doc_id, encode_query_key, urlencoded};
+    use super::{
+        CouchDbAllDocsResponse, HttpAdapter, encode_doc_id, encode_query_key,
+        fill_inline_attachment_lengths, urlencoded, winning_open_rev,
+    };
+    use rouchdb_core::adapter::Adapter;
 
     #[test]
     fn design_and_local_ids_keep_prefix_slash() {
@@ -863,5 +1083,240 @@ mod tests {
         assert_eq!(resp.rows.len(), 2);
         assert_eq!(resp.rows[0].id.as_deref(), Some("a"));
         assert!(resp.rows[1].id.is_none() && resp.rows[1].value.is_none());
+    }
+
+    #[test]
+    fn bulk_get_inline_attachments_parse() {
+        // Verbatim CouchDB 3 `_bulk_get?attachments=true` doc: inline data
+        // with no `length` or `stub`.
+        let doc: serde_json::Value = serde_json::from_str(
+            r#"{"_id":"doc1","_rev":"1-ab5b0978671b42f37de2b4485c8386ff","v":1,
+            "_revisions":{"start":1,"ids":["ab5b0978671b42f37de2b4485c8386ff"]},
+            "_attachments":{
+                "hi.txt":{"content_type":"text/plain","revpos":1,"digest":"md5-O9yO4zjoapsrEQwYrCDNZw==","data":"aGkh"},
+                "one.bin":{"content_type":"application/octet-stream","revpos":1,"digest":"md5-x","data":"AQ=="},
+                "two.bin":{"content_type":"application/octet-stream","revpos":1,"digest":"md5-y","data":"AQI="}
+            }}"#,
+        )
+        .unwrap();
+        let doc = rouchdb_core::document::Document::from_json(fill_inline_attachment_lengths(doc))
+            .unwrap();
+        assert_eq!(doc.attachments["hi.txt"].data.as_deref(), Some(&b"hi!"[..]));
+        assert_eq!(doc.attachments["hi.txt"].length, 3);
+        assert_eq!(doc.attachments["one.bin"].length, 1);
+        assert_eq!(doc.attachments["two.bin"].length, 2);
+    }
+
+    #[tokio::test]
+    async fn id_is_server_uuid_plus_db_or_the_url_without_credentials() {
+        let (with_uuid, _) = recording_stub_server(json_response(
+            "200 OK",
+            r#"{"couchdb":"Welcome","uuid":"abc123"}"#,
+        ))
+        .await;
+        let db = HttpAdapter::new(&format!("{with_uuid}/userdb"));
+        assert_eq!(db.id().await.unwrap(), "abc123userdb");
+
+        let (no_uuid, _) =
+            recording_stub_server(json_response("200 OK", r#"{"couchdb":"Welcome"}"#)).await;
+        let url = no_uuid.replace("http://", "http://admin:secret@");
+        let db = HttpAdapter::new(&format!("{url}/userdb"));
+        assert_eq!(db.id().await.unwrap(), format!("{no_uuid}/userdb"));
+
+        // Nothing listens on port 1: no id rather than a fallback one that
+        // would not match the id used once the server is reachable.
+        let offline = HttpAdapter::new("http://127.0.0.1:1/userdb");
+        assert!(offline.id().await.is_err());
+    }
+
+    /// Serve one canned raw HTTP `response` to every connection; returns the
+    /// server's base URL.
+    pub(crate) async fn stub_server(response: String) -> String {
+        recording_stub_server(response).await.0
+    }
+
+    /// Like [`stub_server`], also recording each request line
+    /// (`"PUT /path HTTP/1.1"`).
+    pub(crate) async fn recording_stub_server(
+        response: String,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let response = response.clone();
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    // Read the request head and body before answering.
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let Ok(n) = socket.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        req.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&req).to_string();
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let len = text
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if req.len() >= end + 4 + len {
+                                let line = text.lines().next().unwrap_or_default();
+                                recorded.lock().unwrap().push(line.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{}", addr), requests)
+    }
+
+    /// A raw JSON response with the given status line.
+    pub(crate) fn json_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    async fn error_for(status: &str, body: &str) -> rouchdb_core::error::RouchError {
+        let url = stub_server(json_response(status, body)).await;
+        let db = HttpAdapter::with_options(
+            &format!("{url}/db"),
+            super::HttpAdapterOptions {
+                skip_setup: true,
+                ..Default::default()
+            },
+        );
+        db.info().await.unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn http_errors_map_to_rouch_errors() {
+        use rouchdb_core::error::RouchError;
+        let err = error_for(
+            "400 Bad Request",
+            r#"{"error":"bad_request","reason":"Invalid rev format"}"#,
+        )
+        .await;
+        assert!(
+            matches!(err, RouchError::BadRequest(ref r) if r == "Invalid rev format"),
+            "{err:?}"
+        );
+
+        let err = error_for(
+            "412 Precondition Failed",
+            r#"{"error":"file_exists","reason":"The database could not be created, the file already exists."}"#,
+        )
+        .await;
+        assert!(matches!(err, RouchError::DatabaseExists(_)), "{err:?}");
+
+        let err = error_for(
+            "412 Precondition Failed",
+            r#"{"error":"missing_stub","reason":"Invalid attachment stub in d for a.txt"}"#,
+        )
+        .await;
+        assert!(
+            matches!(err, RouchError::BadRequest(ref r) if r.contains("missing_stub")),
+            "{err:?}"
+        );
+
+        let err = error_for(
+            "413 Request Entity Too Large",
+            r#"{"error":"document_too_large","reason":"d"}"#,
+        )
+        .await;
+        assert!(matches!(err, RouchError::BadRequest(_)), "{err:?}");
+
+        let err = error_for(
+            "415 Unsupported Media Type",
+            r#"{"error":"bad_content_type","reason":"Content-Type must be application/json"}"#,
+        )
+        .await;
+        assert!(matches!(err, RouchError::BadRequest(_)), "{err:?}");
+
+        let err = error_for("403 Forbidden", r#"{"error":"forbidden","reason":"no"}"#).await;
+        assert!(
+            matches!(err, RouchError::Forbidden(ref r) if r == "no"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_with_bad_credentials_is_unauthorized() {
+        let url = stub_server(json_response(
+            "401 Unauthorized",
+            r#"{"error":"unauthorized","reason":"Name or password is incorrect."}"#,
+        ))
+        .await;
+        let auth = super::auth::AuthClient::new(&url);
+        let err = auth.login("bob", "wrong").await.unwrap_err();
+        assert!(
+            matches!(err, rouchdb_core::error::RouchError::Unauthorized),
+            "{err:?}"
+        );
+    }
+
+    /// A server that accepts connections and never answers.
+    async fn hung_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                open.push(socket);
+            }
+        });
+        format!("http://{}/db", addr)
+    }
+
+    #[tokio::test]
+    async fn stalled_server_times_out() {
+        let db = HttpAdapter::with_options(
+            &hung_server().await,
+            super::HttpAdapterOptions {
+                skip_setup: true,
+                read_timeout: std::time::Duration::from_millis(200),
+                ..Default::default()
+            },
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), db.info())
+            .await
+            .expect("request to a stalled server never timed out");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_revs_reply_yields_the_winning_leaf() {
+        // CouchDB `GET /db/d?open_revs=all` with Accept: application/json.
+        let reply: serde_json::Value = serde_json::from_str(
+            r#"[{"ok":{"_id":"d","_rev":"2-bbb","v":"b"}},
+                {"ok":{"_id":"d","_rev":"3-ddd","_deleted":true}},
+                {"missing":"4-eee"}]"#,
+        )
+        .unwrap();
+        let doc = winning_open_rev(reply, "d").unwrap();
+        assert_eq!(doc.rev.unwrap().to_string(), "2-bbb");
+
+        let none: serde_json::Value = serde_json::from_str(r#"[{"missing":"1-x"}]"#).unwrap();
+        assert!(matches!(
+            winning_open_rev(none, "d"),
+            Err(rouchdb_core::error::RouchError::NotFound(_))
+        ));
     }
 }

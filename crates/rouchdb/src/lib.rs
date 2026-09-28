@@ -43,8 +43,8 @@ pub use rouchdb_core::error::{Result, RouchError};
 pub use rouchdb_core::merge::{is_deleted, winning_rev};
 
 // Re-export adapters
-pub use rouchdb_adapter_http::HttpAdapter;
 pub use rouchdb_adapter_http::auth::{AuthClient, Session, UserContext};
+pub use rouchdb_adapter_http::{HttpAdapter, HttpAdapterOptions};
 pub use rouchdb_adapter_memory::MemoryAdapter;
 pub use rouchdb_adapter_redb::RedbAdapter;
 
@@ -67,22 +67,227 @@ pub use rouchdb_replication::{
 
 /// Plugin trait for extending Database behavior.
 ///
-/// Plugins receive lifecycle hooks during database operations.
+/// Plugins receive lifecycle hooks during database operations, including
+/// documents replicated into the database.
 #[async_trait::async_trait]
 pub trait Plugin: Send + Sync {
     /// The plugin name.
     fn name(&self) -> &str;
-    /// Called before documents are written.
+    /// Called before documents are written; may modify them or reject the
+    /// write with an error.
+    ///
+    /// For replicated documents it acts like a CouchDB `validate_doc_update`:
+    /// it is called once per document, changes it makes are ignored (the
+    /// source's body is kept under the source's revision id), and a document
+    /// it drops or rejects with `Forbidden`, `Unauthorized` or `BadRequest`
+    /// is reported as denied while the rest of the batch is still written.
     async fn before_write(&self, _docs: &mut Vec<Document>) -> Result<()> {
         Ok(())
     }
-    /// Called after documents are written.
+    /// Called after documents (or attachments) were written. The write is
+    /// already committed: an error is returned to the caller but does not
+    /// undo it, so retrying the same write will conflict.
     async fn after_write(&self, _results: &[DocResult]) -> Result<()> {
         Ok(())
     }
     /// Called when the database is destroyed.
     async fn on_destroy(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+/// Runs a database's plugins around writes that do not go through
+/// `Database::bulk_docs`: it is the adapter replication writes into.
+struct PluginAdapter {
+    inner: Arc<dyn Adapter>,
+    plugins: Vec<Arc<dyn Plugin>>,
+}
+
+/// The per-doc error a plugin rejection is reported as, if it is a
+/// rejection that retrying cannot fix.
+fn denial(error: &RouchError) -> Option<&'static str> {
+    match error {
+        RouchError::Forbidden(_) | RouchError::BadRequest(_) => Some("forbidden"),
+        RouchError::Unauthorized => Some("unauthorized"),
+        _ => None,
+    }
+}
+
+#[async_trait::async_trait]
+impl Adapter for PluginAdapter {
+    async fn info(&self) -> Result<DbInfo> {
+        self.inner.info().await
+    }
+
+    async fn id(&self) -> Result<String> {
+        self.inner.id().await
+    }
+
+    async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
+        self.inner.get(id, opts).await
+    }
+
+    async fn bulk_docs(
+        &self,
+        docs: Vec<Document>,
+        opts: BulkDocsOptions,
+    ) -> Result<Vec<DocResult>> {
+        // Validate each doc on its own so one rejected doc is reported as
+        // denied instead of failing (and forever blocking) the whole batch.
+        // Plugins only accept or reject replicated docs: the original body
+        // is written, since a changed body stored under the source's
+        // revision id would silently diverge from it for good.
+        let mut accepted = Vec::with_capacity(docs.len());
+        let mut denied = Vec::new();
+        for doc in docs {
+            let mut probe = vec![doc.clone()];
+            let mut outcome = Ok(());
+            for plugin in &self.plugins {
+                outcome = plugin.before_write(&mut probe).await;
+                if outcome.is_err() {
+                    break;
+                }
+                if probe.is_empty() {
+                    outcome = Err(RouchError::Forbidden(format!(
+                        "dropped by plugin {}",
+                        plugin.name()
+                    )));
+                    break;
+                }
+            }
+            match outcome {
+                Ok(()) => accepted.push(doc),
+                Err(e) => match denial(&e) {
+                    Some(kind) => denied.push(DocResult {
+                        ok: false,
+                        id: doc.id,
+                        rev: None,
+                        error: Some(kind.to_string()),
+                        reason: Some(e.to_string()),
+                    }),
+                    None => return Err(e),
+                },
+            }
+        }
+
+        let written: Vec<(String, Option<String>)> = accepted
+            .iter()
+            .map(|d| (d.id.clone(), d.rev.as_ref().map(|r| r.to_string())))
+            .collect();
+        let mut results = if accepted.is_empty() {
+            Vec::new()
+        } else {
+            self.inner.bulk_docs(accepted, opts.clone()).await?
+        };
+        // CouchDB answers new_edits=false writes with only the failures;
+        // report the rest as written so after_write sees every doc.
+        if !opts.new_edits && results.len() < written.len() {
+            let failed: std::collections::HashSet<String> =
+                results.iter().map(|r| r.id.clone()).collect();
+            for (id, rev) in written {
+                if !failed.contains(&id) {
+                    results.push(DocResult {
+                        ok: true,
+                        id,
+                        rev,
+                        error: None,
+                        reason: None,
+                    });
+                }
+            }
+        }
+        for plugin in &self.plugins {
+            plugin.after_write(&results).await?;
+        }
+        results.extend(denied);
+        Ok(results)
+    }
+
+    async fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
+        self.inner.all_docs(opts).await
+    }
+
+    async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
+        self.inner.changes(opts).await
+    }
+
+    async fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
+        self.inner.revs_diff(revs).await
+    }
+
+    async fn bulk_get(&self, docs: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
+        self.inner.bulk_get(docs).await
+    }
+
+    async fn put_attachment(
+        &self,
+        doc_id: &str,
+        att_id: &str,
+        rev: &str,
+        data: Vec<u8>,
+        content_type: &str,
+    ) -> Result<DocResult> {
+        let result = self
+            .inner
+            .put_attachment(doc_id, att_id, rev, data, content_type)
+            .await?;
+        for plugin in &self.plugins {
+            plugin.after_write(std::slice::from_ref(&result)).await?;
+        }
+        Ok(result)
+    }
+
+    async fn get_attachment(
+        &self,
+        doc_id: &str,
+        att_id: &str,
+        opts: GetAttachmentOptions,
+    ) -> Result<Vec<u8>> {
+        self.inner.get_attachment(doc_id, att_id, opts).await
+    }
+
+    async fn remove_attachment(&self, doc_id: &str, att_id: &str, rev: &str) -> Result<DocResult> {
+        let result = self.inner.remove_attachment(doc_id, att_id, rev).await?;
+        for plugin in &self.plugins {
+            plugin.after_write(std::slice::from_ref(&result)).await?;
+        }
+        Ok(result)
+    }
+
+    async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
+        self.inner.get_local(id).await
+    }
+
+    async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
+        self.inner.put_local(id, doc).await
+    }
+
+    async fn remove_local(&self, id: &str) -> Result<()> {
+        self.inner.remove_local(id).await
+    }
+
+    async fn compact(&self) -> Result<()> {
+        self.inner.compact().await
+    }
+
+    async fn destroy(&self) -> Result<()> {
+        self.inner.destroy().await
+    }
+
+    async fn close(&self) -> Result<()> {
+        self.inner.close().await
+    }
+
+    async fn purge(&self, req: HashMap<String, Vec<String>>) -> Result<PurgeResponse> {
+        self.inner.purge(req).await
+    }
+
+    async fn get_security(&self) -> Result<SecurityDocument> {
+        self.inner.get_security().await
+    }
+
+    async fn put_security(&self, doc: SecurityDocument) -> Result<()> {
+        self.inner.put_security(doc).await
     }
 }
 
@@ -153,6 +358,19 @@ impl Database {
     /// Get a reference to the underlying adapter.
     pub fn adapter(&self) -> &dyn Adapter {
         self.adapter.as_ref()
+    }
+
+    /// The adapter writes from outside `bulk_docs` (replication, attachment
+    /// updates) go through, so they run this database's plugins.
+    fn plugin_adapter(&self) -> Arc<dyn Adapter> {
+        if self.plugins.is_empty() {
+            self.adapter.clone()
+        } else {
+            Arc::new(PluginAdapter {
+                inner: self.adapter.clone(),
+                plugins: self.plugins.clone(),
+            })
+        }
     }
 
     // -----------------------------------------------------------------
@@ -324,54 +542,13 @@ impl Database {
     /// Returns a receiver for `ChangeEvent` and a `ChangesHandle` that can be
     /// used to cancel the stream. Dropping the handle also cancels it.
     ///
-    /// If `opts.selector` is set, events are post-filtered using the Mango
-    /// selector — only matching changes are forwarded through the channel.
+    /// If `opts.selector` is set, only changes whose document matches the
+    /// Mango selector are forwarded through the channel.
     pub fn live_changes(
         &self,
         opts: ChangesStreamOptions,
     ) -> (tokio::sync::mpsc::Receiver<ChangeEvent>, ChangesHandle) {
-        if let Some(selector) = opts.selector.clone() {
-            let user_wants_docs = opts.include_docs;
-            // Push the selector into the stream's filter so `limit` counts only
-            // matching changes (composing with any pre-existing filter).
-            let existing = opts.filter.clone();
-            let filter: ChangesFilter = Arc::new(move |e: &ChangeEvent| {
-                if let Some(ref ex) = existing
-                    && !ex(e)
-                {
-                    return false;
-                }
-                e.doc
-                    .as_ref()
-                    .is_some_and(|d| matches_selector(d, &selector))
-            });
-            let inner_opts = ChangesStreamOptions {
-                include_docs: true, // Need docs for selector evaluation
-                selector: None,
-                filter: Some(filter),
-                ..opts
-            };
-            let (inner_rx, handle) = live_changes(self.adapter.clone(), inner_opts);
-            if user_wants_docs {
-                return (inner_rx, handle);
-            }
-
-            // Strip docs the user did not request.
-            let (tx, rx) = tokio::sync::mpsc::channel(64);
-            tokio::spawn(async move {
-                let mut inner_rx = inner_rx;
-                while let Some(mut event) = inner_rx.recv().await {
-                    event.doc = None;
-                    if tx.send(event).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            (rx, handle)
-        } else {
-            live_changes(self.adapter.clone(), opts)
-        }
+        live_changes(self.adapter.clone(), opts)
     }
 
     /// Start a live changes feed with lifecycle events.
@@ -382,54 +559,7 @@ impl Database {
         &self,
         opts: ChangesStreamOptions,
     ) -> (tokio::sync::mpsc::Receiver<ChangesEvent>, ChangesHandle) {
-        if let Some(selector) = opts.selector.clone() {
-            let user_wants_docs = opts.include_docs;
-            // Push the selector into the stream's filter so `limit` counts only
-            // matching changes (composing with any pre-existing filter).
-            let existing = opts.filter.clone();
-            let filter: ChangesFilter = Arc::new(move |e: &ChangeEvent| {
-                if let Some(ref ex) = existing
-                    && !ex(e)
-                {
-                    return false;
-                }
-                e.doc
-                    .as_ref()
-                    .is_some_and(|d| matches_selector(d, &selector))
-            });
-            let inner_opts = ChangesStreamOptions {
-                include_docs: true,
-                selector: None,
-                filter: Some(filter),
-                ..opts
-            };
-            let (inner_rx, handle) = live_changes_events(self.adapter.clone(), inner_opts);
-            if user_wants_docs {
-                return (inner_rx, handle);
-            }
-
-            // Strip docs the user did not request from Change events.
-            let (tx, rx) = tokio::sync::mpsc::channel(64);
-            tokio::spawn(async move {
-                let mut inner_rx = inner_rx;
-                while let Some(event) = inner_rx.recv().await {
-                    let forward = match event {
-                        ChangesEvent::Change(mut ce) => {
-                            ce.doc = None;
-                            ChangesEvent::Change(ce)
-                        }
-                        other => other,
-                    };
-                    if tx.send(forward).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            (rx, handle)
-        } else {
-            live_changes_events(self.adapter.clone(), opts)
-        }
+        live_changes_events(self.adapter.clone(), opts)
     }
 
     // -----------------------------------------------------------------
@@ -445,7 +575,7 @@ impl Database {
         data: Vec<u8>,
         content_type: &str,
     ) -> Result<DocResult> {
-        self.adapter
+        self.plugin_adapter()
             .put_attachment(doc_id, att_id, rev, data, content_type)
             .await
     }
@@ -476,7 +606,9 @@ impl Database {
         att_id: &str,
         rev: &str,
     ) -> Result<DocResult> {
-        self.adapter.remove_attachment(doc_id, att_id, rev).await
+        self.plugin_adapter()
+            .remove_attachment(doc_id, att_id, rev)
+            .await
     }
 
     // -----------------------------------------------------------------
@@ -768,20 +900,24 @@ impl Database {
     // -----------------------------------------------------------------
 
     /// Replicate from this database to the target.
+    ///
+    /// The target's plugins run on the replicated documents.
     pub async fn replicate_to(&self, target: &Database) -> Result<ReplicationResult> {
         replicate(
             self.adapter.as_ref(),
-            target.adapter.as_ref(),
+            target.plugin_adapter().as_ref(),
             ReplicationOptions::default(),
         )
         .await
     }
 
     /// Replicate from the source to this database.
+    ///
+    /// This database's plugins run on the replicated documents.
     pub async fn replicate_from(&self, source: &Database) -> Result<ReplicationResult> {
         replicate(
             source.adapter.as_ref(),
-            self.adapter.as_ref(),
+            self.plugin_adapter().as_ref(),
             ReplicationOptions::default(),
         )
         .await
@@ -793,13 +929,18 @@ impl Database {
         target: &Database,
         opts: ReplicationOptions,
     ) -> Result<ReplicationResult> {
-        replicate(self.adapter.as_ref(), target.adapter.as_ref(), opts).await
+        replicate(
+            self.adapter.as_ref(),
+            target.plugin_adapter().as_ref(),
+            opts,
+        )
+        .await
     }
 
     /// Replicate with event streaming.
     ///
-    /// Same as `replicate_to()` but emits `ReplicationEvent` through the
-    /// returned receiver as replication progresses.
+    /// Same as `replicate_to()` but also returns every `ReplicationEvent`
+    /// emitted while replicating, buffered in the returned receiver.
     pub async fn replicate_to_with_events(
         &self,
         target: &Database,
@@ -808,9 +949,28 @@ impl Database {
         ReplicationResult,
         tokio::sync::mpsc::Receiver<ReplicationEvent>,
     )> {
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let result =
-            replicate_with_events(self.adapter.as_ref(), target.adapter.as_ref(), opts, tx).await?;
+        // Drain the events while replicating: nobody can read the returned
+        // receiver until this call finishes, so a bounded channel that fills
+        // up would stall the replication forever.
+        let (tx, mut inner_rx) = tokio::sync::mpsc::channel(64);
+        let target_adapter = target.plugin_adapter();
+        let replication =
+            replicate_with_events(self.adapter.as_ref(), target_adapter.as_ref(), opts, tx);
+        let collect = async {
+            let mut events = Vec::new();
+            while let Some(event) = inner_rx.recv().await {
+                events.push(event);
+            }
+            events
+        };
+        let (result, events) = tokio::join!(replication, collect);
+        let result = result?;
+
+        // Hand the events back through a channel large enough to hold them.
+        let (tx, rx) = tokio::sync::mpsc::channel(events.len().max(1));
+        for event in events {
+            let _ = tx.try_send(event);
+        }
         Ok((result, rx))
     }
 
@@ -827,7 +987,7 @@ impl Database {
         tokio::sync::mpsc::Receiver<ReplicationEvent>,
         ReplicationHandle,
     ) {
-        replicate_live(self.adapter.clone(), target.adapter.clone(), opts)
+        replicate_live(self.adapter.clone(), target.plugin_adapter(), opts)
     }
 
     /// Bidirectional sync (replicate in both directions).
@@ -1360,6 +1520,46 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ReplicationEvent::Complete(_)))
         );
+    }
+
+    #[tokio::test]
+    async fn replicate_to_with_events_does_not_stall_on_many_events() {
+        let local = Database::memory("local");
+        let remote = Database::memory("remote");
+        for i in 0..100 {
+            local
+                .put(&format!("doc{i:03}"), serde_json::json!({"i": i}))
+                .await
+                .unwrap();
+        }
+
+        // batch_size=1 produces more events than any fixed channel capacity.
+        let replication = local.replicate_to_with_events(
+            &remote,
+            ReplicationOptions {
+                batch_size: 1,
+                ..Default::default()
+            },
+        );
+        let (result, mut rx) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), replication)
+                .await
+                .expect("replicate_to_with_events stalled")
+                .unwrap();
+        assert!(result.ok);
+        assert_eq!(result.docs_written, 100);
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let changes = events
+            .iter()
+            .filter(|e| matches!(e, ReplicationEvent::Change { .. }))
+            .count();
+        assert_eq!(changes, 100);
+        assert!(matches!(events.first(), Some(ReplicationEvent::Active)));
+        assert!(matches!(events.last(), Some(ReplicationEvent::Complete(_))));
     }
 
     #[tokio::test]
