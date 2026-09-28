@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use rouchdb_core::adapter::Adapter;
@@ -318,12 +318,19 @@ fn rev_data_key(doc_id: &str, rev_str: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Persistent adapter backed by `redb`.
+///
+/// redb is a synchronous engine (commits fsync), so every operation runs on
+/// Tokio's blocking thread pool instead of an async worker thread.
 pub struct RedbAdapter {
-    db: Arc<Database>,
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    db: Database,
     name: String,
-    /// Lock for write serialization (redb handles transactions, but we need
-    /// to serialize our read-modify-write sequences).
-    write_lock: Arc<RwLock<()>>,
+    /// Serializes writers before they reach redb (which would otherwise park
+    /// one blocking thread per waiting writer).
+    write_lock: Mutex<()>,
 }
 
 impl RedbAdapter {
@@ -370,10 +377,40 @@ impl RedbAdapter {
         }
 
         Ok(Self {
-            db: Arc::new(db),
-            name: name.to_string(),
-            write_lock: Arc::new(RwLock::new(())),
+            inner: Arc::new(Inner {
+                db,
+                name: name.to_string(),
+                write_lock: Mutex::new(()),
+            }),
         })
+    }
+
+    /// Run storage work on the blocking thread pool (or inline when called
+    /// outside a Tokio runtime).
+    async fn run<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Inner) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let inner = self.inner.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle
+                .spawn_blocking(move || f(&inner))
+                .await
+                .map_err(|e| RouchError::DatabaseError(format!("storage task failed: {}", e)))?,
+            Err(_) => f(&inner),
+        }
+    }
+
+    /// Like `run`, for operations that write: writers queue on an async
+    /// lock first.
+    async fn run_write<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Inner) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let _guard = self.inner.write_lock.lock().await;
+        self.run(f).await
     }
 }
 
@@ -634,6 +671,112 @@ fn stored_doc_json(
 #[async_trait]
 impl Adapter for RedbAdapter {
     async fn info(&self) -> Result<DbInfo> {
+        self.run(|db| db.info()).await
+    }
+
+    async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
+        let id = id.to_string();
+        self.run(move |db| db.get(&id, opts)).await
+    }
+
+    async fn bulk_docs(
+        &self,
+        docs: Vec<Document>,
+        opts: BulkDocsOptions,
+    ) -> Result<Vec<DocResult>> {
+        self.run_write(move |db| db.bulk_docs(docs, opts)).await
+    }
+
+    async fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
+        self.run(move |db| db.all_docs(opts)).await
+    }
+
+    async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
+        self.run(move |db| db.changes(opts)).await
+    }
+
+    async fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
+        self.run(move |db| db.revs_diff(revs)).await
+    }
+
+    async fn bulk_get(&self, docs: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
+        self.run(move |db| db.bulk_get(docs)).await
+    }
+
+    async fn put_attachment(
+        &self,
+        doc_id: &str,
+        att_id: &str,
+        rev: &str,
+        data: Vec<u8>,
+        content_type: &str,
+    ) -> Result<DocResult> {
+        let (doc_id, att_id, rev, content_type) = (
+            doc_id.to_string(),
+            att_id.to_string(),
+            rev.to_string(),
+            content_type.to_string(),
+        );
+        self.run_write(move |db| db.put_attachment(&doc_id, &att_id, &rev, data, &content_type))
+            .await
+    }
+
+    async fn get_attachment(
+        &self,
+        doc_id: &str,
+        att_id: &str,
+        opts: GetAttachmentOptions,
+    ) -> Result<Vec<u8>> {
+        let (doc_id, att_id) = (doc_id.to_string(), att_id.to_string());
+        self.run(move |db| db.get_attachment(&doc_id, &att_id, opts))
+            .await
+    }
+
+    async fn remove_attachment(&self, doc_id: &str, att_id: &str, rev: &str) -> Result<DocResult> {
+        let (doc_id, att_id, rev) = (doc_id.to_string(), att_id.to_string(), rev.to_string());
+        self.run_write(move |db| db.remove_attachment(&doc_id, &att_id, &rev))
+            .await
+    }
+
+    async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
+        let id = id.to_string();
+        self.run(move |db| db.get_local(&id)).await
+    }
+
+    async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
+        let id = id.to_string();
+        self.run_write(move |db| db.put_local(&id, doc)).await
+    }
+
+    async fn remove_local(&self, id: &str) -> Result<()> {
+        let id = id.to_string();
+        self.run_write(move |db| db.remove_local(&id)).await
+    }
+
+    async fn compact(&self) -> Result<()> {
+        self.run_write(|db| db.compact()).await
+    }
+
+    async fn destroy(&self) -> Result<()> {
+        self.run_write(|db| db.destroy()).await
+    }
+
+    async fn purge(&self, req: HashMap<String, Vec<String>>) -> Result<PurgeResponse> {
+        self.run_write(move |db| db.purge(req)).await
+    }
+
+    async fn get_security(&self) -> Result<SecurityDocument> {
+        self.run(|db| db.get_security()).await
+    }
+
+    async fn put_security(&self, doc: SecurityDocument) -> Result<()> {
+        self.run_write(move |db| db.put_security(doc)).await
+    }
+}
+
+/// The storage operations, run synchronously (see `RedbAdapter::run`).
+impl Inner {
+    fn info(&self) -> Result<DbInfo> {
         // Counts and update_seq live in one metadata record, so they always
         // reflect the same committed state without scanning documents.
         let read_txn = db_err!(self.db.begin_read())?;
@@ -647,7 +790,7 @@ impl Adapter for RedbAdapter {
         })
     }
 
-    async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
+    fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
         if opts.open_revs.is_some() {
             return Err(RouchError::BadRequest(
                 "open_revs is not supported by get(); use bulk_get".into(),
@@ -735,12 +878,7 @@ impl Adapter for RedbAdapter {
         Ok(doc)
     }
 
-    async fn bulk_docs(
-        &self,
-        docs: Vec<Document>,
-        opts: BulkDocsOptions,
-    ) -> Result<Vec<DocResult>> {
-        let _lock = self.write_lock.write().await;
+    fn bulk_docs(&self, docs: Vec<Document>, opts: BulkDocsOptions) -> Result<Vec<DocResult>> {
         let write_txn = db_err!(self.db.begin_write())?;
 
         let mut results = Vec::with_capacity(docs.len());
@@ -768,7 +906,7 @@ impl Adapter for RedbAdapter {
         Ok(results)
     }
 
-    async fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
+    fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
         let read_txn = db_err!(self.db.begin_read())?;
         let doc_table = db_err!(read_txn.open_table(DOC_TABLE))?;
         let rev_table = db_err!(read_txn.open_table(REV_DATA_TABLE))?;
@@ -918,7 +1056,7 @@ impl Adapter for RedbAdapter {
         })
     }
 
-    async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
+    fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
         let read_txn = db_err!(self.db.begin_read())?;
         let changes_table = db_err!(read_txn.open_table(CHANGES_TABLE))?;
         let doc_table = db_err!(read_txn.open_table(DOC_TABLE))?;
@@ -1023,7 +1161,7 @@ impl Adapter for RedbAdapter {
         Ok(ChangesResponse { results, last_seq })
     }
 
-    async fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
+    fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
         let read_txn = db_err!(self.db.begin_read())?;
         let doc_table = db_err!(read_txn.open_table(DOC_TABLE))?;
 
@@ -1072,7 +1210,7 @@ impl Adapter for RedbAdapter {
         Ok(RevsDiffResponse { results })
     }
 
-    async fn bulk_get(&self, docs: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
+    fn bulk_get(&self, docs: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
         let read_txn = db_err!(self.db.begin_read())?;
         let doc_table = db_err!(read_txn.open_table(DOC_TABLE))?;
         let rev_table = db_err!(read_txn.open_table(REV_DATA_TABLE))?;
@@ -1174,7 +1312,7 @@ impl Adapter for RedbAdapter {
         Ok(BulkGetResponse { results })
     }
 
-    async fn put_attachment(
+    fn put_attachment(
         &self,
         doc_id: &str,
         att_id: &str,
@@ -1182,7 +1320,6 @@ impl Adapter for RedbAdapter {
         data: Vec<u8>,
         content_type: &str,
     ) -> Result<DocResult> {
-        let _lock = self.write_lock.write().await;
         let write_txn = db_err!(self.db.begin_write())?;
         let mut meta = read_meta(&db_err!(write_txn.open_table(META_TABLE))?)?;
 
@@ -1230,7 +1367,7 @@ impl Adapter for RedbAdapter {
         Ok(result)
     }
 
-    async fn get_attachment(
+    fn get_attachment(
         &self,
         doc_id: &str,
         att_id: &str,
@@ -1259,8 +1396,7 @@ impl Adapter for RedbAdapter {
         load_blob(&att_table, &rec.digest)?.ok_or_else(not_found)
     }
 
-    async fn remove_attachment(&self, doc_id: &str, att_id: &str, rev: &str) -> Result<DocResult> {
-        let _lock = self.write_lock.write().await;
+    fn remove_attachment(&self, doc_id: &str, att_id: &str, rev: &str) -> Result<DocResult> {
         let write_txn = db_err!(self.db.begin_write())?;
         let mut meta = read_meta(&db_err!(write_txn.open_table(META_TABLE))?)?;
 
@@ -1307,7 +1443,7 @@ impl Adapter for RedbAdapter {
         Ok(result)
     }
 
-    async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
+    fn get_local(&self, id: &str) -> Result<serde_json::Value> {
         let read_txn = db_err!(self.db.begin_read())?;
         let table = db_err!(read_txn.open_table(LOCAL_TABLE))?;
         let guard = db_err!(table.get(id))?
@@ -1316,8 +1452,7 @@ impl Adapter for RedbAdapter {
         Ok(value)
     }
 
-    async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
-        let _lock = self.write_lock.write().await;
+    fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
         let write_txn = db_err!(self.db.begin_write())?;
         {
             let mut table = db_err!(write_txn.open_table(LOCAL_TABLE))?;
@@ -1328,8 +1463,7 @@ impl Adapter for RedbAdapter {
         Ok(())
     }
 
-    async fn remove_local(&self, id: &str) -> Result<()> {
-        let _lock = self.write_lock.write().await;
+    fn remove_local(&self, id: &str) -> Result<()> {
         let write_txn = db_err!(self.db.begin_write())?;
         {
             let mut table = db_err!(write_txn.open_table(LOCAL_TABLE))?;
@@ -1340,8 +1474,7 @@ impl Adapter for RedbAdapter {
         Ok(())
     }
 
-    async fn compact(&self) -> Result<()> {
-        let _lock = self.write_lock.write().await;
+    fn compact(&self) -> Result<()> {
         let write_txn = db_err!(self.db.begin_write())?;
         {
             let mut doc_table = db_err!(write_txn.open_table(DOC_TABLE))?;
@@ -1391,8 +1524,7 @@ impl Adapter for RedbAdapter {
         Ok(())
     }
 
-    async fn destroy(&self) -> Result<()> {
-        let _lock = self.write_lock.write().await;
+    fn destroy(&self) -> Result<()> {
         let write_txn = db_err!(self.db.begin_write())?;
 
         // Delete all tables in O(1) instead of draining entries one by one.
@@ -1415,8 +1547,7 @@ impl Adapter for RedbAdapter {
         Ok(())
     }
 
-    async fn purge(&self, req: HashMap<String, Vec<String>>) -> Result<PurgeResponse> {
-        let _lock = self.write_lock.write().await;
+    fn purge(&self, req: HashMap<String, Vec<String>>) -> Result<PurgeResponse> {
         let write_txn = db_err!(self.db.begin_write())?;
         let mut meta = read_meta(&db_err!(write_txn.open_table(META_TABLE))?)?;
         let mut purged = HashMap::new();
@@ -1476,7 +1607,7 @@ impl Adapter for RedbAdapter {
         })
     }
 
-    async fn get_security(&self) -> Result<SecurityDocument> {
+    fn get_security(&self) -> Result<SecurityDocument> {
         let read_txn = db_err!(self.db.begin_read())?;
         let table = db_err!(read_txn.open_table(META_TABLE))?;
         match db_err!(table.get(SECURITY_KEY))? {
@@ -1485,8 +1616,7 @@ impl Adapter for RedbAdapter {
         }
     }
 
-    async fn put_security(&self, doc: SecurityDocument) -> Result<()> {
-        let _lock = self.write_lock.write().await;
+    fn put_security(&self, doc: SecurityDocument) -> Result<()> {
         let write_txn = db_err!(self.db.begin_write())?;
         {
             let mut table = db_err!(write_txn.open_table(META_TABLE))?;
@@ -2190,7 +2320,7 @@ mod tests {
             seq,
         })
         .unwrap();
-        let txn = db.db.begin_write().unwrap();
+        let txn = db.inner.db.begin_write().unwrap();
         {
             let mut t = txn.open_table(DOC_TABLE).unwrap();
             t.insert(id, bytes.as_slice()).unwrap();
@@ -2199,7 +2329,7 @@ mod tests {
     }
 
     fn raw_record(db: &RedbAdapter, id: &str) -> Vec<u8> {
-        let txn = db.db.begin_read().unwrap();
+        let txn = db.inner.db.begin_read().unwrap();
         let t = txn.open_table(DOC_TABLE).unwrap();
         t.get(id).unwrap().unwrap().value().to_vec()
     }
@@ -2278,7 +2408,7 @@ mod tests {
             let db = RedbAdapter::open(&path, "legacy").unwrap();
             for (id, len) in docs {
                 write_legacy_record(&db, id, &linear_tree(len), len);
-                let txn = db.db.begin_write().unwrap();
+                let txn = db.inner.db.begin_write().unwrap();
                 {
                     let mut t = txn.open_table(REV_DATA_TABLE).unwrap();
                     let rd = serde_json::to_vec(
@@ -2291,7 +2421,7 @@ mod tests {
                 }
                 txn.commit().unwrap();
             }
-            let txn = db.db.begin_write().unwrap();
+            let txn = db.inner.db.begin_write().unwrap();
             {
                 let mut meta = txn.open_table(META_TABLE).unwrap();
                 meta.insert(META_KEY, &br#"{"update_seq":400,"db_uuid":"x"}"#[..])
@@ -2334,7 +2464,7 @@ mod tests {
         .await
         .unwrap();
         {
-            let txn = db.db.begin_write().unwrap();
+            let txn = db.inner.db.begin_write().unwrap();
             {
                 let mut t = txn.open_table(DOC_TABLE).unwrap();
                 t.insert("d", &b"{not json"[..]).unwrap();
@@ -2420,7 +2550,7 @@ mod tests {
             .unwrap();
         }
         {
-            let txn = db.db.begin_write().unwrap();
+            let txn = db.inner.db.begin_write().unwrap();
             {
                 let mut t = txn.open_table(DOC_TABLE).unwrap();
                 t.insert("zzz", &b"{corrupt"[..]).unwrap();
@@ -2468,6 +2598,40 @@ mod tests {
         assert!(db.all_docs(AllDocsOptions::new()).await.is_err());
     }
 
+    /// F87: storage work (fsync'd commits, scans) must not run on the async
+    /// runtime's thread. On a current-thread runtime another task has to keep
+    /// making progress while a large write is in flight.
+    #[test]
+    fn storage_work_runs_off_the_runtime_thread() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_dir, db) = temp_db();
+            let db = Arc::new(db);
+            let docs: Vec<Document> = (0..2000)
+                .map(|i| put_doc(&format!("d{}", i), None, serde_json::json!({"i": i})))
+                .collect();
+            let writer = tokio::spawn({
+                let db = db.clone();
+                async move { db.bulk_docs(docs, BulkDocsOptions::new()).await }
+            });
+            let mut ticks = 0u64;
+            while !writer.is_finished() {
+                tokio::task::yield_now().await;
+                ticks += 1;
+            }
+            let results = writer.await.unwrap().unwrap();
+            assert_eq!(results.len(), 2000);
+            assert!(
+                ticks > 10,
+                "the runtime thread was blocked (ticks = {})",
+                ticks
+            );
+        });
+    }
+
     #[tokio::test]
     async fn compact_empty_db() {
         let (_dir, db) = temp_db();
@@ -2486,7 +2650,7 @@ mod tests {
             let tree = linear_tree(2);
             let rev = format!("2-{:032x}", 2);
             write_legacy_record(&db, "d", &tree, 1);
-            let txn = db.db.begin_write().unwrap();
+            let txn = db.inner.db.begin_write().unwrap();
             {
                 let mut revs = txn.open_table(REV_DATA_TABLE).unwrap();
                 let rd = serde_json::json!({
@@ -2514,7 +2678,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes, b"legacy bytes");
-        let txn = db.db.begin_read().unwrap();
+        let txn = db.inner.db.begin_read().unwrap();
         let atts = txn.open_table(ATTACHMENT_TABLE).unwrap();
         assert!(atts.get("d\0a.txt").unwrap().is_none());
         assert!(atts.get(digest.as_str()).unwrap().is_some());
