@@ -408,9 +408,11 @@ impl Adapter for HttpAdapter {
             url = format!("{}?{}", url, params.join("&"));
         }
 
+        // JSON explicitly: with open_revs CouchDB otherwise replies multipart.
         let resp = self
             .client
             .get(&url)
+            .header(reqwest::header::ACCEPT, "application/json")
             .send()
             .await
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
@@ -420,6 +422,9 @@ impl Adapter for HttpAdapter {
             .await
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
 
+        if opts.open_revs.is_some() {
+            return winning_open_rev(json, id);
+        }
         Document::from_json(json)
     }
 
@@ -932,6 +937,29 @@ impl Adapter for HttpAdapter {
     }
 }
 
+/// Pick the document to return from an `open_revs` reply
+/// (`[{"ok": doc} | {"missing": rev}]`): like the local adapters, `get`
+/// yields one document, the winner among the leaves found (non-deleted
+/// first, then highest revision).
+fn winning_open_rev(reply: serde_json::Value, id: &str) -> Result<Document> {
+    let entries = match reply {
+        serde_json::Value::Array(entries) => entries,
+        _ => {
+            return Err(RouchError::DatabaseError(
+                "unexpected open_revs response".into(),
+            ));
+        }
+    };
+    entries
+        .into_iter()
+        .filter_map(|mut entry| entry.get_mut("ok").map(serde_json::Value::take))
+        .map(Document::from_json)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .max_by(|a, b| (!a.deleted, &a.rev).cmp(&(!b.deleted, &b.rev)))
+        .ok_or_else(|| RouchError::NotFound(id.to_string()))
+}
+
 /// `url` with any `user:password@` removed.
 fn url_without_credentials(url: &str) -> String {
     match reqwest::Url::parse(url) {
@@ -1005,7 +1033,7 @@ fn encode_query_key(value: &str) -> String {
 mod tests {
     use super::{
         CouchDbAllDocsResponse, HttpAdapter, encode_doc_id, encode_query_key,
-        fill_inline_attachment_lengths, urlencoded,
+        fill_inline_attachment_lengths, urlencoded, winning_open_rev,
     };
     use rouchdb_core::adapter::Adapter;
 
@@ -1254,5 +1282,24 @@ mod tests {
             .await
             .expect("request to a stalled server never timed out");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_revs_reply_yields_the_winning_leaf() {
+        // CouchDB `GET /db/d?open_revs=all` with Accept: application/json.
+        let reply: serde_json::Value = serde_json::from_str(
+            r#"[{"ok":{"_id":"d","_rev":"2-bbb","v":"b"}},
+                {"ok":{"_id":"d","_rev":"3-ddd","_deleted":true}},
+                {"missing":"4-eee"}]"#,
+        )
+        .unwrap();
+        let doc = winning_open_rev(reply, "d").unwrap();
+        assert_eq!(doc.rev.unwrap().to_string(), "2-bbb");
+
+        let none: serde_json::Value = serde_json::from_str(r#"[{"missing":"1-x"}]"#).unwrap();
+        assert!(matches!(
+            winning_open_rev(none, "d"),
+            Err(rouchdb_core::error::RouchError::NotFound(_))
+        ));
     }
 }

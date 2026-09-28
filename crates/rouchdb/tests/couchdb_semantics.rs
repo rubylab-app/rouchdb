@@ -343,3 +343,41 @@ async fn http_errors_keep_couchdb_meaning() {
 
     delete_remote_db(&url).await;
 }
+
+// =========================================================================
+// get with open_revs over HTTP (F29)
+// =========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn http_get_with_open_revs() {
+    let url = fresh_remote_db("open_revs").await;
+    let remote = Database::http(&url);
+    put_rev(&remote, "d", &["bbb", "aaa"], serde_json::json!({"v": "b"})).await;
+    put_rev(&remote, "d", &["ccc", "aaa"], serde_json::json!({"v": "c"})).await;
+    let get = |open_revs| {
+        remote.get_with_opts(
+            "d",
+            GetOptions {
+                open_revs: Some(open_revs),
+                ..Default::default()
+            },
+        )
+    };
+
+    // Like the local adapters, a single document comes back: the winner
+    // among the requested leaves.
+    let doc = get(rouchdb::OpenRevs::All).await.unwrap();
+    assert_eq!(doc.rev.unwrap().to_string(), "2-ccc");
+    let doc = get(rouchdb::OpenRevs::Specific(vec!["2-bbb".into()]))
+        .await
+        .unwrap();
+    assert_eq!(doc.rev.unwrap().to_string(), "2-bbb");
+    assert_eq!(doc.data["v"], "b");
+    let err = get(rouchdb::OpenRevs::Specific(vec!["9-zzz".into()]))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, rouchdb::RouchError::NotFound(_)), "{err:?}");
+
+    delete_remote_db(&url).await;
+}
