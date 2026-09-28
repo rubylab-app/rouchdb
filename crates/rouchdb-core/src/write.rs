@@ -199,17 +199,14 @@ pub fn plan_new_edit(
 
     let empty_tree = Vec::new();
     let tree = existing.unwrap_or(&empty_tree);
-    let previously_deleted = !tree.is_empty() && is_deleted(tree);
     let (merged, result, stemmed) = merge_and_stem(tree, &path, rev_limit);
 
-    // Same conflict rule as PouchDB's updateDoc: the edit must add a new leaf
-    // under an existing leaf (any leaf, not only the winner). Re-creating a
-    // deleted document only fails if it would open a new branch.
-    let in_conflict = !tree.is_empty()
-        && match (previously_deleted, doc.deleted) {
-            (true, false) => result == MergeResult::NewBranch,
-            _ => result != MergeResult::NewLeaf,
-        };
+    // The edit must add a new leaf under an existing leaf (any leaf, not
+    // only the winner); re-creating a deleted document extends its
+    // tombstone (see `edit_parent`). Unlike PouchDB, which lets a re-created
+    // document land on a revision that already exists, re-sending an old
+    // edit of a deleted document is a conflict, as in CouchDB.
+    let in_conflict = !tree.is_empty() && result != MergeResult::NewLeaf;
     if in_conflict {
         return Err(conflict(&id));
     }
@@ -862,7 +859,7 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        for rev in ["1-abc", "0-x"] {
+        for rev in ["1-abc", "1-5", "0-x"] {
             let err = local("_local/x", Some(rev), false).unwrap_err();
             assert_eq!(err.reason.as_deref(), Some("Invalid rev format"), "{rev}");
         }

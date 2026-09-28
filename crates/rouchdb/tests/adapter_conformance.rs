@@ -1820,6 +1820,28 @@ async fn changes_limit_zero_is_empty(fx: Fx) {
     assert_eq!(one.results.len(), 1);
 }
 
+/// Re-sending an old edit of a deleted document (same parent, same body,
+/// so the same revision id) is a conflict, as in CouchDB: it must not
+/// report success or rewrite the stored revision.
+async fn old_edit_of_deleted_document_conflicts(fx: Fx) {
+    let db = fx.db();
+    let r1 = write(db, serde_json::json!({"_id": "d", "v": 1})).await;
+    let r2 = write(db, serde_json::json!({"_id": "d", "_rev": r1, "v": 2})).await;
+    db.remove("d", &r2).await.unwrap();
+    let seq = db.info().await.unwrap().update_seq;
+    for v in [2, 9] {
+        assert!(matches!(
+            db.update("d", &r1, serde_json::json!({"v": v})).await,
+            Err(RouchError::Conflict)
+        ));
+    }
+    assert_eq!(db.info().await.unwrap().update_seq, seq);
+    assert_eq!(get_rev(db, "d", &r2).await.unwrap().data["v"], 2);
+    // Re-creating it (no rev) extends the tombstone.
+    let r4 = db.put("d", serde_json::json!({"v": 3})).await.unwrap();
+    assert_eq!(generation(r4.rev.as_deref().unwrap()), 4);
+}
+
 conformance!(storage_fidelity:
     unusual_ids_survive_compact_and_purge,
     deep_documents_round_trip,
@@ -1833,4 +1855,5 @@ conformance!(storage_fidelity:
     destroy_resets_the_database,
     uppercase_revisions_are_normalized,
     changes_limit_zero_is_empty,
+    old_edit_of_deleted_document_conflicts,
 );
