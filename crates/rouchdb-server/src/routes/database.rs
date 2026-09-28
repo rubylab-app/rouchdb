@@ -1,10 +1,11 @@
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
-
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use rouchdb_core::error::RouchError;
 use serde_json::json;
 
+use super::set_location;
 use crate::error::AppError;
 use crate::state::{AppState, db_not_found};
 
@@ -47,7 +48,8 @@ pub async fn get_db_info(
 pub async fn put_db(
     State(state): State<AppState>,
     Path(db): Path<String>,
-) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
     if db != state.db_name {
         return Err(AppError(RouchError::BadRequest(format!(
             "Cannot create database {db}: single-db mode"
@@ -58,7 +60,9 @@ pub async fn put_db(
             "The database could not be created, the file already exists.".into(),
         )));
     }
-    Ok((StatusCode::CREATED, Json(json!({"ok": true}))))
+    let mut resp = (StatusCode::CREATED, Json(json!({"ok": true}))).into_response();
+    set_location(&mut resp, &headers, &[&db]);
+    Ok(resp)
 }
 
 /// DELETE /{db} — delete the database: its data is destroyed and every
@@ -87,17 +91,21 @@ pub async fn delete_db(
 pub async fn post_doc(
     State(state): State<AppState>,
     Path(db): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
-) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+) -> Result<Response, AppError> {
     state.check_db(&db)?;
 
     let result = state.db.post(body).await?;
-    Ok((
+    let mut resp = (
         StatusCode::CREATED,
-        Json(serde_json::json!({
+        Json(json!({
             "ok": result.ok,
             "id": result.id,
             "rev": result.rev,
         })),
-    ))
+    )
+        .into_response();
+    set_location(&mut resp, &headers, &[&db, &result.id]);
+    Ok(resp)
 }

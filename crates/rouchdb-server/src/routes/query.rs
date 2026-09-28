@@ -35,6 +35,11 @@ pub async fn find(
     Json(mut body): Json<serde_json::Value>,
 ) -> Result<Response, AppError> {
     state.check_db(&db)?;
+    if body.get("selector").is_none() {
+        return Err(AppError(RouchError::BadRequest(
+            "Missing required key: selector".into(),
+        )));
+    }
 
     let offset = match body.as_object_mut().and_then(|o| o.remove("bookmark")) {
         None | Some(serde_json::Value::Null) => None,
@@ -52,8 +57,15 @@ pub async fn find(
             }
         },
     };
-    let mut opts: FindOptions = serde_json::from_value(body)
-        .map_err(|e| AppError(RouchError::BadRequest(format!("invalid query: {e}"))))?;
+    let mut opts: FindOptions = serde_json::from_value(body).map_err(|e| {
+        // Keep CouchDB's own reason (e.g. `Invalid sort field: ...`) as is.
+        let reason = e.to_string();
+        if reason.starts_with("Invalid sort field: ") {
+            AppError(RouchError::BadRequest(reason))
+        } else {
+            AppError(RouchError::BadRequest(format!("invalid query: {reason}")))
+        }
+    })?;
 
     // A bookmark resumes after the results already returned; `skip` applies
     // on top of it, as in CouchDB.

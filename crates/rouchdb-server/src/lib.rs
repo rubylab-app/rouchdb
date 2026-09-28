@@ -125,12 +125,16 @@ pub fn build_router(db: Arc<Database>, config: &ServerConfig) -> Router {
         .map(|admin| Arc::new(Auth::with_timeout(admin, config.session_timeout)));
     let state = AppState::new(db, config.db_name.clone(), auth);
 
-    let router = routes::build_routes(state.clone())
+    let routes = routes::build_routes(state.clone())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             routes::changes::notify_writes,
         ))
-        .layer(DefaultBodyLimit::max(config.max_request_size))
+        .layer(DefaultBodyLimit::max(config.max_request_size));
+    // axum adds the `Allow` header of a 405 after the route's own layers have
+    // run, so the error-shaping middleware wraps the whole route tree.
+    let router = Router::new()
+        .fallback_service(routes)
         .layer(axum::middleware::map_response(error::json_errors))
         .layer(axum::middleware::from_fn_with_state(
             state,
