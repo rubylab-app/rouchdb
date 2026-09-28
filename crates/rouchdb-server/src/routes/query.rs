@@ -219,13 +219,7 @@ pub async fn restore_indexes(db: &Database) -> rouchdb::Result<usize> {
 
 /// Turn a failed single-document write into the matching error.
 fn check_write(result: rouchdb::DocResult) -> Result<(), AppError> {
-    if result.ok {
-        return Ok(());
-    }
-    Err(AppError(match result.error.as_deref() {
-        Some("conflict") => RouchError::Conflict,
-        _ => RouchError::BadRequest(result.reason.unwrap_or_else(|| "write failed".into())),
-    }))
+    super::write_result(result).map(drop)
 }
 
 /// Keep only the user fields of a document read back for an update.

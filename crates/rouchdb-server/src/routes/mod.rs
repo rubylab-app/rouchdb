@@ -118,13 +118,9 @@ pub(crate) fn write_result(result: rouchdb::DocResult) -> Result<rouchdb::DocRes
     if result.ok {
         return Ok(result);
     }
-    let reason = result.reason.unwrap_or_else(|| "write failed".into());
     Err(AppError(match result.error.as_deref() {
         Some("conflict") => RouchError::Conflict,
-        Some("not_found") => RouchError::NotFound(reason),
-        Some("forbidden") => RouchError::Forbidden(reason),
-        Some("unauthorized") => RouchError::Unauthorized,
-        _ => RouchError::BadRequest(reason),
+        _ => RouchError::BadRequest(result.reason.unwrap_or_else(|| "write failed".into())),
     }))
 }
 
