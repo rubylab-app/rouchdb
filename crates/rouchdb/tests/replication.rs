@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{ChangesOptions, Database, ReplicationEvent, ReplicationFilter, ReplicationOptions};
 
 // =========================================================================
@@ -10,7 +10,7 @@ use rouchdb::{ChangesOptions, Database, ReplicationEvent, ReplicationFilter, Rep
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replicate_memory_to_couchdb() {
     let url = fresh_remote_db("repl_to_couch").await;
     let local = Database::memory("local");
@@ -38,12 +38,10 @@ async fn replicate_memory_to_couchdb() {
 
     let info = remote.info().await.unwrap();
     assert_eq!(info.doc_count, 3);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replicate_couchdb_to_memory() {
     let url = fresh_remote_db("repl_from_couch").await;
     let remote = Database::http(&url);
@@ -64,12 +62,10 @@ async fn replicate_couchdb_to_memory() {
 
     let doc = local.get("doc1").await.unwrap();
     assert_eq!(doc.data["city"], "NYC");
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn bidirectional_sync_with_couchdb() {
     let url = fresh_remote_db("bidir_sync").await;
     let local = Database::memory("local");
@@ -93,12 +89,10 @@ async fn bidirectional_sync_with_couchdb() {
         "remote"
     );
     assert_eq!(remote.get("local_doc").await.unwrap().data["from"], "local");
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn incremental_replication_to_couchdb() {
     let url = fresh_remote_db("incr_repl").await;
     let local = Database::memory("local");
@@ -125,12 +119,10 @@ async fn incremental_replication_to_couchdb() {
 
     let info = remote.info().await.unwrap();
     assert_eq!(info.doc_count, 3);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replicate_deletes_to_couchdb() {
     let url = fresh_remote_db("repl_del").await;
     let local = Database::memory("local");
@@ -149,12 +141,10 @@ async fn replicate_deletes_to_couchdb() {
 
     let err = remote.get("doc1").await;
     assert!(err.is_err());
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replicate_updates_to_couchdb() {
     let url = fresh_remote_db("repl_upd").await;
     let local = Database::memory("local");
@@ -178,12 +168,10 @@ async fn replicate_updates_to_couchdb() {
 
     let doc = remote.get("doc1").await.unwrap();
     assert_eq!(doc.data["v"], 2);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn batched_replication_to_couchdb() {
     let url = fresh_remote_db("batch_repl").await;
     let local = Database::memory("local");
@@ -212,12 +200,10 @@ async fn batched_replication_to_couchdb() {
 
     let info = remote.info().await.unwrap();
     assert_eq!(info.doc_count, 25);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn already_synced_noop() {
     let url = fresh_remote_db("synced_noop").await;
     let local = Database::memory("local");
@@ -232,8 +218,6 @@ async fn already_synced_noop() {
     let result = local.replicate_to(&remote).await.unwrap();
     assert!(result.ok);
     assert_eq!(result.docs_written, 0);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -261,7 +245,7 @@ async fn replicate_memory_to_redb() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replicate_redb_to_couchdb() {
     let url = fresh_remote_db("redb_to_couch").await;
     let dir = tempfile::tempdir().unwrap();
@@ -280,12 +264,10 @@ async fn replicate_redb_to_couchdb() {
 
     let doc = remote.get("doc1").await.unwrap();
     assert_eq!(doc.data["origin"], "redb");
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn mango_query_against_couchdb_data() {
     let url = fresh_remote_db("mango_couch").await;
     let remote = Database::http(&url);
@@ -315,12 +297,10 @@ async fn mango_query_against_couchdb_data() {
         .unwrap();
 
     assert_eq!(result.docs.len(), 2);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn multiple_sync_rounds() {
     let url = fresh_remote_db("multi_sync").await;
     let local = Database::memory("local");
@@ -355,8 +335,6 @@ async fn multiple_sync_rounds() {
     let remote_info = remote.info().await.unwrap();
     assert_eq!(local_info.doc_count, 4);
     assert_eq!(remote_info.doc_count, 4);
-
-    delete_remote_db(&url).await;
 }
 
 // =========================================================================
@@ -364,7 +342,7 @@ async fn multiple_sync_rounds() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replicate_multiple_updates_same_doc() {
     let url = fresh_remote_db("repl_multiupd").await;
     let local = Database::memory("local");
@@ -393,12 +371,10 @@ async fn replicate_multiple_updates_same_doc() {
     let doc = remote.get("doc1").await.unwrap();
     assert_eq!(doc.data["v"], 4);
     assert!(doc.rev.unwrap().to_string().starts_with("4-"));
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replicate_delete_and_recreate() {
     let url = fresh_remote_db("repl_delrec").await;
     let local = Database::memory("local");
@@ -435,12 +411,10 @@ async fn replicate_delete_and_recreate() {
 
     let doc = remote.get("doc1").await.unwrap();
     assert_eq!(doc.data["v"], "resurrected");
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replicate_empty_databases() {
     let url = fresh_remote_db("repl_empty").await;
     let local = Database::memory("local");
@@ -454,12 +428,10 @@ async fn replicate_empty_databases() {
     let result = local.replicate_from(&remote).await.unwrap();
     assert!(result.ok);
     assert_eq!(result.docs_read, 0);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replicate_couchdb_to_redb() {
     let url = fresh_remote_db("couch_to_redb").await;
     let remote = Database::http(&url);
@@ -482,8 +454,6 @@ async fn replicate_couchdb_to_redb() {
 
     let doc = local.get("doc1").await.unwrap();
     assert_eq!(doc.data["source"], "couchdb");
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -518,7 +488,7 @@ async fn replicate_redb_bidirectional_memory() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replicate_single_doc_batches() {
     let url = fresh_remote_db("batch_one").await;
     let local = Database::memory("local");
@@ -547,12 +517,10 @@ async fn replicate_single_doc_batches() {
 
     let info = remote.info().await.unwrap();
     assert_eq!(info.doc_count, 5);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replicate_exact_batch_boundary() {
     let url = fresh_remote_db("batch_exact").await;
     let local = Database::memory("local");
@@ -578,12 +546,10 @@ async fn replicate_exact_batch_boundary() {
 
     assert!(result.ok);
     assert_eq!(result.docs_written, 10);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replicate_large_batch() {
     let url = fresh_remote_db("batch_large").await;
     let local = Database::memory("local");
@@ -602,8 +568,6 @@ async fn replicate_large_batch() {
 
     let info = remote.info().await.unwrap();
     assert_eq!(info.doc_count, 200);
-
-    delete_remote_db(&url).await;
 }
 
 // =========================================================================
@@ -611,7 +575,7 @@ async fn replicate_large_batch() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replicate_remote_updates_back_to_local() {
     let url = fresh_remote_db("pull_updates").await;
     let local = Database::memory("local");
@@ -637,12 +601,10 @@ async fn replicate_remote_updates_back_to_local() {
 
     let local_doc = local.get("doc1").await.unwrap();
     assert_eq!(local_doc.data["v"], 2);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replicate_remote_deletes_back_to_local() {
     let url = fresh_remote_db("pull_deletes").await;
     let local = Database::memory("local");
@@ -662,12 +624,10 @@ async fn replicate_remote_deletes_back_to_local() {
 
     let result = local.get("doc1").await;
     assert!(result.is_err());
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn sync_interleaved_updates() {
     let url = fresh_remote_db("interleave").await;
     let local = Database::memory("local");
@@ -715,12 +675,10 @@ async fn sync_interleaved_updates() {
         final_local.rev.unwrap().to_string(),
         final_remote.rev.unwrap().to_string()
     );
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn sync_many_docs_diverse_operations() {
     let url = fresh_remote_db("diverse_ops").await;
     let local = Database::memory("local");
@@ -776,8 +734,6 @@ async fn sync_many_docs_diverse_operations() {
         let result = remote.get(&format!("doc{:02}", i)).await;
         assert!(result.is_err(), "doc{:02} should be deleted", i);
     }
-
-    delete_remote_db(&url).await;
 }
 
 // =========================================================================
@@ -785,7 +741,7 @@ async fn sync_many_docs_diverse_operations() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replicate_filtered_doc_ids_to_couchdb() {
     let url = fresh_remote_db("filter_docids").await;
     let local = Database::memory("local");
@@ -835,12 +791,10 @@ async fn replicate_filtered_doc_ids_to_couchdb() {
 
     assert!(remote.get("doc2").await.is_err());
     assert!(remote.get("doc4").await.is_err());
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replicate_filtered_selector_from_couchdb() {
     let url = fresh_remote_db("filter_selector").await;
     let remote = Database::http(&url);
@@ -891,8 +845,6 @@ async fn replicate_filtered_selector_from_couchdb() {
     assert_eq!(doc.data["amount"], 100);
 
     assert!(local.get("user1").await.is_err());
-
-    delete_remote_db(&url).await;
 }
 
 // =========================================================================
@@ -900,7 +852,7 @@ async fn replicate_filtered_selector_from_couchdb() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replicate_to_couchdb_with_events() {
     let url = fresh_remote_db("repl_events").await;
     let local = Database::memory("local");
@@ -938,12 +890,10 @@ async fn replicate_to_couchdb_with_events() {
     // Verify data actually arrived
     let info = remote.info().await.unwrap();
     assert_eq!(info.doc_count, 5);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replicate_events_include_change_progress() {
     let url = fresh_remote_db("repl_evt_prog").await;
     let local = Database::memory("local");
@@ -979,8 +929,6 @@ async fn replicate_events_include_change_progress() {
 
     // With batch_size=5 and 10 docs, should have at least 2 Change events
     assert!(change_events >= 2, "got {} change events", change_events);
-
-    delete_remote_db(&url).await;
 }
 
 // =========================================================================
@@ -988,7 +936,7 @@ async fn replicate_events_include_change_progress() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn live_replicate_to_couchdb() {
     let url = fresh_remote_db("live_repl").await;
     let local = Database::memory("local");
@@ -1041,12 +989,10 @@ async fn live_replicate_to_couchdb() {
 
     // Cancel live replication
     handle.cancel();
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn live_replicate_picks_up_new_docs() {
     let url = fresh_remote_db("live_new").await;
     let local = Database::memory("local");
@@ -1116,6 +1062,4 @@ async fn live_replicate_picks_up_new_docs() {
     );
     let doc = remote.get("late_doc").await.unwrap();
     assert_eq!(doc.data["arrived"], "late");
-
-    delete_remote_db(&url).await;
 }

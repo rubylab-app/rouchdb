@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::Database;
 
 // -----------------------------------------------------------------------
@@ -10,7 +10,7 @@ use rouchdb::Database;
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn post_to_couchdb() {
     let url = fresh_remote_db("post").await;
     let db = Database::http(&url);
@@ -28,12 +28,10 @@ async fn post_to_couchdb() {
 
     let info = db.info().await.unwrap();
     assert_eq!(info.doc_count, 2);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn post_and_replicate_to_couchdb() {
     let url = fresh_remote_db("post_repl").await;
     let local = Database::memory("local");
@@ -54,8 +52,6 @@ async fn post_and_replicate_to_couchdb() {
 
     remote.get(&r1.id).await.unwrap();
     remote.get(&r2.id).await.unwrap();
-
-    delete_remote_db(&url).await;
 }
 
 // -----------------------------------------------------------------------
@@ -63,7 +59,7 @@ async fn post_and_replicate_to_couchdb() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn remove_attachment_from_couchdb() {
     let url = fresh_remote_db("rm_att").await;
     let db = Database::http(&url);
@@ -114,6 +110,4 @@ async fn remove_attachment_from_couchdb() {
         )
         .await;
     assert!(err.is_err());
-
-    delete_remote_db(&url).await;
 }

@@ -1,0 +1,82 @@
+name: Coverage
+
+# Line coverage of the whole test suite (unit tests, doctests and the
+# CouchDB suite) on every push to main, as a job summary and an lcov
+# artifact. Informational: no coverage threshold fails anything.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: Coverage (cargo-llvm-cov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      couchdb:
+        image: couchdb:3.5.1
+        ports:
+          - 15984:5984
+        env:
+          COUCHDB_USER: admin
+          COUCHDB_PASSWORD: password
+        options: >-
+          --health-cmd "curl -fs http://localhost:5984/_up"
+          --health-interval 3s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      COUCHDB_URL: http://admin:password@localhost:15984
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: |
+          rustup toolchain install
+          rustup component add llvm-tools
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Disable CouchDB account lockout
+        run: |
+          curl -fsS --retry 30 --retry-delay 2 --retry-all-errors "$COUCHDB_URL/_up"
+          curl -fsS -X PUT "$COUCHDB_URL/_node/_local/_config/chttpd_auth_lockout/mode" -d '"off"'
+
+      # show-env instruments plain `cargo test`, so the CouchDB script runs
+      # unchanged. Test failures are the CI workflow's business, not this
+      # one's: measure what runs.
+      - name: Run the tests with coverage
+        run: |
+          # shellcheck disable=SC1090
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo llvm-cov clean --workspace
+          cargo test --workspace --locked --no-fail-fast || echo "::warning::Some tests failed"
+          bash scripts/test-couchdb.sh --locked || echo "::warning::Some CouchDB tests failed"
+          cargo llvm-cov report --lcov --output-path lcov.info
+          {
+            echo '## Line coverage'
+            echo
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov-${{ github.sha }}
+          path: lcov.info

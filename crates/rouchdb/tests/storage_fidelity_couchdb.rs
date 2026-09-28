@@ -41,7 +41,7 @@ fn hash32(c: char) -> String {
 /// over http (get, changes, all_docs, bulk_get) and replicates them, up to
 /// its own limit. A deeper one is a clear per-request error, not a crash.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn deep_couchdb_documents_are_readable_and_replicate() {
     let url = fresh_remote_db("sfid_deep").await;
     couch_put(&url, "deep", nested_text(300)).await;
@@ -120,7 +120,7 @@ fn nested(depth: usize) -> serde_json::Value {
 /// of a missing or deleted document is `NotFound` (without writing a
 /// tombstone), like the local adapters.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn missing_documents_and_bad_revisions_over_http() {
     let url = fresh_remote_db("sfid_missing").await;
     let db = Database::http(&url);
@@ -186,7 +186,7 @@ async fn missing_documents_and_bad_revisions_over_http() {
 /// documents, a design-document conflict is an error, and a destroyed
 /// database is usable again (re-created, empty).
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn local_documents_design_conflicts_and_destroy_over_http() {
     let url = fresh_remote_db("sfid_local").await;
     let db = Database::http(&url);
@@ -261,7 +261,7 @@ async fn local_documents_design_conflicts_and_destroy_over_http() {
 /// Q-CORE-10 / Q-CORE-11: `revs_diff` and stub handling give the same
 /// answers on memory as on CouchDB.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn revs_diff_and_stubs_match_couchdb() {
     let url = fresh_remote_db("sfid_diff").await;
     let remote = Database::http(&url);
@@ -352,7 +352,7 @@ async fn revs_diff_and_stubs_match_couchdb() {
 /// `changes` with `limit: 0` is empty over http too (CouchDB 3.5.1), like
 /// the local adapters.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn changes_limit_zero_over_http() {
     let url = fresh_remote_db("sfid_changes").await;
     let db = Database::http(&url);

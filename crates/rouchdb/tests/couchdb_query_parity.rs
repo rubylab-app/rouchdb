@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{Database, FindOptions, ReduceFn, ViewQueryOptions, query_view};
 use serde_json::{Value, json};
 
@@ -66,7 +66,7 @@ async fn local_find(db: &Database, selector: &Value) -> std::result::Result<Vec<
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn mango_selectors_match_couchdb() {
     let url = fresh_remote_db("parity_mango").await;
     let local = Database::memory("local");
@@ -164,7 +164,6 @@ async fn mango_selectors_match_couchdb() {
         }
     }
 
-    delete_remote_db(&url).await;
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
@@ -209,7 +208,7 @@ fn rows_json(result: &rouchdb::ViewResult) -> Value {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn views_match_couchdb() {
     let url = fresh_remote_db("parity_views").await;
     let local = Database::memory("local");
@@ -488,12 +487,11 @@ async fn views_match_couchdb() {
     .await;
     assert!(err.is_err());
 
-    delete_remote_db(&url).await;
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_database_runs_mango_on_couchdb() {
     // F48: find/create_index on Database::http must use CouchDB's _find and
     // _index instead of downloading every document.
@@ -606,6 +604,4 @@ async fn http_database_runs_mango_on_couchdb() {
     remote.delete_index("idx-name").await.unwrap();
     assert!(remote.get_indexes().await.is_empty());
     assert!(remote.delete_index("idx-name").await.is_err());
-
-    delete_remote_db(&url).await;
 }

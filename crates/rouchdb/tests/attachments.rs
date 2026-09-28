@@ -2,11 +2,11 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{Database, GetAttachmentOptions};
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn attachment_put_and_get_http() {
     let url = fresh_remote_db("attach").await;
     let db = Database::http(&url);
@@ -34,12 +34,10 @@ async fn attachment_put_and_get_http() {
 
     let doc = db.get("doc1").await.unwrap();
     assert_eq!(doc.data["name"], "test");
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn attachment_binary_data() {
     let url = fresh_remote_db("attach_bin").await;
     let db = Database::http(&url);
@@ -67,6 +65,4 @@ async fn attachment_binary_data() {
         .await
         .unwrap();
     assert_eq!(retrieved, binary_data);
-
-    delete_remote_db(&url).await;
 }

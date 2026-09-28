@@ -2,11 +2,11 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{AllDocsOptions, ChangesOptions, Database};
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_put_and_get() {
     let url = fresh_remote_db("http_crud").await;
     let db = Database::http(&url);
@@ -19,12 +19,10 @@ async fn http_put_and_get() {
 
     let doc = db.get("doc1").await.unwrap();
     assert_eq!(doc.data["name"], "Alice");
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_update_document() {
     let url = fresh_remote_db("http_update").await;
     let db = Database::http(&url);
@@ -40,12 +38,10 @@ async fn http_update_document() {
 
     let doc = db.get("doc1").await.unwrap();
     assert_eq!(doc.data["v"], 2);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_delete_document() {
     let url = fresh_remote_db("http_delete").await;
     let db = Database::http(&url);
@@ -58,12 +54,10 @@ async fn http_delete_document() {
 
     let err = db.get("doc1").await;
     assert!(err.is_err());
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_all_docs() {
     let url = fresh_remote_db("http_alldocs").await;
     let db = Database::http(&url);
@@ -80,12 +74,10 @@ async fn http_all_docs() {
 
     let result = db.all_docs(AllDocsOptions::new()).await.unwrap();
     assert_eq!(result.total_rows, 3);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_changes_feed() {
     let url = fresh_remote_db("http_changes").await;
     let db = Database::http(&url);
@@ -95,6 +87,4 @@ async fn http_changes_feed() {
 
     let changes = db.changes(ChangesOptions::default()).await.unwrap();
     assert_eq!(changes.results.len(), 2);
-
-    delete_remote_db(&url).await;
 }
