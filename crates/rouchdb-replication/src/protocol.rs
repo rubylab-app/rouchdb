@@ -477,17 +477,26 @@ pub fn replicate_live(
         // Track the last successful result so a single terminal Complete can
         // be emitted when the live loop finally exits.
         let mut last_result: Option<ReplicationResult> = None;
+        // Starts at the caller's `since` (or the checkpoint when unset), then
+        // follows each pass's last_seq so polls never rescan the feed. One
+        // checkpointer (one session) spans the whole live replication.
+        let mut since = opts.since.clone();
+        let mut checkpointer: Option<Checkpointer> = None;
 
         'live: loop {
             let result = async {
-                let checkpointer =
-                    new_checkpointer(source.as_ref(), target.as_ref(), &opts.filter).await?;
+                if checkpointer.is_none() {
+                    checkpointer = Some(
+                        new_checkpointer(source.as_ref(), target.as_ref(), &opts.filter).await?,
+                    );
+                }
+                let checkpointer = checkpointer.as_ref().expect("initialized above");
                 run_replication(
                     source.as_ref(),
                     target.as_ref(),
                     &opts,
-                    &checkpointer,
-                    None,
+                    checkpointer,
+                    since.clone(),
                     Some(&tx),
                 )
                 .await
@@ -496,6 +505,8 @@ pub fn replicate_live(
 
             let failure = match result {
                 Ok(outcome) => {
+                    // Resume the next pass where this one stopped.
+                    since = Some(outcome.result.last_seq.clone());
                     if outcome.failure.is_none() {
                         attempt = 0; // Reset retry counter on success
                         if outcome.result.docs_read == 0 {
@@ -1603,5 +1614,74 @@ mod tests {
                 .any(|e| matches!(e, ReplicationEvent::Error(m) if m.contains("x")))
         );
         assert!(matches!(events.last(), Some(ReplicationEvent::Complete(r)) if !r.ok));
+    }
+
+    /// Wait (bounded) for the first event matching `pred`.
+    async fn wait_for(
+        rx: &mut mpsc::Receiver<ReplicationEvent>,
+        pred: impl Fn(&ReplicationEvent) -> bool,
+    ) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = rx.recv().await {
+                if pred(&event) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn live_replication_honors_since() {
+        let source = Arc::new(MemoryAdapter::new("source"));
+        let target = Arc::new(MemoryAdapter::new("target"));
+        put_doc(source.as_ref(), "old", serde_json::json!({})).await;
+        let now = source.info().await.unwrap().update_seq;
+
+        let (mut rx, handle) = replicate_live(
+            source.clone(),
+            target.clone(),
+            ReplicationOptions {
+                live: true,
+                since: Some(now),
+                checkpoint: false,
+                poll_interval: Duration::from_millis(20),
+                ..Default::default()
+            },
+        );
+        assert!(wait_for(&mut rx, |e| matches!(e, ReplicationEvent::Paused)).await);
+        put_doc(source.as_ref(), "new", serde_json::json!({})).await;
+        assert!(wait_for(&mut rx, |e| matches!(e, ReplicationEvent::Change { .. })).await);
+        handle.cancel();
+
+        assert!(target.get("new", GetOptions::default()).await.is_ok());
+        assert!(target.get("old", GetOptions::default()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn live_replication_without_checkpoints_does_not_rescan() {
+        let source = Arc::new(MemoryAdapter::new("source"));
+        let target = Arc::new(MemoryAdapter::new("target"));
+        for i in 0..3 {
+            put_doc(source.as_ref(), &format!("d{i}"), serde_json::json!({})).await;
+        }
+
+        let (mut rx, handle) = replicate_live(
+            source,
+            target.clone(),
+            ReplicationOptions {
+                live: true,
+                checkpoint: false,
+                poll_interval: Duration::from_millis(20),
+                ..Default::default()
+            },
+        );
+        // Once caught up, later polls must start from where the last one
+        // ended instead of re-reading the whole feed, i.e. go idle.
+        assert!(wait_for(&mut rx, |e| matches!(e, ReplicationEvent::Paused)).await);
+        handle.cancel();
+        assert_eq!(target.info().await.unwrap().doc_count, 3);
     }
 }
