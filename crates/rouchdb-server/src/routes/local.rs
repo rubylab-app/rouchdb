@@ -73,13 +73,7 @@ pub async fn put_local(
     body: Bytes,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     validate_db(&db, &state)?;
-    let body: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|_| AppError(RouchError::BadRequest("invalid UTF-8 JSON".into())))?;
-    let serde_json::Value::Object(mut obj) = body else {
-        return Err(AppError(RouchError::BadRequest(
-            "Document must be a JSON object".into(),
-        )));
-    };
+    let mut obj = super::json_object_body(&body)?;
 
     let body_rev = obj
         .remove("_rev")

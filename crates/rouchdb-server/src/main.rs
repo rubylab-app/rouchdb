@@ -52,6 +52,11 @@ struct Cli {
         value_parser = parse_cors_origin
     )]
     cors_origins: Vec<String>,
+
+    /// Largest accepted request body in bytes (documents, `_bulk_docs`
+    /// batches, attachments)
+    #[arg(long, value_name = "BYTES", default_value_t = rouchdb_server::DEFAULT_MAX_REQUEST_SIZE)]
+    max_request_size: usize,
 }
 
 fn infer_db_name(path: &str) -> String {
@@ -82,6 +87,7 @@ async fn main() {
         db_name,
         cors_origins: cli.cors_origins,
         admin: cli.admin,
+        max_request_size: cli.max_request_size,
     };
 
     if let Err(e) = rouchdb_server::start_server(Arc::new(db), config).await {

@@ -190,6 +190,7 @@ Options:
       --db-name <NAME>             Database name [default: filename without extension]
       --admin <USER:PASSWORD>      Require admin credentials [env: ROUCHDB_ADMIN]
       --cors-origin <ORIGIN>       Allow CORS from this origin (repeatable) [env: ROUCHDB_CORS_ORIGINS]
+      --max-request-size <BYTES>   Largest accepted request body [default: 67108864]
 ```
 
 Security defaults: the server binds to `127.0.0.1`, **CORS is disabled** (so

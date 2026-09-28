@@ -6,6 +6,7 @@ pub mod state;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, Method, header};
 use rouchdb::Database;
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
@@ -32,7 +33,13 @@ pub struct ServerConfig {
     /// Fauxton files requires these credentials, via HTTP Basic auth or a
     /// `_session` cookie. `None` (the default) disables authentication.
     pub admin: Option<AdminCredentials>,
+    /// Largest accepted request body, in bytes (documents, `_bulk_docs`
+    /// batches, attachments). Larger requests get a JSON 413.
+    pub max_request_size: usize,
 }
+
+/// Default request body limit: 64 MiB.
+pub const DEFAULT_MAX_REQUEST_SIZE: usize = 64 * 1024 * 1024;
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -42,6 +49,7 @@ impl Default for ServerConfig {
             db_name: "rouchdb".to_string(),
             cors_origins: Vec::new(),
             admin: None,
+            max_request_size: DEFAULT_MAX_REQUEST_SIZE,
         }
     }
 }
@@ -108,10 +116,13 @@ pub fn build_router(db: Arc<Database>, config: &ServerConfig) -> Router {
         auth: config.admin.clone().map(|admin| Arc::new(Auth::new(admin))),
     };
 
-    let router = routes::build_routes(state.clone()).layer(axum::middleware::from_fn_with_state(
-        state,
-        auth::require_auth,
-    ));
+    let router = routes::build_routes(state.clone())
+        .layer(DefaultBodyLimit::max(config.max_request_size))
+        .layer(axum::middleware::map_response(error::json_errors))
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            auth::require_auth,
+        ));
 
     // CORS goes outermost so preflights are answered before authentication
     // and error responses still carry the CORS headers.

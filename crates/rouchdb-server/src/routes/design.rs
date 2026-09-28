@@ -1,4 +1,5 @@
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
@@ -35,9 +36,10 @@ pub async fn get_design(
 pub async fn put_design(
     State(state): State<AppState>,
     Path((db, ddoc)): Path<(String, String)>,
-    Json(body): Json<serde_json::Value>,
+    body: Bytes,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     validate_db(&db, &state)?;
+    let body = serde_json::Value::Object(super::json_object_body(&body)?);
 
     // Parse the body as a design document, injecting _id
     let mut doc_json = body;

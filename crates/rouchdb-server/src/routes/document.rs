@@ -1,4 +1,5 @@
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
@@ -139,9 +140,10 @@ pub async fn put_doc(
     State(state): State<AppState>,
     Path((db, docid)): Path<(String, String)>,
     Query(query): Query<DeleteDocQuery>,
-    Json(mut body): Json<serde_json::Value>,
+    body: Bytes,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     validate_db(&db, &state)?;
+    let mut body = serde_json::Value::Object(super::json_object_body(&body)?);
 
     // Honor a `_deleted: true` body (CouchDB delete-via-PUT).
     let is_deleted = body

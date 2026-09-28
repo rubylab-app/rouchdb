@@ -21,8 +21,25 @@ pub mod views;
 
 use axum::Router;
 use axum::routing::{delete, get, post};
+use rouchdb_core::error::RouchError;
 
+use crate::error::AppError;
 use crate::state::AppState;
+
+/// Parse a PUT body as a JSON object whatever its Content-Type, as CouchDB
+/// does (`curl -X PUT -d '{...}'` sends `application/x-www-form-urlencoded`).
+pub(crate) fn json_object_body(
+    body: &[u8],
+) -> Result<serde_json::Map<String, serde_json::Value>, AppError> {
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| AppError(RouchError::BadRequest("invalid UTF-8 JSON".into())))?;
+    match value {
+        serde_json::Value::Object(obj) => Ok(obj),
+        _ => Err(AppError(RouchError::BadRequest(
+            "Document must be a JSON object".into(),
+        ))),
+    }
+}
 
 /// Build the full route tree.
 ///
