@@ -302,6 +302,102 @@ async fn all_docs_ranges(fx: Fx) {
         .await
         .unwrap();
     assert_eq!(ids(&exclusive), ["a", "b"]);
+    // Without include_docs no row carries a document.
+    assert!(all.rows.iter().all(|r| r.doc.is_none()));
+    // Descending swaps the bounds; inclusive_end applies to the end key in
+    // both directions.
+    let page = |descending: bool, start: Option<&str>, end: Option<&str>, inclusive_end: bool| {
+        AllDocsOptions {
+            descending,
+            start_key: start.map(String::from),
+            end_key: end.map(String::from),
+            inclusive_end,
+            ..AllDocsOptions::new()
+        }
+    };
+    for (opts, expected) in [
+        (page(true, Some("d"), Some("b"), true), vec!["d", "c", "b"]),
+        (page(true, Some("d"), Some("b"), false), vec!["d", "c"]),
+        (page(true, Some("c"), None, true), vec!["c", "b", "a"]),
+        (page(true, None, Some("c"), true), vec!["e", "d", "c"]),
+        (page(true, None, Some("c"), false), vec!["e", "d"]),
+        (page(false, Some("b"), Some("d"), false), vec!["b", "c"]),
+        (page(false, Some("bb"), Some("dd"), true), vec!["c", "d"]),
+    ] {
+        let desc = format!("{:?}", opts);
+        let res = db.all_docs(opts).await.unwrap();
+        assert_eq!(row_ids(&res), expected, "{}", desc);
+        assert_eq!(res.total_rows, 5, "{}", desc);
+    }
+    // limit=0 returns no rows, whatever the selection.
+    for opts in [
+        AllDocsOptions {
+            limit: Some(0),
+            ..AllDocsOptions::new()
+        },
+        AllDocsOptions {
+            key: Some("b".into()),
+            limit: Some(0),
+            ..AllDocsOptions::new()
+        },
+        AllDocsOptions {
+            start_key: Some("b".into()),
+            limit: Some(0),
+            ..AllDocsOptions::new()
+        },
+    ] {
+        let desc = format!("{:?}", opts);
+        let res = db.all_docs(opts).await.unwrap();
+        assert!(res.rows.is_empty(), "{}", desc);
+        assert_eq!(res.total_rows, 5);
+    }
+    // skip + limit page through the range.
+    let skipped = db
+        .all_docs(AllDocsOptions {
+            start_key: Some("b".into()),
+            skip: 1,
+            limit: Some(2),
+            ..AllDocsOptions::new()
+        })
+        .await
+        .unwrap();
+    assert_eq!(row_ids(&skipped), ["c", "d"]);
+    // include_docs: the document, and `_conflicts` only when there are some.
+    make_conflict(db, "k").await;
+    let docs = db
+        .all_docs(AllDocsOptions {
+            include_docs: true,
+            conflicts: true,
+            start_key: Some("d".into()),
+            ..AllDocsOptions::new()
+        })
+        .await
+        .unwrap();
+    assert_eq!(row_ids(&docs), ["d", "e", "k"]);
+    let rev = |i: usize| docs.rows[i].value.rev.clone();
+    assert_eq!(
+        docs.rows[0].doc,
+        Some(serde_json::json!({"_id": "d", "_rev": rev(0), "n": "d"}))
+    );
+    assert_eq!(
+        docs.rows[2].doc,
+        Some(serde_json::json!({
+            "_id": "k", "_rev": rev(2), "v": "f",
+            "_conflicts": [format!("2-{}", hash32('a'))]
+        }))
+    );
+    let no_conflicts = db
+        .all_docs(AllDocsOptions {
+            include_docs: true,
+            key: Some("k".into()),
+            ..AllDocsOptions::new()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        no_conflicts.rows[0].doc,
+        Some(serde_json::json!({"_id": "k", "_rev": rev(2), "v": "f"}))
+    );
 }
 
 async fn changes_one_entry_per_doc(fx: Fx) {
@@ -708,17 +804,25 @@ async fn update_non_leaf_conflicts(fx: Fx) {
     let r1 = write(db, serde_json::json!({"_id": "d", "v": 1})).await;
     let r2 = write(db, serde_json::json!({"_id": "d", "_rev": r1, "v": 2})).await;
     let seq = db.info().await.unwrap().update_seq;
-    // Also a retry of the very same edit (same parent, same body).
-    for v in [3, 2] {
+    // Also a retry of the very same edit (same parent, same body), and a
+    // revision the document never had.
+    let unknown = format!("1-{}", hash32('9'));
+    for (rev, v) in [(&r1, 3), (&r1, 2), (&unknown, 3)] {
         let res = db
             .bulk_docs(
-                vec![doc(serde_json::json!({"_id": "d", "_rev": r1, "v": v}))],
+                vec![doc(serde_json::json!({"_id": "d", "_rev": rev, "v": v}))],
                 BulkDocsOptions::new(),
             )
             .await
             .unwrap();
         assert!(!res[0].ok);
-        assert_eq!(res[0].error.as_deref(), Some("conflict"), "v={}", v);
+        assert_eq!(
+            res[0].error.as_deref(),
+            Some("conflict"),
+            "rev={} v={}",
+            rev,
+            v
+        );
     }
     assert_eq!(db.info().await.unwrap().update_seq, seq);
     assert_eq!(db.get("d").await.unwrap().rev.unwrap().to_string(), r2);
@@ -999,6 +1103,9 @@ conformance!(f25: security_roundtrip);
 
 /// F26 / F84: compaction drops non-leaf bodies and marks them missing.
 async fn compact_drops_old_revisions(mut fx: Fx) {
+    // Compacting an empty database is a no-op.
+    fx.db().compact().await.unwrap();
+    assert_eq!(fx.db().info().await.unwrap().update_seq, Seq::Num(0));
     let r1 = write(fx.db(), serde_json::json!({"_id": "d", "v": 1})).await;
     let r2 = fx
         .db()
@@ -2010,3 +2117,125 @@ async fn unicode_ids_roundtrip(mut fx: Fx) {
 }
 
 conformance!(ids: unicode_ids_roundtrip);
+
+// === section: writes ===
+
+/// Documents without an `_id` get a generated UUID v4, distinct per doc.
+async fn bulk_docs_generates_missing_ids(mut fx: Fx) {
+    let res = fx
+        .db()
+        .bulk_docs(
+            vec![
+                doc(serde_json::json!({"v": 1})),
+                doc(serde_json::json!({"v": 2})),
+            ],
+            BulkDocsOptions::new(),
+        )
+        .await
+        .unwrap();
+    assert!(res.iter().all(|r| r.ok), "{:?}", res);
+    assert_ne!(res[0].id, res[1].id);
+    for r in &res {
+        let id = uuid::Uuid::parse_str(&r.id).unwrap();
+        assert_eq!(id.get_version_num(), 4, "{}", r.id);
+    }
+    fx.reopen();
+    for (r, v) in res.iter().zip([1, 2]) {
+        let got = fx.db().get(&r.id).await.unwrap();
+        assert_eq!(got.data, serde_json::json!({ "v": v }));
+        assert_eq!(got.rev.map(|r| r.to_string()), r.rev);
+    }
+}
+
+/// Attachment edits against a stale revision conflict and write nothing.
+async fn attachment_edits_on_stale_rev_conflict(fx: Fx) {
+    let db = fx.db();
+    let r1 = write(db, serde_json::json!({"_id": "d"})).await;
+    let r2 = db
+        .put_attachment("d", "a", &r1, b"one".to_vec(), "text/plain")
+        .await
+        .unwrap()
+        .rev
+        .unwrap();
+    let r3 = db
+        .put_attachment("d", "b", &r2, b"bee".to_vec(), "text/plain")
+        .await
+        .unwrap()
+        .rev
+        .unwrap();
+    let seq = db.info().await.unwrap().update_seq;
+    // Same answers as CouchDB: 409 for a stale revision, 404 when the
+    // revision never had the attachment.
+    assert!(matches!(
+        db.put_attachment("d", "a", &r1, b"two".to_vec(), "text/plain")
+            .await,
+        Err(RouchError::Conflict)
+    ));
+    assert!(matches!(
+        db.remove_attachment("d", "a", &r2).await,
+        Err(RouchError::Conflict)
+    ));
+    assert!(matches!(
+        db.remove_attachment("d", "a", &r1).await,
+        Err(RouchError::NotFound(_))
+    ));
+    assert_eq!(db.info().await.unwrap().update_seq, seq);
+    assert_eq!(db.get("d").await.unwrap().rev.unwrap().to_string(), r3);
+    assert_eq!(db.get_attachment("d", "a").await.unwrap(), b"one");
+    assert_eq!(db.get_attachment("d", "b").await.unwrap(), b"bee");
+}
+
+/// `bulk_get` answers every requested item in order: the winner, a
+/// specific revision (with its ancestry), or a `not_found` error.
+async fn bulk_get_reports_each_item(mut fx: Fx) {
+    let r1 = write(fx.db(), serde_json::json!({"_id": "d", "v": 1})).await;
+    let r2 = write(fx.db(), serde_json::json!({"_id": "d", "_rev": r1, "v": 2})).await;
+    fx.reopen();
+    let unknown = format!("9-{}", hash32('9'));
+    let item = |id: &str, rev: Option<&str>| BulkGetItem {
+        id: id.into(),
+        rev: rev.map(String::from),
+    };
+    let res = fx
+        .db()
+        .adapter()
+        .bulk_get(vec![
+            item("d", None),
+            item("missing", None),
+            item("d", Some(&r1)),
+            item("d", Some(&unknown)),
+        ])
+        .await
+        .unwrap();
+    let ids: Vec<&str> = res.results.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, ["d", "missing", "d", "d"]);
+    assert!(res.results.iter().all(|r| r.docs.len() == 1));
+    let ok = |i: usize| res.results[i].docs[0].ok.clone();
+    let err = |i: usize| {
+        let e = res.results[i].docs[0].error.as_ref().unwrap();
+        (e.id.clone(), e.error.clone())
+    };
+    assert_eq!(
+        ok(0),
+        Some(serde_json::json!({
+            "_id": "d", "_rev": r2, "v": 2,
+            "_revisions": {"start": 2, "ids": [hash_of(&r2), hash_of(&r1)]}
+        }))
+    );
+    assert_eq!(err(1), ("missing".to_string(), "not_found".to_string()));
+    assert!(res.results[1].docs[0].ok.is_none());
+    assert_eq!(
+        ok(2),
+        Some(serde_json::json!({
+            "_id": "d", "_rev": r1, "v": 1,
+            "_revisions": {"start": 1, "ids": [hash_of(&r1)]}
+        }))
+    );
+    assert_eq!(err(3), ("d".to_string(), "not_found".to_string()));
+}
+
+conformance!(writes:
+    bulk_docs_generates_missing_ids,
+    attachment_edits_on_stale_rev_conflict,
+    bulk_get_reports_each_item,
+);
