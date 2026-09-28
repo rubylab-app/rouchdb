@@ -129,12 +129,68 @@ fn hash32(c: char) -> String {
     std::iter::repeat_n(c, 32).collect()
 }
 
-/// Build `doc` with two live leaves (2-aaa… and 2-zzz…, 2-zzz… wins).
+/// The hash part of a `pos-hash` revision.
+fn hash_of(rev: &str) -> String {
+    rev.split_once('-').unwrap().1.to_string()
+}
+
+fn row_ids(r: &AllDocsResponse) -> Vec<String> {
+    r.rows.iter().map(|r| r.id.clone()).collect()
+}
+
+/// The change events as JSON, so a scenario can compare them exactly
+/// (seq, id, revisions, deleted flag, doc and conflicts).
+fn changes_json(ch: &ChangesResponse) -> serde_json::Value {
+    serde_json::to_value(&ch.results).unwrap()
+}
+
+async fn get_with_conflicts(db: &Database, id: &str) -> Document {
+    db.get_with_opts(
+        id,
+        GetOptions {
+            conflicts: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// `(rev, status)` pairs of `revs_info` for `rev` (the winner when `None`).
+async fn revs_info(db: &Database, id: &str, rev: Option<&str>) -> Vec<(String, String)> {
+    let got = db
+        .get_with_opts(
+            id,
+            GetOptions {
+                rev: rev.map(String::from),
+                revs_info: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    got.data["_revs_info"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| {
+            (
+                i["rev"].as_str().unwrap().to_string(),
+                i["status"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Build `id` with two live leaves under its first revision: 2-aaa…
+/// (`v: "a"`) and 2-fff… (`v: "f"`). Same generation, so the higher hash
+/// 2-fff… wins; the fixture checks that before returning
+/// `(first rev, loser 2-aaa…, winner 2-fff…)`.
 async fn make_conflict(db: &Database, id: &str) -> (String, String, String) {
     let r1 = write(db, serde_json::json!({"_id": id, "v": 1})).await;
-    let h1 = r1.split('-').nth(1).unwrap().to_string();
-    let (a, z) = (hash32('a'), hash32('z'));
-    for (h, v) in [(&a, "a"), (&z, "z")] {
+    let h1 = hash_of(&r1);
+    let (a, f) = (hash32('a'), hash32('f'));
+    for (h, v) in [(&a, "a"), (&f, "f")] {
         let r = write_replicated(
             db,
             serde_json::json!({
@@ -145,7 +201,24 @@ async fn make_conflict(db: &Database, id: &str) -> (String, String, String) {
         .await;
         assert!(r.ok, "{:?}", r);
     }
-    (r1, format!("2-{}", a), format!("2-{}", z))
+    let (loser, winner) = (format!("2-{}", a), format!("2-{}", f));
+    let got = get_with_conflicts(db, id).await;
+    assert_eq!(
+        got.rev.unwrap().to_string(),
+        winner,
+        "fixture: 2-fff… must win"
+    );
+    assert_eq!(
+        got.data,
+        serde_json::json!({"v": "f", "_conflicts": [loser]}),
+        "fixture: winner body and conflicts"
+    );
+    assert_eq!(
+        get_rev(db, id, &loser).await.unwrap().data,
+        serde_json::json!({"v": "a"}),
+        "fixture: loser body"
+    );
+    (r1, loser, winner)
 }
 
 // === section: basics ===
@@ -154,17 +227,36 @@ async fn crud_roundtrip(fx: Fx) {
     let db = fx.db();
     let r1 = db.put("a", serde_json::json!({"v": 1})).await.unwrap();
     assert!(r1.ok);
+    assert_eq!(r1.id, "a");
+    let r1 = r1.rev.unwrap();
+    assert_eq!(generation(&r1), 1);
     let got = db.get("a").await.unwrap();
-    assert_eq!(got.data["v"], 1);
+    assert_eq!(got.id, "a");
+    assert_eq!(got.rev.unwrap().to_string(), r1);
+    assert_eq!(got.data, serde_json::json!({"v": 1}));
+    assert!(!got.deleted);
     let r2 = db
-        .update("a", r1.rev.as_ref().unwrap(), serde_json::json!({"v": 2}))
+        .update("a", &r1, serde_json::json!({"v": 2}))
         .await
+        .unwrap()
+        .rev
         .unwrap();
-    assert!(r2.ok);
-    assert_eq!(db.get("a").await.unwrap().data["v"], 2);
-    let r3 = db.remove("a", r2.rev.as_ref().unwrap()).await.unwrap();
-    assert!(r3.ok);
+    assert_eq!(generation(&r2), 2);
+    let got = db.get("a").await.unwrap();
+    assert_eq!(got.rev.unwrap().to_string(), r2);
+    assert_eq!(got.data, serde_json::json!({"v": 2}));
+    // The previous revision is still readable by rev.
+    assert_eq!(
+        get_rev(db, "a", &r1).await.unwrap().data,
+        serde_json::json!({"v": 1})
+    );
+    let r3 = db.remove("a", &r2).await.unwrap().rev.unwrap();
+    assert_eq!(generation(&r3), 3);
     assert!(matches!(db.get("a").await, Err(RouchError::NotFound(_))));
+    // The tombstone itself is readable and carries no body.
+    let tomb = get_rev(db, "a", &r3).await.unwrap();
+    assert!(tomb.deleted);
+    assert_eq!(tomb.data, serde_json::json!({}));
     let info = db.info().await.unwrap();
     assert_eq!(info.doc_count, 0);
     assert_eq!(info.doc_del_count, 1);
@@ -228,7 +320,16 @@ async fn changes_one_entry_per_doc(fx: Fx) {
         })
         .await
         .unwrap();
-    assert_eq!(since.results.len(), 1);
+    assert_eq!(
+        since
+            .results
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        ["a"]
+    );
+    assert_eq!(since.results[0].seq, Seq::Num(3));
+    assert_eq!(since.last_seq, Seq::Num(3));
 }
 
 conformance!(basics: crud_roundtrip, all_docs_ranges, changes_one_entry_per_doc);
@@ -252,15 +353,17 @@ async fn long_history_survives_reopen(mut fx: Fx) {
     assert_eq!(got.rev.unwrap().to_string(), rev);
     assert_eq!(got.data["v"], 199);
     assert_eq!(db.info().await.unwrap().doc_count, 1);
-    assert_eq!(
-        db.all_docs(AllDocsOptions::new()).await.unwrap().rows.len(),
-        1
-    );
+    let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
+    assert_eq!(row_ids(&all), ["d"]);
+    assert_eq!(all.rows[0].value.rev, rev);
     // Still writable with the current rev, and no duplicate history.
     let next = write(db, serde_json::json!({"_id": "d", "_rev": rev, "v": 200})).await;
     assert_eq!(generation(&next), 201);
     let ch = db.changes(ChangesOptions::default()).await.unwrap();
-    assert_eq!(ch.results.len(), 1);
+    assert_eq!(
+        changes_json(&ch),
+        serde_json::json!([{"seq": 201, "id": "d", "changes": [{"rev": next}], "deleted": false}])
+    );
 }
 
 /// F01: a replicated document with a 1000-revision ancestry.
@@ -289,7 +392,10 @@ async fn replicated_long_ancestry(mut fx: Fx) {
         .await
         .unwrap();
     let doc = bulk.results[0].docs[0].ok.as_ref().unwrap();
-    assert_eq!(doc["_revisions"]["ids"].as_array().unwrap().len(), 1000);
+    assert_eq!(
+        doc["_revisions"],
+        serde_json::json!({"start": 1000, "ids": ids})
+    );
 }
 
 conformance!(f01: long_history_survives_reopen, replicated_long_ancestry);
@@ -376,42 +482,76 @@ async fn attachment_bytes_per_revision(mut fx: Fx) {
             .unwrap(),
         b"v2"
     );
-    assert!(
-        db.get_attachment_with_opts("d", "a", at(&r4))
-            .await
-            .is_err()
-    );
-    assert!(db.get_attachment("d", "a").await.is_err());
+    assert!(matches!(
+        db.get_attachment_with_opts("d", "a", at(&r4)).await,
+        Err(RouchError::NotFound(_))
+    ));
+    assert!(matches!(
+        db.get_attachment("d", "a").await,
+        Err(RouchError::NotFound(_))
+    ));
 }
 
-/// F05: two conflicting branches keep their own bytes for the same name.
-async fn conflict_branches_keep_own_attachment(fx: Fx) {
-    let db = fx.db();
-    let (_r1, loser, winner) = make_conflict(db, "d").await;
-    let wl = db
+/// F05: two conflicting branches keep their own bytes for the same name,
+/// and an attachment edit on a branch keeps THAT branch's body.
+async fn conflict_branches_keep_own_attachment(mut fx: Fx) {
+    let (_r1, loser, winner) = make_conflict(fx.db(), "d").await;
+    let wl = fx
+        .db()
         .put_attachment("d", "a", &loser, b"loser".to_vec(), "text/plain")
         .await
+        .unwrap()
+        .rev
         .unwrap();
-    assert!(wl.ok, "{:?}", wl);
-    let ww = db
+    let ww = fx
+        .db()
         .put_attachment("d", "a", &winner, b"winner".to_vec(), "text/plain")
         .await
+        .unwrap()
+        .rev
         .unwrap();
+    assert_eq!((generation(&wl), generation(&ww)), (3, 3));
+    fx.reopen();
+    let db = fx.db();
     let at = |rev: &str| GetAttachmentOptions {
         rev: Some(rev.to_string()),
     };
     assert_eq!(
-        db.get_attachment_with_opts("d", "a", at(wl.rev.as_ref().unwrap()))
+        db.get_attachment_with_opts("d", "a", at(&wl))
             .await
             .unwrap(),
         b"loser"
     );
     assert_eq!(
-        db.get_attachment_with_opts("d", "a", at(ww.rev.as_ref().unwrap()))
+        db.get_attachment_with_opts("d", "a", at(&ww))
             .await
             .unwrap(),
         b"winner"
     );
+    // Each new revision extends its own branch with its own body.
+    let on_loser = get_rev(db, "d", &wl).await.unwrap();
+    assert_eq!(on_loser.data, serde_json::json!({"v": "a"}));
+    assert_eq!(on_loser.attachments["a"].length, 5);
+    assert_eq!(
+        revs_info(db, "d", Some(&wl))
+            .await
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect::<Vec<_>>()[1],
+        loser
+    );
+    let on_winner = get_rev(db, "d", &ww).await.unwrap();
+    assert_eq!(on_winner.data, serde_json::json!({"v": "f"}));
+    assert_eq!(on_winner.attachments["a"].length, 6);
+    // Both branches are still in conflict; the higher hash wins.
+    let (top, other) = if hash_of(&wl) > hash_of(&ww) {
+        (&wl, &ww)
+    } else {
+        (&ww, &wl)
+    };
+    let got = get_with_conflicts(db, "d").await;
+    assert_eq!(got.rev.unwrap().to_string(), *top);
+    assert_eq!(got.data["_conflicts"], serde_json::json!([other]));
 }
 
 /// F02: bulk_get (the replication source path) carries attachment bytes.
@@ -503,18 +643,15 @@ async fn attachment_only_edits_diverge(fx: Fx) {
         .unwrap();
     assert_ne!(ra, rb);
     a.sync(&b).await.unwrap();
+    let (top, other) = if hash_of(&ra) > hash_of(&rb) {
+        (&ra, &rb)
+    } else {
+        (&rb, &ra)
+    };
     for db in [a, &b] {
-        let got = db
-            .get_with_opts(
-                "d",
-                GetOptions {
-                    conflicts: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(got.data["_conflicts"].as_array().unwrap().len(), 1);
+        let got = get_with_conflicts(db, "d").await;
+        assert_eq!(got.rev.unwrap().to_string(), *top);
+        assert_eq!(got.data["_conflicts"], serde_json::json!([other]));
     }
 }
 
@@ -523,28 +660,26 @@ conformance!(f06: attachment_only_edits_diverge);
 // === section: conflicts ===
 
 /// F08: a losing conflict leaf can be deleted, which resolves the conflict.
-async fn remove_losing_leaf(fx: Fx) {
-    let db = fx.db();
-    let (_r1, loser, winner) = make_conflict(db, "d").await;
+async fn remove_losing_leaf(mut fx: Fx) {
+    let (_r1, loser, winner) = make_conflict(fx.db(), "d").await;
     let mut tomb = doc(serde_json::json!({"_id": "d", "_rev": loser, "_deleted": true}));
     tomb.data = serde_json::json!({});
-    let res = db
+    let res = fx
+        .db()
         .bulk_docs(vec![tomb], BulkDocsOptions::new())
         .await
         .unwrap();
     assert!(res[0].ok, "{:?}", res[0]);
-    let got = db
-        .get_with_opts(
-            "d",
-            GetOptions {
-                conflicts: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    let tomb_rev = res[0].rev.clone().unwrap();
+    assert_eq!(generation(&tomb_rev), 3);
+    fx.reopen();
+    let db = fx.db();
+    let got = get_with_conflicts(db, "d").await;
     assert_eq!(got.rev.unwrap().to_string(), winner);
-    assert!(got.data.get("_conflicts").is_none(), "{}", got.data);
+    assert_eq!(got.data, serde_json::json!({"v": "f"}));
+    assert!(get_rev(db, "d", &tomb_rev).await.unwrap().deleted);
+    let info = db.info().await.unwrap();
+    assert_eq!((info.doc_count, info.doc_del_count), (1, 0));
 }
 
 /// F08: a losing conflict leaf can be updated.
@@ -557,23 +692,36 @@ async fn update_losing_leaf(fx: Fx) {
     )
     .await;
     assert_eq!(generation(&rev), 3);
-    // The extended branch is now the winner (higher generation).
-    assert_eq!(db.get("d").await.unwrap().data["v"], "fixed");
+    // The extended branch is now the winner (higher generation) and the old
+    // winner becomes the conflict.
+    let got = get_with_conflicts(db, "d").await;
+    assert_eq!(got.rev.unwrap().to_string(), rev);
+    assert_eq!(
+        got.data,
+        serde_json::json!({"v": "fixed", "_conflicts": [_winner]})
+    );
 }
 
 /// F08: editing a non-leaf revision is still a conflict.
 async fn update_non_leaf_conflicts(fx: Fx) {
     let db = fx.db();
     let r1 = write(db, serde_json::json!({"_id": "d", "v": 1})).await;
-    write(db, serde_json::json!({"_id": "d", "_rev": r1, "v": 2})).await;
-    let res = db
-        .bulk_docs(
-            vec![doc(serde_json::json!({"_id": "d", "_rev": r1, "v": 3}))],
-            BulkDocsOptions::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res[0].error.as_deref(), Some("conflict"));
+    let r2 = write(db, serde_json::json!({"_id": "d", "_rev": r1, "v": 2})).await;
+    let seq = db.info().await.unwrap().update_seq;
+    // Also a retry of the very same edit (same parent, same body).
+    for v in [3, 2] {
+        let res = db
+            .bulk_docs(
+                vec![doc(serde_json::json!({"_id": "d", "_rev": r1, "v": v}))],
+                BulkDocsOptions::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!res[0].ok);
+        assert_eq!(res[0].error.as_deref(), Some("conflict"), "v={}", v);
+    }
+    assert_eq!(db.info().await.unwrap().update_seq, seq);
+    assert_eq!(db.get("d").await.unwrap().rev.unwrap().to_string(), r2);
 }
 
 /// F09: deleting the winner of a conflict leaves the other branch live, so
@@ -627,12 +775,18 @@ async fn recreate_after_delete(mut fx: Fx) {
     let got = db.get("d").await.unwrap();
     assert_eq!(got.rev.unwrap().to_string(), r4);
     assert!(got.attachments.is_empty());
-    assert!(db.get_attachment("d", "a.txt").await.is_err());
+    assert_eq!(got.data, serde_json::json!({"v": 1}));
+    assert!(matches!(
+        db.get_attachment("d", "a.txt").await,
+        Err(RouchError::NotFound(_))
+    ));
     let r5 = db
         .put_attachment("d", "b.txt", &r4, b"new".to_vec(), "text/plain")
         .await
+        .unwrap()
+        .rev
         .unwrap();
-    assert!(r5.ok);
+    assert_eq!(generation(&r5), 5);
     assert_eq!(db.get_attachment("d", "b.txt").await.unwrap(), b"new");
     let info = db.info().await.unwrap();
     assert_eq!((info.doc_count, info.doc_del_count), (1, 0));
@@ -702,11 +856,13 @@ async fn get_revs_and_revs_info(fx: Fx) {
     assert_eq!(revisions["start"], 2);
     let h = |r: &str| r.split('-').nth(1).unwrap().to_string();
     assert_eq!(revisions["ids"], serde_json::json!([h(&r2), h(&r1)]));
-    let info = got.data["_revs_info"].as_array().unwrap();
-    assert_eq!(info.len(), 2);
-    assert_eq!(info[0]["rev"], r2);
-    assert_eq!(info[0]["status"], "available");
-    assert_eq!(info[1]["rev"], r1);
+    assert_eq!(
+        got.data["_revs_info"],
+        serde_json::json!([
+            {"rev": r2, "status": "available"},
+            {"rev": r1, "status": "available"}
+        ])
+    );
 }
 
 /// F28 / F84: revs_info lists the requested revision's own ancestry.
@@ -806,13 +962,10 @@ async fn replicated_duplicate_is_noop(fx: Fx) {
     assert_eq!(db.info().await.unwrap().update_seq, seq);
     assert_eq!(db.get("d").await.unwrap().data["v"], 1);
     assert_eq!(db.get_attachment("d", "a").await.unwrap(), b"hi!");
+    let ch = db.changes(ChangesOptions::default()).await.unwrap();
     assert_eq!(
-        db.changes(ChangesOptions::default())
-            .await
-            .unwrap()
-            .results
-            .len(),
-        1
+        changes_json(&ch),
+        serde_json::json!([{"seq": 1, "id": "d", "changes": [{"rev": format!("1-{}", h)}], "deleted": false}])
     );
 }
 
@@ -938,7 +1091,13 @@ async fn explicit_attachment_set_is_exact(fx: Fx) {
     json["v"] = serde_json::json!(2);
     write(db, json).await;
     assert_eq!(db.get_attachment("d", "keep").await.unwrap(), b"keep");
-    assert!(db.get_attachment("d", "drop").await.is_err());
+    assert!(matches!(
+        db.get_attachment("d", "drop").await,
+        Err(RouchError::NotFound(_))
+    ));
+    let got = db.get("d").await.unwrap();
+    assert_eq!(got.attachments.keys().collect::<Vec<_>>(), ["keep"]);
+    assert_eq!(got.data, serde_json::json!({"v": 2}));
 }
 
 conformance!(f27: delete_drops_attachments, explicit_attachment_set_is_exact);
@@ -1010,8 +1169,11 @@ async fn info_counts_track_writes(mut fx: Fx) {
     check(fx.db().info().await.unwrap());
     let all = fx.db().all_docs(AllDocsOptions::new()).await.unwrap();
     assert_eq!(all.total_rows, 3);
+    assert_eq!(row_ids(&all), ["b", "c", "e"]);
     fx.reopen();
     check(fx.db().info().await.unwrap());
+    let all = fx.db().all_docs(AllDocsOptions::new()).await.unwrap();
+    assert_eq!(row_ids(&all), ["b", "c", "e"]);
 }
 
 conformance!(f68: info_counts_track_writes);
@@ -1054,52 +1216,70 @@ conformance!(f83_f86: unknown_stub_rejected, remove_missing_attachment);
 // === section: purge ===
 
 /// F11: purging the only leaf removes the document; it never resurrects an
-/// older revision.
-async fn purge_leaf_removes_doc(fx: Fx) {
+/// older revision, and the purge survives a reopen.
+async fn purge_leaf_removes_doc(mut fx: Fx) {
+    let r1 = write(fx.db(), serde_json::json!({"_id": "d", "v": 1})).await;
+    let r2 = write(fx.db(), serde_json::json!({"_id": "d", "_rev": r1, "v": 2})).await;
+    write(fx.db(), serde_json::json!({"_id": "other"})).await;
+    let seq = fx.db().info().await.unwrap().update_seq.as_num();
+    let res = fx.db().purge("d", vec![r2.clone()]).await.unwrap();
+    assert_eq!(res.purged["d"], std::slice::from_ref(&r2));
+    assert_eq!(res.purged.len(), 1);
+    fx.reopen();
     let db = fx.db();
-    let r1 = write(db, serde_json::json!({"_id": "d", "v": 1})).await;
-    let r2 = write(db, serde_json::json!({"_id": "d", "_rev": r1, "v": 2})).await;
-    let seq = db.info().await.unwrap().update_seq.as_num();
-    let res = db.purge("d", vec![r2.clone()]).await.unwrap();
-    assert_eq!(res.purged["d"], [r2]);
     assert!(matches!(db.get("d").await, Err(RouchError::NotFound(_))));
     assert!(matches!(
         get_rev(db, "d", &r1).await,
         Err(RouchError::NotFound(_))
     ));
     let info = db.info().await.unwrap();
-    assert_eq!((info.doc_count, info.doc_del_count), (0, 0));
-    assert!(info.update_seq.as_num() > seq);
+    assert_eq!((info.doc_count, info.doc_del_count), (1, 0));
+    // A purge is one database update.
+    assert_eq!(info.update_seq.as_num(), seq + 1);
+    assert_eq!(
+        row_ids(&db.all_docs(AllDocsOptions::new()).await.unwrap()),
+        ["other"]
+    );
+    let ch = db.changes(ChangesOptions::default()).await.unwrap();
+    assert_eq!(
+        ch.results.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        ["other"]
+    );
+    // Purging again finds nothing, and purge requests are counted.
+    let again = db.purge("d", vec![r2.clone()]).await.unwrap();
+    assert!(again.purged.get("d").is_none_or(|v| v.is_empty()));
+    assert!(
+        again.purge_seq > res.purge_seq,
+        "{:?} then {:?}",
+        res,
+        again
+    );
 }
 
 /// F11: purging a non-leaf revision is ignored; purging a conflict loser
 /// keeps the winner and records a change.
-async fn purge_conflict_loser(fx: Fx) {
-    let db = fx.db();
-    let (r1, loser, winner) = make_conflict(db, "d").await;
-    let res = db.purge("d", vec![r1.clone()]).await.unwrap();
-    assert!(res.purged.get("d").is_none_or(|v| v.is_empty()));
-    let before = db.info().await.unwrap().update_seq.as_num();
-    let res = db.purge("d", vec![loser.clone()]).await.unwrap();
+async fn purge_conflict_loser(mut fx: Fx) {
+    let (r1, loser, winner) = make_conflict(fx.db(), "d").await;
+    let res = fx.db().purge("d", vec![r1.clone()]).await.unwrap();
+    assert_eq!(res.purged["d"], Vec::<String>::new());
+    let before = fx.db().info().await.unwrap().update_seq.as_num();
+    let res = fx.db().purge("d", vec![loser.clone()]).await.unwrap();
     assert_eq!(res.purged["d"], vec![loser.clone()]);
-    let got = db
-        .get_with_opts(
-            "d",
-            GetOptions {
-                conflicts: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    fx.reopen();
+    let db = fx.db();
+    let got = get_with_conflicts(db, "d").await;
     assert_eq!(got.rev.unwrap().to_string(), winner);
-    assert!(got.data.get("_conflicts").is_none());
+    assert_eq!(got.data, serde_json::json!({"v": "f"}));
     assert!(matches!(
         get_rev(db, "d", &loser).await,
         Err(RouchError::NotFound(_))
     ));
+    // The purge re-records the document as one new change.
     let ch = db.changes(ChangesOptions::default()).await.unwrap();
-    assert!(ch.results.last().unwrap().seq.as_num() > before);
+    assert_eq!(
+        changes_json(&ch),
+        serde_json::json!([{"seq": before + 1, "id": "d", "changes": [{"rev": winner}], "deleted": false}])
+    );
 }
 
 conformance!(purge: purge_leaf_removes_doc, purge_conflict_loser);
@@ -1148,7 +1328,10 @@ async fn put_rejects_non_object(fx: Fx) {
         db.put("a", serde_json::json!([1, 2, 3])).await,
         Err(RouchError::BadRequest(_))
     ));
-    assert!(db.post(serde_json::json!("text")).await.is_err());
+    assert!(matches!(
+        db.post(serde_json::json!("text")).await,
+        Err(RouchError::BadRequest(_))
+    ));
     assert_eq!(db.info().await.unwrap().update_seq, Seq::Num(0));
 }
 
@@ -1198,3 +1381,632 @@ conformance!(facade:
     single_doc_failures_are_errors,
     post_uses_body_id,
 );
+
+// === section: conflicts_more ===
+
+/// Compaction keeps the body of EVERY leaf (not only the winner) and drops
+/// the shared ancestor's body; conflicts survive a reopen.
+async fn compact_keeps_conflict_leaves(mut fx: Fx) {
+    let (r1, loser, winner) = make_conflict(fx.db(), "d").await;
+    fx.db().compact().await.unwrap();
+    fx.reopen();
+    let db = fx.db();
+    assert_eq!(
+        get_rev(db, "d", &loser).await.unwrap().data,
+        serde_json::json!({"v": "a"})
+    );
+    assert_eq!(
+        get_rev(db, "d", &winner).await.unwrap().data,
+        serde_json::json!({"v": "f"})
+    );
+    assert!(matches!(
+        get_rev(db, "d", &r1).await,
+        Err(RouchError::NotFound(_))
+    ));
+    let got = get_with_conflicts(db, "d").await;
+    assert_eq!(got.rev.unwrap().to_string(), winner);
+    assert_eq!(got.data["_conflicts"], serde_json::json!([loser]));
+    assert_eq!(
+        revs_info(db, "d", Some(&loser)).await,
+        [
+            (loser.clone(), "available".to_string()),
+            (r1.clone(), "missing".to_string())
+        ]
+    );
+    // The losing branch is still editable after compaction.
+    let r3 = write(
+        db,
+        serde_json::json!({"_id": "d", "_rev": loser, "v": "a2"}),
+    )
+    .await;
+    assert_eq!(generation(&r3), 3);
+    assert_eq!(db.get("d").await.unwrap().rev.unwrap().to_string(), r3);
+}
+
+/// A tombstone that becomes an internal node (the document was re-created
+/// on top of it) is still reported as `deleted` by revs_info, as CouchDB
+/// does, including after a reopen.
+async fn recreate_revs_info_marks_tombstone_deleted(mut fx: Fx) {
+    let r1 = write(fx.db(), serde_json::json!({"_id": "d", "v": 1})).await;
+    let r2 = fx.db().remove("d", &r1).await.unwrap().rev.unwrap();
+    let r3 = write(fx.db(), serde_json::json!({"_id": "d", "v": 1})).await;
+    assert_eq!(generation(&r3), 3);
+    fx.reopen();
+    let db = fx.db();
+    assert_eq!(
+        revs_info(db, "d", None).await,
+        [
+            (r3.clone(), "available".to_string()),
+            (r2.clone(), "deleted".to_string()),
+            (r1.clone(), "available".to_string())
+        ]
+    );
+    let tomb = get_rev(db, "d", &r2).await.unwrap();
+    assert!(tomb.deleted);
+    assert_eq!(tomb.data, serde_json::json!({}));
+}
+
+/// A live leaf wins over a deleted leaf even when the tombstone is at a
+/// higher generation (CouchDB ranks `deleted` before the position).
+async fn live_leaf_beats_deeper_tombstone(mut fx: Fx) {
+    let (x, y, a, b) = (hash32('0'), hash32('c'), hash32('a'), hash32('d'));
+    let live = format!("2-{}", y);
+    let tomb = format!("3-{}", b);
+    let r = write_replicated(
+        fx.db(),
+        serde_json::json!({
+            "_id": "d", "_rev": live, "v": "live",
+            "_revisions": {"start": 2, "ids": [y, x]}
+        }),
+    )
+    .await;
+    assert!(r.ok, "{:?}", r);
+    let r = write_replicated(
+        fx.db(),
+        serde_json::json!({
+            "_id": "d", "_rev": tomb, "_deleted": true,
+            "_revisions": {"start": 3, "ids": [b, a, x]}
+        }),
+    )
+    .await;
+    assert!(r.ok, "{:?}", r);
+    fx.reopen();
+    let db = fx.db();
+    let got = get_with_conflicts(db, "d").await;
+    assert_eq!(got.rev.unwrap().to_string(), live);
+    // A deleted leaf is never listed as a conflict.
+    assert_eq!(got.data, serde_json::json!({"v": "live"}));
+    let info = db.info().await.unwrap();
+    assert_eq!((info.doc_count, info.doc_del_count), (1, 0));
+    let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
+    assert_eq!(row_ids(&all), ["d"]);
+    assert_eq!(all.rows[0].value.rev, live);
+    assert_eq!(all.rows[0].value.deleted, None);
+    let ch = db.changes(ChangesOptions::default()).await.unwrap();
+    assert_eq!(
+        changes_json(&ch),
+        serde_json::json!([{"seq": 2, "id": "d", "changes": [{"rev": live}], "deleted": false}])
+    );
+    let all_leaves = db
+        .changes(ChangesOptions {
+            style: ChangesStyle::AllDocs,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut leaves: Vec<&str> = all_leaves.results[0]
+        .changes
+        .iter()
+        .map(|c| c.rev.as_str())
+        .collect();
+    leaves.sort();
+    assert_eq!(leaves, [live.as_str(), tomb.as_str()]);
+}
+
+conformance!(conflicts_more:
+    compact_keeps_conflict_leaves,
+    recreate_revs_info_marks_tombstone_deleted,
+    live_leaf_beats_deeper_tombstone,
+);
+
+// === section: lifecycle ===
+
+/// `destroy` removes documents, attachments, local documents, the changes
+/// feed and the security document, and the database is usable afterwards.
+async fn destroy_clears_everything(mut fx: Fx) {
+    let r1 = write(fx.db(), serde_json::json!({"_id": "d", "v": 1})).await;
+    fx.db()
+        .put_attachment("d", "a", &r1, b"bytes".to_vec(), "text/plain")
+        .await
+        .unwrap();
+    make_conflict(fx.db(), "c").await;
+    fx.db()
+        .adapter()
+        .put_local("ck", serde_json::json!({"seq": 7}))
+        .await
+        .unwrap();
+    fx.db()
+        .put_security(SecurityDocument {
+            admins: SecurityGroup {
+                names: vec!["bob".into()],
+                roles: vec![],
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    fx.db().destroy().await.unwrap();
+    for pass in ["after destroy", "after reopen"] {
+        let db = fx.db();
+        let info = db.info().await.unwrap();
+        assert_eq!(
+            (info.doc_count, info.doc_del_count, info.update_seq.clone()),
+            (0, 0, Seq::Num(0)),
+            "{}",
+            pass
+        );
+        assert!(matches!(db.get("d").await, Err(RouchError::NotFound(_))));
+        assert!(matches!(
+            db.get_attachment("d", "a").await,
+            Err(RouchError::NotFound(_))
+        ));
+        assert!(matches!(
+            db.adapter().get_local("ck").await,
+            Err(RouchError::NotFound(_))
+        ));
+        let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
+        assert!(all.rows.is_empty(), "{}", pass);
+        assert_eq!(all.total_rows, 0);
+        let ch = db.changes(ChangesOptions::default()).await.unwrap();
+        assert!(ch.results.is_empty(), "{}", pass);
+        assert_eq!(ch.last_seq, Seq::Num(0));
+        let sec = db.get_security().await.unwrap();
+        assert!(sec.admins.names.is_empty(), "{}: {:?}", pass, sec);
+        fx.reopen();
+    }
+    // Writes start from scratch: a new first revision and sequence 1.
+    let r = write(fx.db(), serde_json::json!({"_id": "d", "v": 2})).await;
+    assert_eq!(generation(&r), 1);
+    assert_eq!(fx.db().info().await.unwrap().update_seq, Seq::Num(1));
+}
+
+/// Local documents are stored apart: they are not documents, not in the
+/// changes feed, do not bump update_seq, and persist.
+async fn local_docs_are_not_documents(mut fx: Fx) {
+    fn local(fx: &Fx) -> &dyn Adapter {
+        fx.db().adapter()
+    }
+    local(&fx)
+        .put_local("ck", serde_json::json!({"seq": 1}))
+        .await
+        .unwrap();
+    local(&fx)
+        .put_local("ck", serde_json::json!({"seq": 2, "history": [1]}))
+        .await
+        .unwrap();
+    local(&fx)
+        .put_local("other", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        local(&fx).get_local("ck").await.unwrap(),
+        serde_json::json!({"seq": 2, "history": [1]})
+    );
+    let info = fx.db().info().await.unwrap();
+    assert_eq!((info.doc_count, info.update_seq), (0, Seq::Num(0)));
+    assert!(
+        fx.db()
+            .all_docs(AllDocsOptions::new())
+            .await
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    assert!(
+        fx.db()
+            .changes(ChangesOptions::default())
+            .await
+            .unwrap()
+            .results
+            .is_empty()
+    );
+    assert!(matches!(
+        fx.db().get("ck").await,
+        Err(RouchError::NotFound(_))
+    ));
+    assert!(matches!(
+        local(&fx).remove_local("missing").await,
+        Err(RouchError::NotFound(_))
+    ));
+    assert!(matches!(
+        local(&fx).get_local("missing").await,
+        Err(RouchError::NotFound(_))
+    ));
+
+    fx.reopen();
+    assert_eq!(
+        local(&fx).get_local("ck").await.unwrap(),
+        serde_json::json!({"seq": 2, "history": [1]})
+    );
+    local(&fx).remove_local("ck").await.unwrap();
+    assert!(matches!(
+        local(&fx).get_local("ck").await,
+        Err(RouchError::NotFound(_))
+    ));
+    // Removing one local document leaves the others alone.
+    assert_eq!(
+        local(&fx).get_local("other").await.unwrap(),
+        serde_json::json!({})
+    );
+    fx.reopen();
+    assert!(matches!(
+        local(&fx).get_local("ck").await,
+        Err(RouchError::NotFound(_))
+    ));
+}
+
+conformance!(lifecycle: destroy_clears_everything, local_docs_are_not_documents);
+
+// === section: revs_diff ===
+
+/// `revs_diff` (the replication negotiation) returns exactly the missing
+/// revisions and, for existing documents, the leaves that could be their
+/// ancestors (leaves of a lower generation, as CouchDB does). Documents with
+/// nothing missing are omitted.
+async fn revs_diff_reports_exact_missing(mut fx: Fx) {
+    let d1 = write(fx.db(), serde_json::json!({"_id": "d", "v": 1})).await;
+    let d2 = write(fx.db(), serde_json::json!({"_id": "d", "_rev": d1, "v": 2})).await;
+    let (_c1, loser, winner) = make_conflict(fx.db(), "c").await;
+    fx.reopen();
+    let db = fx.db();
+    let (h3, h9) = (format!("3-{}", hash32('3')), format!("9-{}", hash32('9')));
+    let req: std::collections::HashMap<String, Vec<String>> = [
+        // Known revisions (leaf and ancestor): nothing missing.
+        ("d".to_string(), vec![d1.clone(), d2.clone()]),
+        // One newer revision: both current leaves are possible ancestors.
+        ("c".to_string(), vec![loser.clone(), h3.clone()]),
+        // A document that does not exist: everything missing, no ancestors.
+        (
+            "nope".to_string(),
+            vec![format!("1-{}", hash32('1')), h9.clone()],
+        ),
+    ]
+    .into();
+    let diff = db.adapter().revs_diff(req).await.unwrap();
+    let mut keys: Vec<&String> = diff.results.keys().collect();
+    keys.sort();
+    assert_eq!(keys, ["c", "nope"]);
+    assert_eq!(diff.results["c"].missing, [h3]);
+    let mut ancestors = diff.results["c"].possible_ancestors.clone();
+    ancestors.sort();
+    assert_eq!(ancestors, [loser.clone(), winner.clone()]);
+    assert_eq!(
+        diff.results["nope"].missing,
+        [format!("1-{}", hash32('1')), h9]
+    );
+    assert!(diff.results["nope"].possible_ancestors.is_empty());
+
+    // Only leaves of a LOWER generation are possible ancestors.
+    for (missing, expected) in [
+        (format!("2-{}", hash32('2')), vec![]),
+        (format!("1-{}", hash32('1')), vec![]),
+        (format!("4-{}", hash32('4')), vec![d2.clone()]),
+    ] {
+        let diff = db
+            .adapter()
+            .revs_diff([("d".to_string(), vec![missing.clone()])].into())
+            .await
+            .unwrap();
+        assert_eq!(diff.results["d"].missing, std::slice::from_ref(&missing));
+        assert_eq!(
+            diff.results["d"].possible_ancestors, expected,
+            "missing {}",
+            missing
+        );
+    }
+}
+
+conformance!(revs_diff: revs_diff_reports_exact_missing);
+
+// === section: changes_options ===
+
+/// Every changes-feed option on the same history: one entry per document at
+/// its latest sequence, in both directions, with limit, doc_ids, conflicts,
+/// style=all_docs and include_docs.
+async fn changes_options(mut fx: Fx) {
+    let ra = write(fx.db(), serde_json::json!({"_id": "a", "v": 1})).await; // seq 1
+    let rb = write(fx.db(), serde_json::json!({"_id": "b"})).await; // seq 2
+    let rc = write(fx.db(), serde_json::json!({"_id": "c"})).await; // seq 3
+    let ra2 = write(fx.db(), serde_json::json!({"_id": "a", "_rev": ra, "v": 2})).await; // 4
+    let (_k1, loser, winner) = make_conflict(fx.db(), "k").await; // 5, 6, 7
+    let rb2 = fx.db().remove("b", &rb).await.unwrap().rev.unwrap(); // seq 8
+    fx.reopen();
+    let db = fx.db();
+    let feed = |opts: ChangesOptions| async move { db.changes(opts).await.unwrap() };
+    let ids = |ch: &ChangesResponse| {
+        ch.results
+            .iter()
+            .map(|c| (c.seq.as_num(), c.id.clone()))
+            .collect::<Vec<_>>()
+    };
+    let s = |id: &str| id.to_string();
+
+    let all = feed(ChangesOptions::default()).await;
+    assert_eq!(
+        changes_json(&all),
+        serde_json::json!([
+            {"seq": 3, "id": "c", "changes": [{"rev": rc}], "deleted": false},
+            {"seq": 4, "id": "a", "changes": [{"rev": ra2}], "deleted": false},
+            {"seq": 7, "id": "k", "changes": [{"rev": winner}], "deleted": false},
+            {"seq": 8, "id": "b", "changes": [{"rev": rb2}], "deleted": true},
+        ])
+    );
+    assert_eq!(all.last_seq, Seq::Num(8));
+
+    let desc = feed(ChangesOptions {
+        descending: true,
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        ids(&desc),
+        [(8, s("b")), (7, s("k")), (4, s("a")), (3, s("c"))]
+    );
+
+    let limited = feed(ChangesOptions {
+        limit: Some(2),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(ids(&limited), [(3, s("c")), (4, s("a"))]);
+    assert_eq!(limited.last_seq, Seq::Num(4));
+
+    let desc_limited = feed(ChangesOptions {
+        descending: true,
+        limit: Some(2),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(ids(&desc_limited), [(8, s("b")), (7, s("k"))]);
+    assert_eq!(desc_limited.last_seq, Seq::Num(7));
+
+    let since = feed(ChangesOptions {
+        since: Seq::Num(4),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(ids(&since), [(7, s("k")), (8, s("b"))]);
+    let caught_up = feed(ChangesOptions {
+        since: Seq::Num(8),
+        ..Default::default()
+    })
+    .await;
+    assert!(caught_up.results.is_empty());
+    assert_eq!(caught_up.last_seq, Seq::Num(8));
+
+    let by_id = feed(ChangesOptions {
+        doc_ids: Some(vec![s("b"), s("a"), s("zz")]),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(ids(&by_id), [(4, s("a")), (8, s("b"))]);
+    assert_eq!(by_id.last_seq, Seq::Num(8));
+
+    let conflicts = feed(ChangesOptions {
+        conflicts: true,
+        ..Default::default()
+    })
+    .await;
+    let with_conflicts: Vec<(String, Option<Vec<String>>)> = conflicts
+        .results
+        .iter()
+        .map(|c| (c.id.clone(), c.conflicts.clone()))
+        .collect();
+    assert_eq!(
+        with_conflicts,
+        [
+            (s("c"), None),
+            (s("a"), None),
+            (s("k"), Some(vec![loser.clone()])),
+            (s("b"), None)
+        ]
+    );
+
+    let leaves = feed(ChangesOptions {
+        style: ChangesStyle::AllDocs,
+        ..Default::default()
+    })
+    .await;
+    let leaf_revs: Vec<(String, Vec<String>)> = leaves
+        .results
+        .iter()
+        .map(|c| {
+            let mut revs: Vec<String> = c.changes.iter().map(|r| r.rev.clone()).collect();
+            revs.sort();
+            (c.id.clone(), revs)
+        })
+        .collect();
+    assert_eq!(
+        leaf_revs,
+        [
+            (s("c"), vec![rc.clone()]),
+            (s("a"), vec![ra2.clone()]),
+            (s("k"), vec![loser.clone(), winner.clone()]),
+            (s("b"), vec![rb2.clone()])
+        ]
+    );
+    // The winner is listed first.
+    assert_eq!(leaves.results[2].changes[0].rev, winner);
+
+    let docs = feed(ChangesOptions {
+        include_docs: true,
+        doc_ids: Some(vec![s("k"), s("b")]),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        docs.results[0].doc,
+        Some(serde_json::json!({"_id": "k", "_rev": winner, "v": "f"}))
+    );
+    assert_eq!(
+        docs.results[1].doc,
+        Some(serde_json::json!({"_id": "b", "_rev": rb2, "_deleted": true}))
+    );
+}
+
+conformance!(changes: changes_options);
+
+// === section: batches ===
+
+/// A `new_edits=true` batch reports one result per document, in order, and
+/// stores only the successful ones. A second write to the same `_id` in the
+/// same batch conflicts, as in CouchDB.
+async fn mixed_batch_results(mut fx: Fx) {
+    let re = write(fx.db(), serde_json::json!({"_id": "e", "v": 1})).await;
+    let seq = fx.db().info().await.unwrap().update_seq.as_num();
+    let res = fx
+        .db()
+        .bulk_docs(
+            vec![
+                doc(serde_json::json!({"_id": "n1", "v": 1})),
+                doc(serde_json::json!({"_id": "e", "v": 9})),
+                doc(serde_json::json!({"_id": "n2"})),
+                doc(serde_json::json!({"_id": "e", "_rev": re, "v": 2})),
+                doc(serde_json::json!({"_id": "n1", "v": 2})),
+                doc(serde_json::json!({"_id": "e", "_rev": re, "v": 3})),
+            ],
+            BulkDocsOptions::new(),
+        )
+        .await
+        .unwrap();
+    let summary: Vec<(String, bool, Option<String>, Option<u64>)> = res
+        .iter()
+        .map(|r| {
+            (
+                r.id.clone(),
+                r.ok,
+                r.error.clone(),
+                r.rev.as_deref().map(generation),
+            )
+        })
+        .collect();
+    let conflict = Some("conflict".to_string());
+    assert_eq!(
+        summary,
+        [
+            ("n1".to_string(), true, None, Some(1)),
+            ("e".to_string(), false, conflict.clone(), None),
+            ("n2".to_string(), true, None, Some(1)),
+            ("e".to_string(), true, None, Some(2)),
+            ("n1".to_string(), false, conflict.clone(), None),
+            ("e".to_string(), false, conflict, None),
+        ]
+    );
+    fx.reopen();
+    let db = fx.db();
+    // Exactly the three successful writes were applied.
+    assert_eq!(db.info().await.unwrap().update_seq.as_num(), seq + 3);
+    assert_eq!(
+        db.get("n1").await.unwrap().data,
+        serde_json::json!({"v": 1})
+    );
+    let e = db.get("e").await.unwrap();
+    assert_eq!(e.rev.unwrap().to_string(), res[3].rev.clone().unwrap());
+    assert_eq!(e.data, serde_json::json!({"v": 2}));
+    assert!(
+        get_with_conflicts(db, "e")
+            .await
+            .data
+            .get("_conflicts")
+            .is_none()
+    );
+    assert_eq!(
+        row_ids(&db.all_docs(AllDocsOptions::new()).await.unwrap()),
+        ["e", "n1", "n2"]
+    );
+}
+
+conformance!(batches: mixed_batch_results);
+
+// === section: ids ===
+
+/// Non-ASCII ids (accents, CJK, emoji, spaces, slashes) round-trip through
+/// every read path and sort by code point.
+async fn unicode_ids_roundtrip(mut fx: Fx) {
+    let ids = [
+        "Zeta",
+        "a b",
+        "a/b",
+        "a%2Fb",
+        "café",
+        "ñandú",
+        "日本語",
+        "🦀crab",
+        "zz",
+    ];
+    for id in ids {
+        write(fx.db(), serde_json::json!({"_id": id, "id": id})).await;
+    }
+    let r = fx
+        .db()
+        .get("🦀crab")
+        .await
+        .unwrap()
+        .rev
+        .unwrap()
+        .to_string();
+    fx.db()
+        .put_attachment("🦀crab", "ñ.txt", &r, b"x".to_vec(), "text/plain")
+        .await
+        .unwrap();
+    fx.reopen();
+    let db = fx.db();
+    for id in ids {
+        let got = db.get(id).await.unwrap();
+        assert_eq!(got.id, id);
+        assert_eq!(got.data["id"], id);
+    }
+    assert_eq!(db.get_attachment("🦀crab", "ñ.txt").await.unwrap(), b"x");
+    let mut sorted: Vec<&str> = ids.to_vec();
+    sorted.sort(); // code point order == UTF-8 byte order
+    let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
+    assert_eq!(row_ids(&all), sorted);
+    let range = db
+        .all_docs(AllDocsOptions {
+            start_key: Some("c".into()),
+            end_key: Some("日".into()),
+            ..AllDocsOptions::new()
+        })
+        .await
+        .unwrap();
+    assert_eq!(row_ids(&range), ["café", "zz", "ñandú"]);
+    let keyed = db
+        .all_docs(AllDocsOptions {
+            keys: Some(vec!["日本語".into(), "a/b".into()]),
+            ..AllDocsOptions::new()
+        })
+        .await
+        .unwrap();
+    assert_eq!(row_ids(&keyed), ["日本語", "a/b"]);
+    let ch = db
+        .changes(ChangesOptions {
+            doc_ids: Some(vec!["ñandú".into()]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(ch.results.len(), 1);
+    assert_eq!(ch.results[0].id, "ñandú");
+    // And they replicate unchanged.
+    let target = fx.sibling("unicode_target");
+    db.replicate_to(&target).await.unwrap();
+    let copied = target.all_docs(AllDocsOptions::new()).await.unwrap();
+    assert_eq!(row_ids(&copied), sorted);
+    assert_eq!(
+        target.get_attachment("🦀crab", "ñ.txt").await.unwrap(),
+        b"x"
+    );
+}
+
+conformance!(ids: unicode_ids_roundtrip);
