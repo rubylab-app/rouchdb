@@ -20,7 +20,7 @@ RouchDB is the Rust equivalent of [PouchDB](https://pouchdb.com/) — it gives y
 - **Conflict resolution** — deterministic winner algorithm, conflict detection utilities
 - **CouchDB-compatible HTTP server** — browse databases with Fauxton, connect any CouchDB client
 - **Pluggable storage** — in-memory, persistent (redb), or remote (HTTP)
-- **Pure Rust** — no C dependencies, compiles everywhere Rust does
+- **No system libraries** — pure-Rust storage (redb), and HTTPS through rustls by default instead of OpenSSL
 
 ## Target Use Cases
 

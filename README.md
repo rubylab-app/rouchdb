@@ -2,7 +2,7 @@
 
 A local-first document database for Rust with CouchDB replication protocol support.
 
-RouchDB is the Rust equivalent of [PouchDB](https://pouchdb.com/) — it stores JSON documents locally and syncs bidirectionally with [CouchDB](https://couchdb.apache.org/) and compatible servers. Pure Rust, no C dependencies.
+RouchDB is the Rust equivalent of [PouchDB](https://pouchdb.com/) — it stores JSON documents locally and syncs bidirectionally with [CouchDB](https://couchdb.apache.org/) and compatible servers. No system libraries required: storage is pure Rust (redb) and HTTPS uses rustls by default, not OpenSSL.
 
 [![Crates.io](https://img.shields.io/crates/v/rouchdb)](https://crates.io/crates/rouchdb)
 [![Docs](https://img.shields.io/docsrs/rouchdb)](https://docs.rs/rouchdb)
@@ -24,7 +24,7 @@ RouchDB is the Rust equivalent of [PouchDB](https://pouchdb.com/) — it stores 
 - **Partitioned databases** — scoped queries by ID prefix
 - **CouchDB-compatible HTTP server** — browse databases with Fauxton, use any CouchDB client
 - **CLI tool** — inspect, query, and modify redb databases from the terminal
-- **Pure Rust** — no C dependencies (redb instead of LevelDB/SQLite)
+- **No system libraries** — pure-Rust storage (redb instead of LevelDB/SQLite) and rustls for HTTPS by default
 
 ## Quick Start
 
@@ -32,10 +32,12 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rouchdb = "0.3"
+rouchdb = "0.4"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
+
+Requires Rust 1.88 or newer.
 
 ```rust
 use rouchdb::Database;
@@ -74,6 +76,17 @@ async fn main() -> rouchdb::Result<()> {
     Ok(())
 }
 ```
+
+### TLS
+
+HTTPS to CouchDB uses [rustls](https://github.com/rustls/rustls) by default. To use the platform TLS stack instead (OpenSSL on Linux), or to trust the OS certificate store, pick a different TLS feature:
+
+```toml
+rouchdb = { version = "0.4", default-features = false, features = ["native-tls"] }
+# or: features = ["rustls-tls-native-roots"]
+```
+
+With no TLS feature only plain `http://` CouchDB URLs work. These features are new after 0.4.0 (see the [changelog](CHANGELOG.md)); 0.4.0 itself always uses native-tls.
 
 ## Querying
 
@@ -231,7 +244,7 @@ Add `--pretty` (or `-p`) to any command for formatted JSON output.
 
 ## Crate Structure
 
-RouchDB is a workspace of 11 crates:
+RouchDB is a workspace of 12 crates:
 
 | Crate | Description |
 |-------|-------------|
@@ -246,6 +259,7 @@ RouchDB is a workspace of 11 crates:
 | `rouchdb-views` | Design documents and persistent view engine |
 | `rouchdb-server` | CouchDB-compatible HTTP server with Fauxton |
 | `rouchdb-cli` | Command-line tool for database inspection and CRUD |
+| `rouchdb-bench` | Criterion benchmarks (not published) |
 
 ## Documentation
 
@@ -256,15 +270,18 @@ RouchDB is a workspace of 11 crates:
 
 ```bash
 # Run tests
-cargo test
+cargo test --workspace
 
-# Lint
+# Lint (the toolchain is pinned in rust-toolchain.toml)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 
 # Integration tests (require CouchDB)
 docker compose up -d
-cargo test -p rouchdb --test '*' -- --ignored
+bash scripts/test-couchdb.sh
+
+# Benchmarks (criterion)
+cargo bench -p rouchdb-bench
 ```
 
 ## License

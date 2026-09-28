@@ -6,12 +6,31 @@ Add RouchDB to your project with all features:
 
 ```toml
 [dependencies]
-rouchdb = "0.3"
+rouchdb = "0.4"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
 
 This gives you local storage (redb), HTTP client, replication, queries, and the high-level `Database` API.
+
+RouchDB requires Rust 1.88 or newer.
+
+## TLS Backend
+
+HTTPS connections to CouchDB (`Database::http("https://...")`) use [rustls](https://github.com/rustls/rustls) with the bundled Mozilla root certificates by default, so no OpenSSL or other system library is needed. Choose another backend with Cargo features:
+
+| Feature | TLS stack | Trusted roots |
+|---------|-----------|---------------|
+| `rustls-tls` (default) | rustls | Bundled Mozilla roots |
+| `rustls-tls-native-roots` | rustls | The operating system's certificate store (e.g. a private CA) |
+| `native-tls` | Platform stack (OpenSSL on Linux) | The operating system's certificate store |
+
+```toml
+[dependencies]
+rouchdb = { version = "0.4", default-features = false, features = ["native-tls"] }
+```
+
+With `default-features = false` and no TLS feature, only plain `http://` URLs work, and the build has no C code at all (rustls' default crypto provider, ring, compiles a small amount of bundled C and assembly). The same features exist on `rouchdb-adapter-http`. They are new after 0.4.0; version 0.4.0 always uses native-tls.
 
 ## Minimal Setup
 
@@ -19,8 +38,8 @@ If you only need local storage without replication or HTTP:
 
 ```toml
 [dependencies]
-rouchdb-core = "0.3"
-rouchdb-adapter-redb = "0.3"
+rouchdb-core = "0.4"
+rouchdb-adapter-redb = "0.4"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```

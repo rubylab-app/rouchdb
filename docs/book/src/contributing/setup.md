@@ -19,7 +19,7 @@ rustc --version
 cargo --version
 ```
 
-The workspace uses edition 2024 and resolver version 3, so you need Rust 1.85 or later.
+The minimum supported Rust version (MSRV) is 1.88, declared as `rust-version` in the root `Cargo.toml`. The toolchain used for development and CI is pinned in `rust-toolchain.toml`; rustup installs it automatically the first time you run `cargo` inside the repository.
 
 ### Docker (for integration tests)
 
@@ -38,7 +38,7 @@ cd rouchdb
 cargo build
 ```
 
-The workspace compiles all 8 crates:
+The workspace contains these crates:
 
 | Crate | Purpose |
 |---|---|
@@ -49,7 +49,11 @@ The workspace compiles all 8 crates:
 | `rouchdb-changes` | Streaming changes feed |
 | `rouchdb-replication` | CouchDB replication protocol |
 | `rouchdb-query` | Mango selectors and map/reduce views |
+| `rouchdb-views` | Design documents and persistent view engine |
 | `rouchdb` | Umbrella crate that re-exports everything |
+| `rouchdb-server` | CouchDB-compatible HTTP server (not published) |
+| `rouchdb-cli` | Command-line tool (not published) |
+| `rouchdb-bench` | Criterion benchmarks (not published) |
 
 ## Running Unit Tests
 
@@ -112,7 +116,7 @@ Integration tests verify RouchDB against a real CouchDB server. They are marked 
 
 ```bash
 docker compose up -d
-cargo test -p rouchdb --test couchdb_integration -- --ignored
+bash scripts/test-couchdb.sh
 ```
 
 ## Environment Variables
@@ -129,7 +133,7 @@ To use a different CouchDB instance:
 
 ```bash
 export COUCHDB_URL="http://myuser:mypass@couchdb.example.com:5984"
-cargo test -p rouchdb --test couchdb_integration -- --ignored
+bash scripts/test-couchdb.sh
 ```
 
 ## Editor Setup
