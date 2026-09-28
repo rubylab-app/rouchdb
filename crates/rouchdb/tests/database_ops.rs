@@ -64,8 +64,16 @@ async fn database_destroy_http() {
 
     db.destroy().await.unwrap();
 
-    let result = db.info().await;
-    assert!(result.is_err());
+    // Like the local adapters, the handle then behaves as a new, empty
+    // database: it is re-created on its next use.
+    let info = db.info().await.unwrap();
+    assert_eq!(info.doc_count, 0);
+    assert!(matches!(
+        db.get("doc1").await,
+        Err(rouchdb::RouchError::NotFound(_))
+    ));
+    db.destroy().await.unwrap();
+    delete_remote_db(&url).await;
 }
 
 #[tokio::test]

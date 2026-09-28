@@ -334,11 +334,15 @@ async fn http_errors_keep_couchdb_meaning() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(err, rouchdb::RouchError::BadRequest(_)), "{err:?}");
+    // CouchDB's 400 "Invalid rev format", reported like the local adapters.
+    assert!(matches!(err, rouchdb::RouchError::InvalidRev(_)), "{err:?}");
 
+    // A user that does not exist: a wrong password for a real account
+    // (admin) would trip CouchDB's lockout on a shared server.
     let server = common::couchdb_url().replace("admin:password@", "");
     let auth = rouchdb::AuthClient::new(&server);
-    let err = auth.login("admin", "wrong-password").await.unwrap_err();
+    let nobody = format!("nobody_{}", uuid::Uuid::new_v4().simple());
+    let err = auth.login(&nobody, "wrong-password").await.unwrap_err();
     assert!(matches!(err, rouchdb::RouchError::Unauthorized), "{err:?}");
 
     delete_remote_db(&url).await;

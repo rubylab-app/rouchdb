@@ -29,11 +29,11 @@ impl HttpAdapter {
             .await
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
         let status = response.status().as_u16();
-        let text = response
-            .text()
+        let bytes = response
+            .bytes()
             .await
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
-        let json = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        let json = crate::decode_response(&bytes).unwrap_or(serde_json::Value::Null);
         Ok((status, json))
     }
 }
