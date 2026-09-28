@@ -1583,6 +1583,7 @@ mod tests {
         inner: MemoryAdapter,
         faults: std::sync::Mutex<Faults>,
         bulk_docs_calls: std::sync::atomic::AtomicUsize,
+        changes_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl Faulty {
@@ -1591,6 +1592,7 @@ mod tests {
                 inner,
                 faults: std::sync::Mutex::new(faults),
                 bulk_docs_calls: std::sync::atomic::AtomicUsize::new(0),
+                changes_calls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -1655,6 +1657,8 @@ mod tests {
         }
         async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
             self.check_online()?;
+            self.changes_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.changes(opts).await
         }
         async fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
@@ -2421,6 +2425,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cp["last_seq"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_short_batch_ends_the_pass_without_another_changes_request() {
+        let inner = MemoryAdapter::new("source");
+        for id in ["a", "b", "c"] {
+            put_doc(&inner, id, serde_json::json!({})).await;
+        }
+        let source = Faulty::new(inner, Faults::default());
+        let target = MemoryAdapter::new("target");
+        // Fewer changes than batch_size means the feed is exhausted, whether
+        // the batch was written, already on the target, or filtered out.
+        let runs = [
+            ReplicationOptions::default(),
+            ReplicationOptions {
+                checkpoint: false,
+                ..Default::default()
+            },
+            ReplicationOptions {
+                filter: Some(ReplicationFilter::Custom(Arc::new(|_| false))),
+                ..Default::default()
+            },
+        ];
+        for (i, opts) in runs.into_iter().enumerate() {
+            let before = source
+                .changes_calls
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let result = replicate(&source, &target, opts).await.unwrap();
+            assert!(result.ok, "{:?}", result.errors);
+            assert_eq!(result.docs_read, [3, 3, 0][i]);
+            let calls = source
+                .changes_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                - before;
+            assert_eq!(calls, 1, "run {i} asked for changes {calls} times");
+        }
     }
 
     #[tokio::test]
