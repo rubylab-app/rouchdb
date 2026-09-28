@@ -18,15 +18,15 @@ path = "src/main.rs"
 
 [dependencies]
 rouchdb = { path = "../rouchdb" }
-base64 = "0.22"
-clap = { version = "4", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+base64 = "0.22.1"
+clap = { version = "4.5", features = ["derive"] }
+serde_json = "1.0.106"
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
-tempfile = "3"
+tempfile = "3.1.0"
 rouchdb = { path = "../rouchdb" }
-serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde_json = "1.0.106"
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }
