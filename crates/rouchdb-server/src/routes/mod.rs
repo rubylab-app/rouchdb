@@ -9,8 +9,10 @@ pub mod database;
 pub mod design;
 pub mod document;
 pub mod fauxton;
+pub mod local;
 pub mod membership;
 pub mod query;
+pub mod replication;
 pub mod root;
 pub mod security;
 pub mod session;
@@ -19,8 +21,25 @@ pub mod views;
 
 use axum::Router;
 use axum::routing::{delete, get, post};
+use rouchdb_core::error::RouchError;
 
+use crate::error::AppError;
 use crate::state::AppState;
+
+/// Parse a PUT body as a JSON object whatever its Content-Type, as CouchDB
+/// does (`curl -X PUT -d '{...}'` sends `application/x-www-form-urlencoded`).
+pub(crate) fn json_object_body(
+    body: &[u8],
+) -> Result<serde_json::Map<String, serde_json::Value>, AppError> {
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| AppError(RouchError::BadRequest("invalid UTF-8 JSON".into())))?;
+    match value {
+        serde_json::Value::Object(obj) => Ok(obj),
+        _ => Err(AppError(RouchError::BadRequest(
+            "Document must be a JSON object".into(),
+        ))),
+    }
+}
 
 /// Build the full route tree.
 ///
@@ -67,8 +86,22 @@ pub fn build_routes(state: AppState) -> Router {
             "/{db}/_index/{ddoc}/{itype}/{name}",
             delete(query::delete_index),
         )
+        .route(
+            "/{db}/_index/_design/{ddoc}/{itype}/{name}",
+            delete(query::delete_index),
+        )
         .route("/{db}/_explain", post(query::explain))
         .route("/{db}/_compact", post(compact::compact))
+        // Replication protocol
+        .route("/{db}/_revs_diff", post(replication::revs_diff))
+        .route("/{db}/_bulk_get", post(replication::bulk_get))
+        .route("/{db}/_purge", post(replication::purge))
+        .route(
+            "/{db}/_local/{*docid}",
+            get(local::get_local)
+                .put(local::put_local)
+                .delete(local::delete_local),
+        )
         .route(
             "/{db}/_security",
             get(security::get_security).put(security::put_security),
@@ -94,9 +127,9 @@ pub fn build_routes(state: AppState) -> Router {
                 .post(database::post_doc)
                 .delete(database::delete_db),
         )
-        // Attachments (before generic doc catch-all)
+        // Attachments (before generic doc catch-all); names may contain `/`
         .route(
-            "/{db}/{docid}/{attname}",
+            "/{db}/{docid}/{*attname}",
             get(attachment::get_attachment)
                 .put(attachment::put_attachment)
                 .delete(attachment::delete_attachment),

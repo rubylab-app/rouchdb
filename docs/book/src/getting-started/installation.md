@@ -129,10 +129,18 @@ Options:
 rouchdb-server <path.redb> [OPTIONS]
 
 Options:
-  -p, --port <PORT>        Port to listen on [default: 5984]
-      --host <HOST>        Host to bind to [default: 127.0.0.1]
-      --db-name <NAME>     Database name [default: filename without extension]
+  -p, --port <PORT>                Port to listen on [default: 5984]
+      --host <HOST>                Host to bind to [default: 127.0.0.1]
+      --db-name <NAME>             Database name [default: filename without extension]
+      --admin <USER:PASSWORD>      Require admin credentials [env: ROUCHDB_ADMIN]
+      --cors-origin <ORIGIN>       Allow CORS from this origin (repeatable) [env: ROUCHDB_CORS_ORIGINS]
+      --max-request-size <BYTES>   Largest accepted request body [default: 67108864]
 ```
+
+By default the server listens on `127.0.0.1` with CORS disabled and no
+authentication. Set `ROUCHDB_ADMIN=user:password` to require credentials
+(HTTP Basic auth or a `_session` cookie), and allow browser apps on other
+origins explicitly with `--cors-origin`.
 
 ## Async Runtime
 

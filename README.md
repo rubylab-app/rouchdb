@@ -185,10 +185,25 @@ Options:
 rouchdb-server <path.redb> [OPTIONS]
 
 Options:
-  -p, --port <PORT>        Port to listen on [default: 5984]
-      --host <HOST>        Host to bind to [default: 127.0.0.1]
-      --db-name <NAME>     Database name [default: filename without extension]
+  -p, --port <PORT>                Port to listen on [default: 5984]
+      --host <HOST>                Host to bind to [default: 127.0.0.1]
+      --db-name <NAME>             Database name [default: filename without extension]
+      --admin <USER:PASSWORD>      Require admin credentials [env: ROUCHDB_ADMIN]
+      --cors-origin <ORIGIN>       Allow CORS from this origin (repeatable) [env: ROUCHDB_CORS_ORIGINS]
+      --max-request-size <BYTES>   Largest accepted request body [default: 67108864]
 ```
+
+Security defaults: the server binds to `127.0.0.1`, **CORS is disabled** (so
+web pages from other origins cannot use your browser to read or write the
+database) and **authentication is off**. To require credentials, set
+`ROUCHDB_ADMIN=user:password` (or `--admin`); clients then authenticate with
+HTTP Basic auth (`http://user:password@host:5984/db`) or a `_session` cookie
+(Fauxton login), and only `/`, `/_session`, `/_uuids` and `/_utils` stay
+public. To let a browser app on another origin talk to the server, allow its
+origin explicitly, e.g. `--cors-origin http://localhost:3000` (credentials are
+allowed for listed origins; `*` allows any origin without credentials). The
+server warns at startup when it listens on a non-loopback address without
+authentication.
 
 ## CLI Tool
 
@@ -220,11 +235,27 @@ rouchdb delete mydb.redb user:alice --rev 2-def                        # Delete
 rouchdb import mydb.redb docs.json                                     # Bulk import
 ```
 
+`dump` exports each document's winning revision with its attachments inlined as
+base64, and `import` restores them. Revision history and conflicting revisions
+are not exported (`dump` warns about documents with conflicts); use `replicate`
+to copy a database with its full history. Read-only commands fail instead of
+creating a missing `.redb` file, and every command exits with status 1 on
+failure (including a `replicate` or `import` that only partly succeeded).
+
 ### Operations
 
 ```bash
 rouchdb replicate mydb.redb http://admin:password@localhost:5984/mydb  # Sync
 rouchdb compact mydb.redb                                              # Compact
+```
+
+To keep the CouchDB password out of shell history and `ps`, `replicate` reads
+credentials from `ROUCHDB_USER` and `ROUCHDB_PASSWORD` for any http(s) URL that
+has none of its own:
+
+```bash
+ROUCHDB_USER=admin ROUCHDB_PASSWORD=password \
+  rouchdb replicate mydb.redb http://localhost:5984/mydb
 ```
 
 Add `--pretty` (or `-p`) to any command for formatted JSON output.
