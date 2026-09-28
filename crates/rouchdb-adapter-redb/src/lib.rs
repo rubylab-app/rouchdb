@@ -1164,6 +1164,19 @@ impl Inner {
 
     fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
         let read_txn = db_err!(self.db.begin_read())?;
+        // `limit: 0` is no change at all (CouchDB): the feed stays at `since`,
+        // or at the current sequence when descending.
+        if opts.limit == Some(0) {
+            let last_seq = if opts.descending {
+                Seq::Num(read_meta(&db_err!(read_txn.open_table(META_TABLE))?)?.update_seq)
+            } else {
+                opts.since.clone()
+            };
+            return Ok(ChangesResponse {
+                results: Vec::new(),
+                last_seq,
+            });
+        }
         let changes_table = db_err!(read_txn.open_table(CHANGES_TABLE))?;
         let doc_table = db_err!(read_txn.open_table(DOC_TABLE))?;
         let rev_table = db_err!(read_txn.open_table(REV_DATA_TABLE))?;

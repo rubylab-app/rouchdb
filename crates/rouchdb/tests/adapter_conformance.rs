@@ -1789,6 +1789,37 @@ async fn uppercase_revisions_are_normalized(mut fx: Fx) {
     assert_eq!(generation(next.rev.as_deref().unwrap()), 3);
 }
 
+/// A `changes` request with `limit: 0` returns no change (CouchDB 3.5.1:
+/// empty `results`; `last_seq` is `since`, or the current sequence when
+/// descending).
+async fn changes_limit_zero_is_empty(fx: Fx) {
+    let db = fx.db();
+    for id in ["a", "b", "c"] {
+        write(db, serde_json::json!({"_id": id})).await;
+    }
+    for (descending, since, last) in [(false, 0, 0), (false, 1, 1), (true, 0, 3)] {
+        let res = db
+            .changes(ChangesOptions {
+                limit: Some(0),
+                descending,
+                since: Seq::Num(since),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(res.results.is_empty(), "{descending} {since}: {res:?}");
+        assert_eq!(res.last_seq, Seq::Num(last), "{descending} {since}");
+    }
+    let one = db
+        .changes(ChangesOptions {
+            limit: Some(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(one.results.len(), 1);
+}
+
 conformance!(storage_fidelity:
     unusual_ids_survive_compact_and_purge,
     deep_documents_round_trip,
@@ -1801,4 +1832,5 @@ conformance!(storage_fidelity:
     put_design_conflict_is_an_error,
     destroy_resets_the_database,
     uppercase_revisions_are_normalized,
+    changes_limit_zero_is_empty,
 );

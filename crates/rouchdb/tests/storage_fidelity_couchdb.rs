@@ -348,3 +348,22 @@ async fn revs_diff_and_stubs_match_couchdb() {
     }
     delete_remote_db(&url).await;
 }
+
+/// `changes` with `limit: 0` is empty over http too (CouchDB 3.5.1), like
+/// the local adapters.
+#[tokio::test]
+#[ignore]
+async fn changes_limit_zero_over_http() {
+    let url = fresh_remote_db("sfid_changes").await;
+    let db = Database::http(&url);
+    db.put("a", serde_json::json!({})).await.unwrap();
+    let res = db
+        .changes(ChangesOptions {
+            limit: Some(0),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(res.results.is_empty(), "{res:?}");
+    delete_remote_db(&url).await;
+}

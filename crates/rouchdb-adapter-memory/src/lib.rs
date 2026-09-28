@@ -108,6 +108,20 @@ fn canonical_rev(rev_str: &str) -> Result<String> {
     Ok(rev_str.parse::<Revision>()?.to_string())
 }
 
+/// The answer to a `changes` request with `limit: 0`: no change, and the
+/// position the feed stands at (like CouchDB: `since`, or the current
+/// sequence when descending).
+fn empty_changes(opts: &ChangesOptions, update_seq: u64) -> ChangesResponse {
+    ChangesResponse {
+        results: Vec::new(),
+        last_seq: if opts.descending {
+            Seq::Num(update_seq)
+        } else {
+            opts.since.clone()
+        },
+    }
+}
+
 /// Map a failed attachment edit to the error the attachment APIs return.
 fn attachment_edit_error(result: DocResult) -> RouchError {
     match result.error.as_deref() {
@@ -426,6 +440,9 @@ impl Adapter for MemoryAdapter {
 
     async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
         let inner = self.inner.read().await;
+        if opts.limit == Some(0) {
+            return Ok(empty_changes(&opts, inner.update_seq));
+        }
 
         let mut results = Vec::new();
         // Highest sequence actually inspected (even if filtered out), so the
