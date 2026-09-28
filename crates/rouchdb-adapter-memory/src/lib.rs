@@ -977,7 +977,7 @@ impl Adapter for MemoryAdapter {
 // Document processing (new_edits = true)
 // ---------------------------------------------------------------------------
 
-fn process_doc_new_edits(inner: &mut Inner, doc: Document) -> DocResult {
+fn process_doc_new_edits(inner: &mut Inner, mut doc: Document) -> DocResult {
     let doc_id = if doc.id.is_empty() {
         Uuid::new_v4().to_string()
     } else {
@@ -986,25 +986,28 @@ fn process_doc_new_edits(inner: &mut Inner, doc: Document) -> DocResult {
 
     let existing = inner.docs.get(&doc_id);
 
+    // When re-creating a deleted document, the tombstone revision is adopted
+    // as the parent of the new edit (CouchDB does the same).
+    let mut recreate_parent: Option<Revision> = None;
+
     // Check for conflicts: if the doc has a _rev, it must match the winning rev
     if let Some(stored) = existing {
         let winner = winning_rev(&stored.rev_tree);
 
         match (&doc.rev, &winner) {
-            (Some(provided_rev), Some(current_winner)) => {
-                if provided_rev.to_string() != current_winner.to_string() {
-                    return DocResult {
-                        ok: false,
-                        id: doc_id,
-                        rev: None,
-                        error: Some("conflict".into()),
-                        reason: Some("Document update conflict".into()),
-                    };
-                }
+            (Some(provided_rev), Some(current_winner))
+                if provided_rev.to_string() != current_winner.to_string() =>
+            {
+                return DocResult {
+                    ok: false,
+                    id: doc_id,
+                    rev: None,
+                    error: Some("conflict".into()),
+                    reason: Some("Document update conflict".into()),
+                };
             }
             // Creating a doc that already exists and is not deleted is a
-            // conflict; if the current winner is deleted, fall through and
-            // allow re-creating it at the same id.
+            // conflict.
             (None, Some(_)) if !is_deleted(&stored.rev_tree) => {
                 return DocResult {
                     ok: false,
@@ -1013,6 +1016,14 @@ fn process_doc_new_edits(inner: &mut Inner, doc: Document) -> DocResult {
                     error: Some("conflict".into()),
                     reason: Some("Document update conflict".into()),
                 };
+            }
+            // A deleted winner may be re-created. Extend from the tombstone
+            // rather than starting a fresh pos-1 branch: the rev hash is
+            // deterministic, so a pos-1 re-create of the original content
+            // would regenerate a revision already inside the tree and merge
+            // as a no-op, leaving the tombstone as the winner.
+            (None, Some(current_winner)) => {
+                recreate_parent = Some(current_winner.clone());
             }
             _ => {}
         }
@@ -1025,6 +1036,11 @@ fn process_doc_new_edits(inner: &mut Inner, doc: Document) -> DocResult {
             error: Some("not_found".into()),
             reason: Some("missing".into()),
         };
+    }
+
+    let recreating = recreate_parent.is_some();
+    if let Some(parent) = recreate_parent {
+        doc.rev = Some(parent);
     }
 
     // Generate new revision
@@ -1052,12 +1068,16 @@ fn process_doc_new_edits(inner: &mut Inner, doc: Document) -> DocResult {
     let existing_tree = existing.map(|s| s.rev_tree.clone()).unwrap_or_default();
 
     // Carry forward the parent revision's attachments so a body-only edit
-    // does not silently drop them.
-    let parent_atts: HashMap<String, AttachmentMeta> = doc
-        .rev
-        .as_ref()
-        .and_then(|r| existing.and_then(|s| s.rev_attachments.get(&r.to_string()).cloned()))
-        .unwrap_or_default();
+    // does not silently drop them. A re-created document starts fresh: its
+    // parent is the tombstone only for rev-tree placement, not for content.
+    let parent_atts: HashMap<String, AttachmentMeta> = if recreating {
+        HashMap::new()
+    } else {
+        doc.rev
+            .as_ref()
+            .and_then(|r| existing.and_then(|s| s.rev_attachments.get(&r.to_string()).cloned()))
+            .unwrap_or_default()
+    };
 
     let (merged_tree, _merge_result) = merge_tree(&existing_tree, &new_path, DEFAULT_REV_LIMIT);
 
@@ -1426,6 +1446,61 @@ mod tests {
         // Info should show 0 docs
         let info = db.info().await.unwrap();
         assert_eq!(info.doc_count, 0);
+    }
+
+    #[tokio::test]
+    async fn recreate_deleted_doc_with_same_content() {
+        let db = new_db().await;
+
+        let doc = Document {
+            id: "doc1".into(),
+            rev: None,
+            deleted: false,
+            data: serde_json::json!({"name": "Alice"}),
+            attachments: HashMap::new(),
+        };
+        let results = db
+            .bulk_docs(vec![doc], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        let rev1: Revision = results[0].rev.clone().unwrap().parse().unwrap();
+
+        let del = Document {
+            id: "doc1".into(),
+            rev: Some(rev1),
+            deleted: true,
+            data: serde_json::json!({}),
+            attachments: HashMap::new(),
+        };
+        let results = db
+            .bulk_docs(vec![del], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        assert!(results[0].ok);
+
+        // Re-create with the identical content and no rev. The deterministic
+        // rev hash would reproduce rev 1 exactly, so the new edit must extend
+        // the tombstone instead of starting a fresh pos-1 branch.
+        let recreated = Document {
+            id: "doc1".into(),
+            rev: None,
+            deleted: false,
+            data: serde_json::json!({"name": "Alice"}),
+            attachments: HashMap::new(),
+        };
+        let results = db
+            .bulk_docs(vec![recreated], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        assert!(results[0].ok);
+        let rev3 = results[0].rev.clone().unwrap();
+        assert!(rev3.starts_with("3-"), "expected pos 3, got {rev3}");
+
+        let fetched = db.get("doc1", GetOptions::default()).await.unwrap();
+        assert_eq!(fetched.data["name"], "Alice");
+
+        let info = db.info().await.unwrap();
+        assert_eq!(info.doc_count, 1);
     }
 
     #[tokio::test]

@@ -1211,7 +1211,7 @@ fn process_doc_new_edits(
     rev_table: &mut redb::Table<&str, &[u8]>,
     changes_table: &mut redb::Table<u64, &[u8]>,
     meta: &mut MetaRecord,
-    doc: Document,
+    mut doc: Document,
 ) -> Result<DocResult> {
     let doc_id = if doc.id.is_empty() {
         Uuid::new_v4().to_string()
@@ -1232,24 +1232,28 @@ fn process_doc_new_edits(
         .map(|r| serialized_to_rev_tree(&r.rev_tree))
         .unwrap_or_default();
 
+    // When re-creating a deleted document, the tombstone revision is adopted
+    // as the parent of the new edit (CouchDB does the same).
+    let mut recreate_parent: Option<Revision> = None;
+
     // Conflict check
     if let Some(ref record) = existing_record {
         let tree = serialized_to_rev_tree(&record.rev_tree);
         let winner = winning_rev(&tree);
         match (&doc.rev, &winner) {
-            (Some(provided_rev), Some(current_winner)) => {
-                if provided_rev.to_string() != current_winner.to_string() {
-                    return Ok(DocResult {
-                        ok: false,
-                        id: doc_id,
-                        rev: None,
-                        error: Some("conflict".into()),
-                        reason: Some("Document update conflict".into()),
-                    });
-                }
+            (Some(provided_rev), Some(current_winner))
+                if provided_rev.to_string() != current_winner.to_string() =>
+            {
+                return Ok(DocResult {
+                    ok: false,
+                    id: doc_id,
+                    rev: None,
+                    error: Some("conflict".into()),
+                    reason: Some("Document update conflict".into()),
+                });
             }
             // Creating a doc that already exists and is not deleted is a
-            // conflict; a deleted winner falls through and may be re-created.
+            // conflict.
             (None, Some(_)) if !is_deleted(&tree) => {
                 return Ok(DocResult {
                     ok: false,
@@ -1258,6 +1262,14 @@ fn process_doc_new_edits(
                     error: Some("conflict".into()),
                     reason: Some("Document update conflict".into()),
                 });
+            }
+            // A deleted winner may be re-created. Extend from the tombstone
+            // rather than starting a fresh pos-1 branch: the rev hash is
+            // deterministic, so a pos-1 re-create of the original content
+            // would regenerate a revision already inside the tree and merge
+            // as a no-op, leaving the tombstone as the winner.
+            (None, Some(current_winner)) => {
+                recreate_parent = Some(current_winner.clone());
             }
             _ => {}
         }
@@ -1269,6 +1281,10 @@ fn process_doc_new_edits(
             error: Some("not_found".into()),
             reason: Some("missing".into()),
         });
+    }
+
+    if let Some(parent) = recreate_parent {
+        doc.rev = Some(parent);
     }
 
     // Generate new revision
@@ -2014,6 +2030,58 @@ mod tests {
             .unwrap();
         assert!(!r[0].ok);
         assert_eq!(r[0].error.as_deref(), Some("conflict"));
+    }
+
+    #[tokio::test]
+    async fn recreate_deleted_doc_with_same_content() {
+        let (_dir, db) = temp_db();
+
+        let doc = Document {
+            id: "doc1".into(),
+            rev: None,
+            deleted: false,
+            data: serde_json::json!({"v": 1}),
+            attachments: HashMap::new(),
+        };
+        let r = db
+            .bulk_docs(vec![doc], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        let rev1: Revision = r[0].rev.clone().unwrap().parse().unwrap();
+
+        let del = Document {
+            id: "doc1".into(),
+            rev: Some(rev1),
+            deleted: true,
+            data: serde_json::json!({}),
+            attachments: HashMap::new(),
+        };
+        let r = db
+            .bulk_docs(vec![del], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        assert!(r[0].ok);
+
+        // Re-create with the identical content and no rev. The deterministic
+        // rev hash would reproduce rev 1 exactly, so the new edit must extend
+        // the tombstone instead of starting a fresh pos-1 branch.
+        let recreated = Document {
+            id: "doc1".into(),
+            rev: None,
+            deleted: false,
+            data: serde_json::json!({"v": 1}),
+            attachments: HashMap::new(),
+        };
+        let r = db
+            .bulk_docs(vec![recreated], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        assert!(r[0].ok);
+        let rev3 = r[0].rev.clone().unwrap();
+        assert!(rev3.starts_with("3-"), "expected pos 3, got {rev3}");
+
+        let fetched = db.get("doc1", GetOptions::default()).await.unwrap();
+        assert_eq!(fetched.data["v"], serde_json::json!(1));
     }
 
     #[tokio::test]
