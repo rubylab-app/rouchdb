@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Output, Stdio};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -14,6 +16,30 @@ async fn setup_db(docs: &[(&str, serde_json::Value)]) -> (TempDir, PathBuf) {
             db.put(id, data.clone()).await.unwrap();
         }
         // db dropped here — releases redb file lock
+    }
+    (dir, db_path)
+}
+
+/// Create a database with `n` padded documents in a single transaction.
+async fn setup_bulk_db(n: usize, padding: usize) -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.redb");
+    {
+        let db = rouchdb::Database::open(&db_path, "test").unwrap();
+        let docs = (0..n)
+            .map(|i| rouchdb::Document {
+                id: format!("doc{:05}", i),
+                rev: None,
+                deleted: false,
+                data: serde_json::json!({"i": i, "pad": "x".repeat(padding)}),
+                attachments: HashMap::new(),
+            })
+            .collect();
+        let results = db
+            .bulk_docs(docs, rouchdb::BulkDocsOptions::new())
+            .await
+            .unwrap();
+        assert!(results.iter().all(|r| r.ok));
     }
     (dir, db_path)
 }
@@ -880,4 +906,28 @@ async fn import_invalid_file_fails() {
     let output = run(&["import", p, path_str(&missing)]);
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr_str(&output).contains("cannot read file"));
+}
+
+// ─── BROKEN PIPE ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn dump_to_closed_pipe_exits_cleanly() {
+    // ~2000 docs of ~150 bytes: far more than a pipe buffer holds.
+    let (_dir, db_path) = setup_bulk_db(2000, 128).await;
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rouchdb"))
+        .args(["dump", path_str(&db_path)])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut head = [0u8; 100];
+    stdout.read_exact(&mut head).unwrap();
+    drop(stdout);
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = stderr_str(&output);
+    assert!(!stderr.contains("panicked"), "stderr: {}", stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr);
 }

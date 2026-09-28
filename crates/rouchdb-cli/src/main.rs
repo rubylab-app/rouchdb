@@ -1,3 +1,4 @@
+use std::io::{self, BufWriter, Write};
 use std::process;
 
 use clap::{Parser, Subcommand};
@@ -252,12 +253,26 @@ fn check_doc_result(result: &rouchdb::DocResult) -> rouchdb::Result<()> {
 }
 
 fn print_json(value: &serde_json::Value, pretty: bool) {
-    let output = if pretty {
-        serde_json::to_string_pretty(value).unwrap()
+    let mut out = BufWriter::new(io::stdout().lock());
+    let result = if pretty {
+        serde_json::to_writer_pretty(&mut out, value)
     } else {
-        serde_json::to_string(value).unwrap()
-    };
-    println!("{}", output);
+        serde_json::to_writer(&mut out, value)
+    }
+    .map_err(io::Error::from)
+    .and_then(|()| writeln!(out))
+    .and_then(|()| out.flush());
+
+    match result {
+        Ok(()) => {}
+        // The reader went away (e.g. `rouchdb dump db.redb | head`): stop
+        // writing and let the command finish instead of panicking.
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
+        Err(e) => {
+            eprintln!("Error writing output: {}", e);
+            process::exit(1);
+        }
+    }
 }
 
 #[tokio::main]
