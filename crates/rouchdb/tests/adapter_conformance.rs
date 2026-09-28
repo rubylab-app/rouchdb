@@ -494,7 +494,59 @@ async fn replicated_long_ancestry(mut fx: Fx) {
     );
 }
 
-conformance!(f01: long_history_survives_reopen, replicated_long_ancestry);
+/// Q-CORE-1: past the default rev_limit (1000) the stored history is
+/// stemmed on write, so the ancestry reported for the winner never grows
+/// beyond 1000 revisions. (A replicated 1000-revision history plus five
+/// local edits, so the test does not need 1005 separate commits.)
+async fn rev_limit_stems_long_histories(mut fx: Fx) {
+    let ids: Vec<String> = (0..1000).map(|i| format!("{:032x}", 1000 - i)).collect();
+    let res = write_replicated(
+        fx.db(),
+        serde_json::json!({
+            "_id": "d", "_rev": format!("1000-{}", ids[0]), "v": 0,
+            "_revisions": {"start": 1000, "ids": ids}
+        }),
+    )
+    .await;
+    assert!(res.ok, "{:?}", res);
+    let mut rev = format!("1000-{}", ids[0]);
+    for i in 1..=5 {
+        rev = write(
+            fx.db(),
+            serde_json::json!({"_id": "d", "_rev": rev, "v": i}),
+        )
+        .await;
+    }
+    assert_eq!(generation(&rev), 1005);
+    fx.reopen();
+    let got = fx
+        .db()
+        .get_with_opts(
+            "d",
+            GetOptions {
+                revs: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(got.rev.unwrap().to_string(), rev);
+    assert_eq!(got.data["v"], 5);
+    assert_eq!(got.data["_revisions"]["start"], 1005);
+    let kept = got.data["_revisions"]["ids"].as_array().unwrap();
+    assert_eq!(kept.len(), 1000);
+    assert_eq!(kept[0], hash_of(&rev));
+    // The oldest kept revision is the 6th generation of the original chain.
+    assert_eq!(kept[999], serde_json::json!(format!("{:032x}", 6)));
+    let info = fx.db().info().await.unwrap();
+    assert_eq!((info.doc_count, info.update_seq), (1, Seq::Num(6)));
+}
+
+conformance!(f01:
+    long_history_survives_reopen,
+    replicated_long_ancestry,
+    rev_limit_stems_long_histories,
+);
 
 // === section: attachments ===
 
