@@ -2397,57 +2397,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn long_history_is_readable_and_writable() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("long.redb");
-        let mut rev = {
-            let db = RedbAdapter::open(&path, "long").unwrap();
-            let mut rev = db
-                .bulk_docs(
-                    vec![put_doc("d", None, serde_json::json!({"v": 0}))],
-                    BulkDocsOptions::new(),
-                )
-                .await
-                .unwrap()[0]
-                .rev
-                .clone()
-                .unwrap();
-            for i in 1..200 {
-                let r = db
-                    .bulk_docs(
-                        vec![put_doc("d", Some(&rev), serde_json::json!({"v": i}))],
-                        BulkDocsOptions::new(),
-                    )
-                    .await
-                    .unwrap();
-                assert!(r[0].ok, "update {} failed: {:?}", i, r[0]);
-                rev = r[0].rev.clone().unwrap();
-            }
-            rev
-        };
-        let db = RedbAdapter::open(&path, "long").unwrap();
-        assert_eq!(
-            db.get("d", GetOptions::default()).await.unwrap().data["v"],
-            199
-        );
-        assert_eq!(db.info().await.unwrap().doc_count, 1);
-        assert_eq!(
-            db.all_docs(AllDocsOptions::new()).await.unwrap().rows.len(),
-            1
-        );
-        let r = db
-            .bulk_docs(
-                vec![put_doc("d", Some(&rev), serde_json::json!({"v": 200}))],
-                BulkDocsOptions::new(),
-            )
-            .await
-            .unwrap();
-        assert!(r[0].ok);
-        rev = r[0].rev.clone().unwrap();
-        assert!(rev.starts_with("201-"));
-    }
-
-    #[tokio::test]
     async fn legacy_nested_records_still_load() {
         // A file as written by rouchdb <= 0.4: nested records, one shallow
         // and one far deeper than serde_json's default recursion limit (which

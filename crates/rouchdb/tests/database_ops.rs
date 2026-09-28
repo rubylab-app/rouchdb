@@ -39,9 +39,9 @@ async fn database_compact_http() {
             .ok
     );
 
+    // CouchDB compacts in the background; the reads below do not depend
+    // on when it finishes, so there is nothing to wait for.
     db.compact().await.unwrap();
-
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let doc = db.get("doc1").await.unwrap();
     assert_eq!(doc.data["v"], 3);
