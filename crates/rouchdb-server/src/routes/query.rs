@@ -217,11 +217,6 @@ pub async fn restore_indexes(db: &Database) -> rouchdb::Result<usize> {
     Ok(created)
 }
 
-/// Turn a failed single-document write into the matching error.
-fn check_write(result: rouchdb::DocResult) -> Result<(), AppError> {
-    super::write_result(result).map(drop)
-}
-
 /// Keep only the user fields of a document read back for an update.
 fn body_of(doc: &rouchdb::Document) -> serde_json::Map<String, serde_json::Value> {
     let mut obj = match doc.to_json() {
@@ -257,14 +252,15 @@ async fn persist_index(
             }
             views[name] = view;
             let rev = doc.rev.map(|r| r.to_string()).unwrap_or_default();
-            check_write(
-                db.update(ddoc_id, &rev, serde_json::Value::Object(body))
-                    .await?,
-            )
+            // `update` / `put` / `remove` report a failed write as an error.
+            db.update(ddoc_id, &rev, serde_json::Value::Object(body))
+                .await?;
+            Ok(())
         }
         Err(RouchError::NotFound(_)) => {
             let body = serde_json::json!({ "language": "query", "views": { name: view } });
-            check_write(db.put(ddoc_id, body).await?)
+            db.put(ddoc_id, body).await?;
+            Ok(())
         }
         Err(e) => Err(AppError(e)),
     }
@@ -396,14 +392,12 @@ pub async fn delete_index(
     views.remove(&name);
 
     if views.is_empty() {
-        check_write(state.db.remove(&ddoc_id, &rev).await?)?;
+        state.db.remove(&ddoc_id, &rev).await?;
     } else {
-        check_write(
-            state
-                .db
-                .update(&ddoc_id, &rev, serde_json::Value::Object(body))
-                .await?,
-        )?;
+        state
+            .db
+            .update(&ddoc_id, &rev, serde_json::Value::Object(body))
+            .await?;
     }
     // The in-memory index may be missing (e.g. never rebuilt); that is fine.
     let _ = state.db.delete_index(&name).await;

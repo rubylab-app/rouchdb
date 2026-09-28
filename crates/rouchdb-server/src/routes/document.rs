@@ -245,7 +245,6 @@ pub async fn put_doc(
     let body_rev = body.get("_rev").and_then(|v| v.as_str()).map(String::from);
     let rev = resolve_rev(query.rev, body_rev, &headers)?;
 
-    let has_rev = rev.is_some();
     let result = if is_deleted {
         let rev_str = rev.ok_or_else(|| {
             AppError(rouchdb_core::error::RouchError::BadRequest(
@@ -269,9 +268,9 @@ pub async fn put_doc(
         state.db.put(&docid, body).await
     };
     let result = match result {
-        // Editing a revision of a document that does not exist is a
-        // conflict in CouchDB.
-        Err(RouchError::NotFound(_)) if has_rev => return Err(AppError(RouchError::Conflict)),
+        // Only an edit of a given revision can miss its document: editing a
+        // revision of a document that does not exist is a conflict in CouchDB.
+        Err(RouchError::NotFound(_)) => return Err(AppError(RouchError::Conflict)),
         other => other?,
     };
 
