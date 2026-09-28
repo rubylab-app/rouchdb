@@ -299,8 +299,13 @@ async fn http_skip_setup_does_not_create_database() {
         common::couchdb_url(),
         uuid::Uuid::new_v4().simple()
     );
-    let remote =
-        rouchdb::HttpAdapter::with_options(&url, rouchdb::HttpAdapterOptions { skip_setup: true });
+    let remote = rouchdb::HttpAdapter::with_options(
+        &url,
+        rouchdb::HttpAdapterOptions {
+            skip_setup: true,
+            ..Default::default()
+        },
+    );
     use rouchdb::Adapter;
     assert!(matches!(
         remote.info().await,

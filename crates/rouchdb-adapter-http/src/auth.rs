@@ -35,10 +35,11 @@ pub struct AuthClient {
 impl AuthClient {
     /// Create a new auth client for the given CouchDB server URL.
     pub fn new(server_url: &str) -> Self {
-        let client = Client::builder()
-            .cookie_store(true)
-            .build()
-            .unwrap_or_default();
+        let client =
+            crate::client_builder(crate::DEFAULT_CONNECT_TIMEOUT, crate::DEFAULT_READ_TIMEOUT)
+                .cookie_store(true)
+                .build()
+                .unwrap_or_default();
         Self {
             client,
             server_url: server_url.trim_end_matches('/').to_string(),

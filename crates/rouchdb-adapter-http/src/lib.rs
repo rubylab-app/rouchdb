@@ -6,9 +6,10 @@
 pub mod auth;
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize};
 
 use rouchdb_core::adapter::Adapter;
@@ -147,12 +148,40 @@ struct CouchDbAllDocsRowValue {
 // HttpAdapter
 // ---------------------------------------------------------------------------
 
+/// Default time allowed to establish a connection.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default time a response may stay silent before the request fails.
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Options for [`HttpAdapter::with_options`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct HttpAdapterOptions {
     /// Do not create the remote database on first use (PouchDB's
     /// `skip_setup`): operations on a missing database fail with NotFound.
     pub skip_setup: bool,
+    /// Time allowed to establish a connection.
+    pub connect_timeout: Duration,
+    /// Time a response may stay silent (no bytes received) before the
+    /// request fails, so a stalled server cannot hang a replication forever.
+    /// It bounds inactivity, not the total duration of large transfers.
+    pub read_timeout: Duration,
+}
+
+impl Default for HttpAdapterOptions {
+    fn default() -> Self {
+        Self {
+            skip_setup: false,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            read_timeout: DEFAULT_READ_TIMEOUT,
+        }
+    }
+}
+
+/// The reqwest client builder used by default, with the given timeouts.
+pub(crate) fn client_builder(connect_timeout: Duration, read_timeout: Duration) -> ClientBuilder {
+    Client::builder()
+        .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
 }
 
 /// HTTP adapter that talks to a remote CouchDB instance.
@@ -178,12 +207,16 @@ impl HttpAdapter {
 
     /// Create a new HTTP adapter with explicit options.
     pub fn with_options(url: &str, opts: HttpAdapterOptions) -> Self {
-        let mut adapter = Self::with_client(url, Client::new());
+        let client = client_builder(opts.connect_timeout, opts.read_timeout)
+            .build()
+            .unwrap_or_default();
+        let mut adapter = Self::with_client(url, client);
         adapter.skip_setup = opts.skip_setup;
         adapter
     }
 
-    /// Create a new HTTP adapter with a custom reqwest client.
+    /// Create a new HTTP adapter with a custom reqwest client. The client's
+    /// own timeouts apply (reqwest has none by default).
     pub fn with_client(url: &str, client: Client) -> Self {
         let base_url = url.trim_end_matches('/').to_string();
         Self {
@@ -1120,7 +1153,10 @@ mod tests {
         let url = stub_server(json_response(status, body)).await;
         let db = HttpAdapter::with_options(
             &format!("{url}/db"),
-            super::HttpAdapterOptions { skip_setup: true },
+            super::HttpAdapterOptions {
+                skip_setup: true,
+                ..Default::default()
+            },
         );
         db.info().await.unwrap_err()
     }
@@ -1189,5 +1225,34 @@ mod tests {
             matches!(err, rouchdb_core::error::RouchError::Unauthorized),
             "{err:?}"
         );
+    }
+
+    /// A server that accepts connections and never answers.
+    async fn hung_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                open.push(socket);
+            }
+        });
+        format!("http://{}/db", addr)
+    }
+
+    #[tokio::test]
+    async fn stalled_server_times_out() {
+        let db = HttpAdapter::with_options(
+            &hung_server().await,
+            super::HttpAdapterOptions {
+                skip_setup: true,
+                read_timeout: std::time::Duration::from_millis(200),
+                ..Default::default()
+            },
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), db.info())
+            .await
+            .expect("request to a stalled server never timed out");
+        assert!(result.is_err());
     }
 }
