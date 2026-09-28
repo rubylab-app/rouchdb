@@ -487,6 +487,28 @@ mod tests {
     }
 
     #[test]
+    fn rev_on_a_missing_document_is_rejected() {
+        // Editing a revision of a document that does not exist must fail
+        // rather than create the document under a dangling parent. (Which
+        // error is Q-CORE-8: rouchdb says not_found, CouchDB conflict.)
+        let err = plan_new_edit(
+            None,
+            doc("d", Some("1-abc"), serde_json::json!({"v": 1})),
+            None,
+            true,
+            1000,
+        )
+        .unwrap_err();
+        assert!(!err.ok);
+        assert!(
+            matches!(err.error.as_deref(), Some("not_found" | "conflict")),
+            "{:?}",
+            err
+        );
+        assert!(err.rev.is_none());
+    }
+
+    #[test]
     fn new_document_rev_is_generation_one_hash_of_body() {
         let data = serde_json::json!({"name": "Alice"});
         let expected = generate_rev_hash(&data, false, None, &HashMap::new());
