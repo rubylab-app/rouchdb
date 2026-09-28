@@ -55,7 +55,7 @@ let opts = FindOptions {
 ```
 
 - `selector` -- the query (see operators below).
-- `fields` -- field projection; only these fields (plus `_id`) are returned.
+- `fields` -- field projection; only these fields are returned (list `_id` explicitly if you need it). Nested paths such as `address.city` keep their structure.
 - `sort` -- sort by one or more fields, ascending (`"asc"`) or descending (`"desc"`).
 - `limit` -- maximum number of results.
 - `skip` -- number of results to skip (for pagination).
@@ -205,8 +205,8 @@ let result = query_view(
 - `inclusive_end` -- whether to include the end key.
 - `descending` -- reverse the sort order.
 - `skip` / `limit` -- pagination.
-- `include_docs` -- embed full documents.
-- `reduce` -- whether to run the reduce function.
+- `include_docs` -- embed full documents (a value `{"_id": ...}` embeds that document instead).
+- `reduce` -- whether to run the reduce function (on by default with `new()`, as in CouchDB).
 - `group` -- group reduced results by key.
 - `group_level` -- for array keys, group by the first N elements.
 
@@ -230,10 +230,10 @@ let sum_result = query_view(
         ..ViewQueryOptions::new()
     },
 ).await?;
-// sum_result.rows[0].value == 90.0 (30 + 25 + 35)
+// sum_result.rows[0].value == 90 (30 + 25 + 35; integers stay integers)
 ```
 
-- `ReduceFn::Sum` -- sums all numeric values.
+- `ReduceFn::Sum` -- sums numbers (arrays element-wise, objects field by field); other values are an error.
 - `ReduceFn::Count` -- counts the number of rows.
 - `ReduceFn::Stats` -- computes `{"sum", "count", "min", "max", "sumsqr"}`.
 

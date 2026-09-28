@@ -46,11 +46,15 @@ All nulls are equal.
 
 ### Number
 
-Compared by numeric value as IEEE 754 f64. `-100 < -1 < 0 < 1 < 1.5 < 2`.
+Compared by exact numeric value: integers beyond 2^53 are not rounded, an
+integer and a float are compared exactly, and `-0.0` equals `0`.
+`-100 < -1 < 0 < 1 < 1.5 < 2`.
 
 ### String
 
-Standard lexicographic (Unicode codepoint) ordering. `"a" < "aa" < "b"`.
+Compared by UTF-16 code units, like PouchDB (JavaScript). `"a" < "aa" < "b"`,
+and `"B" < "a"`. CouchDB itself uses ICU collation for strings (`"a" < "B"`),
+which RouchDB does not implement.
 
 ### Array
 
@@ -66,10 +70,11 @@ the shorter array sorts first.
 
 ### Object
 
-Keys are sorted alphabetically first, then compared key-by-key. For each key
-pair, the key strings are compared; if equal, the values are compared
-recursively. If all shared key-value pairs are equal, the object with fewer keys
-sorts first.
+Compared key-by-key in map order. For each key pair, the key strings are
+compared; if equal, the values are compared recursively. If all shared
+key-value pairs are equal, the object with fewer keys sorts first. CouchDB uses
+the document's key order; `serde_json` keeps keys sorted, so RouchDB compares
+them in sorted order.
 
 ```
 {}           < {"a": 1}
@@ -129,9 +134,13 @@ cross-type ordering:
 | Null    | `1`    | Just the prefix character |
 | Boolean | `2`    | `2F` for false, `2T` for true |
 | Number  | `3`    | `3` + encoded number (see below) |
-| String  | `4`    | `4` + the raw string value |
-| Array   | `5`    | `5` + encoded elements separated by null bytes (`\0`) |
-| Object  | `6`    | `6` + sorted key-value pairs separated by null bytes |
+| String  | `4`    | `4` + the string, remapped so byte order is UTF-16 order |
+| Array   | `5`    | `5` + encoded elements |
+| Object  | `6`    | `6` + encoded keys and values |
+
+Every encoded value ends with a `\0` terminator (`\0`, `\1` and `\2` inside
+strings are escaped), so an array or object that is a prefix of another sorts
+first.
 
 Because the prefix characters are `1` through `6`, the inter-type ordering is
 automatically correct: any null-encoded string (`"1..."`) sorts before any
@@ -140,55 +149,39 @@ boolean-encoded string (`"2..."`), and so on.
 ### Number Encoding
 
 Numbers require special treatment because naive string representations do not
-sort correctly (`"9" > "10"` lexicographically). The encoding uses a scheme
-matching PouchDB's `numToIndexableString`:
+sort correctly (`"9" > "10"` lexicographically). A number is written as its
+significant decimal digits `d.ddd` and a decimal exponent, exactly (integers
+use all their digits; other floats use the shortest representation that
+round-trips):
 
-**Zero:** Encoded as `"1"`.
+**Zero** (including `-0.0`): `"1"`.
 
-**Positive numbers:** Prefix `"2"`, followed by a 5-digit zero-padded
-exponent (offset by 10000 to keep it positive), followed by the mantissa
-(normalized to `[1, 10)`).
+**Positive numbers:** `"2"`, the exponent plus 500 in 3 digits, then the
+significant digits.
 
-```
-encode(1)    -> "3" + "2" + "10000" + "1."
-encode(100)  -> "3" + "2" + "10002" + "1."
-encode(1.5)  -> "3" + "2" + "10000" + "1.5"
-```
-
-Since the exponent field is fixed-width and the mantissa is a decimal in
-`[1, 10)`, larger numbers always produce lexicographically later strings.
-
-**Negative numbers:** Prefix `"0"`, followed by the _inverted_ exponent
-(`10000 - exponent`), followed by the _inverted_ mantissa (`10 - mantissa`).
-Inversion ensures that numbers closer to zero (larger negatives) sort after
-more-negative numbers.
+**Negative numbers:** `"0"`, 500 minus the exponent in 3 digits, then the
+nines' complement of the significant digits, then `":"` (which sorts after
+every digit), so that numbers closer to zero sort later.
 
 ```
-encode(-1)   -> "3" + "0" + "10000" + "9."
-encode(-100) -> "3" + "0" + "09998" + "9."
-```
-
-The full encoding for a number is: `"3"` (type prefix) + sign/magnitude
-encoding.
-
-The ordering is:
-
-```
--100      ->  "3" + "0" + "09998..."   (sorts first)
--1        ->  "3" + "0" + "10000..."
+-100      ->  "3" + "0" + "498" + "8:"   (sorts first)
+-1        ->  "3" + "0" + "500" + "8:"
  0        ->  "3" + "1"
- 1        ->  "3" + "2" + "10000..."
- 100      ->  "3" + "2" + "10002..."   (sorts last)
+ 1        ->  "3" + "2" + "500" + "1"
+ 1.5      ->  "3" + "2" + "500" + "15"
+ 100      ->  "3" + "2" + "502" + "1"    (sorts last)
 ```
+
+(each followed by the `\0` terminator).
 
 ### Array and Object Encoding
 
-Arrays encode each element recursively with null-byte separators. Because
-`\0` is the lowest byte value, a shorter array with a matching prefix will
-always sort before a longer one.
+Arrays encode each element recursively. Because every element ends with the
+`\0` terminator and `\0` is the lowest byte value, a shorter array with a
+matching prefix always sorts before a longer one (and `[[1], 2]` differs from
+`[[1, 2]]`).
 
-Objects sort their keys alphabetically, then encode alternating key-value
-pairs separated by null bytes.
+Objects encode alternating keys and values in map order.
 
 ## Why This Matters
 
@@ -218,8 +211,10 @@ agree on ordering.
 
 ## Verifying Correctness
 
-The test suite confirms that `to_indexable_string` preserves `collate`
-ordering across the full type spectrum:
+The test suite confirms that comparing `to_indexable_string` encodings gives
+the same result as `collate` for every pair of a mixed corpus (large
+integers, floats, `-0.0`, control and supplementary characters, nested arrays
+and objects), and that it preserves ordering across the full type spectrum:
 
 ```rust
 let values = vec![
