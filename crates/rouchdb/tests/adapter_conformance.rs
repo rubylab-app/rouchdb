@@ -1198,3 +1198,607 @@ conformance!(facade:
     single_doc_failures_are_errors,
     post_uses_body_id,
 );
+
+// === section: storage fidelity ===
+//
+// Each scenario pins the behaviour of CouchDB 3.5.1 (checked with curl) so
+// memory and redb cannot drift from it (or from each other).
+
+/// A database of the fixture's kind whose adapter stems histories to
+/// `limit` revisions (`name` selects the redb file, so it can be reopened).
+fn with_rev_limit(fx: &Fx, name: &str, limit: u64) -> Database {
+    use std::sync::Arc;
+    match fx.kind {
+        Kind::Memory => {
+            Database::from_adapter(Arc::new(MemoryAdapter::new(name).with_rev_limit(limit)))
+        }
+        Kind::Redb => Database::from_adapter(Arc::new(
+            RedbAdapter::open(fx.dir.path().join(format!("{name}.redb")), name)
+                .unwrap()
+                .with_rev_limit(limit),
+        )),
+    }
+}
+
+/// A document body whose deepest path crosses `depth` containers (the
+/// top-level object included): `{"v": [[...[1]...]]}`.
+fn nested(depth: usize) -> serde_json::Value {
+    let mut v = serde_json::json!(1);
+    for _ in 1..depth {
+        v = serde_json::Value::Array(vec![v]);
+    }
+    serde_json::json!({ "v": v })
+}
+
+/// Q-CORE-3: ids that share a prefix with another id up to a NUL (which
+/// CouchDB accepts, so they arrive by replication) are separate documents:
+/// compacting or purging one never touches the other's bodies.
+async fn unusual_ids_survive_compact_and_purge(mut fx: Fx) {
+    let ids = [
+        "a",
+        "a\u{0}b",
+        "a\u{0}",
+        "\u{1F600}",
+        "ä/\\x",
+        "x",
+        "x\u{0}y",
+    ];
+    for (i, id) in ids.iter().enumerate() {
+        let r1 = write(fx.db(), serde_json::json!({"_id": id, "n": i})).await;
+        write(fx.db(), serde_json::json!({"_id": id, "_rev": r1, "n": i})).await;
+    }
+    fx.db().compact().await.unwrap();
+    let x = fx.db().get("x").await.unwrap().rev.unwrap().to_string();
+    let res = fx.db().purge("x", vec![x.clone()]).await.unwrap();
+    assert_eq!(res.purged["x"], [x]);
+    fx.reopen();
+    let db = fx.db();
+    for (i, id) in ids.iter().enumerate() {
+        if *id == "x" {
+            assert!(matches!(db.get(id).await, Err(RouchError::NotFound(_))));
+            continue;
+        }
+        let got = db.get(id).await.unwrap_or_else(|e| panic!("{id:?}: {e}"));
+        assert_eq!(got.data, serde_json::json!({"n": i}), "{id:?}");
+        assert_eq!(got.rev.unwrap().pos, 2, "{id:?}");
+    }
+    let all = db
+        .all_docs(AllDocsOptions {
+            include_docs: true,
+            ..AllDocsOptions::new()
+        })
+        .await
+        .unwrap();
+    assert_eq!(all.rows.len(), ids.len() - 1);
+    assert!(all.rows.iter().all(|r| r.doc.is_some()));
+    // Compacting again (after the purge) still keeps every body.
+    db.compact().await.unwrap();
+    assert_eq!(db.get("a\u{0}b").await.unwrap().data["n"], 1);
+    assert_eq!(db.get("x\u{0}y").await.unwrap().data["n"], 6);
+}
+
+/// Q-API-3: CouchDB accepts (and serves) deeply nested documents; every
+/// read path must decode what a write accepted, and the limit rouchdb
+/// enforces is applied consistently at write time.
+async fn deep_documents_round_trip(mut fx: Fx) {
+    let deep = nested(300);
+    fx.db().put("deep", deep.clone()).await.unwrap();
+    let edge = nested(MAX_NESTING_DEPTH);
+    fx.db().put("edge", edge.clone()).await.unwrap();
+    assert!(matches!(
+        fx.db().put("over", nested(MAX_NESTING_DEPTH + 1)).await,
+        Err(RouchError::BadRequest(_))
+    ));
+    let mut over = nested(MAX_NESTING_DEPTH + 1);
+    over["_id"] = "over".into();
+    over["_rev"] = format!("1-{}", hash32('a')).into();
+    let res = write_replicated(fx.db(), over).await;
+    assert!(!res.ok);
+    assert_eq!(res.error.as_deref(), Some("bad_request"));
+    fx.reopen();
+
+    let db = fx.db();
+    assert_eq!(db.get("deep").await.unwrap().data, deep);
+    assert_eq!(db.get("edge").await.unwrap().data, edge);
+    assert!(matches!(db.get("over").await, Err(RouchError::NotFound(_))));
+    let changes = db
+        .changes(ChangesOptions {
+            include_docs: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(changes.results.len(), 2);
+    assert_eq!(changes.results[0].doc.as_ref().unwrap()["v"], deep["v"]);
+    let all = db
+        .all_docs(AllDocsOptions {
+            include_docs: true,
+            ..AllDocsOptions::new()
+        })
+        .await
+        .unwrap();
+    assert_eq!(all.rows[0].doc.as_ref().unwrap()["v"], deep["v"]);
+    let found = db
+        .find(FindOptions {
+            selector: serde_json::json!({"v": {"$type": "array"}}),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(found.docs.len(), 2);
+    let target = fx.sibling("deep_target");
+    let rep = db.replicate_to(&target).await.unwrap();
+    assert_eq!(rep.docs_written, 2);
+    assert_eq!(target.get("deep").await.unwrap().data, deep);
+    db.compact().await.unwrap();
+    assert_eq!(db.get("edge").await.unwrap().data, edge);
+}
+
+/// Q-CORE-1: revisions stemmed by the revision limit are gone, like in
+/// CouchDB: `get` and `bulk_get` report them missing and `revs_diff` asks
+/// for them again; the bodies of the kept (non-leaf) revisions stay
+/// readable until compaction.
+async fn stemmed_revisions_are_unreadable(fx: Fx) {
+    let mut db = with_rev_limit(&fx, "stem", 5);
+    let mut revs = vec![write(&db, serde_json::json!({"_id": "d", "v": 1})).await];
+    for v in 2..=8 {
+        let prev = revs.last().unwrap().clone();
+        revs.push(write(&db, serde_json::json!({"_id": "d", "_rev": prev, "v": v})).await);
+    }
+    for _ in 0..2 {
+        for (i, rev) in revs.iter().enumerate() {
+            let got = get_rev(&db, "d", rev).await;
+            if i < 3 {
+                assert!(
+                    matches!(got, Err(RouchError::NotFound(_))),
+                    "{rev}: {got:?}"
+                );
+            } else {
+                assert_eq!(got.unwrap().data["v"], i + 1);
+            }
+        }
+        let bulk = db
+            .adapter()
+            .bulk_get(vec![BulkGetItem {
+                id: "d".into(),
+                rev: Some(revs[0].clone()),
+            }])
+            .await
+            .unwrap();
+        assert!(bulk.results[0].docs[0].ok.is_none());
+        let got = db
+            .get_with_opts(
+                "d",
+                GetOptions {
+                    revs: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(got.data["_revisions"]["ids"].as_array().unwrap().len(), 5);
+        let diff = db
+            .adapter()
+            .revs_diff(std::collections::HashMap::from([(
+                "d".to_string(),
+                vec![revs[0].clone()],
+            )]))
+            .await
+            .unwrap();
+        assert_eq!(diff.results["d"].missing, [revs[0].clone()]);
+        if fx.kind == Kind::Memory {
+            break;
+        }
+        // Reopen: stemmed revisions stay gone.
+        db.close().await.unwrap();
+        drop(db);
+        db = with_rev_limit(&fx, "stem", 5);
+    }
+}
+
+/// Q-CORE-9: `_revisions` must be well formed; CouchDB rejects non-string
+/// revision ids instead of dropping them (which shifted the ancestry and
+/// invented revisions).
+async fn replicated_revisions_are_validated(fx: Fx) {
+    let db = fx.db();
+    let (a, c) = (hash32('a'), hash32('c'));
+    let bad = [
+        (
+            serde_json::json!({"start": 3, "ids": [c, 5, a]}),
+            "RevId isn't a string",
+        ),
+        (
+            serde_json::json!({"start": 3, "ids": [c, null]}),
+            "RevId isn't a string",
+        ),
+        (
+            serde_json::json!({"start": "3", "ids": [c]}),
+            "_revisions.start isn't an integer.",
+        ),
+        (
+            serde_json::json!({"ids": [c]}),
+            "_revisions.start isn't an integer.",
+        ),
+        (
+            serde_json::json!({"start": 3, "ids": c}),
+            "_revisions.ids isn't a array.",
+        ),
+        (
+            serde_json::json!([1]),
+            "Bad special document member: _revisions",
+        ),
+    ];
+    for (revisions, reason) in bad {
+        let res = write_replicated(
+            db,
+            serde_json::json!({"_id": "d", "_rev": format!("3-{c}"), "_revisions": revisions}),
+        )
+        .await;
+        assert!(!res.ok, "{revisions}");
+        assert_eq!(res.error.as_deref(), Some("doc_validation"), "{revisions}");
+        assert_eq!(res.reason.as_deref(), Some(reason), "{revisions}");
+    }
+    assert!(matches!(db.get("d").await, Err(RouchError::NotFound(_))));
+    assert_eq!(db.info().await.unwrap().update_seq, Seq::Num(0));
+}
+
+/// Q-CORE-10: `revs_diff` returns exactly what CouchDB does: missing revs
+/// in (generation, id) order, and every leaf older than a missing rev as a
+/// possible ancestor, once, in winner order (deleted leaves last).
+async fn revs_diff_matches_couchdb(fx: Fx) {
+    let db = fx.db();
+    let (x, a, b, e, f) = (
+        hash32('1'),
+        hash32('a'),
+        hash32('b'),
+        hash32('e'),
+        hash32('f'),
+    );
+    let rev = |pos: u64, h: &str| format!("{pos}-{h}");
+    let diff = |revs: Vec<String>| async move {
+        let res = db
+            .adapter()
+            .revs_diff(std::collections::HashMap::from([("rd".to_string(), revs)]))
+            .await
+            .unwrap();
+        res.results
+            .get("rd")
+            .map(|r| (r.missing.clone(), r.possible_ancestors.clone()))
+    };
+    assert!(
+        write_replicated(db, serde_json::json!({"_id": "rd", "_rev": rev(1, &x)}))
+            .await
+            .ok
+    );
+    assert_eq!(
+        diff(vec![rev(2, &a), rev(3, &b), rev(1, &x)]).await,
+        Some((vec![rev(2, &a), rev(3, &b)], vec![rev(1, &x)]))
+    );
+    for doc in [
+        serde_json::json!({"_id": "rd", "_rev": rev(2, &a), "_revisions": {"start": 2, "ids": [a, x]}}),
+        serde_json::json!({"_id": "rd", "_rev": rev(2, &b), "_deleted": true, "_revisions": {"start": 2, "ids": [b, x]}}),
+        serde_json::json!({"_id": "rd", "_rev": rev(3, &e), "_revisions": {"start": 3, "ids": [e, e, x]}}),
+    ] {
+        assert!(write_replicated(db, doc).await.ok);
+    }
+    let all = vec![rev(3, &e), rev(2, &a), rev(2, &b)];
+    assert_eq!(
+        diff(vec![rev(3, &f), rev(4, &f), rev(2, &f)]).await,
+        Some((vec![rev(2, &f), rev(3, &f), rev(4, &f)], all.clone()))
+    );
+    assert_eq!(
+        diff(vec![rev(3, &f)]).await,
+        Some((vec![rev(3, &f)], vec![rev(2, &a), rev(2, &b)]))
+    );
+    assert_eq!(
+        diff(vec![rev(2, &f)]).await,
+        Some((vec![rev(2, &f)], vec![]))
+    );
+    // Duplicates are kept (as CouchDB does); ancestors are listed once.
+    assert_eq!(
+        diff(vec![rev(4, &f), rev(4, &f)]).await,
+        Some((vec![rev(4, &f), rev(4, &f)], all))
+    );
+    // Upper-case ids are the same revisions (Q-CORE-17).
+    assert_eq!(diff(vec![rev(3, &e.to_uppercase())]).await, None);
+    assert_eq!(
+        diff(vec![rev(3, &f.to_uppercase())]).await,
+        Some((vec![rev(3, &f)], vec![rev(2, &a), rev(2, &b)]))
+    );
+}
+
+/// Q-CORE-11: stubs are matched by name (the stored metadata wins); a stub
+/// under a name the parent does not have is `missing_stub`, even when its
+/// digest matches another attachment.
+async fn stubs_match_by_name(fx: Fx) {
+    let db = fx.db();
+    let r1 = write(
+        db,
+        serde_json::json!({"_id": "d", "_attachments": {"a.txt": {"content_type": "text/plain", "data": "SGVsbG8="}}}),
+    )
+    .await;
+    let stored = get_rev(db, "d", &r1).await.unwrap().attachments["a.txt"].clone();
+    let r2 = write(
+        db,
+        serde_json::json!({"_id": "d", "_rev": r1, "v": 1, "_attachments": {"a.txt": {
+            "stub": true, "digest": "md5-AAAAAAAAAAAAAAAAAAAAAA==", "content_type": "image/png", "length": 999
+        }}}),
+    )
+    .await;
+    let r3 = write(
+        db,
+        serde_json::json!({"_id": "d", "_rev": r2, "v": 2, "_attachments": {"a.txt": {"stub": true}}}),
+    )
+    .await;
+    let got = get_rev(db, "d", &r3).await.unwrap();
+    let att = &got.attachments["a.txt"];
+    assert_eq!(
+        (&att.digest, &att.content_type, att.length),
+        (&stored.digest, &stored.content_type, stored.length)
+    );
+    assert_eq!(db.get_attachment("d", "a.txt").await.unwrap(), b"Hello");
+    let res = db
+        .bulk_docs(
+            vec![doc(serde_json::json!({
+                "_id": "d", "_rev": r3, "_attachments": {"b.txt": {"stub": true, "digest": stored.digest}}
+            }))],
+            BulkDocsOptions::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res[0].error.as_deref(), Some("missing_stub"));
+    assert_eq!(
+        res[0].reason.as_deref(),
+        Some("Invalid attachment stub in d for b.txt")
+    );
+}
+
+/// Q-CORE-8: an edit that names a revision of a document that does not
+/// exist is a conflict (CouchDB PUT and `_bulk_docs`, PouchDB); `remove`
+/// of such a document is `not_found` like CouchDB's DELETE; a malformed
+/// revision is `InvalidRev` (CouchDB: 400 "Invalid rev format").
+async fn edits_of_missing_documents(fx: Fx) {
+    let db = fx.db();
+    let rev = format!("1-{}", hash32('a'));
+    for deleted in [false, true] {
+        let res = db
+            .bulk_docs(
+                vec![doc(
+                    serde_json::json!({"_id": "nodoc", "_rev": rev, "_deleted": deleted}),
+                )],
+                BulkDocsOptions::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res[0].error.as_deref(), Some("conflict"));
+    }
+    assert!(matches!(
+        db.put("nodoc", serde_json::json!({"_rev": rev})).await,
+        Err(RouchError::Conflict)
+    ));
+    assert!(matches!(
+        db.update("nodoc", &rev, serde_json::json!({})).await,
+        Err(RouchError::Conflict)
+    ));
+    assert!(matches!(
+        db.remove("nodoc", &rev).await,
+        Err(RouchError::NotFound(_))
+    ));
+    let r1 = write(db, serde_json::json!({"_id": "d"})).await;
+    let r2 = db.remove("d", &r1).await.unwrap().rev.unwrap();
+    assert!(matches!(
+        db.remove("d", &r2).await,
+        Err(RouchError::NotFound(_))
+    ));
+    assert_eq!(db.info().await.unwrap().update_seq, Seq::Num(2));
+    for bad in ["not-a-rev", "abc", "x-1"] {
+        let got = get_rev(db, "d", bad).await;
+        assert!(
+            matches!(got, Err(RouchError::InvalidRev(_))),
+            "{bad}: {got:?}"
+        );
+    }
+}
+
+/// Q-API-4: `_local/` ids are local documents (like CouchDB and the http
+/// adapter): not listed, not in the changes feed, never replicated, and
+/// versioned `0-N` without MVCC.
+async fn local_ids_are_local_documents(mut fx: Fx) {
+    let db = fx.db();
+    let r = db
+        .put("_local/x", serde_json::json!({"v": 1}))
+        .await
+        .unwrap();
+    assert_eq!((r.id.as_str(), r.rev.as_deref()), ("_local/x", Some("0-1")));
+    let r = db
+        .update("_local/x", "0-1", serde_json::json!({"v": 2}))
+        .await
+        .unwrap();
+    assert_eq!(r.rev.as_deref(), Some("0-2"));
+    let res = db
+        .bulk_docs(
+            vec![
+                doc(serde_json::json!({"_id": "_local/y", "v": 3, "_rev": "0-7"})),
+                doc(serde_json::json!({"_id": "_local/z", "_rev": "1-abc"})),
+            ],
+            BulkDocsOptions::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res[0].rev.as_deref(), Some("0-8"));
+    assert!(!res[1].ok);
+    let info = db.info().await.unwrap();
+    assert_eq!((info.doc_count, info.update_seq), (0, Seq::Num(0)));
+    assert!(
+        db.all_docs(AllDocsOptions::new())
+            .await
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    assert!(
+        db.changes(ChangesOptions::default())
+            .await
+            .unwrap()
+            .results
+            .is_empty()
+    );
+    fx.reopen();
+    let db = fx.db();
+    let got = db.get("_local/x").await.unwrap();
+    assert_eq!(got.id, "_local/x");
+    assert_eq!(got.rev.unwrap().to_string(), "0-2");
+    assert_eq!(got.data, serde_json::json!({"v": 2}));
+    assert_eq!(db.adapter().get_local("x").await.unwrap()["v"], 2);
+    let target = fx.sibling("local_target");
+    db.put("real", serde_json::json!({})).await.unwrap();
+    db.replicate_to(&target).await.unwrap();
+    assert!(matches!(
+        target.get("_local/x").await,
+        Err(RouchError::NotFound(_))
+    ));
+    // `_local/_security` is an ordinary local document, not the security
+    // document.
+    let mut sec = SecurityDocument::default();
+    sec.members.roles.push("team".into());
+    db.put_security(sec).await.unwrap();
+    assert!(matches!(
+        db.get("_local/_security").await,
+        Err(RouchError::NotFound(_))
+    ));
+    db.put(
+        "_local/_security",
+        serde_json::json!({"admins": {"names": ["eve"]}}),
+    )
+    .await
+    .unwrap();
+    let sec = db.get_security().await.unwrap();
+    assert!(sec.admins.names.is_empty());
+    assert_eq!(sec.members.roles, ["team"]);
+    let r = db.remove("_local/x", "0-2").await.unwrap();
+    assert_eq!(r.rev.as_deref(), Some("0-0"));
+    assert!(matches!(
+        db.get("_local/x").await,
+        Err(RouchError::NotFound(_))
+    ));
+    assert!(matches!(
+        db.remove("_local/x", "0-2").await,
+        Err(RouchError::NotFound(_))
+    ));
+}
+
+/// Q-API-7: a failed `put_design` is an error, like `put`.
+async fn put_design_conflict_is_an_error(fx: Fx) {
+    let db = fx.db();
+    let ddoc = || DesignDocument {
+        id: "_design/app".into(),
+        rev: None,
+        views: std::collections::HashMap::new(),
+        filters: std::collections::HashMap::new(),
+        validate_doc_update: None,
+        shows: std::collections::HashMap::new(),
+        lists: std::collections::HashMap::new(),
+        updates: std::collections::HashMap::new(),
+        language: None,
+    };
+    assert!(db.put_design(ddoc()).await.unwrap().ok);
+    assert!(matches!(
+        db.put_design(ddoc()).await,
+        Err(RouchError::Conflict)
+    ));
+}
+
+/// Q-API-11: `destroy` drops everything (documents, local documents such
+/// as replication checkpoints, attachments, security) and the handle then
+/// behaves as a new, empty database.
+async fn destroy_resets_the_database(fx: Fx) {
+    let db = fx.db();
+    let r1 = write(db, serde_json::json!({"_id": "d"})).await;
+    db.put_attachment("d", "a", &r1, b"x".to_vec(), "text/plain")
+        .await
+        .unwrap();
+    db.adapter()
+        .put_local("checkpoint", serde_json::json!({"last_seq": 2}))
+        .await
+        .unwrap();
+    db.put("_local/other", serde_json::json!({})).await.unwrap();
+    let mut sec = SecurityDocument::default();
+    sec.admins.names.push("bob".into());
+    db.put_security(sec).await.unwrap();
+    db.destroy().await.unwrap();
+    let info = db.info().await.unwrap();
+    assert_eq!(
+        (info.doc_count, info.doc_del_count, info.update_seq),
+        (0, 0, Seq::Num(0))
+    );
+    assert!(matches!(
+        db.adapter().get_local("checkpoint").await,
+        Err(RouchError::NotFound(_))
+    ));
+    assert!(matches!(
+        db.get("_local/other").await,
+        Err(RouchError::NotFound(_))
+    ));
+    assert!(db.get_security().await.unwrap().admins.names.is_empty());
+    assert!(db.get_attachment("d", "a").await.is_err());
+    let r = db.put("d", serde_json::json!({"v": 2})).await.unwrap();
+    assert_eq!(generation(r.rev.as_deref().unwrap()), 1);
+    assert_eq!(db.info().await.unwrap().update_seq, Seq::Num(1));
+}
+
+/// Q-CORE-17: CouchDB stores 32-digit hex revision ids in lower case, so
+/// an upper-case id is the same revision (and sorts like it for the
+/// winner).
+async fn uppercase_revisions_are_normalized(mut fx: Fx) {
+    let (up_f, a) = (hash32('F'), hash32('a'));
+    let base = hash32('0');
+    for (h, v) in [(&up_f, "f"), (&a, "a")] {
+        let res = write_replicated(
+            fx.db(),
+            serde_json::json!({
+                "_id": "d", "_rev": format!("2-{h}"), "v": v,
+                "_revisions": {"start": 2, "ids": [h, base.to_uppercase()]}
+            }),
+        )
+        .await;
+        assert!(res.ok, "{res:?}");
+    }
+    fx.reopen();
+    let db = fx.db();
+    let got = db
+        .get_with_opts(
+            "d",
+            GetOptions {
+                revs: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(got.rev.unwrap().to_string(), format!("2-{}", hash32('f')));
+    assert_eq!(
+        got.data["_revisions"],
+        serde_json::json!({"start": 2, "ids": [hash32('f'), base]})
+    );
+    let old = get_rev(db, "d", &format!("2-{up_f}")).await.unwrap();
+    assert_eq!(old.data["v"], "f");
+    let next = db
+        .update("d", &format!("2-{up_f}"), serde_json::json!({"v": 3}))
+        .await
+        .unwrap();
+    assert_eq!(generation(next.rev.as_deref().unwrap()), 3);
+}
+
+conformance!(storage_fidelity:
+    unusual_ids_survive_compact_and_purge,
+    deep_documents_round_trip,
+    stemmed_revisions_are_unreadable,
+    replicated_revisions_are_validated,
+    revs_diff_matches_couchdb,
+    stubs_match_by_name,
+    edits_of_missing_documents,
+    local_ids_are_local_documents,
+    put_design_conflict_is_an_error,
+    destroy_resets_the_database,
+    uppercase_revisions_are_normalized,
+);
