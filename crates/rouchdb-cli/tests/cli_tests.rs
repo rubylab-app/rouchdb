@@ -1330,12 +1330,16 @@ async fn dump_exports_all() {
         .output()
         .unwrap();
 
-    assert!(output.status.success());
-    let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let docs = v.as_array().unwrap();
-    assert_eq!(docs.len(), 2);
-    assert!(docs[0].get("_id").is_some());
-    assert!(docs[0].get("_rev").is_some());
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(stderr_str(&output), "");
+    // Each document at its winning revision, in _id order.
+    let p = path_str(&db_path);
+    let expected: Vec<serde_json::Value> = ["doc1", "doc2"]
+        .iter()
+        .map(|id| stdout_json(&run(&["get", p, id])))
+        .collect();
+    assert_eq!(expected[1]["name"], "Bob");
+    assert_eq!(stdout_json(&output), serde_json::Value::Array(expected));
 }
 
 #[tokio::test]
@@ -2063,6 +2067,110 @@ async fn dump_then_import_round_trip_preserves_data_and_attachments() {
             .collect()
     };
     assert_eq!(strip_revs(redump), strip_revs(stdout_json(&dump)));
+}
+
+/// The documents of a `dump` output by id, without `_rev` (import gives
+/// documents new revisions). Fails on a document dumped twice.
+fn dumped_docs(output: &Output) -> BTreeMap<String, serde_json::Value> {
+    assert!(output.status.success(), "{}", stderr_str(output));
+    let mut docs = BTreeMap::new();
+    for mut doc in stdout_json(output).as_array().unwrap().iter().cloned() {
+        let obj = doc.as_object_mut().unwrap();
+        assert!(obj.remove("_rev").is_some(), "no _rev in {:?}", obj);
+        let id = obj["_id"].as_str().unwrap().to_string();
+        assert!(
+            docs.insert(id.clone(), doc).is_none(),
+            "{} dumped twice",
+            id
+        );
+    }
+    docs
+}
+
+#[tokio::test]
+async fn dump_then_import_round_trip_keeps_every_doc_design_doc_and_unicode_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.redb");
+    // Every document as a dump must show it, without its `_rev`: more than
+    // 1000 of them, a design doc and non-ASCII ids.
+    let mut expected: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    {
+        let db = rouchdb::Database::open(&src, "src").unwrap();
+        let mut bodies: Vec<(String, serde_json::Value)> = (0..1234)
+            .map(|i| {
+                let body = serde_json::json!({"i": i, "even": i % 2 == 0});
+                (format!("doc{:05}", i), body)
+            })
+            .collect();
+        bodies.extend([
+            (
+                "_design/app".to_string(),
+                serde_json::json!({
+                    "language": "javascript",
+                    "views": {"by_i": {"map": "function(doc) { emit(doc.i, null); }"}}
+                }),
+            ),
+            (
+                "ñandú".to_string(),
+                serde_json::json!({"name": "ñandú", "kind": "ave"}),
+            ),
+            ("日本".to_string(), serde_json::json!({"país": "日本"})),
+            (
+                "🦀 crab".to_string(),
+                serde_json::json!({"emoji": "🦀", "nested": {"list": [1, "dos", null, 3.5]}}),
+            ),
+        ]);
+        let docs = bodies
+            .iter()
+            .map(|(id, body)| rouchdb::Document {
+                id: id.clone(),
+                rev: None,
+                deleted: false,
+                data: body.clone(),
+                attachments: HashMap::new(),
+            })
+            .collect();
+        let results = db
+            .bulk_docs(docs, rouchdb::BulkDocsOptions::new())
+            .await
+            .unwrap();
+        assert!(results.iter().all(|r| r.ok), "{:?}", results);
+        for (id, body) in bodies {
+            let mut doc = body;
+            doc["_id"] = id.clone().into();
+            expected.insert(id, doc);
+        }
+
+        for (id, name, content_type, data) in [
+            ("ñandú", "foto ñ.png", "image/png", vec![0u8, 255, 1, 128]),
+            ("doc00007", "notes.txt", "text/plain", b"hola".to_vec()),
+        ] {
+            let rev = db.get(id).await.unwrap().rev.unwrap().to_string();
+            db.put_attachment(id, name, &rev, data.clone(), content_type)
+                .await
+                .unwrap();
+            expected.get_mut(id).unwrap()["_attachments"] = serde_json::json!({
+                name: {"content_type": content_type, "data": b64(&data)}
+            });
+        }
+    }
+    assert_eq!(expected.len(), 1238);
+
+    let dump = run(&["dump", path_str(&src)]);
+    assert_eq!(stderr_str(&dump), "");
+    assert_eq!(dumped_docs(&dump), expected);
+
+    let backup = dir.path().join("backup.json");
+    std::fs::write(&backup, &dump.stdout).unwrap();
+    let restored = dir.path().join("restored.redb");
+    let output = run(&["import", path_str(&restored), path_str(&backup)]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({"ok": true, "imported": 1238, "total": 1238, "errors": []})
+    );
+
+    assert_eq!(dumped_docs(&run(&["dump", path_str(&restored)])), expected);
 }
 
 #[tokio::test]
