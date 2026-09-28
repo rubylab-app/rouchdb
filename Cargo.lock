@@ -1275,6 +1275,7 @@ name = "rouchdb-cli"
 version = "0.4.0"
 dependencies = [
  "assert_cmd",
+ "base64",
  "clap",
  "predicates",
  "rouchdb",

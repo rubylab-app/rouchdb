@@ -1,9 +1,12 @@
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
+use std::sync::{Arc, Mutex};
 
 use assert_cmd::Command;
+use base64::Engine;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
@@ -70,6 +73,205 @@ fn stderr_str(output: &Output) -> String {
 
 fn path_str(path: &Path) -> &str {
     path.to_str().unwrap()
+}
+
+fn b64(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+// ─── FAKE COUCHDB ───────────────────────────────────────────────────────────
+
+/// A request captured by the fake CouchDB server.
+#[derive(Debug, Clone)]
+struct FakeRequest {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl FakeRequest {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.body).unwrap()
+    }
+}
+
+fn read_request(stream: &TcpStream) -> Option<FakeRequest> {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?.to_string();
+    let path = parts.next()?.to_string();
+
+    let mut headers = Vec::new();
+    loop {
+        let mut header = String::new();
+        reader.read_line(&mut header).ok()?;
+        let header = header.trim_end();
+        if header.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = header.split_once(':') {
+            headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+        }
+    }
+
+    let len = headers
+        .iter()
+        .find(|(k, _)| k == "content-length")
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(0);
+    let mut body = vec![0; len];
+    reader.read_exact(&mut body).ok()?;
+
+    Some(FakeRequest {
+        method,
+        path,
+        headers,
+        body,
+    })
+}
+
+/// Serve a minimal CouchDB stand-in on an ephemeral port, one request per
+/// connection. Returns the base URL and the log of received requests.
+fn spawn_fake_couchdb<F>(handler: F) -> (String, Arc<Mutex<Vec<FakeRequest>>>)
+where
+    F: Fn(&FakeRequest) -> (u16, serde_json::Value) + Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log_clone = log.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let Some(req) = read_request(&stream) else {
+                continue;
+            };
+            let (status, body) = handler(&req);
+            log_clone.lock().unwrap().push(req);
+            let body = body.to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status,
+                body.len(),
+                body
+            );
+        }
+    });
+    (base, log)
+}
+
+/// Handler emulating an empty CouchDB database named `db`. When
+/// `reject_writes` is set, `_bulk_docs` rejects every document the way a
+/// `validate_doc_update` function does (per-doc `forbidden`, HTTP 201).
+fn fake_target(reject_writes: bool) -> impl Fn(&FakeRequest) -> (u16, serde_json::Value) {
+    move |req| {
+        let path = req.path.split('?').next().unwrap_or("");
+        match (req.method.as_str(), path) {
+            ("GET", "/db") => (
+                200,
+                serde_json::json!({
+                    "db_name": "db", "doc_count": 0, "doc_del_count": 0, "update_seq": "0"
+                }),
+            ),
+            ("GET", p) if p.starts_with("/db/_local/") => (
+                404,
+                serde_json::json!({"error": "not_found", "reason": "missing"}),
+            ),
+            ("PUT", p) if p.starts_with("/db/_local/") => (
+                201,
+                serde_json::json!({"ok": true, "id": "_local/x", "rev": "0-1"}),
+            ),
+            ("POST", "/db/_revs_diff") => {
+                let mut out = serde_json::Map::new();
+                for (id, revs) in req.json().as_object().unwrap() {
+                    out.insert(id.clone(), serde_json::json!({"missing": revs}));
+                }
+                (200, serde_json::Value::Object(out))
+            }
+            ("POST", "/db/_bulk_docs") if reject_writes => {
+                let results: Vec<serde_json::Value> = req.json()["docs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|d| {
+                        serde_json::json!({
+                            "id": d["_id"], "rev": d["_rev"],
+                            "error": "forbidden", "reason": "rejected by validator"
+                        })
+                    })
+                    .collect();
+                (201, serde_json::Value::Array(results))
+            }
+            // new_edits=false: an empty array means every doc was stored.
+            ("POST", "/db/_bulk_docs") => (201, serde_json::json!([])),
+            _ => (
+                404,
+                serde_json::json!({"error": "not_found", "reason": "missing"}),
+            ),
+        }
+    }
+}
+
+/// A local URL whose port nothing is listening on.
+fn closed_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+/// Minimal raw HTTP client for setting up the real CouchDB in ignored tests.
+fn couch_request(method: &str, url: &str, body: Option<&str>) -> (u16, String) {
+    let rest = url.strip_prefix("http://").expect("http URL");
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let path = if path.is_empty() { "/" } else { path };
+    let (userinfo, host) = match authority.rsplit_once('@') {
+        Some((u, h)) => (Some(u), h),
+        None => (None, authority),
+    };
+    let mut stream = TcpStream::connect(host).unwrap();
+    let body = body.unwrap_or("");
+    let mut req = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        method,
+        path,
+        host,
+        body.len()
+    );
+    if let Some(userinfo) = userinfo {
+        req.push_str(&format!(
+            "Authorization: Basic {}\r\n",
+            b64(userinfo.as_bytes())
+        ));
+    }
+    req.push_str("\r\n");
+    req.push_str(body);
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let status = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
+fn couchdb_url() -> String {
+    std::env::var("COUCHDB_URL").unwrap_or_else(|_| "http://admin:password@localhost:15984".into())
 }
 
 // ─── INFO ───────────────────────────────────────────────────────────────────
@@ -969,6 +1171,125 @@ async fn import_invalid_file_fails() {
     let output = run(&["import", p, path_str(&missing)]);
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr_str(&output).contains("cannot read file"));
+}
+
+// ─── REPLICATE CREDENTIALS ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn replicate_error_does_not_print_url_password() {
+    let (_src_dir, src_path) = setup_db(&[("a", serde_json::json!({"x": 1}))]).await;
+    let port = closed_port();
+
+    for url in [
+        format!("http://admin:s3cret@127.0.0.1:{}/db", port),
+        // reqwest cannot percent-decode this username, so it leaves the
+        // credentials in the URL it reports in its error message.
+        format!("http://ad%FFmin:s3cret@127.0.0.1:{}/db", port),
+    ] {
+        let output = run(&["replicate", path_str(&src_path), &url]);
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = stderr_str(&output);
+        assert!(stderr.contains("Error"), "{}", stderr);
+        assert!(!stderr.contains("s3cret"), "password leaked: {}", stderr);
+
+        let output = run(&["replicate", &url, path_str(&src_path)]);
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = stderr_str(&output);
+        assert!(!stderr.contains("s3cret"), "password leaked: {}", stderr);
+    }
+}
+
+#[tokio::test]
+async fn replicate_uses_credentials_from_env() {
+    let (_src_dir, src_path) = setup_db(&[("a", serde_json::json!({"x": 1}))]).await;
+    let (base, log) = spawn_fake_couchdb(fake_target(false));
+    let password = "p@ss:w/rd %?#";
+
+    let output = rouchdb_cmd()
+        .args(["replicate", path_str(&src_path), &format!("{}/db", base)])
+        .env("ROUCHDB_USER", "alice")
+        .env("ROUCHDB_PASSWORD", password)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(stdout_json(&output)["docs_written"], 1);
+
+    let expected = format!("Basic {}", b64(format!("alice:{}", password).as_bytes()));
+    let log = log.lock().unwrap();
+    assert!(!log.is_empty());
+    for req in log.iter() {
+        assert_eq!(
+            req.header("authorization"),
+            Some(expected.as_str()),
+            "{} {}",
+            req.method,
+            req.path
+        );
+    }
+}
+
+#[tokio::test]
+async fn replicate_url_credentials_take_precedence_over_env() {
+    let (_src_dir, src_path) = setup_db(&[("a", serde_json::json!({"x": 1}))]).await;
+    let (base, log) = spawn_fake_couchdb(fake_target(false));
+    let url = base.replace("http://", "http://bob:hunter2@") + "/db";
+
+    let output = rouchdb_cmd()
+        .args(["replicate", path_str(&src_path), &url])
+        .env("ROUCHDB_USER", "alice")
+        .env("ROUCHDB_PASSWORD", "other")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr_str(&output));
+
+    let expected = format!("Basic {}", b64(b"bob:hunter2"));
+    for req in log.lock().unwrap().iter() {
+        assert_eq!(req.header("authorization"), Some(expected.as_str()));
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn replicate_to_couchdb_with_env_credentials() {
+    let admin_url = couchdb_url();
+    let db_name = format!("rouchdb_cli_env_auth_{}", std::process::id());
+    let admin_db_url = format!("{}/{}", admin_url, db_name);
+    // The same URL without credentials; they come from the environment.
+    let (scheme, rest) = admin_url.split_once("://").unwrap();
+    let (userinfo, host) = rest.rsplit_once('@').expect("COUCHDB_URL has credentials");
+    let (user, password) = userinfo.split_once(':').unwrap();
+    let plain_db_url = format!("{}://{}/{}", scheme, host, db_name);
+
+    // Database::http does not create the remote database; do it up front.
+    let (status, body) = couch_request("PUT", &admin_db_url, None);
+    assert!(status == 201 || status == 202, "{} {}", status, body);
+
+    let (_src_dir, src_path) = setup_db(&[
+        ("a", serde_json::json!({"x": 1})),
+        ("b", serde_json::json!({"x": 2})),
+    ])
+    .await;
+
+    let without_env = rouchdb_cmd()
+        .args(["replicate", path_str(&src_path), &plain_db_url])
+        .env_remove("ROUCHDB_USER")
+        .env_remove("ROUCHDB_PASSWORD")
+        .output()
+        .unwrap();
+    let with_env = rouchdb_cmd()
+        .args(["replicate", path_str(&src_path), &plain_db_url])
+        .env("ROUCHDB_USER", user)
+        .env("ROUCHDB_PASSWORD", password)
+        .output()
+        .unwrap();
+    couch_request("DELETE", &admin_db_url, None);
+
+    assert_eq!(without_env.status.code(), Some(1));
+    assert!(stderr_str(&without_env).contains("unauthorized"));
+    assert!(with_env.status.success(), "{}", stderr_str(&with_env));
+    let v = stdout_json(&with_env);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["docs_written"], 2);
 }
 
 // ─── BROKEN PIPE ────────────────────────────────────────────────────────────

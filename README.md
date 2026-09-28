@@ -241,6 +241,15 @@ rouchdb replicate mydb.redb http://admin:password@localhost:5984/mydb  # Sync
 rouchdb compact mydb.redb                                              # Compact
 ```
 
+To keep the CouchDB password out of shell history and `ps`, `replicate` reads
+credentials from `ROUCHDB_USER` and `ROUCHDB_PASSWORD` for any http(s) URL that
+has none of its own:
+
+```bash
+ROUCHDB_USER=admin ROUCHDB_PASSWORD=password \
+  rouchdb replicate mydb.redb http://localhost:5984/mydb
+```
+
 Add `--pretty` (or `-p`) to any command for formatted JSON output.
 
 ## Crate Structure

@@ -127,6 +127,12 @@ enum Commands {
     },
 
     /// Replicate between a redb file and CouchDB (or two redb files)
+    ///
+    /// CouchDB credentials can be embedded in the URL
+    /// (http://user:pass@host:5984/db) or, to keep the password out of shell
+    /// history and process listings, read from the ROUCHDB_USER and
+    /// ROUCHDB_PASSWORD environment variables. The variables apply to every
+    /// http(s) source or target whose URL has no credentials of its own.
     Replicate {
         /// Source: path to an existing .redb file or CouchDB URL
         source: String,
@@ -242,12 +248,84 @@ fn open_existing_db(path: &str, name: Option<&str>) -> Database {
 
 fn open_source_or_target(path_or_url: &str, name: Option<&str>, must_exist: bool) -> Database {
     if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
-        Database::http(path_or_url)
+        Database::http(&with_env_credentials(path_or_url))
     } else if must_exist {
         open_existing_db(path_or_url, name)
     } else {
         open_db(path_or_url, name)
     }
+}
+
+/// Environment variables holding CouchDB credentials, so they do not have to
+/// be written into the URL (and end up in shell history or `ps`).
+const USER_ENV: &str = "ROUCHDB_USER";
+const PASSWORD_ENV: &str = "ROUCHDB_PASSWORD";
+
+/// Add `ROUCHDB_USER` / `ROUCHDB_PASSWORD` to the URL's userinfo, unless the
+/// URL already carries credentials or no user is set. reqwest turns the
+/// userinfo into a Basic auth header and strips it from the request URL.
+fn with_env_credentials(url: &str) -> String {
+    let user = match std::env::var(USER_ENV) {
+        Ok(user) if !user.is_empty() => user,
+        _ => return url.to_string(),
+    };
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if rest[..authority_end].contains('@') {
+        return url.to_string();
+    }
+
+    let mut userinfo = percent_encode_userinfo(&user);
+    if let Ok(password) = std::env::var(PASSWORD_ENV) {
+        userinfo.push(':');
+        userinfo.push_str(&percent_encode_userinfo(&password));
+    }
+    format!("{}://{}@{}", scheme, userinfo, rest)
+}
+
+fn percent_encode_userinfo(s: &str) -> String {
+    let mut encoded = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(b as char);
+        } else {
+            encoded.push_str(&format!("%{:02X}", b));
+        }
+    }
+    encoded
+}
+
+/// Mask the password of every `scheme://user:password@host` URL in `text`.
+/// reqwest normally strips credentials from the URL it puts in its errors,
+/// but keeps them when it cannot percent-decode the userinfo.
+fn redact_credentials(text: &str) -> String {
+    let mut redacted = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(idx) = rest.find("://") {
+        let (head, tail) = rest.split_at(idx + 3);
+        redacted.push_str(head);
+        let authority_end = tail
+            .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+            .unwrap_or(tail.len());
+        match tail[..authority_end].rfind('@') {
+            Some(at) => {
+                let userinfo = &tail[..at];
+                match userinfo.split_once(':') {
+                    Some((user, _)) => {
+                        redacted.push_str(user);
+                        redacted.push_str(":***");
+                    }
+                    None => redacted.push_str(userinfo),
+                }
+                rest = &tail[at..];
+            }
+            None => rest = tail,
+        }
+    }
+    redacted.push_str(rest);
+    redacted
 }
 
 fn check_doc_result(result: &rouchdb::DocResult) -> rouchdb::Result<()> {
@@ -294,7 +372,7 @@ async fn main() {
 
     let result = run(cli).await;
     if let Err(e) = result {
-        eprintln!("Error: {}", e);
+        eprintln!("Error: {}", redact_credentials(&e.to_string()));
         process::exit(1);
     }
 }
@@ -637,4 +715,32 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_credentials_masks_passwords_only() {
+        assert_eq!(
+            redact_credentials("error sending request for url (http://ad%FFmin:s3cret@h:1/db)"),
+            "error sending request for url (http://ad%FFmin:***@h:1/db)"
+        );
+        assert_eq!(
+            redact_credentials("a https://u:p@ss@h/x and http://h/y?q=a@b and http://v@h"),
+            "a https://u:***@h/x and http://h/y?q=a@b and http://v@h"
+        );
+        assert_eq!(redact_credentials("no url here"), "no url here");
+    }
+
+    #[test]
+    fn percent_encode_userinfo_escapes_reserved_bytes() {
+        assert_eq!(percent_encode_userinfo("alice"), "alice");
+        assert_eq!(
+            percent_encode_userinfo("p@ss:w/rd %"),
+            "p%40ss%3Aw%2Frd%20%25"
+        );
+        assert_eq!(percent_encode_userinfo("ñ"), "%C3%B1");
+    }
 }
