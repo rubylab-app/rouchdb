@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::io::{self, BufWriter, Write};
 use std::process;
 
 use clap::{Parser, Subcommand};
 use rouchdb::{
-    AllDocsOptions, ChangesOptions, Database, FindOptions, GetOptions, ReplicationOptions,
+    AllDocsOptions, BulkDocsOptions, ChangesOptions, Database, Document, FindOptions, GetOptions,
+    ReplicationOptions,
 };
 
 #[derive(Parser)]
@@ -329,6 +331,40 @@ fn redact_credentials(text: &str) -> String {
     }
     redacted.push_str(rest);
     redacted
+}
+
+/// Documents written per `bulk_docs` call by `import`.
+const IMPORT_BATCH_SIZE: usize = 500;
+
+/// Turn one element of an import file into a new document, or the error to
+/// report for it. Any `_rev` is dropped: imported docs get fresh revisions.
+fn import_doc(mut value: serde_json::Value) -> Result<Document, serde_json::Value> {
+    let id = match value.get("_id").and_then(|v| v.as_str()).map(String::from) {
+        Some(id) if id.is_empty() => {
+            return Err(serde_json::json!({
+                "id": id,
+                "error": rouchdb::RouchError::MissingId.to_string(),
+            }));
+        }
+        Some(id) => id,
+        None => {
+            return Err(serde_json::json!({
+                "error": "missing _id field",
+                "doc": value,
+            }));
+        }
+    };
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("_id");
+        obj.remove("_rev");
+    }
+    Ok(Document {
+        id,
+        rev: None,
+        deleted: false,
+        data: value,
+        attachments: HashMap::new(),
+    })
 }
 
 fn check_doc_result(result: &rouchdb::DocResult) -> rouchdb::Result<()> {
@@ -661,61 +697,84 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
             db_name,
         } => {
             let db = open_db(&path, db_name.as_deref());
-            let content = std::fs::read_to_string(&file).map_err(|e| {
+            let reader = std::fs::File::open(&file).map_err(|e| {
                 rouchdb::RouchError::BadRequest(format!("cannot read file '{}': {}", file, e))
             })?;
-            let docs: Vec<serde_json::Value> = serde_json::from_str(&content).map_err(|e| {
-                rouchdb::RouchError::BadRequest(format!("invalid JSON in '{}': {}", file, e))
-            })?;
+            let docs: Vec<serde_json::Value> = serde_json::from_reader(io::BufReader::new(reader))
+                .map_err(|e| {
+                    let what = if e.is_io() {
+                        "cannot read file"
+                    } else {
+                        "invalid JSON in"
+                    };
+                    rouchdb::RouchError::BadRequest(format!("{} '{}': {}", what, file, e))
+                })?;
+            let total = docs.len();
 
             let mut imported = 0u64;
-            let mut errors = Vec::new();
-            for doc in &docs {
-                let id = match doc.get("_id").and_then(|v| v.as_str()) {
-                    Some(id) => id.to_string(),
-                    None => {
-                        errors.push(serde_json::json!({
-                            "error": "missing _id field",
-                            "doc": doc,
-                        }));
-                        continue;
+            // Errors carry the document's position so they are reported in
+            // file order, whichever stage rejected the document.
+            let mut errors: Vec<(usize, serde_json::Value)> = Vec::new();
+            let mut docs = docs.into_iter().enumerate().peekable();
+            while docs.peek().is_some() {
+                let mut batch = Vec::with_capacity(IMPORT_BATCH_SIZE);
+                let mut positions = Vec::with_capacity(IMPORT_BATCH_SIZE);
+                for (index, value) in docs.by_ref().take(IMPORT_BATCH_SIZE) {
+                    match import_doc(value) {
+                        Ok(doc) => {
+                            positions.push((index, doc.id.clone()));
+                            batch.push(doc);
+                        }
+                        Err(e) => errors.push((index, e)),
                     }
-                };
-
-                let mut data = doc.clone();
-                // Strip _id and _rev from the body — put() handles them
-                if let Some(obj) = data.as_object_mut() {
-                    obj.remove("_id");
-                    obj.remove("_rev");
+                }
+                if batch.is_empty() {
+                    continue;
                 }
 
-                match db.put(&id, data).await {
-                    Ok(ref r) if !r.ok => {
-                        let reason = r
-                            .reason
-                            .as_deref()
-                            .or(r.error.as_deref())
-                            .unwrap_or("document update conflict");
-                        errors.push(serde_json::json!({
-                            "id": id,
-                            "error": reason,
-                        }));
+                // One transaction per batch instead of one per document.
+                match db.bulk_docs(batch, BulkDocsOptions::new()).await {
+                    Ok(results) => {
+                        let mut results = results.into_iter();
+                        for (index, id) in positions {
+                            match results.next() {
+                                Some(r) if r.ok => imported += 1,
+                                Some(r) => {
+                                    let reason = r
+                                        .reason
+                                        .as_deref()
+                                        .or(r.error.as_deref())
+                                        .unwrap_or("document update conflict");
+                                    errors.push((
+                                        index,
+                                        serde_json::json!({"id": id, "error": reason}),
+                                    ));
+                                }
+                                None => errors.push((
+                                    index,
+                                    serde_json::json!({"id": id, "error": "no write result"}),
+                                )),
+                            }
+                        }
                     }
-                    Ok(_) => imported += 1,
                     Err(e) => {
-                        errors.push(serde_json::json!({
-                            "id": id,
-                            "error": e.to_string(),
-                        }));
+                        for (index, id) in positions {
+                            errors.push((
+                                index,
+                                serde_json::json!({"id": id, "error": e.to_string()}),
+                            ));
+                        }
                     }
                 }
             }
+            errors.sort_by_key(|(index, _)| *index);
+            let errors: Vec<serde_json::Value> = errors.into_iter().map(|(_, e)| e).collect();
 
             print_json(
                 &serde_json::json!({
                     "ok": errors.is_empty(),
                     "imported": imported,
-                    "total": docs.len(),
+                    "total": total,
                     "errors": errors,
                 }),
                 cli.pretty,
@@ -727,7 +786,7 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
                 return Err(rouchdb::RouchError::BadRequest(format!(
                     "{} of {} documents failed to import",
                     errors.len(),
-                    docs.len()
+                    total
                 )));
             }
         }

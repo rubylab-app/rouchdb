@@ -1157,6 +1157,26 @@ async fn import_recreates_deleted_document() {
 }
 
 #[tokio::test]
+async fn import_many_docs_across_batches() {
+    let (dir, db_path) = setup_db(&[]).await;
+    let p = path_str(&db_path);
+    let docs: Vec<serde_json::Value> = (0..1200)
+        .map(|i| serde_json::json!({"_id": format!("doc{:05}", i), "i": i}))
+        .collect();
+    let file = write_json_file(dir.path(), "docs.json", &serde_json::json!(docs));
+
+    let output = run(&["import", p, path_str(&file)]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let v = stdout_json(&output);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["imported"], 1200);
+    assert_eq!(v["total"], 1200);
+
+    assert_eq!(stdout_json(&run(&["info", p]))["doc_count"], 1200);
+    assert_eq!(stdout_json(&run(&["get", p, "doc01199"]))["i"], 1199);
+}
+
+#[tokio::test]
 async fn import_invalid_file_fails() {
     let (dir, db_path) = setup_db(&[]).await;
     let p = path_str(&db_path);
