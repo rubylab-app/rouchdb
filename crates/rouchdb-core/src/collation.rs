@@ -682,6 +682,10 @@ mod tests {
             #![proptest_config(ProptestConfig {
                 cases: 300,
                 failure_persistence: None,
+                // Bound shrinking so a failure is reported in seconds (the
+                // default is unbounded, which can take minutes on nested
+                // values and makes mutation runs time out).
+                max_shrink_iters: 1024,
                 ..ProptestConfig::default()
             })]
 
