@@ -516,7 +516,8 @@ pub fn replicate_live(
         let mut last_result: Option<ReplicationResult> = None;
         // Starts at the caller's `since` (or the checkpoint when unset), then
         // follows each pass's last_seq so polls never rescan the feed. One
-        // checkpointer (one session) spans the whole live replication.
+        // checkpointer (one session) spans the live replication until a pass
+        // fails with an error.
         let mut since = opts.since.clone();
         let mut checkpointer: Option<Checkpointer> = None;
 
@@ -554,7 +555,13 @@ pub fn replicate_live(
                     last_result = Some(outcome.result);
                     outcome.failure
                 }
-                Err(e) => Some(e.to_string()),
+                Err(e) => {
+                    // The peer may have been unreachable when the id was
+                    // derived (an HTTP adapter then falls back to its URL):
+                    // derive it again on the next attempt.
+                    checkpointer = None;
+                    Some(e.to_string())
+                }
             };
 
             if let Some(message) = failure {
@@ -1452,6 +1459,9 @@ mod tests {
         write_error: Option<(String, String)>,
         /// `put_local` fails with this error.
         put_local_error: Option<fn() -> RouchError>,
+        /// Unreachable: every call fails, except `id()`, which falls back to
+        /// this value (as an HTTP adapter may without a server answer).
+        offline_id: Option<String>,
     }
 
     struct Faulty {
@@ -1472,10 +1482,26 @@ mod tests {
         }
     }
 
+    impl Faulty {
+        fn check_online(&self) -> Result<()> {
+            match self.faults.lock().unwrap().offline_id {
+                Some(_) => Err(RouchError::DatabaseError("offline".into())),
+                None => Ok(()),
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl Adapter for Faulty {
         async fn info(&self) -> Result<DbInfo> {
+            self.check_online()?;
             self.inner.info().await
+        }
+        async fn id(&self) -> Result<String> {
+            if let Some(id) = self.faults.lock().unwrap().offline_id.clone() {
+                return Ok(id);
+            }
+            self.inner.id().await
         }
         async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
             self.inner.get(id, opts).await
@@ -1485,6 +1511,7 @@ mod tests {
             docs: Vec<Document>,
             opts: BulkDocsOptions,
         ) -> Result<Vec<DocResult>> {
+            self.check_online()?;
             let write_error = self.faults.lock().unwrap().write_error.clone();
             let Some((bad_id, error)) = write_error else {
                 return self.inner.bulk_docs(docs, opts).await;
@@ -1504,12 +1531,15 @@ mod tests {
             self.inner.all_docs(opts).await
         }
         async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
+            self.check_online()?;
             self.inner.changes(opts).await
         }
         async fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
+            self.check_online()?;
             self.inner.revs_diff(revs).await
         }
         async fn bulk_get(&self, docs: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
+            self.check_online()?;
             let supersede = self.faults.lock().unwrap().supersede_on_bulk_get.take();
             if let Some(id) = supersede {
                 let current = self.inner.get(&id, GetOptions::default()).await?;
@@ -1566,9 +1596,11 @@ mod tests {
             self.inner.remove_attachment(doc_id, att_id, rev).await
         }
         async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
+            self.check_online()?;
             self.inner.get_local(id).await
         }
         async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
+            self.check_online()?;
             if let Some(error) = self.faults.lock().unwrap().put_local_error {
                 return Err(error());
             }
@@ -1926,5 +1958,47 @@ mod tests {
         assert!(!result.ok);
         assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
         assert!(result.errors[0].contains("disk full"));
+    }
+
+    #[tokio::test]
+    async fn live_replication_started_offline_checkpoints_under_the_real_id() {
+        let source = Arc::new(MemoryAdapter::new("source"));
+        for i in 0..3 {
+            put_doc(source.as_ref(), &format!("d{i}"), serde_json::json!({})).await;
+        }
+        let target = Arc::new(Faulty::new(
+            MemoryAdapter::new("target"),
+            Faults {
+                offline_id: Some("http://target/db".into()),
+                ..Default::default()
+            },
+        ));
+
+        let (mut rx, handle) = replicate_live(
+            source.clone(),
+            target.clone(),
+            ReplicationOptions {
+                live: true,
+                retry: true,
+                back_off_function: Some(Box::new(|_| Duration::from_millis(10))),
+                poll_interval: Duration::from_millis(20),
+                ..Default::default()
+            },
+        );
+        assert!(wait_for(&mut rx, |e| matches!(e, ReplicationEvent::Error(_))).await);
+        target.heal(); // back online
+        assert!(wait_for(&mut rx, |e| matches!(e, ReplicationEvent::Paused)).await);
+        handle.cancel();
+
+        // The progress is stored under the id computed once the target
+        // answered, so the next session resumes instead of rescanning.
+        let checkpointer = new_checkpointer(source.as_ref(), target.as_ref(), &None)
+            .await
+            .unwrap();
+        let since = checkpointer
+            .read_checkpoint(source.as_ref(), target.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(since, Seq::Num(3));
     }
 }

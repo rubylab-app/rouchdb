@@ -353,19 +353,24 @@ impl Adapter for HttpAdapter {
     async fn id(&self) -> Result<String> {
         // Like PouchDB: the server's uuid plus the database name, so every
         // URL of the same database maps to one replication id (and same-named
-        // databases on different servers do not); otherwise the URL without
-        // credentials.
+        // databases on different servers do not). A server that answers
+        // without a uuid gets the URL without credentials; an unreachable one
+        // is an error, so a fallback id is never used by mistake.
         let (server, db) = self
             .base_url
             .rsplit_once('/')
             .unwrap_or((self.base_url.as_str(), ""));
-        let uuid = async {
-            let resp = self.client.get(server).send().await.ok()?;
-            let root: serde_json::Value = resp.error_for_status().ok()?.json().await.ok()?;
-            root.get("uuid")?.as_str().map(String::from)
-        }
-        .await;
-        Ok(match uuid {
+        let resp = self
+            .client
+            .get(server)
+            .send()
+            .await
+            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+        let root: Option<serde_json::Value> = match resp.error_for_status() {
+            Ok(resp) => resp.json().await.ok(),
+            Err(_) => None,
+        };
+        Ok(match root.as_ref().and_then(|r| r.get("uuid")?.as_str()) {
             Some(uuid) => format!("{}{}", uuid, db),
             None => url_without_credentials(&self.base_url),
         })
@@ -1103,13 +1108,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn id_without_server_uuid_is_the_url_without_credentials() {
-        // Nothing listens on port 1: the uuid lookup fails fast.
-        let a = HttpAdapter::new("http://admin:secret@127.0.0.1:1/userdb");
-        let b = HttpAdapter::new("http://127.0.0.1:2/userdb");
-        let id_a = a.id().await.unwrap();
-        assert_eq!(id_a, "http://127.0.0.1:1/userdb");
-        assert_ne!(id_a, b.id().await.unwrap());
+    async fn id_is_server_uuid_plus_db_or_the_url_without_credentials() {
+        let (with_uuid, _) = recording_stub_server(json_response(
+            "200 OK",
+            r#"{"couchdb":"Welcome","uuid":"abc123"}"#,
+        ))
+        .await;
+        let db = HttpAdapter::new(&format!("{with_uuid}/userdb"));
+        assert_eq!(db.id().await.unwrap(), "abc123userdb");
+
+        let (no_uuid, _) =
+            recording_stub_server(json_response("200 OK", r#"{"couchdb":"Welcome"}"#)).await;
+        let url = no_uuid.replace("http://", "http://admin:secret@");
+        let db = HttpAdapter::new(&format!("{url}/userdb"));
+        assert_eq!(db.id().await.unwrap(), format!("{no_uuid}/userdb"));
+
+        // Nothing listens on port 1: no id rather than a fallback one that
+        // would not match the id used once the server is reachable.
+        let offline = HttpAdapter::new("http://127.0.0.1:1/userdb");
+        assert!(offline.id().await.is_err());
     }
 
     /// Serve one canned raw HTTP `response` to every connection; returns the
