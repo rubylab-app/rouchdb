@@ -6,7 +6,7 @@ use common::fresh_remote_db;
 use rouchdb::{Database, ReduceFn, ViewQueryOptions, query_view};
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn view_basic_map() {
     let url = fresh_remote_db("view_map").await;
     let remote = Database::http(&url);
@@ -52,7 +52,7 @@ async fn view_basic_map() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn view_reduce_sum_and_count() {
     let url = fresh_remote_db("view_reduce").await;
     let remote = Database::http(&url);
@@ -129,7 +129,7 @@ async fn view_reduce_sum_and_count() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn view_key_range() {
     let url = fresh_remote_db("view_range").await;
     let remote = Database::http(&url);

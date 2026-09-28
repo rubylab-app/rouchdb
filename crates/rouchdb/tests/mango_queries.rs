@@ -8,7 +8,7 @@ use common::fresh_remote_db;
 use rouchdb::{Database, FindOptions, IndexDefinition, SortField};
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn mango_equality_and_inequality() {
     let url = fresh_remote_db("mango_eq").await;
     let remote = Database::http(&url);
@@ -63,7 +63,7 @@ async fn mango_equality_and_inequality() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn mango_comparison_operators() {
     let url = fresh_remote_db("mango_cmp").await;
     let remote = Database::http(&url);
@@ -126,7 +126,7 @@ async fn mango_comparison_operators() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn mango_in_nin_exists() {
     let url = fresh_remote_db("mango_in").await;
     let remote = Database::http(&url);
@@ -186,7 +186,7 @@ async fn mango_in_nin_exists() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn mango_logical_operators() {
     let url = fresh_remote_db("mango_logic").await;
     let remote = Database::http(&url);
@@ -251,7 +251,7 @@ async fn mango_logical_operators() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn mango_nested_field_query() {
     let url = fresh_remote_db("mango_nested").await;
     let remote = Database::http(&url);
@@ -301,7 +301,7 @@ async fn mango_nested_field_query() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn mango_regex_and_type() {
     let url = fresh_remote_db("mango_regex").await;
     let remote = Database::http(&url);
@@ -352,7 +352,7 @@ async fn mango_regex_and_type() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn mango_array_operators() {
     let url = fresh_remote_db("mango_arr").await;
     let remote = Database::http(&url);
@@ -402,7 +402,7 @@ async fn mango_array_operators() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn mango_sort_skip_limit_projection() {
     let url = fresh_remote_db("mango_sort").await;
     let remote = Database::http(&url);
@@ -494,7 +494,7 @@ async fn mango_sort_skip_limit_projection() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn mango_empty_selector_matches_all() {
     let url = fresh_remote_db("mango_empty").await;
     let remote = Database::http(&url);
@@ -521,7 +521,7 @@ async fn mango_empty_selector_matches_all() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn mango_create_index_and_query() {
     let url = fresh_remote_db("mango_idx").await;
     let remote = Database::http(&url);
@@ -594,7 +594,7 @@ async fn mango_create_index_and_query() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn mango_index_with_sort_and_limit() {
     let url = fresh_remote_db("mango_idx_sort").await;
     let remote = Database::http(&url);
@@ -642,7 +642,7 @@ async fn mango_index_with_sort_and_limit() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn mango_multi_field_index() {
     let url = fresh_remote_db("mango_idx_multi").await;
     let remote = Database::http(&url);

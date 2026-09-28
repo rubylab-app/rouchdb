@@ -6,7 +6,7 @@ use common::fresh_remote_db;
 use rouchdb::{AllDocsOptions, Database};
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn all_docs_include_docs() {
     let url = fresh_remote_db("ad_incdocs").await;
     let db = Database::http(&url);
@@ -33,7 +33,7 @@ async fn all_docs_include_docs() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn all_docs_key_range() {
     let url = fresh_remote_db("ad_range").await;
     let db = Database::http(&url);
@@ -62,7 +62,7 @@ async fn all_docs_key_range() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn all_docs_descending() {
     let url = fresh_remote_db("ad_desc").await;
     let db = Database::http(&url);
@@ -86,7 +86,7 @@ async fn all_docs_descending() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn all_docs_skip_and_limit() {
     let url = fresh_remote_db("ad_paging").await;
     let db = Database::http(&url);
@@ -110,7 +110,7 @@ async fn all_docs_skip_and_limit() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn all_docs_empty_database() {
     let url = fresh_remote_db("ad_empty").await;
     let db = Database::http(&url);

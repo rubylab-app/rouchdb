@@ -748,7 +748,7 @@ async fn replicate_redb_to_redb() {
     assert_eq!(info["doc_count"], 3);
 }
 
-#[ignore]
+#[ignore = "requires CouchDB"]
 #[tokio::test]
 async fn replicate_to_couchdb() {
     // The replication creates the target database; the guard deletes it.
@@ -1436,7 +1436,7 @@ async fn replicate_with_rejected_docs_exits_non_zero() {
     assert!(stderr_str(&output).contains("replication"));
 }
 
-#[ignore]
+#[ignore = "requires CouchDB"]
 #[tokio::test]
 async fn replicate_rejected_by_couchdb_validator_exits_non_zero() {
     let db_url = common::fresh_remote_db("cli_vdu").await;
@@ -1540,7 +1540,7 @@ async fn replicate_url_credentials_take_precedence_over_env() {
     }
 }
 
-#[ignore]
+#[ignore = "requires CouchDB"]
 #[tokio::test]
 async fn replicate_to_couchdb_with_env_credentials() {
     let couch = common::couchdb();

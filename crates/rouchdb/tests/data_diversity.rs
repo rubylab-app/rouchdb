@@ -10,7 +10,7 @@ use rouchdb::Database;
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_nested_objects_roundtrip() {
     let url = fresh_remote_db("data_nested").await;
     let local = Database::memory("local");
@@ -43,7 +43,7 @@ async fn data_nested_objects_roundtrip() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_arrays_roundtrip() {
     let url = fresh_remote_db("data_arrays").await;
     let local = Database::memory("local");
@@ -66,7 +66,7 @@ async fn data_arrays_roundtrip() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_null_and_bool_roundtrip() {
     let url = fresh_remote_db("data_nullbool").await;
     let local = Database::memory("local");
@@ -92,7 +92,7 @@ async fn data_null_and_bool_roundtrip() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_numeric_types_roundtrip() {
     let url = fresh_remote_db("data_nums").await;
     let local = Database::memory("local");
@@ -122,7 +122,7 @@ async fn data_numeric_types_roundtrip() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_empty_structures_roundtrip() {
     let url = fresh_remote_db("data_empty").await;
     let local = Database::memory("local");
@@ -146,7 +146,7 @@ async fn data_empty_structures_roundtrip() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_mixed_type_array_roundtrip() {
     let url = fresh_remote_db("data_mixed").await;
     let local = Database::memory("local");
@@ -170,7 +170,7 @@ async fn data_mixed_type_array_roundtrip() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_unicode_roundtrip() {
     let url = fresh_remote_db("data_unicode").await;
     let local = Database::memory("local");
@@ -200,7 +200,7 @@ async fn data_unicode_roundtrip() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_large_document() {
     let url = fresh_remote_db("data_large").await;
     let local = Database::memory("local");
@@ -233,7 +233,7 @@ async fn data_large_document() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn special_id_with_spaces() {
     let url = fresh_remote_db("id_spaces").await;
     let db = Database::http(&url);
@@ -247,7 +247,7 @@ async fn special_id_with_spaces() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn special_id_with_unicode() {
     let url = fresh_remote_db("id_unicode").await;
     let db = Database::http(&url);
@@ -260,7 +260,7 @@ async fn special_id_with_unicode() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn special_id_replicate_roundtrip() {
     let url = fresh_remote_db("id_repl").await;
     let local = Database::memory("local");

@@ -6,7 +6,7 @@ use common::fresh_remote_db;
 use rouchdb::{Database, RouchError};
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn error_get_nonexistent_doc() {
     let url = fresh_remote_db("err_noexist").await;
     let db = Database::http(&url);
@@ -16,7 +16,7 @@ async fn error_get_nonexistent_doc() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn error_update_wrong_rev() {
     let url = fresh_remote_db("err_wrongrev").await;
     let db = Database::http(&url);
@@ -33,7 +33,7 @@ async fn error_update_wrong_rev() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn error_delete_wrong_rev() {
     let url = fresh_remote_db("err_delrev").await;
     let db = Database::http(&url);
@@ -48,7 +48,7 @@ async fn error_delete_wrong_rev() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn error_put_existing_without_rev() {
     let url = fresh_remote_db("err_dup").await;
     let db = Database::http(&url);
@@ -63,7 +63,7 @@ async fn error_put_existing_without_rev() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn error_get_deleted_doc() {
     let url = fresh_remote_db("err_deleted").await;
     let db = Database::http(&url);

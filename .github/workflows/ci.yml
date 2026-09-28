@@ -45,6 +45,18 @@ jobs:
             exit 1
           fi
 
+      # The CouchDB scripts select tests by these two reasons (and by the
+      # blocked_on_ name of blocked tests), so no other kind of #[ignore].
+      - name: Every ignored test says why
+        run: |
+          bad=$(git grep -nE '#\[ignore' -- '*.rs' \
+            | grep -vE '#\[ignore = "(requires CouchDB|blocked on [^"]+)"\]' || true)
+          if [ -n "$bad" ]; then
+            echo '::error::Use #[ignore = "requires CouchDB"] or #[ignore = "blocked on Fxx"] (docs/book/src/contributing/testing.md):'
+            echo "$bad"
+            exit 1
+          fi
+
       # --all-targets also type-checks tests, examples and benches.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -97,7 +109,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build tests
-        run: cargo test --workspace --locked --no-run
+        run: cargo test --workspace --tests --locked --no-run
 
       - name: Wait for CouchDB
         run: curl -fsS --retry 30 --retry-delay 2 --retry-all-errors "$COUCHDB_URL/_up"
@@ -110,10 +122,28 @@ jobs:
         run: |
           curl -fsS -X PUT "$COUCHDB_URL/_node/_local/_config/chttpd_auth_lockout/mode" -d '"off"'
 
-      # The #[ignore]d tests are the ones that need a real CouchDB. The script
-      # skips tests marked #[ignore = "blocked on Fxx"] (known library bugs).
-      - name: Run ignored (CouchDB) tests
+      # Every #[ignore = "requires CouchDB"] test, in parallel. The script
+      # skips the tests blocked on a known bug (`blocked_on_` in the name) and
+      # fails if a test leaves one of its rouchdb_test_* databases behind.
+      - name: Run CouchDB tests
         run: bash scripts/test-couchdb.sh --locked
+
+      # xfail check, non-blocking: flags blocked tests that pass now, i.e.
+      # bugs that seem fixed while the test is still marked as blocked.
+      - name: Blocked tests still fail
+        continue-on-error: true
+        run: bash scripts/test-blocked.sh --locked
+
+      # Also catches databases created outside the common helpers.
+      - name: No databases left behind
+        if: success() || failure()
+        run: |
+          leftovers=$(curl -fsS "$COUCHDB_URL/_all_dbs" | jq -r '.[] | select(startswith("_") | not)')
+          if [ -n "$leftovers" ]; then
+            echo "::error::The CouchDB tests left these databases behind:"
+            echo "$leftovers"
+            exit 1
+          fi
 
   bench:
     name: Benchmarks (build only)

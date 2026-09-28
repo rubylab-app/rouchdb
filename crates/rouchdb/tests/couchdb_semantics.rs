@@ -42,7 +42,7 @@ async fn conflicts_of(db: &Database, id: &str) -> Vec<String> {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn pull_from_couchdb_brings_conflict_branches() {
     let url = fresh_remote_db("conflict_pull").await;
     let remote = Database::http(&url);
@@ -58,7 +58,7 @@ async fn pull_from_couchdb_brings_conflict_branches() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn push_to_couchdb_carries_conflict_branches() {
     let url = fresh_remote_db("conflict_push").await;
     let remote = Database::http(&url);
@@ -94,7 +94,7 @@ async fn couch_doc_with_attachment(url: &str) -> String {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_bulk_get_returns_attachment_bytes() {
     let url = fresh_remote_db("bulk_get_atts").await;
     let rev = couch_doc_with_attachment(&url).await;
@@ -119,7 +119,7 @@ async fn http_bulk_get_returns_attachment_bytes() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn pull_from_couchdb_carries_attachment_bytes() {
     let url = fresh_remote_db("pull_atts").await;
     couch_doc_with_attachment(&url).await;
@@ -140,7 +140,7 @@ async fn pull_from_couchdb_carries_attachment_bytes() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn push_skips_docs_denied_by_validate_doc_update() {
     let url = fresh_remote_db("vdu_denied").await;
     reqwest::Client::new()
@@ -189,7 +189,7 @@ async fn push_skips_docs_denied_by_validate_doc_update() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_id_is_server_uuid_plus_db_name() {
     let url = fresh_remote_db("repl_id").await;
     let db_name = url.rsplit('/').next().unwrap().to_string();
@@ -213,7 +213,7 @@ async fn http_id_is_server_uuid_plus_db_name() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_changes_report_conflicts() {
     let url = fresh_remote_db("changes_conflicts").await;
     let remote = Database::http(&url);
@@ -239,7 +239,7 @@ async fn http_changes_report_conflicts() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_all_docs_reports_update_seq() {
     let url = fresh_remote_db("all_docs_seq").await;
     let remote = Database::http(&url);
@@ -257,7 +257,7 @@ async fn http_all_docs_reports_update_seq() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_creates_missing_database_on_first_use() {
     let url = common::unique_remote_db("created_on_use");
     let remote = Database::http(&url);
@@ -270,7 +270,7 @@ async fn http_creates_missing_database_on_first_use() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_skip_setup_does_not_create_database() {
     let url = common::unique_remote_db("not_created");
     let remote = rouchdb::HttpAdapter::with_options(
@@ -292,7 +292,7 @@ async fn http_skip_setup_does_not_create_database() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_errors_keep_couchdb_meaning() {
     let url = fresh_remote_db("http_errors").await;
     let remote = Database::http(&url);
@@ -323,7 +323,7 @@ async fn http_errors_keep_couchdb_meaning() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_get_with_open_revs() {
     let url = fresh_remote_db("open_revs").await;
     let remote = Database::http(&url);
@@ -359,7 +359,7 @@ async fn http_get_with_open_revs() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn cookie_login_against_couchdb() {
     let url = fresh_remote_db("cookie_login").await;
     let couch = common::couchdb();
@@ -399,7 +399,7 @@ impl rouchdb::Plugin for CountWrites {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn after_write_sees_docs_replicated_to_couchdb() {
     let url = fresh_remote_db("plugin_push").await;
     let counter = std::sync::Arc::new(CountWrites::default());

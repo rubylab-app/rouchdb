@@ -17,7 +17,7 @@ use std::time::Duration;
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn close_http_db() {
     let url = fresh_remote_db("close").await;
     let db = Database::http(&url);
@@ -30,7 +30,7 @@ async fn close_http_db() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn explain_on_http_without_index() {
     let url = fresh_remote_db("explain").await;
     let db = Database::http(&url);
@@ -51,7 +51,7 @@ async fn explain_on_http_without_index() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn explain_on_http_with_index() {
     let url = fresh_remote_db("explain_idx").await;
     let db = Database::http(&url);
@@ -84,7 +84,7 @@ async fn explain_on_http_with_index() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn design_doc_crud_on_http() {
     let url = fresh_remote_db("ddoc").await;
     let db = Database::http(&url);
@@ -132,7 +132,7 @@ async fn design_doc_crud_on_http() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn security_document_on_http() {
     let url = fresh_remote_db("security").await;
     let db = Database::http(&url);
@@ -147,7 +147,7 @@ async fn security_document_on_http() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replication_since_override_http() {
     let url = fresh_remote_db("repl_since").await;
     let remote = Database::http(&url);
@@ -181,7 +181,7 @@ async fn replication_since_override_http() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replication_no_checkpoint_http() {
     let url = fresh_remote_db("repl_nockpt").await;
     let remote = Database::http(&url);
@@ -215,7 +215,7 @@ async fn replication_no_checkpoint_http() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn all_docs_conflicts_http() {
     let url = fresh_remote_db("alldocs_conflicts").await;
     let db = Database::http(&url);
@@ -240,7 +240,7 @@ async fn all_docs_conflicts_http() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn changes_selector_filter_http() {
     let url = fresh_remote_db("ch_sel_http").await;
     let db = Database::http(&url);
@@ -282,7 +282,7 @@ async fn changes_selector_filter_http() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn live_changes_events_http() {
     let url = fresh_remote_db("ch_events").await;
     let db = Database::http(&url);
@@ -325,7 +325,7 @@ async fn live_changes_events_http() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn mango_find_with_index_http() {
     let url = fresh_remote_db("mango_idx").await;
     let db = Database::http(&url);
@@ -375,7 +375,7 @@ async fn mango_find_with_index_http() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replication_events_http() {
     let url = fresh_remote_db("repl_events").await;
     let remote = Database::http(&url);

@@ -6,7 +6,7 @@ use common::fresh_remote_db;
 use rouchdb::Database;
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn database_info_http() {
     let url = fresh_remote_db("db_info").await;
     let db = Database::http(&url);
@@ -22,7 +22,7 @@ async fn database_info_http() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn database_compact_http() {
     let url = fresh_remote_db("db_compact").await;
     let db = Database::http(&url);
@@ -51,7 +51,7 @@ async fn database_compact_http() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn database_destroy_http() {
     let url = fresh_remote_db("db_destroy").await;
     let db = Database::http(&url);
@@ -65,7 +65,7 @@ async fn database_destroy_http() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn cross_adapter_fidelity_memory_couchdb_redb() {
     let url = fresh_remote_db("fidelity").await;
     let memory = Database::memory("mem");

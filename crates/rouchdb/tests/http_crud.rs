@@ -6,7 +6,7 @@ use common::fresh_remote_db;
 use rouchdb::{AllDocsOptions, ChangesOptions, Database};
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_put_and_get() {
     let url = fresh_remote_db("http_crud").await;
     let db = Database::http(&url);
@@ -22,7 +22,7 @@ async fn http_put_and_get() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_update_document() {
     let url = fresh_remote_db("http_update").await;
     let db = Database::http(&url);
@@ -41,7 +41,7 @@ async fn http_update_document() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_delete_document() {
     let url = fresh_remote_db("http_delete").await;
     let db = Database::http(&url);
@@ -57,7 +57,7 @@ async fn http_delete_document() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_all_docs() {
     let url = fresh_remote_db("http_alldocs").await;
     let db = Database::http(&url);
@@ -77,7 +77,7 @@ async fn http_all_docs() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_changes_feed() {
     let url = fresh_remote_db("http_changes").await;
     let db = Database::http(&url);

@@ -66,7 +66,7 @@ async fn local_find(db: &Database, selector: &Value) -> std::result::Result<Vec<
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn mango_selectors_match_couchdb() {
     let url = fresh_remote_db("parity_mango").await;
     let local = Database::memory("local");
@@ -208,7 +208,7 @@ fn rows_json(result: &rouchdb::ViewResult) -> Value {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn views_match_couchdb() {
     let url = fresh_remote_db("parity_views").await;
     let local = Database::memory("local");
@@ -491,7 +491,7 @@ async fn views_match_couchdb() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_database_runs_mango_on_couchdb() {
     // F48: find/create_index on Database::http must use CouchDB's _find and
     // _index instead of downloading every document.

@@ -10,7 +10,7 @@ use rouchdb::Database;
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn post_to_couchdb() {
     let url = fresh_remote_db("post").await;
     let db = Database::http(&url);
@@ -31,7 +31,7 @@ async fn post_to_couchdb() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn post_and_replicate_to_couchdb() {
     let url = fresh_remote_db("post_repl").await;
     let local = Database::memory("local");
@@ -59,7 +59,7 @@ async fn post_and_replicate_to_couchdb() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn remove_attachment_from_couchdb() {
     let url = fresh_remote_db("rm_att").await;
     let db = Database::http(&url);

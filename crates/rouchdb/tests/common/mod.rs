@@ -141,9 +141,17 @@ impl Drop for RemoteDb {
     }
 }
 
-/// A new, unique database name: `rouchdb_test_<label>_<uuid>`.
+/// A new, unique database name: `rouchdb_test_[<run>_]<label>_<uuid>`, where
+/// `<run>` is `ROUCHDB_TEST_RUN`, set by `scripts/test-couchdb.sh` to check
+/// for leftovers of its own run only.
 pub fn unique_db_name(label: &str) -> String {
-    format!("{TEST_DB_PREFIX}{label}_{}", uuid::Uuid::new_v4().simple())
+    let run = std::env::var("ROUCHDB_TEST_RUN")
+        .map(|run| format!("{run}_"))
+        .unwrap_or_default();
+    format!(
+        "{TEST_DB_PREFIX}{run}{label}_{}",
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 /// A guard for a unique database that is *not* created, for tests where the

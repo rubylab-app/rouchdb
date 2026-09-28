@@ -6,7 +6,7 @@ use common::fresh_remote_db;
 use rouchdb::{Database, GetOptions};
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn conflict_both_sides_modify_same_doc() {
     let url = fresh_remote_db("conflict_both").await;
     let local = Database::memory("local");
@@ -88,7 +88,7 @@ async fn conflict_both_sides_modify_same_doc() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn conflict_local_delete_remote_update() {
     let url = fresh_remote_db("conflict_delupd").await;
     let local = Database::memory("local");
@@ -124,7 +124,7 @@ async fn conflict_local_delete_remote_update() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn conflict_remote_delete_local_update() {
     let url = fresh_remote_db("conflict_updel").await;
     let local = Database::memory("local");
@@ -156,7 +156,7 @@ async fn conflict_remote_delete_local_update() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn conflict_three_way() {
     let url = fresh_remote_db("conflict_3way").await;
     let local1 = Database::memory("local1");
@@ -213,7 +213,7 @@ async fn conflict_three_way() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn conflict_resolve_by_update() {
     let url = fresh_remote_db("conflict_resolve").await;
     let local = Database::memory("local");

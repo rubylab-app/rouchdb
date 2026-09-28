@@ -6,7 +6,7 @@ use common::fresh_remote_db;
 use rouchdb::{ChangesOptions, ChangesStreamOptions, Database};
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn changes_since_sequence() {
     let url = fresh_remote_db("ch_since").await;
     let db = Database::http(&url);
@@ -31,7 +31,7 @@ async fn changes_since_sequence() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn changes_with_limit() {
     let url = fresh_remote_db("ch_limit").await;
     let db = Database::http(&url);
@@ -54,7 +54,7 @@ async fn changes_with_limit() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn changes_include_docs() {
     let url = fresh_remote_db("ch_docs").await;
     let db = Database::http(&url);
@@ -77,7 +77,7 @@ async fn changes_include_docs() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn changes_after_updates_and_deletes() {
     let url = fresh_remote_db("ch_upddel").await;
     let db = Database::http(&url);
@@ -110,7 +110,7 @@ async fn changes_after_updates_and_deletes() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn changes_with_selector_filter() {
     let url = fresh_remote_db("ch_sel").await;
     let db = Database::http(&url);
@@ -152,7 +152,7 @@ async fn changes_with_selector_filter() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn live_changes_picks_up_new_docs() {
     let url = fresh_remote_db("ch_live").await;
     let db = Database::http(&url);
