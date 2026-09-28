@@ -3,6 +3,7 @@ name = "rouchdb-query"
 description = "Mango query selectors and map/reduce views for RouchDB"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
