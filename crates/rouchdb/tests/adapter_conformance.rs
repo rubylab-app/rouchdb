@@ -1103,3 +1103,98 @@ async fn purge_conflict_loser(fx: Fx) {
 }
 
 conformance!(purge: purge_leaf_removes_doc, purge_conflict_loser);
+
+// === section: facade ===
+
+/// F07: reserved members in a `put` body are interpreted, not stored.
+async fn put_interprets_reserved_members(fx: Fx) {
+    let db = fx.db();
+    db.put("gone", serde_json::json!({"_deleted": true, "x": 1}))
+        .await
+        .unwrap();
+    assert!(matches!(db.get("gone").await, Err(RouchError::NotFound(_))));
+
+    let r1 = db.put("d", serde_json::json!({"v": 1})).await.unwrap();
+    let mut got = db
+        .get_with_opts(
+            "d",
+            GetOptions {
+                conflicts: true,
+                revs_info: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    got.data["_conflicts"] = serde_json::json!(["2-x"]);
+    let r2 = db
+        .update("d", r1.rev.as_ref().unwrap(), got.data.clone())
+        .await
+        .unwrap();
+    let stored = get_rev(db, "d", r2.rev.as_ref().unwrap()).await.unwrap();
+    assert_eq!(stored.data, serde_json::json!({"v": 1}));
+
+    assert!(matches!(
+        db.put("bad", serde_json::json!({"_foo": 1})).await,
+        Err(RouchError::BadRequest(_))
+    ));
+    assert!(matches!(db.get("bad").await, Err(RouchError::NotFound(_))));
+}
+
+/// F64: non-object bodies are rejected instead of being stored as `{}`.
+async fn put_rejects_non_object(fx: Fx) {
+    let db = fx.db();
+    assert!(matches!(
+        db.put("a", serde_json::json!([1, 2, 3])).await,
+        Err(RouchError::BadRequest(_))
+    ));
+    assert!(db.post(serde_json::json!("text")).await.is_err());
+    assert_eq!(db.info().await.unwrap().update_seq, Seq::Num(0));
+}
+
+/// F57: a failed single-document write is an error, not `Ok(ok:false)`.
+async fn single_doc_failures_are_errors(fx: Fx) {
+    let db = fx.db();
+    let r1 = db.put("d", serde_json::json!({"v": 1})).await.unwrap();
+    assert!(matches!(
+        db.put("d", serde_json::json!({"v": 1})).await,
+        Err(RouchError::Conflict)
+    ));
+    let r1 = r1.rev.unwrap();
+    db.update("d", &r1, serde_json::json!({"v": 2}))
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.update("d", &r1, serde_json::json!({"v": 3})).await,
+        Err(RouchError::Conflict)
+    ));
+    assert!(matches!(
+        db.remove("d", &r1).await,
+        Err(RouchError::Conflict)
+    ));
+    assert!(matches!(
+        db.update("missing", "1-abc", serde_json::json!({})).await,
+        Err(RouchError::NotFound(_))
+    ));
+}
+
+/// F57: `post` honours an `_id` in the body.
+async fn post_uses_body_id(fx: Fx) {
+    let db = fx.db();
+    let res = db
+        .post(serde_json::json!({"_id": "chosen", "v": 1}))
+        .await
+        .unwrap();
+    assert_eq!(res.id, "chosen");
+    assert_eq!(
+        db.get("chosen").await.unwrap().data,
+        serde_json::json!({"v": 1})
+    );
+}
+
+conformance!(facade:
+    put_interprets_reserved_members,
+    put_rejects_non_object,
+    single_doc_failures_are_errors,
+    post_uses_body_id,
+);
