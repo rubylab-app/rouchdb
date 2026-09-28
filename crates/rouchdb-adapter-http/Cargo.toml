@@ -24,7 +24,7 @@ native-tls = ["reqwest/native-tls"]
 rouchdb-core = { path = "../rouchdb-core", version = "0.4.0" }
 async-trait = "0.1.68"
 percent-encoding = "2.3"
-reqwest = { version = "0.12.16", default-features = false, features = [
+reqwest = { version = "0.12.17", default-features = false, features = [
     "charset",
     "cookies",
     "http2",
