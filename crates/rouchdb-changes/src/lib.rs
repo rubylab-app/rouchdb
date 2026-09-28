@@ -165,12 +165,14 @@ fn apply_selector(opts: &mut ChangesStreamOptions) -> bool {
     let Some(selector) = opts.selector.take() else {
         return false;
     };
+    // Compiled once for the whole stream; an invalid selector matches nothing.
+    let selector = rouchdb_query::CompiledSelector::new(&selector).ok();
     let existing = opts.filter.take();
     opts.filter = Some(Arc::new(move |e: &ChangeEvent| {
         existing.as_ref().is_none_or(|f| f(e))
             && e.doc
                 .as_ref()
-                .is_some_and(|d| rouchdb_query::matches_selector(d, &selector))
+                .is_some_and(|d| selector.as_ref().is_some_and(|s| s.matches(d)))
     }));
     let strip_docs = !opts.include_docs;
     opts.include_docs = true;
