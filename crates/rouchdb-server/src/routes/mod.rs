@@ -123,9 +123,9 @@ pub fn build_routes(state: AppState) -> Router {
                 .post(database::post_doc)
                 .delete(database::delete_db),
         )
-        // Attachments (before generic doc catch-all)
+        // Attachments (before generic doc catch-all); names may contain `/`
         .route(
-            "/{db}/{docid}/{attname}",
+            "/{db}/{docid}/{*attname}",
             get(attachment::get_attachment)
                 .put(attachment::put_attachment)
                 .delete(attachment::delete_attachment),
