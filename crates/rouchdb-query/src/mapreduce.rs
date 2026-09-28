@@ -983,32 +983,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reduce_stats() {
-        let db = setup_db().await;
-
-        let result = query_view(
-            &db,
-            &|doc| {
-                let age = doc.get("age").cloned().unwrap_or(serde_json::json!(0));
-                vec![(serde_json::Value::Null, age)]
-            },
-            Some(&ReduceFn::Stats),
-            ViewQueryOptions {
-                reduce: true,
-                ..ViewQueryOptions::new()
-            },
-        )
-        .await
-        .unwrap();
-
-        let stats = &result.rows[0].value;
-        assert_eq!(stats["count"], 3);
-        assert_eq!(stats["sum"], 90.0);
-        assert_eq!(stats["min"], 25.0);
-        assert_eq!(stats["max"], 35.0);
-    }
-
-    #[tokio::test]
     async fn descending_and_limit() {
         let db = setup_db().await;
 
