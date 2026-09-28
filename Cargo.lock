@@ -1710,6 +1710,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "mime_guess",
+ "reqwest",
  "rouchdb",
  "rouchdb-core",
  "rust-embed",

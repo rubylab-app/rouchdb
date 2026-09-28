@@ -1,5 +1,7 @@
 //! HTTP behaviors pinned to what CouchDB 3.5.1 answers for the same request
-//! (captured with curl against the reference server).
+//! (captured with curl against the reference server; see also the
+//! `couchdb_differential` test below, which replays them against a live
+//! CouchDB).
 mod common;
 
 use std::sync::Arc;
@@ -8,7 +10,8 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use common::*;
 use rouchdb::Database;
-use serde_json::json;
+use rouchdb_server::ServerConfig;
+use serde_json::{Value, json};
 
 async fn request(
     app: &axum::Router,
@@ -628,4 +631,218 @@ async fn changes_report_pending_and_omit_deleted_false() {
     }
     assert_eq!(results[2]["id"], "c");
     assert_eq!(results[2]["deleted"], true);
+}
+
+// ─── Differential check against a live CouchDB ─────────────────────────────
+
+/// A request replayed against CouchDB and RouchDB.
+struct Probe {
+    method: Method,
+    /// Path below the database, e.g. `"/doc"`; `""` is the database itself.
+    path: &'static str,
+    headers: Vec<(&'static str, &'static str)>,
+    body: Option<Value>,
+    /// Response headers whose presence must agree.
+    headers_present: &'static [&'static str],
+}
+
+fn probe(method: Method, path: &'static str, body: Option<Value>) -> Probe {
+    let headers = if body.is_some() {
+        vec![("content-type", "application/json")]
+    } else {
+        vec![]
+    };
+    Probe {
+        method,
+        path,
+        headers,
+        body,
+        headers_present: &[],
+    }
+}
+
+/// What must agree between the two servers.
+fn outcome(status: u16, body: &Value) -> Value {
+    let shape = match body {
+        Value::Object(o) if o.contains_key("error") => {
+            json!({"error": o["error"], "reason": o["reason"]})
+        }
+        Value::Object(o) if o.contains_key("docs") => {
+            json!({"docs": o["docs"].as_array().map(|d| d.iter().map(|d| d["_id"].clone()).collect::<Vec<_>>())})
+        }
+        Value::Object(o) if o.contains_key("pending") => {
+            json!({"n": o["results"].as_array().map(Vec::len), "pending": o["pending"]})
+        }
+        Value::Object(o) if o.contains_key("rev") => {
+            let rev = o["rev"].as_str().unwrap_or_default();
+            json!({"ok": o.get("ok"), "id": o["id"], "rev_pos": rev.split('-').next()})
+        }
+        Value::Array(items) => json!({"array_len": items.len()}),
+        other => json!({"ok": other.get("ok")}),
+    };
+    json!({"status": status, "body": shape})
+}
+
+#[tokio::test]
+#[ignore]
+async fn couchdb_differential() {
+    let couch_root = std::env::var("COUCHDB_URL")
+        .unwrap_or_else(|_| "http://admin:password@localhost:15984".to_string());
+    let name = format!("c2_fidelity_{}", uuid_like());
+    let couch = format!("{couch_root}/{name}");
+    let client = reqwest::Client::new();
+    assert!(
+        client
+            .put(&couch)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+
+    let config = ServerConfig {
+        db_name: name.clone(),
+        ..Default::default()
+    };
+    let addr = serve(app_with(Arc::new(Database::memory(&name)), &config)).await;
+    let ours = format!("http://{addr}/{name}");
+
+    let docs = json!({"docs": [
+        {"_id": "a1", "f": 1, "sc": [50, 60]},
+        {"_id": "a2", "f": "x", "sc": [50]},
+        {"_id": "a3", "f": null, "sc": 50},
+        {"_id": "a4", "f": [1, 2], "sc": [50.0]},
+        {"_id": "a5", "f": {"k": 1}, "sc": [50.0, 60]},
+        {"_id": "mi", "g": 1},
+    ]});
+    let find = |selector: Value| probe(Method::POST, "/_find", Some(json!({"selector": selector})));
+    let mut probes = vec![
+        probe(Method::POST, "/_bulk_docs", Some(docs)),
+        probe(Method::GET, "/_changes?limit=1", None),
+        probe(Method::GET, "/nope", None),
+        probe(Method::GET, "/a1?rev=garbage", None),
+        probe(Method::GET, "/a1/att?rev=garbage", None),
+        probe(Method::PUT, "/a1", Some(json!({}))),
+        probe(Method::PUT, "/_bad", Some(json!({}))),
+        probe(Method::DELETE, "/nope?rev=1-abc", None),
+        probe(Method::GET, "/_design/nope", None),
+        Probe {
+            headers: vec![("content-type", "text/plain")],
+            body: Some(json!("x")),
+            ..probe(Method::PUT, "/nope/a.txt?rev=1-abc", None)
+        },
+        probe(Method::DELETE, "/nope/a.txt?rev=1-abc", None),
+        probe(Method::DELETE, "/a1/none.txt?rev=1-abc", None),
+        probe(Method::GET, "/_all_docs?limit=abc", None),
+        probe(Method::GET, "/_all_docs?skip=-1", None),
+        probe(Method::GET, "/_all_docs?descending=abc", None),
+        probe(Method::POST, "/_compact", None),
+        probe(
+            Method::POST,
+            "/_bulk_docs",
+            Some(json!({"docs": [{"_id": "ok1"}, {"_id": "_bad"}]})),
+        ),
+        probe(
+            Method::POST,
+            "/_bulk_docs",
+            Some(json!({"docs": [{"_id": "x1", "_foo": 1}]})),
+        ),
+        probe(
+            Method::POST,
+            "/_bulk_docs",
+            Some(json!({"new_edits": false, "docs": [{"_id": "r1", "_rev": "3-abc"}]})),
+        ),
+        probe(
+            Method::POST,
+            "/_bulk_docs",
+            Some(json!({"new_edits": false, "docs": [{"_id": "r2"}]})),
+        ),
+        probe(Method::POST, "/_find", Some(json!({"sel": {}}))),
+        find(json!({"a": {"$foo": 1}})),
+        find(json!({"f": {"$not": 5}})),
+        find(json!({"$not": 5})),
+        find(json!({"$gt": 1})),
+        find(json!({"a..b": 1})),
+        find(json!({"$and": []})),
+        find(json!({"$nor": []})),
+        find(json!({"$or": []})),
+        find(json!({"f": {"$and": []}})),
+        find(json!({"$not": {"$or": []}})),
+        find(json!({"f": {"$exists": true}, "$or": []})),
+        find(json!({"$or": [{"$and": []}, {"f": 1}]})),
+        find(json!({"sc": {"$all": [50.0]}})),
+        find(json!({"sc": {"$all": [50]}})),
+        find(json!({"sc": {"$all": [[50.0]]}})),
+        find(json!({"s": {"$regex": "(?=a)"}})),
+        Probe {
+            headers_present: &["location", "etag"],
+            ..probe(Method::PUT, "/newdoc", Some(json!({})))
+        },
+        Probe {
+            headers: vec![("content-type", "text/plain")],
+            body: Some(json!("hello")),
+            headers_present: &["location"],
+            ..probe(Method::PUT, "/attdoc/att.txt", None)
+        },
+        Probe {
+            headers_present: &["etag", "accept-ranges", "content-security-policy"],
+            ..probe(Method::GET, "/attdoc/att.txt", None)
+        },
+        Probe {
+            headers_present: &["location"],
+            ..probe(Method::PUT, "/_local/l1", Some(json!({})))
+        },
+        probe(Method::DELETE, "", None),
+        probe(Method::GET, "", None),
+        probe(Method::GET, "/a1", None),
+        probe(Method::PUT, "/a1", Some(json!({}))),
+        probe(Method::DELETE, "", None),
+        probe(Method::PUT, "", None),
+        probe(Method::PUT, "", None),
+    ];
+
+    let mut mismatches = Vec::new();
+    for p in probes.drain(..) {
+        let mut results = Vec::new();
+        for base in [&couch, &ours] {
+            let mut req = client.request(p.method.clone(), format!("{base}{}", p.path));
+            for (k, v) in &p.headers {
+                req = req.header(*k, *v);
+            }
+            req = match &p.body {
+                Some(Value::String(s)) => req.body(s.clone()),
+                Some(v) => req.body(v.to_string()),
+                None => req,
+            };
+            let resp = req.send().await.unwrap();
+            let status = resp.status().as_u16();
+            let present: Vec<bool> = p
+                .headers_present
+                .iter()
+                .map(|h| resp.headers().contains_key(*h))
+                .collect();
+            let text = resp.text().await.unwrap();
+            let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            results.push((outcome(status, &body), present));
+        }
+        if results[0] != results[1] {
+            mismatches.push(format!(
+                "{} {}\n  couchdb: {:?}\n  rouchdb: {:?}",
+                p.method, p.path, results[0], results[1]
+            ));
+        }
+    }
+    let _ = client.delete(&couch).send().await;
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+fn uuid_like() -> String {
+    format!(
+        "{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
 }
