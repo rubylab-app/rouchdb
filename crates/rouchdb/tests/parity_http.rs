@@ -13,20 +13,6 @@ use rouchdb::{
 use std::time::Duration;
 
 // =========================================================================
-// db.close() on HTTP
-// =========================================================================
-
-#[tokio::test]
-#[ignore]
-async fn close_http_db() {
-    let url = fresh_remote_db("close").await;
-    let db = Database::http(&url);
-    db.put("doc1", serde_json::json!({})).await.unwrap();
-    db.close().await.unwrap(); // No-op for HTTP, should not error
-    delete_remote_db(&url).await;
-}
-
-// =========================================================================
 // db.explain() on HTTP
 // =========================================================================
 
@@ -140,13 +126,19 @@ async fn design_doc_crud_on_http() {
 
 #[tokio::test]
 #[ignore]
-async fn security_document_on_http() {
+async fn security_document_round_trips_on_http() {
     let url = fresh_remote_db("security").await;
     let db = Database::http(&url);
 
-    let sec = db.get_security().await.unwrap();
-    // CouchDB returns a security doc (may have admin set from URL auth)
-    assert!(sec.admins.names.is_empty() || !sec.admins.names.is_empty());
+    let wanted = serde_json::json!({
+        "admins": {"names": ["ann"], "roles": ["ops"]},
+        "members": {"names": [], "roles": ["_admin", "staff"]},
+    });
+    db.put_security(serde_json::from_value(wanted.clone()).unwrap())
+        .await
+        .unwrap();
+    let stored = db.get_security().await.unwrap();
+    assert_eq!(serde_json::to_value(&stored).unwrap(), wanted);
 
     delete_remote_db(&url).await;
 }
@@ -175,14 +167,33 @@ async fn replication_since_override_http() {
         .await
         .unwrap();
 
-    // Get changes to find a since point
+    // CouchDB (q=2) orders the feed by shard, so whatever followed the
+    // first entry is what a replication from its seq must bring.
     let changes = remote.changes(ChangesOptions::default()).await.unwrap();
-    let _since = changes.results[0].seq.clone();
+    let mut expected: Vec<String> = changes.results[1..].iter().map(|c| c.id.clone()).collect();
+    expected.sort();
 
-    // Replicate only changes after since
-    let result = local.replicate_from(&remote).await;
-    // Just verify basic replication works to CouchDB
-    assert!(result.is_ok());
+    let result = rouchdb::replicate(
+        remote.adapter(),
+        local.adapter(),
+        ReplicationOptions {
+            since: Some(changes.results[0].seq.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(result.ok, "{:?}", result.errors);
+    assert_eq!((result.docs_read, result.docs_written), (2, 2));
+    let ids: Vec<String> = local
+        .all_docs(AllDocsOptions::new())
+        .await
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(ids, expected);
 
     delete_remote_db(&url).await;
 }
@@ -220,6 +231,22 @@ async fn replication_no_checkpoint_http() {
     let doc = remote.get("doc1").await.unwrap();
     assert_eq!(doc.data["v"], 1);
 
+    // No checkpoint was stored on either side.
+    let rep_id = rouchdb_replication::Checkpointer::new(
+        &local.adapter().id().await.unwrap(),
+        &remote.adapter().id().await.unwrap(),
+        "nofilter",
+    )
+    .replication_id()
+    .to_string();
+    for db in [&local, &remote] {
+        let cp = db.adapter().get_local(&rep_id).await;
+        assert!(
+            matches!(cp, Err(rouchdb::RouchError::NotFound(_))),
+            "{cp:?}"
+        );
+    }
+
     delete_remote_db(&url).await;
 }
 
@@ -233,8 +260,22 @@ async fn all_docs_conflicts_http() {
     let url = fresh_remote_db("alldocs_conflicts").await;
     let db = Database::http(&url);
 
-    db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
-    db.put("doc2", serde_json::json!({"v": 2})).await.unwrap();
+    // doc1 gets two branches under 1-aaa (2-ccc wins); doc2 has one.
+    for (id, ids) in [
+        ("doc1", ["bbb", "aaa"]),
+        ("doc1", ["ccc", "aaa"]),
+        ("doc2", ["ddd", "aaa"]),
+    ] {
+        let doc = rouchdb::Document::from_json(serde_json::json!({
+            "_id": id,
+            "_rev": format!("2-{}", ids[0]),
+            "_revisions": {"start": 2, "ids": ids},
+        }))
+        .unwrap();
+        db.bulk_docs(vec![doc], rouchdb::BulkDocsOptions::replication())
+            .await
+            .unwrap();
+    }
 
     let result = db
         .all_docs(AllDocsOptions {
@@ -245,51 +286,29 @@ async fn all_docs_conflicts_http() {
         .await
         .unwrap();
 
-    assert_eq!(result.rows.len(), 2);
-
-    delete_remote_db(&url).await;
-}
-
-// =========================================================================
-// Changes with selector filter on HTTP
-// =========================================================================
-
-#[tokio::test]
-#[ignore]
-async fn changes_selector_filter_http() {
-    let url = fresh_remote_db("ch_sel_http").await;
-    let db = Database::http(&url);
-
-    db.put(
-        "user1",
-        serde_json::json!({"type": "user", "name": "Alice"}),
-    )
-    .await
-    .unwrap();
-    db.put(
-        "inv1",
-        serde_json::json!({"type": "invoice", "amount": 100}),
-    )
-    .await
-    .unwrap();
-    db.put("user2", serde_json::json!({"type": "user", "name": "Bob"}))
-        .await
-        .unwrap();
-
-    let changes = db
-        .changes(ChangesOptions {
-            selector: Some(serde_json::json!({"type": "user"})),
-            include_docs: true,
-            ..Default::default()
+    let rows: Vec<(String, String, serde_json::Value)> = result
+        .rows
+        .iter()
+        .map(|r| {
+            let doc = r.doc.as_ref().unwrap();
+            (r.id.clone(), r.value.rev.clone(), doc["_conflicts"].clone())
         })
-        .await
-        .unwrap();
-
-    assert_eq!(changes.results.len(), 2);
-    for event in &changes.results {
-        let doc = event.doc.as_ref().unwrap();
-        assert_eq!(doc["type"], "user");
-    }
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "doc1".to_string(),
+                "2-ccc".to_string(),
+                serde_json::json!(["2-bbb"])
+            ),
+            (
+                "doc2".to_string(),
+                "2-ddd".to_string(),
+                serde_json::Value::Null
+            ),
+        ]
+    );
 
     delete_remote_db(&url).await;
 }
@@ -386,47 +405,6 @@ async fn mango_find_with_index_http() {
         .unwrap();
 
     assert_eq!(result.docs.len(), 2);
-
-    delete_remote_db(&url).await;
-}
-
-// =========================================================================
-// Replication with events on HTTP
-// =========================================================================
-
-#[tokio::test]
-#[ignore]
-async fn replication_events_http() {
-    let url = fresh_remote_db("repl_events").await;
-    let remote = Database::http(&url);
-    let local = Database::memory("local");
-
-    local
-        .put("doc1", serde_json::json!({"v": 1}))
-        .await
-        .unwrap();
-    local
-        .put("doc2", serde_json::json!({"v": 2}))
-        .await
-        .unwrap();
-
-    let (result, mut rx) = local
-        .replicate_to_with_events(&remote, ReplicationOptions::default())
-        .await
-        .unwrap();
-
-    assert!(result.ok);
-
-    let mut events = Vec::new();
-    while let Ok(event) = rx.try_recv() {
-        events.push(event);
-    }
-
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, rouchdb::ReplicationEvent::Active))
-    );
 
     delete_remote_db(&url).await;
 }

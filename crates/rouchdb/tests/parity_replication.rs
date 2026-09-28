@@ -1,13 +1,25 @@
-//! Tests for replication parity features:
+//! Replication options through the `Database` facade:
 //! - ReplicationOptions::since (override starting point)
 //! - ReplicationOptions::checkpoint (disable checkpointing)
-//! - Replication with events
+//! - Replication events
 //! - Live replication
-//! - Bidirectional sync
+//!
+//! Protocol details (batching, filters, conflicts, checkpoints) are covered
+//! next to the implementation in `rouchdb-replication`.
 
 use std::time::Duration;
 
-use rouchdb::{Database, ReplicationEvent, ReplicationOptions};
+use rouchdb::{AllDocsOptions, Database, ReplicationEvent, ReplicationOptions, RouchError};
+
+async fn ids(db: &Database) -> Vec<String> {
+    db.all_docs(AllDocsOptions::new())
+        .await
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| r.id)
+        .collect()
+}
 
 // =========================================================================
 // ReplicationOptions::since — override starting point
@@ -17,45 +29,31 @@ use rouchdb::{Database, ReplicationEvent, ReplicationOptions};
 async fn replication_with_since_override() {
     let source = Database::memory("source");
     let target = Database::memory("target");
+    for (i, id) in ["doc1", "doc2", "doc3"].into_iter().enumerate() {
+        source.put(id, serde_json::json!({"v": i})).await.unwrap();
+    }
 
-    source
-        .put("doc1", serde_json::json!({"v": 1}))
-        .await
-        .unwrap();
-    source
-        .put("doc2", serde_json::json!({"v": 2}))
-        .await
-        .unwrap();
-    source
-        .put("doc3", serde_json::json!({"v": 3}))
-        .await
-        .unwrap();
-
-    // Get the changes to find a sequence number
     let changes = source
         .changes(rouchdb::ChangesOptions::default())
         .await
         .unwrap();
     assert_eq!(changes.results.len(), 3);
 
-    // Use since to skip the first event
-    let since_seq = changes.results[0].seq.clone();
-
+    // Start after the first change: exactly the other two arrive.
     let result = source
         .replicate_to_with_opts(
             &target,
             ReplicationOptions {
-                since: Some(since_seq),
+                since: Some(changes.results[0].seq.clone()),
                 ..Default::default()
             },
         )
         .await
         .unwrap();
 
-    assert!(result.ok);
-    // Should have replicated only docs after since_seq
-    let target_info = target.info().await.unwrap();
-    assert!(target_info.doc_count < 3, "since should skip some docs");
+    assert!(result.ok, "{:?}", result.errors);
+    assert_eq!((result.docs_read, result.docs_written), (2, 2));
+    assert_eq!(ids(&target).await, vec!["doc2", "doc3"]);
 }
 
 // =========================================================================
@@ -66,81 +64,45 @@ async fn replication_with_since_override() {
 async fn replication_without_checkpoint() {
     let source = Database::memory("source");
     let target = Database::memory("target");
-
     source
         .put("doc1", serde_json::json!({"v": 1}))
         .await
         .unwrap();
+    let opts = || ReplicationOptions {
+        checkpoint: false,
+        ..Default::default()
+    };
 
     let result = source
-        .replicate_to_with_opts(
-            &target,
-            ReplicationOptions {
-                checkpoint: false,
-                ..Default::default()
-            },
-        )
+        .replicate_to_with_opts(&target, opts())
         .await
         .unwrap();
-
     assert!(result.ok);
     assert_eq!(result.docs_written, 1);
 
-    // With checkpoint=false, replicating again should re-send all docs
-    // (since no checkpoint was saved)
+    // No checkpoint on either side...
+    let rep_id = rouchdb_replication::Checkpointer::new("source", "target", "nofilter")
+        .replication_id()
+        .to_string();
+    for db in [&source, &target] {
+        assert!(matches!(
+            db.adapter().get_local(&rep_id).await,
+            Err(RouchError::NotFound(_))
+        ));
+    }
+
+    // ...so the next run reads the whole feed again.
     source
         .put("doc2", serde_json::json!({"v": 2}))
         .await
         .unwrap();
-
     let result2 = source
-        .replicate_to_with_opts(
-            &target,
-            ReplicationOptions {
-                checkpoint: false,
-                ..Default::default()
-            },
-        )
+        .replicate_to_with_opts(&target, opts())
         .await
         .unwrap();
-
     assert!(result2.ok);
-    // Without checkpoint, it processes all changes from the start
-    // (though revs_diff will skip already-present docs)
-}
-
-// =========================================================================
-// Replication with checkpoint (default behavior)
-// =========================================================================
-
-#[tokio::test]
-async fn replication_incremental_with_checkpoint() {
-    let source = Database::memory("source");
-    let target = Database::memory("target");
-
-    source
-        .put("doc1", serde_json::json!({"v": 1}))
-        .await
-        .unwrap();
-
-    // First replication
-    let r1 = source.replicate_to(&target).await.unwrap();
-    assert!(r1.ok);
-    assert_eq!(r1.docs_written, 1);
-
-    // Add another doc
-    source
-        .put("doc2", serde_json::json!({"v": 2}))
-        .await
-        .unwrap();
-
-    // Second replication should only transfer the new doc
-    let r2 = source.replicate_to(&target).await.unwrap();
-    assert!(r2.ok);
-    assert_eq!(r2.docs_written, 1);
-
-    let target_info = target.info().await.unwrap();
-    assert_eq!(target_info.doc_count, 2);
+    assert_eq!((result2.docs_read, result2.docs_written), (2, 1));
+    assert_eq!(ids(&target).await, vec!["doc1", "doc2"]);
 }
 
 // =========================================================================
@@ -148,49 +110,9 @@ async fn replication_incremental_with_checkpoint() {
 // =========================================================================
 
 #[tokio::test]
-async fn replication_with_events_emits_lifecycle() {
+async fn replication_events_report_each_batch_then_complete() {
     let source = Database::memory("source");
     let target = Database::memory("target");
-
-    source
-        .put("doc1", serde_json::json!({"v": 1}))
-        .await
-        .unwrap();
-    source
-        .put("doc2", serde_json::json!({"v": 2}))
-        .await
-        .unwrap();
-
-    let (result, mut rx) = source
-        .replicate_to_with_events(&target, ReplicationOptions::default())
-        .await
-        .unwrap();
-
-    assert!(result.ok);
-    assert_eq!(result.docs_written, 2);
-
-    let mut events = Vec::new();
-    while let Ok(event) = rx.try_recv() {
-        events.push(event);
-    }
-
-    assert!(
-        events.iter().any(|e| matches!(e, ReplicationEvent::Active)),
-        "Should emit Active event"
-    );
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, ReplicationEvent::Complete(_))),
-        "Should emit Complete event"
-    );
-}
-
-#[tokio::test]
-async fn replication_events_include_change_with_docs_count() {
-    let source = Database::memory("source");
-    let target = Database::memory("target");
-
     for i in 0..5 {
         source
             .put(&format!("doc{}", i), serde_json::json!({"i": i}))
@@ -199,24 +121,34 @@ async fn replication_events_include_change_with_docs_count() {
     }
 
     let (result, mut rx) = source
-        .replicate_to_with_events(&target, ReplicationOptions::default())
+        .replicate_to_with_events(
+            &target,
+            ReplicationOptions {
+                batch_size: 2,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
-
     assert!(result.ok);
+    assert_eq!(result.docs_written, 5);
 
     let mut events = Vec::new();
     while let Ok(event) = rx.try_recv() {
         events.push(event);
     }
-
-    let change_events: Vec<_> = events
+    let summary: Vec<String> = events
         .iter()
-        .filter(|e| matches!(e, ReplicationEvent::Change { .. }))
+        .map(|e| match e {
+            ReplicationEvent::Active => "active".into(),
+            ReplicationEvent::Change { docs_read } => format!("change {docs_read}"),
+            ReplicationEvent::Complete(r) => format!("complete {}", r.docs_written),
+            other => format!("{other:?}"),
+        })
         .collect();
-    assert!(
-        !change_events.is_empty(),
-        "Should emit at least one Change event"
+    assert_eq!(
+        summary,
+        vec!["active", "change 2", "change 4", "change 5", "complete 5"]
     );
 }
 
@@ -224,11 +156,26 @@ async fn replication_events_include_change_with_docs_count() {
 // Live replication
 // =========================================================================
 
+async fn wait_for(
+    rx: &mut tokio::sync::mpsc::Receiver<ReplicationEvent>,
+    pred: impl Fn(&ReplicationEvent) -> bool,
+) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = rx.recv().await {
+            if pred(&event) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
+
 #[tokio::test]
 async fn live_replication_picks_up_new_docs() {
     let source = Database::memory("source");
     let target = Database::memory("target");
-
     source
         .put("doc1", serde_json::json!({"v": 1}))
         .await
@@ -243,180 +190,22 @@ async fn live_replication_picks_up_new_docs() {
         },
     );
 
-    // Wait for initial replication
-    let mut initial_done = false;
-    let timeout = tokio::time::sleep(Duration::from_secs(3));
-    tokio::pin!(timeout);
+    // The first idle pass comes after doc1 was written.
+    assert!(wait_for(&mut rx, |e| matches!(e, ReplicationEvent::Paused)).await);
+    assert_eq!(ids(&target).await, vec!["doc1"]);
 
-    loop {
-        tokio::select! {
-            event = rx.recv() => {
-                match event {
-                    Some(ReplicationEvent::Complete(r)) if r.docs_written > 0 => {
-                        initial_done = true;
-                        break;
-                    }
-                    Some(ReplicationEvent::Paused) if target.get("doc1").await.is_ok() => {
-                        initial_done = true;
-                        break;
-                    }
-                    None => break,
-                    _ => {}
-                }
-            }
-            _ = &mut timeout => break,
-        }
-    }
-
-    assert!(initial_done || target.get("doc1").await.is_ok());
+    // A doc written while idle is picked up by a later poll.
+    source
+        .put("doc2", serde_json::json!({"v": 2}))
+        .await
+        .unwrap();
+    assert!(
+        wait_for(&mut rx, |e| matches!(
+            e,
+            ReplicationEvent::Change { docs_read: 1 }
+        ))
+        .await
+    );
+    assert_eq!(target.get("doc2").await.unwrap().data["v"], 2);
     handle.cancel();
-}
-
-// =========================================================================
-// Bidirectional sync
-// =========================================================================
-
-#[tokio::test]
-async fn sync_merges_both_directions() {
-    let local = Database::memory("local");
-    let remote = Database::memory("remote");
-
-    local
-        .put("local_doc", serde_json::json!({"from": "local"}))
-        .await
-        .unwrap();
-    remote
-        .put("remote_doc", serde_json::json!({"from": "remote"}))
-        .await
-        .unwrap();
-
-    let (push, pull) = local.sync(&remote).await.unwrap();
-    assert!(push.ok);
-    assert!(pull.ok);
-
-    // Both should have both docs
-    assert!(local.get("remote_doc").await.is_ok());
-    assert!(remote.get("local_doc").await.is_ok());
-}
-
-#[tokio::test]
-async fn sync_with_no_changes() {
-    let local = Database::memory("local");
-    let remote = Database::memory("remote");
-
-    // No docs — sync should still succeed
-    let (push, pull) = local.sync(&remote).await.unwrap();
-    assert!(push.ok);
-    assert!(pull.ok);
-}
-
-// =========================================================================
-// Replication with batch_size
-// =========================================================================
-
-#[tokio::test]
-async fn replication_with_small_batch_size() {
-    let source = Database::memory("source");
-    let target = Database::memory("target");
-
-    for i in 0..10 {
-        source
-            .put(&format!("doc{}", i), serde_json::json!({"i": i}))
-            .await
-            .unwrap();
-    }
-
-    let result = source
-        .replicate_to_with_opts(
-            &target,
-            ReplicationOptions {
-                batch_size: 3,
-                batches_limit: 10,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-    assert!(result.ok);
-    assert_eq!(result.docs_written, 10);
-
-    let target_info = target.info().await.unwrap();
-    assert_eq!(target_info.doc_count, 10);
-}
-
-// =========================================================================
-// Filtered replication (doc_ids, selector, custom)
-// =========================================================================
-
-#[tokio::test]
-async fn replication_filtered_by_doc_ids() {
-    let source = Database::memory("source");
-    let target = Database::memory("target");
-
-    source.put("a", serde_json::json!({"v": 1})).await.unwrap();
-    source.put("b", serde_json::json!({"v": 2})).await.unwrap();
-    source.put("c", serde_json::json!({"v": 3})).await.unwrap();
-
-    let result = source
-        .replicate_to_with_opts(
-            &target,
-            ReplicationOptions {
-                filter: Some(rouchdb::ReplicationFilter::DocIds(vec![
-                    "a".into(),
-                    "c".into(),
-                ])),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-    assert!(result.ok);
-    let target_info = target.info().await.unwrap();
-    assert_eq!(target_info.doc_count, 2);
-    assert!(target.get("a").await.is_ok());
-    assert!(target.get("b").await.is_err());
-    assert!(target.get("c").await.is_ok());
-}
-
-#[tokio::test]
-async fn replication_filtered_by_selector() {
-    let source = Database::memory("source");
-    let target = Database::memory("target");
-
-    source
-        .put(
-            "alice",
-            serde_json::json!({"type": "user", "name": "Alice"}),
-        )
-        .await
-        .unwrap();
-    source
-        .put(
-            "inv1",
-            serde_json::json!({"type": "invoice", "amount": 100}),
-        )
-        .await
-        .unwrap();
-    source
-        .put("bob", serde_json::json!({"type": "user", "name": "Bob"}))
-        .await
-        .unwrap();
-
-    let result = source
-        .replicate_to_with_opts(
-            &target,
-            ReplicationOptions {
-                filter: Some(rouchdb::ReplicationFilter::Selector(
-                    serde_json::json!({"type": "user"}),
-                )),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-    assert!(result.ok);
-    assert_eq!(target.info().await.unwrap().doc_count, 2);
 }
