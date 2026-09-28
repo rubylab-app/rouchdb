@@ -128,6 +128,22 @@ fn selector_view(doc: &Document) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
+/// Whether `rev` is still a leaf of document `id` on `adapter`.
+async fn is_leaf(adapter: &dyn Adapter, id: &str, rev: &str) -> Result<bool> {
+    let changes = adapter
+        .changes(ChangesOptions {
+            doc_ids: Some(vec![id.to_string()]),
+            style: ChangesStyle::AllDocs,
+            ..Default::default()
+        })
+        .await?;
+    Ok(changes
+        .results
+        .iter()
+        .filter(|c| c.id == id)
+        .any(|c| c.changes.iter().any(|r| r.rev == rev)))
+}
+
 /// Run a one-shot replication from source to target.
 ///
 /// Implements the CouchDB replication protocol:
@@ -321,6 +337,18 @@ async fn run_replication(
                             batch_failed = true;
                         }
                     }
+                } else if let Some(ref err) = doc.error {
+                    // A rev that vanished after the feed listed it (edited
+                    // then compacted, or purged) is not needed: its successor
+                    // has a later seq. Any other failure must be retried.
+                    if err.error == "not_found" && !is_leaf(source, &result.id, &err.rev).await? {
+                        continue;
+                    }
+                    errors.push(format!(
+                        "fetch error for {} {}: {}: {}",
+                        result.id, err.rev, err.error, err.reason
+                    ));
+                    batch_failed = true;
                 }
             }
         }
@@ -1193,5 +1221,193 @@ mod tests {
         assert!(result.ok);
         assert_eq!(result.docs_written, 3);
         assert_eq!(target.info().await.unwrap().doc_count, 3);
+    }
+
+    /// Faults a [`Faulty`] adapter injects around a memory adapter.
+    #[derive(Default)]
+    struct Faults {
+        /// `bulk_get` answers this doc id with an error item of this kind.
+        bulk_get_error: Option<(String, String)>,
+        /// Before answering `bulk_get`, edit this doc and compact, so the
+        /// requested rev no longer exists (one-shot).
+        supersede_on_bulk_get: Option<String>,
+    }
+
+    struct Faulty {
+        inner: MemoryAdapter,
+        faults: std::sync::Mutex<Faults>,
+    }
+
+    impl Faulty {
+        fn new(inner: MemoryAdapter, faults: Faults) -> Self {
+            Self {
+                inner,
+                faults: std::sync::Mutex::new(faults),
+            }
+        }
+
+        fn heal(&self) {
+            *self.faults.lock().unwrap() = Faults::default();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Adapter for Faulty {
+        async fn info(&self) -> Result<DbInfo> {
+            self.inner.info().await
+        }
+        async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
+            self.inner.get(id, opts).await
+        }
+        async fn bulk_docs(
+            &self,
+            docs: Vec<Document>,
+            opts: BulkDocsOptions,
+        ) -> Result<Vec<DocResult>> {
+            self.inner.bulk_docs(docs, opts).await
+        }
+        async fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
+            self.inner.all_docs(opts).await
+        }
+        async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
+            self.inner.changes(opts).await
+        }
+        async fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
+            self.inner.revs_diff(revs).await
+        }
+        async fn bulk_get(&self, docs: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
+            let supersede = self.faults.lock().unwrap().supersede_on_bulk_get.take();
+            if let Some(id) = supersede {
+                let current = self.inner.get(&id, GetOptions::default()).await?;
+                let mut next = current.clone();
+                next.data = serde_json::json!({"v": "next"});
+                self.inner
+                    .bulk_docs(vec![next], BulkDocsOptions::new())
+                    .await?;
+                self.inner.compact().await?;
+            }
+            let mut resp = self.inner.bulk_get(docs).await?;
+            if let Some((id, error)) = self.faults.lock().unwrap().bulk_get_error.clone() {
+                for result in resp.results.iter_mut().filter(|r| r.id == id) {
+                    for doc in &mut result.docs {
+                        let rev = doc.ok.as_ref().unwrap()["_rev"].as_str().unwrap().into();
+                        doc.ok = None;
+                        doc.error = Some(BulkGetError {
+                            id: id.clone(),
+                            rev,
+                            error: error.clone(),
+                            reason: "injected".into(),
+                        });
+                    }
+                }
+            }
+            Ok(resp)
+        }
+        async fn put_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            rev: &str,
+            data: Vec<u8>,
+            content_type: &str,
+        ) -> Result<DocResult> {
+            self.inner
+                .put_attachment(doc_id, att_id, rev, data, content_type)
+                .await
+        }
+        async fn get_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            opts: GetAttachmentOptions,
+        ) -> Result<Vec<u8>> {
+            self.inner.get_attachment(doc_id, att_id, opts).await
+        }
+        async fn remove_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            rev: &str,
+        ) -> Result<DocResult> {
+            self.inner.remove_attachment(doc_id, att_id, rev).await
+        }
+        async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
+            self.inner.get_local(id).await
+        }
+        async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
+            self.inner.put_local(id, doc).await
+        }
+        async fn remove_local(&self, id: &str) -> Result<()> {
+            self.inner.remove_local(id).await
+        }
+        async fn compact(&self) -> Result<()> {
+            self.inner.compact().await
+        }
+        async fn destroy(&self) -> Result<()> {
+            self.inner.destroy().await
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_get_errors_fail_the_batch() {
+        let inner = MemoryAdapter::new("source");
+        put_doc(&inner, "a", serde_json::json!({"v": 1})).await;
+        put_doc(&inner, "b", serde_json::json!({"v": 2})).await;
+        let source = Faulty::new(
+            inner,
+            Faults {
+                bulk_get_error: Some(("b".into(), "unknown_error".into())),
+                ..Default::default()
+            },
+        );
+        let target = MemoryAdapter::new("target");
+
+        let r1 = replicate(&source, &target, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert!(!r1.ok);
+        assert!(r1.errors.iter().any(|e| e.contains("b")), "{:?}", r1.errors);
+
+        // The checkpoint did not skip `b`: once the source recovers, the next
+        // run delivers it.
+        source.heal();
+        let r2 = replicate(&source, &target, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert!(r2.ok, "{:?}", r2.errors);
+        assert_eq!(
+            target.get("b", GetOptions::default()).await.unwrap().data["v"],
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_get_not_found_for_superseded_rev_is_skipped() {
+        let inner = MemoryAdapter::new("source");
+        put_doc(&inner, "d", serde_json::json!({"v": 1})).await;
+        let source = Faulty::new(
+            inner,
+            Faults {
+                supersede_on_bulk_get: Some("d".into()),
+                ..Default::default()
+            },
+        );
+        let target = MemoryAdapter::new("target");
+
+        // The listed rev was edited and compacted away before it could be
+        // fetched: nothing is lost, its successor comes later in the feed.
+        let r1 = replicate(&source, &target, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert!(r1.ok, "{:?}", r1.errors);
+
+        let r2 = replicate(&source, &target, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert!(r2.ok, "{:?}", r2.errors);
+        assert_eq!(
+            target.get("d", GetOptions::default()).await.unwrap().data["v"],
+            "next"
+        );
     }
 }
