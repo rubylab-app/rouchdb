@@ -658,7 +658,7 @@ async fn get_unknown_rev_not_found(fx: Fx) {
     ));
     assert!(matches!(
         get_rev(db, "d", "not-a-rev").await,
-        Err(RouchError::NotFound(_)) | Err(RouchError::InvalidRev(_))
+        Err(RouchError::InvalidRev(_))
     ));
 }
 
