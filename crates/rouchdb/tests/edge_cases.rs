@@ -643,9 +643,9 @@ async fn put_design_keeps_fields_of_the_revision_it_replaces() {
             .rev
             .unwrap();
         let h1 = r1.split_once('-').unwrap().1.to_string();
-        // Two sibling revisions: 2-aaa… loses to 2-zzz….
+        // Two sibling revisions: 2-aaa… loses to 2-fff….
         let mut revs = Vec::new();
-        for (c, custom) in [('a', "loser"), ('z', "winner")] {
+        for (c, custom) in [('a', "loser"), ('f', "winner")] {
             let hash: String = std::iter::repeat_n(c, 32).collect();
             let doc = Document::from_json(serde_json::json!({
                 "_id": "_design/app",

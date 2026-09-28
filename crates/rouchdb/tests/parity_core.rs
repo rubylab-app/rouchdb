@@ -165,7 +165,7 @@ async fn close_redb_db_keeps_the_data_for_the_next_open() {
 // db.allDocs() with conflicts / update_seq
 // =========================================================================
 
-/// `doc1` with two live leaves (the replicated `2-zzz…` wins over the
+/// `doc1` with two live leaves (the replicated `2-fff…` wins over the
 /// local `2-…`), and a plain `doc2`. Returns (winner, loser).
 async fn conflicted(db: &Database) -> (String, String) {
     let r1 = db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
@@ -176,7 +176,7 @@ async fn conflicted(db: &Database) -> (String, String) {
         .unwrap()
         .rev
         .unwrap();
-    let hash = "z".repeat(32);
+    let hash = "f".repeat(32);
     let winner = format!("2-{hash}");
     let results = db
         .bulk_docs(
