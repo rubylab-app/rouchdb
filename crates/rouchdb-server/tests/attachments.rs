@@ -77,9 +77,16 @@ async fn get_attachment_honors_rev() {
 
     let resp = get(&app, "/db/doc/f.txt?rev=9-nope").await;
     assert_eq!(resp.status, StatusCode::NOT_FOUND);
-    assert_eq!(resp.json()["error"], "not_found");
+    assert_eq!(
+        resp.json(),
+        json!({"error": "not_found", "reason": "missing"})
+    );
     let resp = get(&app, "/db/doc/nope.txt").await;
     assert_eq!(resp.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        resp.json(),
+        json!({"error": "not_found", "reason": "Document is missing attachment"})
+    );
 }
 
 #[tokio::test]
@@ -116,22 +123,43 @@ async fn attachment_revision_from_if_match() {
         )
         .await,
     );
+    assert!(r2.starts_with("2-"), "{r2}");
+    assert_eq!(&get(&app, "/db/doc/i.txt").await.body[..], b"x");
+    let r3 = rev_of(
+        &put_att(
+            &app,
+            "/db/doc/j.txt",
+            "text/plain",
+            "y",
+            &[("if-match", &format!("\"{r2}\""))],
+        )
+        .await,
+    );
 
     let resp = send(
         &app,
         Request::builder()
             .method(Method::DELETE)
             .uri("/db/doc/i.txt")
-            .header("if-match", format!("\"{r2}\""))
+            .header("if-match", format!("\"{r3}\""))
             .body(Body::empty())
             .unwrap(),
     )
     .await;
     assert_eq!(resp.status, StatusCode::OK);
+    let r4 = resp.json()["rev"].as_str().unwrap().to_string();
+    assert!(r4.starts_with("4-"), "{r4}");
+    assert_eq!(resp.json(), json!({"ok": true, "id": "doc", "rev": r4}));
     assert_eq!(
-        delete(&app, "/db/doc/i.txt").await.status,
-        StatusCode::CONFLICT
+        get(&app, "/db/doc/i.txt").await.status,
+        StatusCode::NOT_FOUND
     );
+
+    // Deleting an existing attachment without any revision is a conflict.
+    let resp = delete(&app, "/db/doc/j.txt").await;
+    assert_eq!(resp.status, StatusCode::CONFLICT);
+    assert_eq!(resp.json()["error"], "conflict");
+    assert_eq!(&get(&app, "/db/doc/j.txt").await.body[..], b"y");
 }
 
 #[tokio::test]

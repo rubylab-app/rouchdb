@@ -28,10 +28,16 @@ fn ids(resp: &Resp) -> Vec<String> {
 
 #[tokio::test]
 async fn key_is_json_decoded() {
-    let (_db, app) = seeded().await;
+    let (db, app) = seeded().await;
     let resp = get(&app, &format!("/db/_all_docs?key={}", q(json!("b")))).await;
     assert_eq!(resp.status, StatusCode::OK);
-    assert_eq!(ids(&resp), ["b"]);
+    let rev = db.get("b").await.unwrap().rev.unwrap().to_string();
+    let body = resp.json();
+    assert_eq!(body["total_rows"], 4);
+    assert_eq!(
+        body["rows"],
+        json!([{"id": "b", "key": "b", "value": {"rev": rev}}])
+    );
 }
 
 #[tokio::test]
@@ -77,7 +83,11 @@ async fn invalid_json_key_is_a_bad_request() {
     ] {
         let resp = get(&app, uri).await;
         assert_eq!(resp.status, StatusCode::BAD_REQUEST, "{uri}");
-        assert_eq!(resp.json()["error"], "bad_request", "{uri}");
+        assert_eq!(
+            resp.json(),
+            json!({"error": "bad_request", "reason": "invalid UTF-8 JSON"}),
+            "{uri}"
+        );
     }
 }
 
@@ -115,7 +125,10 @@ async fn keys_query_parameter() {
 
     let resp = get(&app, &format!("/db/_all_docs?keys={}", q(json!("a")))).await;
     assert_eq!(resp.status, StatusCode::BAD_REQUEST);
-    assert_eq!(resp.json()["error"], "bad_request");
+    assert_eq!(
+        resp.json(),
+        json!({"error": "bad_request", "reason": "`keys` parameter must be an array."})
+    );
 }
 
 #[tokio::test]
@@ -130,7 +143,10 @@ async fn keys_in_post_body() {
 
     let resp = post(&app, "/db/_all_docs", json!({"keys": "a"})).await;
     assert_eq!(resp.status, StatusCode::BAD_REQUEST);
-    assert_eq!(resp.json()["error"], "bad_request");
+    assert_eq!(
+        resp.json(),
+        json!({"error": "bad_request", "reason": "`keys` body member must be an array."})
+    );
 }
 
 #[tokio::test]

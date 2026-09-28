@@ -9,6 +9,19 @@ use common::*;
 use rouchdb::{BulkDocsOptions, Database, Document, ReplicationOptions};
 use serde_json::json;
 
+fn bad_request(reason: &str) -> serde_json::Value {
+    json!({"error": "bad_request", "reason": reason})
+}
+
+fn missing() -> serde_json::Value {
+    json!({"error": "not_found", "reason": "missing"})
+}
+
+/// The hash part of a `N-hash` revision.
+fn hash(rev: &str) -> &str {
+    rev.split_once('-').unwrap().1
+}
+
 async fn doc_with_two_revs(db: &Database) -> (String, String) {
     let r1 = db.put("a", json!({"v": 1})).await.unwrap().rev.unwrap();
     let r2 = db
@@ -64,7 +77,10 @@ async fn revs_diff_reports_missing_revisions() {
     assert_eq!(resp.status, StatusCode::BAD_REQUEST);
     let resp = post(&app, "/db/_revs_diff", json!([1])).await;
     assert_eq!(resp.status, StatusCode::BAD_REQUEST);
-    assert_eq!(resp.json()["error"], "bad_request");
+    assert_eq!(
+        resp.json(),
+        bad_request("Request body must be a JSON object")
+    );
 }
 
 // ─── _bulk_get ──────────────────────────────────────────────────────────────
@@ -90,30 +106,42 @@ async fn bulk_get_returns_requested_revisions() {
     let results = resp.json()["results"].clone();
     assert_eq!(results.as_array().unwrap().len(), 4);
 
-    let latest = &results[0]["docs"][0]["ok"];
-    assert_eq!(latest["_id"], "a");
-    assert_eq!(latest["_rev"], r2.as_str());
-    assert_eq!(latest["v"], 2);
-    assert!(latest.get("_revisions").is_none(), "only with revs=true");
-
-    assert_eq!(results[1]["docs"][0]["ok"]["_rev"], r1.as_str());
-    assert_eq!(results[1]["docs"][0]["ok"]["v"], 1);
-
-    let err = &results[2]["docs"][0]["error"];
-    assert_eq!(err["id"], "a");
-    assert_eq!(err["rev"], "9-nope");
+    // `_revisions` only with revs=true.
+    assert_eq!(
+        results[0],
+        json!({"id": "a", "docs": [{"ok": {"_id": "a", "_rev": r2, "v": 2}}]})
+    );
+    assert_eq!(
+        results[1],
+        json!({"id": "a", "docs": [{"ok": {"_id": "a", "_rev": r1, "v": 1}}]})
+    );
+    assert_eq!(
+        results[2],
+        json!({"id": "a", "docs": [{"error": {
+            "id": "a", "rev": "9-nope", "error": "not_found", "reason": "missing",
+        }}]})
+    );
+    let err = &results[3]["docs"][0]["error"];
+    assert_eq!(results[3]["id"], "nope");
+    assert_eq!(err["id"], "nope");
     assert_eq!(err["error"], "not_found");
-    assert_eq!(results[3]["docs"][0]["error"]["error"], "not_found");
+    assert_eq!(err["reason"], "missing");
 
     let resp = post(
         &app,
         "/db/_bulk_get?revs=true",
-        json!({"docs": [{"id": "a"}]}),
+        json!({"docs": [{"id": "a"}, {"id": "a", "rev": r1}]}),
     )
     .await;
-    let revisions = resp.json()["results"][0]["docs"][0]["ok"]["_revisions"].clone();
-    assert_eq!(revisions["start"], 2);
-    assert_eq!(revisions["ids"].as_array().unwrap().len(), 2);
+    let results = resp.json()["results"].clone();
+    assert_eq!(
+        results[0]["docs"][0]["ok"]["_revisions"],
+        json!({"start": 2, "ids": [hash(&r2), hash(&r1)]})
+    );
+    assert_eq!(
+        results[1]["docs"][0]["ok"]["_revisions"],
+        json!({"start": 1, "ids": [hash(&r1)]})
+    );
 }
 
 #[tokio::test]
@@ -121,13 +149,15 @@ async fn bulk_get_validates_its_body() {
     let app = app();
     let resp = post(&app, "/db/_bulk_get", json!({})).await;
     assert_eq!(resp.status, StatusCode::BAD_REQUEST);
-    assert_eq!(resp.json()["error"], "bad_request");
+    assert_eq!(resp.json(), bad_request("Missing JSON list of 'docs'."));
 
     let resp = post(&app, "/db/_bulk_get", json!({"docs": [{"rev": "1-a"}]})).await;
     assert_eq!(resp.status, StatusCode::OK);
     assert_eq!(
-        resp.json()["results"][0]["docs"][0]["error"]["error"],
-        "bad_request"
+        resp.json(),
+        json!({"results": [{"id": null, "docs": [{"error": {
+            "id": null, "rev": null, "error": "bad_request", "reason": "document id missed",
+        }}]}]})
     );
 }
 
@@ -158,8 +188,10 @@ async fn local_documents_crud() {
 
     let resp = put(&app, "/db/_local/ck", json!({"_rev": "garbage"})).await;
     assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+    assert_eq!(resp.json(), bad_request("Invalid rev format"));
     let resp = put(&app, "/db/_local/ck", json!([1])).await;
     assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+    assert_eq!(resp.json(), bad_request("Document must be a JSON object"));
 
     // Local docs are not documents: not listed, not in the changes feed.
     assert_eq!(db.info().await.unwrap().doc_count, 0);
@@ -172,14 +204,12 @@ async fn local_documents_crud() {
         resp.json(),
         json!({"ok": true, "id": "_local/ck", "rev": "0-0"})
     );
-    assert_eq!(
-        get(&app, "/db/_local/ck").await.status,
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        delete(&app, "/db/_local/ck").await.status,
-        StatusCode::NOT_FOUND
-    );
+    let resp = get(&app, "/db/_local/ck").await;
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
+    assert_eq!(resp.json(), missing());
+    let resp = delete(&app, "/db/_local/ck").await;
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
+    assert_eq!(resp.json(), missing());
 
     // Ids may contain a slash, encoded or not.
     let resp = put(&app, "/db/_local/a%2Fb", json!({"x": 1})).await;
@@ -202,15 +232,18 @@ async fn purge_removes_revisions() {
     )
     .await;
     assert_eq!(resp.status, StatusCode::CREATED);
-    let body = resp.json();
-    assert_eq!(body["purged"]["b"], json!([rev]));
-    assert_eq!(body["purged"]["zz"], json!([]));
+    assert_eq!(resp.json()["purged"], json!({"b": [rev], "zz": []}));
     assert_eq!(get(&app, "/db/b").await.status, StatusCode::NOT_FOUND);
 
     let resp = post(&app, "/db/_purge", json!([1])).await;
     assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        resp.json(),
+        bad_request("Request body must be a JSON object")
+    );
     let resp = post(&app, "/db/_purge", json!({"c": "1-x"})).await;
     assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+    assert_eq!(resp.json(), bad_request("Invalid list of revisions"));
 }
 
 // ─── open_revs ──────────────────────────────────────────────────────────────
@@ -238,7 +271,31 @@ async fn open_revs_returns_an_array_of_leaves() {
     assert!(leaves[0]["ok"].get("_revisions").is_none());
 
     let resp = get(&app, "/db/a?open_revs=all&revs=true").await;
-    assert!(resp.json()[0]["ok"]["_revisions"]["ids"].is_array());
+    let mut histories: Vec<(String, serde_json::Value)> = resp
+        .json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| {
+            (
+                l["ok"]["_rev"].as_str().unwrap().to_string(),
+                l["ok"]["_revisions"].clone(),
+            )
+        })
+        .collect();
+    histories.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut expected = vec![
+        (
+            r2.clone(),
+            json!({"start": 2, "ids": [hash(&r2), hash(&r1)]}),
+        ),
+        (
+            "2-bbbb".to_string(),
+            json!({"start": 2, "ids": ["bbbb", hash(&r1)]}),
+        ),
+    ];
+    expected.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(histories, expected);
 
     let uri = format!("/db/a?open_revs={}", q(json!([r1.clone(), "5-nope"])));
     let resp = get(&app, &uri).await;
@@ -247,14 +304,12 @@ async fn open_revs_returns_an_array_of_leaves() {
         json!([{"ok": {"_id": "a", "_rev": r1, "v": 1}}, {"missing": "5-nope"}])
     );
 
-    assert_eq!(
-        get(&app, "/db/a?open_revs=bogus").await.status,
-        StatusCode::BAD_REQUEST
-    );
-    assert_eq!(
-        get(&app, "/db/nope?open_revs=all").await.status,
-        StatusCode::NOT_FOUND
-    );
+    let resp = get(&app, "/db/a?open_revs=bogus").await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+    assert_eq!(resp.json(), bad_request("invalid UTF-8 JSON"));
+    let resp = get(&app, "/db/nope?open_revs=all").await;
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
+    assert_eq!(resp.json(), missing());
     let uri = format!("/db/nope?open_revs={}", q(json!(["1-a"])));
     assert_eq!(get(&app, &uri).await.json(), json!([{"missing": "1-a"}]));
 }
