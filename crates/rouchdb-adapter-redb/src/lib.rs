@@ -133,6 +133,12 @@ struct MetaRecord {
     /// Number of purge requests applied.
     #[serde(default)]
     purge_seq: u64,
+    /// Live / deleted document counts, maintained on every write so `info()`
+    /// and `total_rows` do not scan the database (schema >= 2).
+    #[serde(default)]
+    doc_count: u64,
+    #[serde(default)]
+    doc_del_count: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +355,9 @@ impl RedbAdapter {
                         if meta.schema < 1 {
                             migrate_attachments_to_digest_keys(&write_txn)?;
                         }
+                        if meta.schema < 2 {
+                            count_documents(&write_txn, &mut meta)?;
+                        }
                         meta.schema = SCHEMA_VERSION;
                         write_meta(&mut meta_table, &meta)?;
                     }
@@ -372,7 +381,8 @@ impl RedbAdapter {
 ///
 /// - 0: rouchdb <= 0.4 (attachment bytes keyed by `doc_id\0name`).
 /// - 1: attachment bytes keyed by digest (content-addressed, shared).
-const SCHEMA_VERSION: u32 = 1;
+/// - 2: document counts maintained in the metadata record.
+const SCHEMA_VERSION: u32 = 2;
 
 const META_KEY: &str = "meta";
 const SECURITY_KEY: &str = "security";
@@ -384,6 +394,23 @@ impl MetaRecord {
             db_uuid: Uuid::new_v4().to_string(),
             schema: SCHEMA_VERSION,
             purge_seq: 0,
+            doc_count: 0,
+            doc_del_count: 0,
+        }
+    }
+
+    /// Account for a document going from `before` to `after`
+    /// (`Some(deleted)`, or `None` when it does not exist).
+    fn adjust_counts(&mut self, before: Option<bool>, after: Option<bool>) {
+        match before {
+            Some(true) => self.doc_del_count = self.doc_del_count.saturating_sub(1),
+            Some(false) => self.doc_count = self.doc_count.saturating_sub(1),
+            None => {}
+        }
+        match after {
+            Some(true) => self.doc_del_count += 1,
+            Some(false) => self.doc_count += 1,
+            None => {}
         }
     }
 }
@@ -420,6 +447,19 @@ fn migrate_attachments_to_digest_keys(txn: &redb::WriteTransaction) -> Result<()
                 db_err!(table.insert(digest.as_str(), bytes.as_slice()))?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Schema 1 -> 2: compute the document counts once.
+fn count_documents(txn: &redb::WriteTransaction, meta: &mut MetaRecord) -> Result<()> {
+    let table = db_err!(txn.open_table(DOC_TABLE))?;
+    meta.doc_count = 0;
+    meta.doc_del_count = 0;
+    for entry in db_err!(table.iter())? {
+        let (_, value) = db_err!(entry)?;
+        let (tree, _) = decode_doc_record(value.value())?;
+        meta.adjust_counts(None, Some(is_deleted(&tree)));
     }
     Ok(())
 }
@@ -594,29 +634,15 @@ fn stored_doc_json(
 #[async_trait]
 impl Adapter for RedbAdapter {
     async fn info(&self) -> Result<DbInfo> {
-        // Read metadata and document data from a SINGLE read transaction so
-        // update_seq and the doc snapshot reflect the same committed state.
+        // Counts and update_seq live in one metadata record, so they always
+        // reflect the same committed state without scanning documents.
         let read_txn = db_err!(self.db.begin_read())?;
         let meta = read_meta(&db_err!(read_txn.open_table(META_TABLE))?)?;
-        let table = db_err!(read_txn.open_table(DOC_TABLE))?;
-
-        let mut doc_count = 0u64;
-        let mut doc_del_count = 0u64;
-        let iter = db_err!(table.iter())?;
-        for entry in iter {
-            let entry = db_err!(entry)?;
-            let (tree, _) = decode_doc_record(entry.1.value())?;
-            if is_deleted(&tree) {
-                doc_del_count += 1;
-            } else {
-                doc_count += 1;
-            }
-        }
 
         Ok(DbInfo {
             db_name: self.name.clone(),
-            doc_count,
-            doc_del_count,
+            doc_count: meta.doc_count,
+            doc_del_count: meta.doc_del_count,
             update_seq: Seq::Num(meta.update_seq),
         })
     }
@@ -748,7 +774,9 @@ impl Adapter for RedbAdapter {
         let rev_table = db_err!(read_txn.open_table(REV_DATA_TABLE))?;
 
         let mut rows = Vec::new();
-        let mut total_count = 0u64;
+        let meta = read_meta(&db_err!(read_txn.open_table(META_TABLE))?)?;
+        let skip = opts.skip as usize;
+        let limit = opts.limit.map(|l| l as usize).unwrap_or(usize::MAX);
 
         // Build one row for a document, or None for a deleted one that is not
         // explicitly requested.
@@ -814,76 +842,69 @@ impl Adapter for RedbAdapter {
                     rows.push(row);
                 }
             }
-        }
-
-        let iter = db_err!(doc_table.iter())?;
-        for entry in iter {
-            let entry = db_err!(entry)?;
-            let doc_id = entry.0.value().to_string();
-            let (tree, _) = decode_doc_record(entry.1.value())?;
-            let deleted = is_deleted(&tree);
-
-            // total_rows is the count of non-deleted documents in the whole
-            // database, independent of any range / key / skip / limit filters.
-            if !deleted {
-                total_count += 1;
+            rows = rows.into_iter().skip(skip).take(limit).collect();
+        } else if let Some(ref key) = opts.key {
+            // A single key is a direct lookup; a deleted doc yields no row.
+            if skip == 0
+                && limit > 0
+                && let Some((tree, _)) = load_doc_record(&doc_table, key)?
+                && let Some(row) = make_row(key, &tree, false)?
+            {
+                rows.push(row);
             }
-
-            if opts.keys.is_some() {
-                continue;
-            }
-
-            // Apply key range filters (descending flips startkey/endkey meaning)
-            if opts.key.is_none() {
-                if let Some(ref start) = opts.start_key
-                    && ((!opts.descending && doc_id.as_str() < start.as_str())
-                        || (opts.descending && doc_id.as_str() > start.as_str()))
-                {
-                    continue;
-                }
-                if let Some(ref end) = opts.end_key {
-                    if opts.inclusive_end {
-                        if (!opts.descending && doc_id.as_str() > end.as_str())
-                            || (opts.descending && doc_id.as_str() < end.as_str())
-                        {
+        } else {
+            // Key range scan in the requested direction, stopping as soon as
+            // the page is full. Descending swaps the meaning of start/end.
+            use std::ops::Bound;
+            let (low, high) = if opts.descending {
+                (opts.end_key.as_deref(), opts.start_key.as_deref())
+            } else {
+                (opts.start_key.as_deref(), opts.end_key.as_deref())
+            };
+            let lower = match low {
+                None => Bound::Unbounded,
+                Some(k) if opts.descending && !opts.inclusive_end => Bound::Excluded(k),
+                Some(k) => Bound::Included(k),
+            };
+            let upper = match high {
+                None => Bound::Unbounded,
+                Some(k) if !opts.descending && !opts.inclusive_end => Bound::Excluded(k),
+                Some(k) => Bound::Included(k),
+            };
+            // An inverted range matches nothing.
+            let inverted = matches!((low, high), (Some(l), Some(h)) if l > h);
+            if !inverted && limit > 0 {
+                let range = db_err!(doc_table.range::<&str>((lower, upper)))?;
+                let iter: Box<dyn Iterator<Item = _>> = if opts.descending {
+                    Box::new(range.rev())
+                } else {
+                    Box::new(range)
+                };
+                let mut skipped = 0usize;
+                for entry in iter {
+                    let (key, value) = db_err!(entry)?;
+                    let (tree, _) = decode_doc_record(value.value())?;
+                    if let Some(row) = make_row(key.value(), &tree, false)? {
+                        if skipped < skip {
+                            skipped += 1;
                             continue;
                         }
-                    } else if (!opts.descending && doc_id.as_str() >= end.as_str())
-                        || (opts.descending && doc_id.as_str() <= end.as_str())
-                    {
-                        continue;
+                        rows.push(row);
+                        if rows.len() >= limit {
+                            break;
+                        }
                     }
                 }
             }
-
-            if let Some(ref key) = opts.key
-                && &doc_id != key
-            {
-                continue;
-            }
-
-            if let Some(row) = make_row(&doc_id, &tree, false)? {
-                rows.push(row);
-            }
         }
 
-        if opts.descending && opts.keys.is_none() {
-            rows.reverse();
-        }
-
-        let total_rows = total_count;
-        let skip = opts.skip as usize;
-        if skip > 0 {
-            rows = rows.into_iter().skip(skip).collect();
-        }
-        if let Some(limit) = opts.limit {
-            rows.truncate(limit as usize);
-        }
+        // total_rows is the count of non-deleted documents in the whole
+        // database, independent of any range / key / skip / limit filters.
+        let total_rows = meta.doc_count;
 
         // Read update_seq from the SAME read transaction as the doc snapshot
         // to avoid a TOCTOU inconsistency with a concurrent committed write.
         let update_seq = if opts.update_seq {
-            let meta = read_meta(&db_err!(read_txn.open_table(META_TABLE))?)?;
             Some(Seq::Num(meta.update_seq))
         } else {
             None
@@ -906,31 +927,24 @@ impl Adapter for RedbAdapter {
         let mut results = Vec::new();
 
         let start = opts.since.as_num().saturating_add(1);
-        let iter = db_err!(changes_table.range(start..))?;
-
-        // Propagate deserialization errors instead of panicking on a corrupt
-        // or truncated change record.
-        let entries: Vec<(u64, ChangeRecord)> = iter
-            .map(|e| {
-                let e = db_err!(e)?;
-                Ok((
-                    e.0.value(),
-                    serde_json::from_slice::<ChangeRecord>(e.1.value())?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let iter: Box<dyn Iterator<Item = &(u64, ChangeRecord)>> = if opts.descending {
-            Box::new(entries.iter().rev())
+        let range = db_err!(changes_table.range(start..))?;
+        // Iterate lazily (in either direction) so `limit` stops the scan.
+        let iter: Box<dyn Iterator<Item = _>> = if opts.descending {
+            Box::new(range.rev())
         } else {
-            Box::new(entries.iter())
+            Box::new(range)
         };
 
         // Highest sequence inspected, so last_seq advances past a fully
         // filtered range instead of sticking at `since`.
         let mut max_scanned: Option<u64> = None;
 
-        for (seq, change) in iter {
+        for entry in iter {
+            // Propagate deserialization errors instead of panicking on a
+            // corrupt or truncated change record.
+            let entry = db_err!(entry)?;
+            let seq = &entry.0.value();
+            let change: ChangeRecord = serde_json::from_slice(entry.1.value())?;
             max_scanned = Some(max_scanned.map_or(*seq, |m| m.max(*seq)));
 
             if let Some(ref doc_ids) = opts.doc_ids
@@ -1208,7 +1222,7 @@ impl Adapter for RedbAdapter {
                 DEFAULT_REV_LIMIT,
             )
             .map_err(attachment_edit_error)?;
-            apply_write(&mut tables, &mut meta, Some(seq), plan)?
+            apply_write(&mut tables, &mut meta, Some((&tree, seq)), plan)?
         };
 
         write_meta(&mut db_err!(write_txn.open_table(META_TABLE))?, &meta)?;
@@ -1285,7 +1299,7 @@ impl Adapter for RedbAdapter {
                 DEFAULT_REV_LIMIT,
             )
             .map_err(attachment_edit_error)?;
-            apply_write(&mut tables, &mut meta, Some(seq), plan)?
+            apply_write(&mut tables, &mut meta, Some((&tree, seq)), plan)?
         };
 
         write_meta(&mut db_err!(write_txn.open_table(META_TABLE))?, &meta)?;
@@ -1423,6 +1437,10 @@ impl Adapter for RedbAdapter {
                 }
                 db_err!(tables.changes.remove(old_seq))?;
                 drop_rev_data_except(&mut tables.revs, &doc_id, &tree_revs(&new_tree))?;
+                meta.adjust_counts(
+                    Some(is_deleted(&tree)),
+                    (!new_tree.is_empty()).then(|| is_deleted(&new_tree)),
+                );
 
                 if new_tree.is_empty() {
                     db_err!(tables.docs.remove(doc_id.as_str()))?;
@@ -1530,7 +1548,7 @@ fn write_new_edit(
     };
 
     match plan_new_edit(tree, doc, parent_atts.as_ref(), true, DEFAULT_REV_LIMIT) {
-        Ok(plan) => apply_write(tables, meta, existing.map(|(_, seq)| seq), plan),
+        Ok(plan) => apply_write(tables, meta, existing.as_ref().map(|(t, s)| (t, *s)), plan),
         Err(result) => Ok(result),
     }
 }
@@ -1569,7 +1587,7 @@ fn write_replicated(
         }
     }
 
-    apply_write(tables, meta, existing.map(|(_, seq)| seq), plan)
+    apply_write(tables, meta, existing.as_ref().map(|(t, s)| (t, *s)), plan)
 }
 
 /// Persist a planned write: attachment bytes (by digest), the revision tree,
@@ -1577,9 +1595,15 @@ fn write_replicated(
 fn apply_write(
     tables: &mut WriteTables,
     meta: &mut MetaRecord,
-    old_seq: Option<u64>,
+    existing: Option<(&RevTree, u64)>,
     plan: PlannedWrite,
 ) -> Result<DocResult> {
+    let old_seq = existing.map(|(_, seq)| seq);
+    meta.adjust_counts(
+        existing.map(|(tree, _)| is_deleted(tree)),
+        Some(plan.doc_deleted),
+    );
+
     for (digest, bytes) in &plan.new_blobs {
         if db_err!(tables.atts.get(digest.as_str()))?.is_none() {
             db_err!(tables.atts.insert(digest.as_str(), bytes.as_slice()))?;
@@ -2243,24 +2267,43 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_nested_records_still_load() {
-        let (_dir, db) = temp_db();
-        // A shallow legacy record and one far deeper than serde_json's
-        // default recursion limit (which is what bricked F01 databases).
-        for (id, len) in [("shallow", 3u64), ("deep", 400u64)] {
-            let tree = linear_tree(len);
-            let leaf = format!("{}-{:032x}", len, len);
-            write_legacy_record(&db, id, &tree, len);
+        // A file as written by rouchdb <= 0.4: nested records, one shallow
+        // and one far deeper than serde_json's default recursion limit (which
+        // is what bricked F01 databases), and a metadata record without the
+        // newer fields.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.redb");
+        let docs = [("shallow", 3u64), ("deep", 400u64)];
+        {
+            let db = RedbAdapter::open(&path, "legacy").unwrap();
+            for (id, len) in docs {
+                write_legacy_record(&db, id, &linear_tree(len), len);
+                let txn = db.db.begin_write().unwrap();
+                {
+                    let mut t = txn.open_table(REV_DATA_TABLE).unwrap();
+                    let rd = serde_json::to_vec(
+                        &serde_json::json!({"data": {"id": id}, "deleted": false}),
+                    )
+                    .unwrap();
+                    let leaf = format!("{}-{:032x}", len, len);
+                    t.insert(rev_data_key(id, &leaf).as_str(), rd.as_slice())
+                        .unwrap();
+                }
+                txn.commit().unwrap();
+            }
             let txn = db.db.begin_write().unwrap();
             {
-                let mut t = txn.open_table(REV_DATA_TABLE).unwrap();
-                let rd =
-                    serde_json::to_vec(&serde_json::json!({"data": {"id": id}, "deleted": false}))
-                        .unwrap();
-                t.insert(rev_data_key(id, &leaf).as_str(), rd.as_slice())
+                let mut meta = txn.open_table(META_TABLE).unwrap();
+                meta.insert(META_KEY, &br#"{"update_seq":400,"db_uuid":"x"}"#[..])
                     .unwrap();
             }
             txn.commit().unwrap();
+        }
 
+        let db = RedbAdapter::open(&path, "legacy").unwrap();
+        assert_eq!(db.info().await.unwrap().doc_count, 2);
+        for (id, len) in docs {
+            let leaf = format!("{}-{:032x}", len, len);
             let got = db.get(id, GetOptions::default()).await.unwrap();
             assert_eq!(got.rev.unwrap().to_string(), leaf);
             assert_eq!(got.data["id"], id);
@@ -2363,6 +2406,68 @@ mod tests {
         assert_eq!(format!("{:?}", back), format!("{:?}", tree));
     }
 
+    /// F68: bounded queries must not scan (and decode) the whole database.
+    /// A corrupt record placed outside the requested range proves it.
+    #[tokio::test]
+    async fn bounded_queries_do_not_scan_everything() {
+        let (_dir, db) = temp_db();
+        for id in ["a", "b", "c", "zzz"] {
+            db.bulk_docs(
+                vec![put_doc(id, None, serde_json::json!({"id": id}))],
+                BulkDocsOptions::new(),
+            )
+            .await
+            .unwrap();
+        }
+        {
+            let txn = db.db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(DOC_TABLE).unwrap();
+                t.insert("zzz", &b"{corrupt"[..]).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let info = db.info().await.unwrap();
+        assert_eq!(info.doc_count, 4);
+        let page = db
+            .all_docs(AllDocsOptions {
+                limit: Some(2),
+                include_docs: true,
+                ..AllDocsOptions::new()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.rows.len(), 2);
+        assert_eq!(page.total_rows, 4);
+        let range = db
+            .all_docs(AllDocsOptions {
+                start_key: Some("b".into()),
+                end_key: Some("c".into()),
+                ..AllDocsOptions::new()
+            })
+            .await
+            .unwrap();
+        assert_eq!(range.rows.len(), 2);
+        let key = db
+            .all_docs(AllDocsOptions {
+                key: Some("a".into()),
+                ..AllDocsOptions::new()
+            })
+            .await
+            .unwrap();
+        assert_eq!(key.rows.len(), 1);
+        let ch = db
+            .changes(ChangesOptions {
+                limit: Some(2),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(ch.results.len(), 2);
+        // Scanning into the corrupt record still reports the error.
+        assert!(db.all_docs(AllDocsOptions::new()).await.is_err());
+    }
+
     #[tokio::test]
     async fn compact_empty_db() {
         let (_dir, db) = temp_db();
@@ -2416,6 +2521,9 @@ mod tests {
         let meta = read_meta(&txn.open_table(META_TABLE).unwrap()).unwrap();
         assert_eq!(meta.schema, SCHEMA_VERSION);
         assert_eq!(meta.update_seq, 1);
+        // Document counts are computed once for files that predate them.
+        let info = db.info().await.unwrap();
+        assert_eq!((info.doc_count, info.doc_del_count), (1, 0));
     }
 
     #[tokio::test]
