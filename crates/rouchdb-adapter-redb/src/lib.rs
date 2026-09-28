@@ -2318,8 +2318,9 @@ mod tests {
             .bulk_docs(vec![doc], BulkDocsOptions::new())
             .await
             .unwrap();
+        // CouchDB and PouchDB: a revision of a missing document conflicts.
         assert!(!r[0].ok);
-        assert_eq!(r[0].error.as_deref(), Some("not_found"));
+        assert_eq!(r[0].error.as_deref(), Some("conflict"));
     }
 
     #[tokio::test]

@@ -1174,7 +1174,7 @@ async fn single_doc_failures_are_errors(fx: Fx) {
     ));
     assert!(matches!(
         db.update("missing", "1-abc", serde_json::json!({})).await,
-        Err(RouchError::NotFound(_))
+        Err(RouchError::Conflict)
     ));
 }
 
