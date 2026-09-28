@@ -37,13 +37,15 @@ impl Clone for ReplicationFilter {
 pub struct ReplicationOptions {
     /// Number of documents to process per batch.
     pub batch_size: u64,
-    /// Maximum number of batches to buffer.
+    /// Maximum number of batches to buffer (PouchDB option). Currently has
+    /// no effect: batches are fetched and written one at a time.
     pub batches_limit: u64,
     /// Optional filter for selective replication.
     pub filter: Option<ReplicationFilter>,
-    /// Enable continuous/live replication.
+    /// Enable continuous/live replication. Only honored by
+    /// [`replicate_live`]; [`replicate`] always runs a single pass.
     pub live: bool,
-    /// Automatically retry on transient errors.
+    /// Automatically retry on transient errors (live replication only).
     pub retry: bool,
     /// Polling interval for live replication (default: 500ms).
     pub poll_interval: Duration,
@@ -118,30 +120,96 @@ fn filter_fingerprint(filter: &Option<ReplicationFilter>) -> String {
 /// 4. Fetch missing docs from source
 /// 5. Write to target
 /// 6. Save checkpoint
+///
+/// This is a single pass: `live`, `retry`, `back_off_function` and
+/// `poll_interval` only apply to [`replicate_live`].
 pub async fn replicate(
     source: &dyn Adapter,
     target: &dyn Adapter,
     opts: ReplicationOptions,
 ) -> Result<ReplicationResult> {
+    let checkpointer = new_checkpointer(source, target, &opts.filter).await?;
+    let since = opts.since.clone();
+    let outcome = run_replication(source, target, &opts, &checkpointer, since, None).await?;
+    Ok(outcome.result)
+}
+
+/// Run a one-shot replication with event streaming.
+///
+/// Same as `replicate()` but emits `ReplicationEvent` through the provided
+/// channel as replication progresses. The replication waits for room in the
+/// channel, so the receiver must be drained concurrently (or the channel must
+/// be large enough to hold every event).
+pub async fn replicate_with_events(
+    source: &dyn Adapter,
+    target: &dyn Adapter,
+    opts: ReplicationOptions,
+    events_tx: mpsc::Sender<ReplicationEvent>,
+) -> Result<ReplicationResult> {
+    let checkpointer = new_checkpointer(source, target, &opts.filter).await?;
+    let since = opts.since.clone();
+    let outcome = run_replication(
+        source,
+        target,
+        &opts,
+        &checkpointer,
+        since,
+        Some(&events_tx),
+    )
+    .await?;
+    let _ = events_tx
+        .send(ReplicationEvent::Complete(outcome.result.clone()))
+        .await;
+    Ok(outcome.result)
+}
+
+/// Result of one pass of the replication loop.
+struct RunOutcome {
+    result: ReplicationResult,
+}
+
+/// Send an event if there is a listener.
+async fn emit(events: Option<&mpsc::Sender<ReplicationEvent>>, event: ReplicationEvent) {
+    if let Some(tx) = events {
+        let _ = tx.send(event).await;
+    }
+}
+
+/// Build the checkpointer (and so the replication id) for a source/target
+/// pair and filter.
+async fn new_checkpointer(
+    source: &dyn Adapter,
+    target: &dyn Adapter,
+    filter: &Option<ReplicationFilter>,
+) -> Result<Checkpointer> {
     let source_info = source.info().await?;
     let target_info = target.info().await?;
-
-    let checkpointer = Checkpointer::new(
+    Ok(Checkpointer::new(
         &source_info.db_name,
         &target_info.db_name,
-        &filter_fingerprint(&opts.filter),
-    );
+        &filter_fingerprint(filter),
+    ))
+}
 
-    // Step 1: Read checkpoint (or use override)
-    let since = if let Some(ref override_since) = opts.since {
-        override_since.clone()
+/// One replication pass shared by the one-shot and live paths. `since`
+/// overrides the checkpoint as the starting sequence. Does not emit
+/// `Complete`; callers decide when the replication as a whole is done.
+async fn run_replication(
+    source: &dyn Adapter,
+    target: &dyn Adapter,
+    opts: &ReplicationOptions,
+    checkpointer: &Checkpointer,
+    since: Option<Seq>,
+    events: Option<&mpsc::Sender<ReplicationEvent>>,
+) -> Result<RunOutcome> {
+    let since = if let Some(override_since) = since {
+        override_since
     } else if opts.checkpoint {
         checkpointer.read_checkpoint(source, target).await?
     } else {
         Seq::default()
     };
 
-    // Extract doc_ids from filter (for ChangesOptions)
     let filter_doc_ids = match &opts.filter {
         Some(ReplicationFilter::DocIds(ids)) => Some(ids.clone()),
         _ => None,
@@ -151,6 +219,8 @@ pub async fn replicate(
     let mut total_docs_written = 0u64;
     let mut errors = Vec::new();
     let mut current_seq = since;
+
+    emit(events, ReplicationEvent::Active).await;
 
     loop {
         // Step 2: Fetch changes from source
@@ -265,6 +335,14 @@ pub async fn replicate(
             total_docs_written += attempted - failed;
         }
 
+        emit(
+            events,
+            ReplicationEvent::Change {
+                docs_read: total_docs_read,
+            },
+        )
+        .await;
+
         // Do not advance the checkpoint past a batch that had any parse or
         // write failure; stop so the next run retries from the un-advanced
         // sequence rather than silently losing those docs.
@@ -286,212 +364,15 @@ pub async fn replicate(
         }
     }
 
-    Ok(ReplicationResult {
-        ok: errors.is_empty(),
-        docs_read: total_docs_read,
-        docs_written: total_docs_written,
-        errors,
-        last_seq: current_seq,
+    Ok(RunOutcome {
+        result: ReplicationResult {
+            ok: errors.is_empty(),
+            docs_read: total_docs_read,
+            docs_written: total_docs_written,
+            errors,
+            last_seq: current_seq,
+        },
     })
-}
-
-/// Run a one-shot replication with event streaming.
-///
-/// Same as `replicate()` but emits `ReplicationEvent` through the provided
-/// channel as replication progresses.
-pub async fn replicate_with_events(
-    source: &dyn Adapter,
-    target: &dyn Adapter,
-    opts: ReplicationOptions,
-    events_tx: mpsc::Sender<ReplicationEvent>,
-) -> Result<ReplicationResult> {
-    replicate_with_events_inner(source, target, opts, events_tx, false).await
-}
-
-/// Inner driver shared by the one-shot and live paths. `suppress_complete`
-/// lets the live loop withhold the per-run `Complete` so only one terminal
-/// `Complete` is emitted when the whole live replication ends.
-async fn replicate_with_events_inner(
-    source: &dyn Adapter,
-    target: &dyn Adapter,
-    opts: ReplicationOptions,
-    events_tx: mpsc::Sender<ReplicationEvent>,
-    suppress_complete: bool,
-) -> Result<ReplicationResult> {
-    let source_info = source.info().await?;
-    let target_info = target.info().await?;
-
-    let checkpointer = Checkpointer::new(
-        &source_info.db_name,
-        &target_info.db_name,
-        &filter_fingerprint(&opts.filter),
-    );
-
-    let since = if let Some(ref override_since) = opts.since {
-        override_since.clone()
-    } else if opts.checkpoint {
-        checkpointer.read_checkpoint(source, target).await?
-    } else {
-        Seq::default()
-    };
-
-    let filter_doc_ids = match &opts.filter {
-        Some(ReplicationFilter::DocIds(ids)) => Some(ids.clone()),
-        _ => None,
-    };
-
-    let mut total_docs_read = 0u64;
-    let mut total_docs_written = 0u64;
-    let mut errors = Vec::new();
-    let mut current_seq = since;
-
-    let _ = events_tx.send(ReplicationEvent::Active).await;
-
-    loop {
-        let changes = source
-            .changes(ChangesOptions {
-                since: current_seq.clone(),
-                limit: Some(opts.batch_size),
-                include_docs: false,
-                doc_ids: filter_doc_ids.clone(),
-                ..Default::default()
-            })
-            .await?;
-
-        if changes.results.is_empty() {
-            break;
-        }
-
-        let batch_last_seq = changes.last_seq;
-
-        let filtered_changes: Vec<&ChangeEvent> = match &opts.filter {
-            Some(ReplicationFilter::Custom(predicate)) => {
-                changes.results.iter().filter(|c| predicate(c)).collect()
-            }
-            _ => changes.results.iter().collect(),
-        };
-
-        total_docs_read += filtered_changes.len() as u64;
-
-        if filtered_changes.is_empty() {
-            current_seq = batch_last_seq;
-            if (changes.results.len() as u64) < opts.batch_size {
-                break;
-            }
-            continue;
-        }
-
-        let mut rev_map: HashMap<String, Vec<String>> = HashMap::new();
-        for change in &filtered_changes {
-            let revs: Vec<String> = change.changes.iter().map(|c| c.rev.clone()).collect();
-            rev_map.insert(change.id.clone(), revs);
-        }
-
-        let diff = target.revs_diff(rev_map).await?;
-
-        if diff.results.is_empty() {
-            current_seq = batch_last_seq;
-            if (changes.results.len() as u64) < opts.batch_size {
-                break;
-            }
-            continue;
-        }
-
-        let mut bulk_get_items: Vec<BulkGetItem> = Vec::new();
-        for (doc_id, diff_result) in &diff.results {
-            for missing_rev in &diff_result.missing {
-                bulk_get_items.push(BulkGetItem {
-                    id: doc_id.clone(),
-                    rev: Some(missing_rev.clone()),
-                });
-            }
-        }
-
-        let bulk_get_response = source.bulk_get(bulk_get_items).await?;
-
-        let mut docs_to_write: Vec<Document> = Vec::new();
-        let mut batch_failed = false;
-        for result in &bulk_get_response.results {
-            for doc in &result.docs {
-                if let Some(ref json) = doc.ok {
-                    match Document::from_json(json.clone()) {
-                        Ok(document) => docs_to_write.push(document),
-                        Err(e) => {
-                            errors.push(format!("parse error for {}: {}", result.id, e));
-                            batch_failed = true;
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(ReplicationFilter::Selector(ref selector)) = opts.filter {
-            docs_to_write.retain(|doc| rouchdb_query::matches_selector(&doc.data, selector));
-        }
-
-        if !docs_to_write.is_empty() {
-            let attempted = docs_to_write.len() as u64;
-            let write_results = target
-                .bulk_docs(docs_to_write, BulkDocsOptions::replication())
-                .await?;
-
-            for wr in &write_results {
-                if !wr.ok {
-                    errors.push(format!(
-                        "write error for {}: {}",
-                        wr.id,
-                        wr.reason.as_deref().unwrap_or("unknown")
-                    ));
-                    batch_failed = true;
-                }
-            }
-
-            // With new_edits=false CouchDB replies only with the docs that
-            // failed (an empty array means every doc was stored), so count
-            // what was sent minus the reported failures.
-            let failed = write_results.iter().filter(|wr| !wr.ok).count() as u64;
-            total_docs_written += attempted - failed;
-        }
-
-        // Emit change event
-        let _ = events_tx
-            .send(ReplicationEvent::Change {
-                docs_read: total_docs_read,
-            })
-            .await;
-
-        // Do not advance past a batch with parse/write failures.
-        if batch_failed {
-            break;
-        }
-
-        current_seq = batch_last_seq;
-        if opts.checkpoint {
-            let _ = checkpointer
-                .write_checkpoint(source, target, current_seq.clone())
-                .await;
-        }
-
-        if (changes.results.len() as u64) < opts.batch_size {
-            break;
-        }
-    }
-
-    let result = ReplicationResult {
-        ok: errors.is_empty(),
-        docs_read: total_docs_read,
-        docs_written: total_docs_written,
-        errors,
-        last_seq: current_seq,
-    };
-
-    if !suppress_complete {
-        let _ = events_tx
-            .send(ReplicationEvent::Complete(result.clone()))
-            .await;
-    }
-
-    Ok(result)
 }
 
 /// Run continuous (live) replication from source to target.
@@ -507,9 +388,10 @@ pub fn replicate_live(
     opts: ReplicationOptions,
 ) -> (mpsc::Receiver<ReplicationEvent>, ReplicationHandle) {
     let (tx, rx) = mpsc::channel(64);
+    let mut opts = opts;
     let poll_interval = opts.poll_interval;
     let retry = opts.retry;
-    let back_off = opts.back_off_function;
+    let back_off = opts.back_off_function.take();
 
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
@@ -521,29 +403,21 @@ pub fn replicate_live(
         let mut last_result: Option<ReplicationResult> = None;
 
         'live: loop {
-            // Clone the filter for each iteration so Selector and Custom
-            // filters remain active across the entire live replication.
-            let one_shot_opts = ReplicationOptions {
-                batch_size: opts.batch_size,
-                batches_limit: opts.batches_limit,
-                filter: opts.filter.clone(),
-                live: false,
-                retry: false,
-                poll_interval,
-                back_off_function: None,
-                since: None,
-                checkpoint: opts.checkpoint,
-            };
-
-            // Suppress the per-run Complete; the live loop emits one at the end.
-            let result = replicate_with_events_inner(
-                source.as_ref(),
-                target.as_ref(),
-                one_shot_opts,
-                tx.clone(),
-                true,
-            )
-            .await;
+            let result = async {
+                let checkpointer =
+                    new_checkpointer(source.as_ref(), target.as_ref(), &opts.filter).await?;
+                run_replication(
+                    source.as_ref(),
+                    target.as_ref(),
+                    &opts,
+                    &checkpointer,
+                    None,
+                    Some(&tx),
+                )
+                .await
+            }
+            .await
+            .map(|outcome| outcome.result);
 
             match result {
                 Ok(r) => {
