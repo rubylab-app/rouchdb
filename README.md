@@ -185,10 +185,24 @@ Options:
 rouchdb-server <path.redb> [OPTIONS]
 
 Options:
-  -p, --port <PORT>        Port to listen on [default: 5984]
-      --host <HOST>        Host to bind to [default: 127.0.0.1]
-      --db-name <NAME>     Database name [default: filename without extension]
+  -p, --port <PORT>                Port to listen on [default: 5984]
+      --host <HOST>                Host to bind to [default: 127.0.0.1]
+      --db-name <NAME>             Database name [default: filename without extension]
+      --admin <USER:PASSWORD>      Require admin credentials [env: ROUCHDB_ADMIN]
+      --cors-origin <ORIGIN>       Allow CORS from this origin (repeatable) [env: ROUCHDB_CORS_ORIGINS]
 ```
+
+Security defaults: the server binds to `127.0.0.1`, **CORS is disabled** (so
+web pages from other origins cannot use your browser to read or write the
+database) and **authentication is off**. To require credentials, set
+`ROUCHDB_ADMIN=user:password` (or `--admin`); clients then authenticate with
+HTTP Basic auth (`http://user:password@host:5984/db`) or a `_session` cookie
+(Fauxton login), and only `/`, `/_session`, `/_uuids` and `/_utils` stay
+public. To let a browser app on another origin talk to the server, allow its
+origin explicitly, e.g. `--cors-origin http://localhost:3000` (credentials are
+allowed for listed origins; `*` allows any origin without credentials). The
+server warns at startup when it listens on a non-loopback address without
+authentication.
 
 ## CLI Tool
 

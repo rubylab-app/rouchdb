@@ -1328,14 +1328,18 @@ name = "rouchdb-server"
 version = "0.4.0"
 dependencies = [
  "axum",
+ "base64",
  "clap",
+ "http-body-util",
  "mime_guess",
  "rouchdb",
  "rouchdb-core",
  "rust-embed",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "tokio",
+ "tower",
  "tower-http",
  "uuid",
 ]

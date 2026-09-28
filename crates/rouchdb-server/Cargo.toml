@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 rouchdb = { path = "../rouchdb", version = "0.4.0" }
 rouchdb-core = { path = "../rouchdb-core", version = "0.4.0" }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 rust-embed = "8"
@@ -23,3 +23,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+serde_urlencoded = "0.7"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
