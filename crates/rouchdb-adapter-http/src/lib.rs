@@ -4,6 +4,7 @@
 /// implementing the Adapter trait by mapping each method to the
 /// corresponding CouchDB REST API endpoint.
 pub mod auth;
+mod request;
 
 use std::collections::HashMap;
 

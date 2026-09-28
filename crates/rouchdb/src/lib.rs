@@ -91,6 +91,9 @@ pub trait Plugin: Send + Sync {
 /// Provides a user-friendly API similar to PouchDB's JavaScript interface.
 pub struct Database {
     adapter: Arc<dyn Adapter>,
+    /// Set for `http()` databases, whose Mango queries and indexes run on
+    /// the server.
+    remote: Option<Arc<HttpAdapter>>,
     indexes: Arc<RwLock<HashMap<String, MangoIndex>>>,
     plugins: Vec<Arc<dyn Plugin>>,
 }
@@ -127,6 +130,7 @@ impl Database {
     pub fn memory(name: &str) -> Self {
         Self {
             adapter: Arc::new(MemoryAdapter::new(name)),
+            remote: None,
             indexes: Arc::new(RwLock::new(HashMap::new())),
             plugins: Vec::new(),
         }
@@ -137,26 +141,32 @@ impl Database {
         let adapter = RedbAdapter::open(path, name)?;
         Ok(Self {
             adapter: Arc::new(adapter),
+            remote: None,
             indexes: Arc::new(RwLock::new(HashMap::new())),
             plugins: Vec::new(),
         })
     }
 
     /// Connect to a remote CouchDB instance.
+    ///
+    /// Mango queries and indexes (`find`, `create_index`, `get_indexes`,
+    /// `delete_index`, `explain`) run on the server.
     pub fn http(url: &str) -> Self {
-        Self {
-            adapter: Arc::new(HttpAdapter::new(url)),
-            indexes: Arc::new(RwLock::new(HashMap::new())),
-            plugins: Vec::new(),
-        }
+        Self::remote(HttpAdapter::new(url))
     }
 
     /// Connect to a remote CouchDB instance using an authenticated client.
     ///
     /// The `AuthClient` should have been logged in via `auth.login()` first.
     pub fn http_with_auth(url: &str, auth: &AuthClient) -> Self {
+        Self::remote(HttpAdapter::with_auth_client(url, auth))
+    }
+
+    fn remote(adapter: HttpAdapter) -> Self {
+        let adapter = Arc::new(adapter);
         Self {
-            adapter: Arc::new(HttpAdapter::with_auth_client(url, auth)),
+            adapter: adapter.clone(),
+            remote: Some(adapter),
             indexes: Arc::new(RwLock::new(HashMap::new())),
             plugins: Vec::new(),
         }
@@ -166,6 +176,7 @@ impl Database {
     pub fn from_adapter(adapter: Arc<dyn Adapter>) -> Self {
         Self {
             adapter,
+            remote: None,
             indexes: Arc::new(RwLock::new(HashMap::new())),
             plugins: Vec::new(),
         }
@@ -513,7 +524,17 @@ impl Database {
     /// used to avoid a full table scan. Otherwise falls back to scanning all
     /// documents. The index is brought up to date incrementally from the
     /// changes feed; invalid selectors or sort fields return `BadRequest`.
+    ///
+    /// On an `http()` database the query runs on the server (`_find`); only
+    /// when the server has no index for the requested sort are the
+    /// documents fetched and queried locally.
     pub async fn find(&self, opts: FindOptions) -> Result<FindResponse> {
+        if let Some(ref remote) = self.remote
+            && let Some(response) = remote_find(remote, &opts).await?
+        {
+            return Ok(response);
+        }
+
         // Validate the query before doing any work.
         CompiledSelector::new(&opts.selector)?;
         for sort_field in opts.sort.iter().flatten() {
@@ -596,7 +617,8 @@ impl Database {
     ///
     /// Equivalent to PouchDB's `db.createIndex()`. Builds the index
     /// immediately by scanning all documents; later finds keep it up to date
-    /// from the changes feed.
+    /// from the changes feed. On an `http()` database the index is created
+    /// on the server (`_index`).
     pub async fn create_index(&self, def: IndexDefinition) -> Result<CreateIndexResponse> {
         for sort_field in &def.fields {
             sort_field.try_field_and_direction()?;
@@ -615,6 +637,10 @@ impl Database {
         } else {
             def.name.clone()
         };
+
+        if let Some(ref remote) = self.remote {
+            return remote_create_index(remote, name, def).await;
+        }
 
         let exists = || CreateIndexResponse {
             result: "exists".to_string(),
@@ -664,7 +690,20 @@ impl Database {
     }
 
     /// Get all indexes defined on this database.
+    ///
+    /// On an `http()` database these are the server's JSON indexes (none if
+    /// the server cannot be reached).
     pub async fn get_indexes(&self) -> Vec<IndexInfo> {
+        if let Some(ref remote) = self.remote {
+            let mut result: Vec<IndexInfo> = remote_indexes(remote)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, info)| info)
+                .collect();
+            result.sort_by(|a, b| a.name.cmp(&b.name));
+            return result;
+        }
         let indexes = self.indexes.read().await;
         let mut result: Vec<IndexInfo> = indexes
             .values()
@@ -684,6 +723,11 @@ impl Database {
     ///
     /// Returns which index would be used and the query plan.
     pub async fn explain(&self, opts: FindOptions) -> ExplainResponse {
+        if let Some(ref remote) = self.remote
+            && let Some(explained) = remote_explain(remote, &opts).await
+        {
+            return explained;
+        }
         let usable = {
             let indexes = self.indexes.read().await;
             usable_index(&indexes, &opts.selector)
@@ -722,6 +766,9 @@ impl Database {
 
     /// Delete an index by name.
     pub async fn delete_index(&self, name: &str) -> Result<()> {
+        if let Some(ref remote) = self.remote {
+            return remote_delete_index(remote, name).await;
+        }
         let mut indexes = self.indexes.write().await;
         indexes
             .remove(name)
@@ -1022,6 +1069,173 @@ impl Partition<'_> {
         };
         self.db.put(&full_id, data).await
     }
+}
+
+// ---------------------------------------------------------------------------
+// Mango on a remote CouchDB
+// ---------------------------------------------------------------------------
+
+/// `limit` sent to `_find` when the caller wants every match (CouchDB
+/// returns 25 documents by default).
+const REMOTE_FIND_NO_LIMIT: u64 = (1 << 53) - 1;
+
+/// Turn an error response from CouchDB into a `RouchError`.
+fn remote_error(status: u16, body: &serde_json::Value) -> RouchError {
+    let reason = body
+        .get("reason")
+        .and_then(|r| r.as_str())
+        .unwrap_or_default()
+        .to_string();
+    match status {
+        400 => RouchError::BadRequest(reason),
+        401 => RouchError::Unauthorized,
+        403 => RouchError::Forbidden(reason),
+        404 => RouchError::NotFound(reason),
+        409 => RouchError::Conflict,
+        _ => RouchError::DatabaseError(format!("HTTP {status}: {body}")),
+    }
+}
+
+/// Send a request and return the JSON body of a successful response, or
+/// the status and body of an error response.
+async fn remote_request(
+    remote: &HttpAdapter,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<std::result::Result<serde_json::Value, (u16, serde_json::Value)>> {
+    let (status, response) = remote.request_json(method, path, body).await?;
+    Ok(if (200..300).contains(&status) {
+        Ok(response)
+    } else {
+        Err((status, response))
+    })
+}
+
+/// The `_find`/`_explain` request body for a query.
+fn remote_query_body(opts: &FindOptions) -> Result<serde_json::Value> {
+    let mut body = serde_json::to_value(opts)?;
+    body["limit"] = serde_json::json!(opts.limit.unwrap_or(REMOTE_FIND_NO_LIMIT));
+    Ok(body)
+}
+
+/// Run a query with `_find`; `None` if the server has no index for the
+/// requested sort (the caller then queries locally).
+async fn remote_find(remote: &HttpAdapter, opts: &FindOptions) -> Result<Option<FindResponse>> {
+    let body = remote_query_body(opts)?;
+    match remote_request(remote, "POST", "_find", Some(&body)).await? {
+        Ok(response) => {
+            let docs = match response.get("docs") {
+                Some(serde_json::Value::Array(docs)) => docs.clone(),
+                _ => Vec::new(),
+            };
+            Ok(Some(FindResponse { docs }))
+        }
+        Err((400, body)) if body["error"] == "no_usable_index" => Ok(None),
+        Err((status, body)) => Err(remote_error(status, &body)),
+    }
+}
+
+async fn remote_create_index(
+    remote: &HttpAdapter,
+    name: String,
+    def: IndexDefinition,
+) -> Result<CreateIndexResponse> {
+    let mut body = serde_json::json!({
+        "index": {"fields": def.fields},
+        "name": name,
+        "type": "json",
+    });
+    if let Some(ddoc) = def.ddoc {
+        body["ddoc"] = serde_json::json!(ddoc);
+    }
+    match remote_request(remote, "POST", "_index", Some(&body)).await? {
+        Ok(response) => Ok(CreateIndexResponse {
+            result: response["result"].as_str().unwrap_or("created").to_string(),
+            name: response["name"].as_str().unwrap_or(&name).to_string(),
+        }),
+        Err((status, body)) => Err(remote_error(status, &body)),
+    }
+}
+
+/// The server's JSON indexes, with the id of their design document.
+async fn remote_indexes(remote: &HttpAdapter) -> Result<Vec<(String, IndexInfo)>> {
+    let response = remote_request(remote, "GET", "_index", None)
+        .await?
+        .map_err(|(status, body)| remote_error(status, &body))?;
+    let mut result = Vec::new();
+    for index in response["indexes"].as_array().into_iter().flatten() {
+        if index["type"] != "json" {
+            continue;
+        }
+        let ddoc = index["ddoc"].as_str().unwrap_or_default().to_string();
+        let fields = serde_json::from_value(index["def"]["fields"].clone()).unwrap_or_default();
+        result.push((
+            ddoc.clone(),
+            IndexInfo {
+                name: index["name"].as_str().unwrap_or_default().to_string(),
+                ddoc: Some(ddoc),
+                def: IndexFields { fields },
+            },
+        ));
+    }
+    Ok(result)
+}
+
+async fn remote_delete_index(remote: &HttpAdapter, name: &str) -> Result<()> {
+    let ddoc = remote_indexes(remote)
+        .await?
+        .into_iter()
+        .find(|(_, info)| info.name == name)
+        .map(|(ddoc, _)| ddoc)
+        .ok_or_else(|| RouchError::NotFound(format!("index {}", name)))?;
+    let ddoc = ddoc.strip_prefix("_design/").unwrap_or(&ddoc);
+    let path = format!(
+        "_index/{}/json/{}",
+        encode_path_segment(ddoc),
+        encode_path_segment(name)
+    );
+    remote_request(remote, "DELETE", &path, None)
+        .await?
+        .map(|_| ())
+        .map_err(|(status, body)| remote_error(status, &body))
+}
+
+/// Ask the server how it would run a query; `None` if that fails.
+async fn remote_explain(remote: &HttpAdapter, opts: &FindOptions) -> Option<ExplainResponse> {
+    let body = remote_query_body(opts).ok()?;
+    let response = remote_request(remote, "POST", "_explain", Some(&body))
+        .await
+        .ok()?
+        .ok()?;
+    let index = &response["index"];
+    Some(ExplainResponse {
+        dbname: response["dbname"].as_str().unwrap_or_default().to_string(),
+        index: ExplainIndex {
+            ddoc: index["ddoc"].as_str().map(str::to_string),
+            name: index["name"].as_str().unwrap_or_default().to_string(),
+            index_type: index["type"].as_str().unwrap_or_default().to_string(),
+            def: IndexFields {
+                fields: serde_json::from_value(index["def"]["fields"].clone()).unwrap_or_default(),
+            },
+        },
+        selector: opts.selector.clone(),
+        fields: opts.fields.clone(),
+    })
+}
+
+/// Percent-encode a URL path segment (everything but RFC 3986 unreserved
+/// characters).
+fn encode_path_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 /// Batch size for reading a changes feed filtered by a selector.

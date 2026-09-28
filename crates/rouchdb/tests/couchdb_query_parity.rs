@@ -491,3 +491,121 @@ async fn views_match_couchdb() {
     delete_remote_db(&url).await;
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
+
+#[tokio::test]
+#[ignore]
+async fn http_database_runs_mango_on_couchdb() {
+    // F48: find/create_index on Database::http must use CouchDB's _find and
+    // _index instead of downloading every document.
+    let url = fresh_remote_db("remote_mango").await;
+    let remote = Database::http(&url);
+    for name in ["apple", "Banana", "cherry"] {
+        remote.put(name, json!({"name": name})).await.unwrap();
+    }
+    for i in 0..30 {
+        remote
+            .put(&format!("n{i:02}"), json!({"n": i}))
+            .await
+            .unwrap();
+    }
+
+    let created = remote
+        .create_index(rouchdb::IndexDefinition {
+            name: String::new(),
+            fields: vec![rouchdb::SortField::Simple("name".into())],
+            ddoc: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.result, "created");
+    assert_eq!(created.name, "idx-name");
+    // The index exists on the server.
+    let server: Value = reqwest::get(format!("{url}/_index"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        server["indexes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["name"] == "idx-name")
+    );
+    let indexes = remote.get_indexes().await;
+    assert_eq!(indexes.len(), 1);
+    assert_eq!(indexes[0].name, "idx-name");
+    let plan = remote
+        .explain(FindOptions {
+            selector: json!({"name": {"$gt": null}}),
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(plan.index.name, "idx-name");
+
+    // CouchDB sorts with ICU collation ("apple" < "Banana"), which only
+    // happens if the query ran on the server.
+    let sorted = remote
+        .find(FindOptions {
+            selector: json!({"name": {"$gt": null}}),
+            sort: Some(vec![rouchdb::SortField::Simple("name".into())]),
+            fields: Some(vec!["name".into()]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let names: Vec<_> = sorted.docs.iter().map(|d| d["name"].clone()).collect();
+    assert_eq!(names, [json!("apple"), json!("Banana"), json!("cherry")]);
+
+    // No limit means every match, not CouchDB's default of 25.
+    let all = remote
+        .find(FindOptions {
+            selector: json!({"n": {"$gte": 0}}),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(all.docs.len(), 30);
+    let page = remote
+        .find(FindOptions {
+            selector: json!({"n": {"$gte": 0}}),
+            skip: Some(5),
+            limit: Some(3),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.docs.len(), 3);
+
+    // A sort CouchDB cannot serve without an index still works.
+    let by_n = remote
+        .find(FindOptions {
+            selector: json!({"n": {"$gte": 28}}),
+            sort: Some(vec![rouchdb::SortField::WithDirection(
+                [("n".to_string(), "desc".to_string())].into(),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let ns: Vec<_> = by_n.docs.iter().map(|d| d["n"].clone()).collect();
+    assert_eq!(ns, [json!(29), json!(28)]);
+
+    // Invalid selectors are reported.
+    assert!(
+        remote
+            .find(FindOptions {
+                selector: json!({"n": {"$foo": 1}}),
+                ..Default::default()
+            })
+            .await
+            .is_err()
+    );
+
+    remote.delete_index("idx-name").await.unwrap();
+    assert!(remote.get_indexes().await.is_empty());
+    assert!(remote.delete_index("idx-name").await.is_err());
+
+    delete_remote_db(&url).await;
+}
