@@ -345,7 +345,7 @@ async fn view_engine_handles_deleted_docs() {
     assert_eq!(engine.get_index("app", "all").unwrap().entries.len(), 2);
 
     // Delete doc1
-    db.remove("doc1", &r1.rev.unwrap()).await.unwrap();
+    assert!(db.remove("doc1", &r1.rev.unwrap()).await.unwrap().ok);
 
     engine
         .update_index(db.adapter(), "app", "all")

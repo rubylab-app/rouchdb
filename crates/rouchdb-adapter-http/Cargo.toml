@@ -3,6 +3,7 @@ name = "rouchdb-adapter-http"
 description = "CouchDB HTTP client adapter for RouchDB"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -10,11 +11,26 @@ keywords.workspace = true
 categories.workspace = true
 readme.workspace = true
 
+[features]
+default = ["rustls-tls"]
+# TLS through rustls with the bundled Mozilla root store (no OpenSSL).
+rustls-tls = ["reqwest/rustls-tls"]
+# TLS through rustls, trusting the operating system's certificate store.
+rustls-tls-native-roots = ["reqwest/rustls-tls-native-roots"]
+# TLS through the platform stack (OpenSSL on Linux).
+native-tls = ["reqwest/native-tls"]
+
 [dependencies]
 rouchdb-core = { path = "../rouchdb-core", version = "0.4.0" }
 async-trait = "0.1"
 percent-encoding = "2"
-reqwest = { version = "0.12", features = ["json", "cookies"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "charset",
+    "cookies",
+    "http2",
+    "json",
+    "system-proxy",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["sync"] }

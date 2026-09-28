@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-RouchDB is a local-first document database in Rust — the Rust equivalent of PouchDB. It stores JSON documents locally (in-memory or on disk via redb) and replicates bidirectionally with CouchDB using the standard replication protocol. Pure Rust, no C dependencies.
+RouchDB is a local-first document database in Rust — the Rust equivalent of PouchDB. It stores JSON documents locally (in-memory or on disk via redb) and replicates bidirectionally with CouchDB using the standard replication protocol. No system libraries required: pure-Rust storage (redb) and rustls for HTTPS by default (`native-tls` / `rustls-tls-native-roots` are opt-in features).
 
 ## Build & Test Commands
 
@@ -24,8 +24,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 # Integration tests (require CouchDB at localhost:15984)
 docker compose up -d
-cargo test -p rouchdb --test '*' -- --ignored
+bash scripts/test-couchdb.sh              # all #[ignore]d tests, skips "blocked on Fxx"
 cargo test -p rouchdb --test replication replicate_memory_to_couchdb -- --ignored
+
+# Benchmarks (criterion, crates/rouchdb-bench)
+cargo bench -p rouchdb-bench
+cargo bench --workspace --no-run          # compile-only, as in CI
 
 # HTTP server
 cargo run -p rouchdb-server -- mydb.redb --port 5984
@@ -54,7 +58,8 @@ rouchdb                     <- umbrella: Database struct + re-exports + Plugin t
 ├── rouchdb-query           -> core         (Mango selectors + map/reduce)
 ├── rouchdb-views           -> core         (design documents + view engine)
 ├── rouchdb-server          -> rouchdb, core (Axum HTTP server + Fauxton UI)
-└── rouchdb-cli             -> rouchdb      (CLI tool for database inspection + CRUD)
+├── rouchdb-cli             -> rouchdb      (CLI tool for database inspection + CRUD)
+└── rouchdb-bench           -> rouchdb, core (criterion benchmarks)
 ```
 
 ### The Adapter Trait (`rouchdb-core/src/adapter.rs`)
@@ -109,11 +114,12 @@ Clap-based CLI. Read commands: `info`, `get`, `all-docs`, `find`, `changes`, `du
 
 ## Workspace Conventions
 
-- **Edition 2024**, resolver 3, stable Rust (no nightly features)
+- **Edition 2024**, resolver 3, stable Rust (no nightly features). MSRV 1.88 (`rust-version`); the dev/CI toolchain is pinned in `rust-toolchain.toml`
 - Workspace-level `version` in root `Cargo.toml` — all crate versions must stay in sync
-- Internal dependency versions must match workspace version (e.g., `rouchdb-core = { path = "../rouchdb-core", version = "0.2.1" }`)
+- Internal dependency versions must match workspace version (e.g., `rouchdb-core = { path = "../rouchdb-core", version = "0.4.0" }`)
 - All async via Tokio; tests use `#[tokio::test]`
 - Integration tests are `#[ignore]` — they need CouchDB at `http://admin:password@localhost:15984` (override with `COUCHDB_URL` env var)
+- A test that exposes a known unfixed bug is marked `#[ignore = "blocked on Fxx"]` rather than weakened; `scripts/test-couchdb.sh` and CI skip those
 - `Database::memory("test")` is the go-to for fast unit testing
 - `tempfile::tempdir()` for RedbAdapter tests
 - Edition 2024 requires collapsible if-let chains (no nested `if let` inside `if`)
@@ -124,8 +130,8 @@ Clap-based CLI. Read commands: `info`, `get`, `all-docs`, `find`, `changes`, `du
 
 ## Publishing
 
-All 9 library crates must be published to crates.io in dependency order: core → adapter-memory, adapter-redb, adapter-http, query → changes, views, replication → rouchdb (umbrella). Server and CLI are `publish = false`.
+All 9 library crates must be published to crates.io in dependency order: core → adapter-memory, adapter-redb, adapter-http, query → changes, views, replication → rouchdb (umbrella). Server, CLI and bench are `publish = false`.
 
 ## CI
 
-GitHub Actions (`.github/workflows/ci.yml`): `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --workspace`. Docs deploy via `docs.yml` (mdBook → GitHub Pages).
+GitHub Actions (`.github/workflows/ci.yml`), all on the toolchain pinned in `rust-toolchain.toml` unless noted: fmt + clippy `-D warnings` + TLS feature checks, `cargo test --workspace`, the `#[ignore]`d suite against a `couchdb:3` service container, `cargo bench --no-run`, an MSRV (1.88) check, and a non-blocking clippy run on stable/beta. `bench.yml` runs the benchmarks on demand (workflow_dispatch). Docs deploy via `docs.yml` (mdBook → GitHub Pages).

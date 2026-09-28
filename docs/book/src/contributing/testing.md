@@ -50,11 +50,13 @@ The default connection URL is `http://admin:password@localhost:15984`.
 
 ### Running Integration Tests
 
-All integration tests are marked `#[ignore]` so they are skipped during `cargo test`. Run them with:
+All integration tests are marked `#[ignore]` so they are skipped during `cargo test`. Run the whole suite (every crate, one test at a time) with:
 
 ```bash
-cargo test -p rouchdb --test '*' -- --ignored
+bash scripts/test-couchdb.sh
 ```
+
+The script runs `cargo test --workspace --no-fail-fast -- --ignored --test-threads=1` and skips the tests marked `#[ignore = "blocked on Fxx"]` (see below). Extra arguments go to `cargo test`, e.g. `bash scripts/test-couchdb.sh -p rouchdb`.
 
 To run a single integration test by name:
 
@@ -67,9 +69,20 @@ cargo test -p rouchdb --test http_crud http_put_and_get -- --ignored
 To point tests at a different CouchDB instance, set the `COUCHDB_URL` environment variable:
 
 ```bash
-COUCHDB_URL="http://user:pass@myhost:5984" \
-  cargo test -p rouchdb --test '*' -- --ignored
+COUCHDB_URL="http://user:pass@myhost:5984" bash scripts/test-couchdb.sh
 ```
+
+### Tests Blocked on a Known Bug
+
+A test that pins down a known, not yet fixed library bug is marked with the finding it is waiting for, instead of weakening its assertions:
+
+```rust
+#[tokio::test]
+#[ignore = "blocked on F03"]
+async fn inline_base64_attachment_decoding() { /* ... */ }
+```
+
+`scripts/test-couchdb.sh` (and therefore CI) skips these. Run one explicitly with `cargo test -p rouchdb --test parity_core inline_base64 -- --ignored`, and remove the marker in the PR that fixes the bug.
 
 ## Writing New Unit Tests
 
@@ -230,18 +243,40 @@ The integration test files share three common helpers:
 - `fresh_remote_db(prefix)` -- Creates a new CouchDB database with a UUID-based name and returns its URL.
 - `delete_remote_db(url)` -- Deletes a CouchDB database by URL.
 
-## Continuous Integration
+## Assertions
 
-When running tests in CI, use two stages:
+A test must be able to fail. In particular:
+
+- `update`, `remove` and `bulk_docs` report conflicts per document (`DocResult { ok: false, error: Some("conflict"), .. }`), not as `Err`. `db.update(..).await.unwrap()` alone passes on a rejected write; assert `ok` (or the exact `error`) instead.
+- Do not accept every outcome (`assert!(r.is_ok() || r.is_err())`, `match` arms that all do nothing). Assert the behavior CouchDB has, and verify it against a real CouchDB when in doubt.
+
+## Benchmarks
+
+Criterion benchmarks live in the `rouchdb-bench` crate:
+
+- `benches/core_ops.rs`: `bulk_docs`, `get`, `all_docs`, `changes`, Mango `find` with and without an index, and replication, on the memory and redb backends.
+- `benches/revtree.rs`: `merge_tree`, `stem`, `winning_rev` and `collect_conflicts` on deep and wide revision trees.
 
 ```bash
-# Stage 1: Unit tests (no services needed)
-cargo test
-
-# Stage 2: Integration tests (CouchDB required)
-docker compose up -d --wait
-cargo test -p rouchdb --test '*' -- --ignored
-docker compose down
+cargo bench -p rouchdb-bench                   # everything
+cargo bench -p rouchdb-bench -- find/redb      # filter by benchmark name
+ROUCHDB_BENCH_N=100000 cargo bench -p rouchdb-bench --bench core_ops
+cargo bench -p rouchdb-bench -- --save-baseline main   # then compare with --baseline main
 ```
 
-The `--wait` flag tells Docker Compose to block until the health check passes before proceeding.
+Results depend heavily on the machine; compare runs on the same machine only.
+
+## Continuous Integration
+
+GitHub Actions (`.github/workflows/ci.yml`) runs these jobs on every pull request:
+
+| Job | What it runs |
+|-----|--------------|
+| Check & Lint | `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, and the TLS feature combinations |
+| Tests | `cargo test --workspace` |
+| CouchDB integration tests | `scripts/test-couchdb.sh` against a `couchdb:3` service container |
+| Benchmarks (build only) | `cargo bench --no-run` |
+| MSRV (1.88) | `cargo check --all-targets --all-features` on Rust 1.88 |
+| Clippy on stable/beta | Non-blocking early warning about lints from newer toolchains |
+
+The blocking jobs use the toolchain pinned in `rust-toolchain.toml`. To move to a newer Rust, bump it there and fix any new lints in the same PR. The benchmarks can be run on a GitHub runner from the Actions tab (the manual "Benchmarks" workflow); shared runners are noisy, so use those numbers for trends only.

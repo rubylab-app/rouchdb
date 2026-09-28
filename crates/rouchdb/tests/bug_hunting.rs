@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use rouchdb::{
     AllDocsOptions, BulkDocsOptions, ChangesOptions, ChangesStreamOptions, Database,
-    DesignDocument, Document, FindOptions, Plugin, Result, Revision, SecurityDocument,
+    DesignDocument, Document, FindOptions, GetOptions, Plugin, Result, Revision, SecurityDocument,
     SecurityGroup, SortField, ViewDef, ViewEngine, ViewQueryOptions, query_view,
 };
 
@@ -124,13 +124,17 @@ async fn partition_empty_name() {
 
 #[tokio::test]
 async fn document_roundtrip_preserves_attachments() {
+    // Attachment stub exactly as CouchDB 3.5.1 returns it from `GET /db/doc1`
+    // ("Hello, World!" stored as application/octet-stream).
     let json = serde_json::json!({
         "_id": "doc1",
+        "_rev": "1-d13178e2b436fa29621d6329b3a5f83b",
         "_attachments": {
             "file.txt": {
-                "content_type": "text/plain",
-                "digest": "md5-abc123",
-                "length": 5,
+                "content_type": "application/octet-stream",
+                "revpos": 1,
+                "digest": "md5-ZajifYh5KDgxtmS9i38K1A==",
+                "length": 13,
                 "stub": true
             }
         },
@@ -145,8 +149,12 @@ async fn document_roundtrip_preserves_attachments() {
     let json_out = doc.to_json();
     let doc2 = Document::from_json(json_out).unwrap();
     assert_eq!(doc2.attachments.len(), 1);
-    assert!(doc2.attachments.contains_key("file.txt"));
-    assert_eq!(doc2.attachments["file.txt"].content_type, "text/plain");
+    let att = &doc2.attachments["file.txt"];
+    assert_eq!(att.content_type, "application/octet-stream");
+    assert_eq!(att.digest, "md5-ZajifYh5KDgxtmS9i38K1A==");
+    assert_eq!(att.length, 13);
+    assert!(att.stub);
+    assert!(att.data.is_none());
 }
 
 #[tokio::test]
@@ -432,9 +440,12 @@ async fn plugin_before_write_called_on_update() {
     let r1 = db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
     assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-    db.update("doc1", &r1.rev.unwrap(), serde_json::json!({"v": 2}))
-        .await
-        .unwrap();
+    assert!(
+        db.update("doc1", &r1.rev.unwrap(), serde_json::json!({"v": 2}))
+            .await
+            .unwrap()
+            .ok
+    );
     assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
@@ -459,7 +470,7 @@ async fn plugin_before_write_called_on_remove() {
     let db = Database::memory("test").with_plugin(Arc::new(WriteCountPlugin2(counter_clone)));
 
     let r1 = db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
-    db.remove("doc1", &r1.rev.unwrap()).await.unwrap();
+    assert!(db.remove("doc1", &r1.rev.unwrap()).await.unwrap().ok);
     assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
@@ -875,9 +886,15 @@ async fn create_conflict_via_bulk_docs() {
     let db = Database::memory("test");
 
     // Create initial doc
-    db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
+    let local_rev = db
+        .put("doc1", serde_json::json!({"v": 1}))
+        .await
+        .unwrap()
+        .rev
+        .unwrap();
 
     // Force a conflicting revision via replication mode
+    let conflict_rev = "1-conflicting_hash".to_string();
     let conflict_doc = Document {
         id: "doc1".into(),
         rev: Some(Revision::new(1, "conflicting_hash".into())),
@@ -886,13 +903,33 @@ async fn create_conflict_via_bulk_docs() {
         attachments: HashMap::new(),
     };
 
-    db.bulk_docs(vec![conflict_doc], BulkDocsOptions::replication())
+    let results = db
+        .bulk_docs(vec![conflict_doc], BulkDocsOptions::replication())
         .await
         .unwrap();
+    assert!(results.iter().all(|r| r.ok), "{results:?}");
 
-    // Get the doc — should get the winning revision
-    let doc = db.get("doc1").await.unwrap();
-    assert!(doc.data.get("v").is_some());
+    // Both leaves are generation 1 and live, so the winner is the one with
+    // the lexicographically greater hash (deterministic, like CouchDB).
+    let (winner, loser, winner_v) = if conflict_rev > local_rev {
+        (&conflict_rev, &local_rev, serde_json::json!("conflict"))
+    } else {
+        (&local_rev, &conflict_rev, serde_json::json!(1))
+    };
+
+    let doc = db
+        .get_with_opts(
+            "doc1",
+            GetOptions {
+                conflicts: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(&doc.rev.unwrap().to_string(), winner);
+    assert_eq!(doc.data["v"], winner_v);
+    assert_eq!(doc.data["_conflicts"], serde_json::json!([loser]));
 }
 
 // =========================================================================

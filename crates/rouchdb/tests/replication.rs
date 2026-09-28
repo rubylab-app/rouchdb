@@ -88,8 +88,11 @@ async fn bidirectional_sync_with_couchdb() {
     assert!(push.ok);
     assert!(pull.ok);
 
-    let _ = local.get("remote_doc").await.unwrap();
-    let _ = remote.get("local_doc").await.unwrap();
+    assert_eq!(
+        local.get("remote_doc").await.unwrap().data["from"],
+        "remote"
+    );
+    assert_eq!(remote.get("local_doc").await.unwrap().data["from"], "local");
 
     delete_remote_db(&url).await;
 }
@@ -139,7 +142,7 @@ async fn replicate_deletes_to_couchdb() {
         .unwrap();
     local.replicate_to(&remote).await.unwrap();
 
-    local.remove("doc1", &r1.rev.unwrap()).await.unwrap();
+    assert!(local.remove("doc1", &r1.rev.unwrap()).await.unwrap().ok);
 
     let result = local.replicate_to(&remote).await.unwrap();
     assert!(result.ok);
@@ -163,10 +166,13 @@ async fn replicate_updates_to_couchdb() {
         .unwrap();
     local.replicate_to(&remote).await.unwrap();
 
-    local
-        .update("doc1", &r1.rev.unwrap(), serde_json::json!({"v": 2}))
-        .await
-        .unwrap();
+    assert!(
+        local
+            .update("doc1", &r1.rev.unwrap(), serde_json::json!({"v": 2}))
+            .await
+            .unwrap()
+            .ok
+    );
 
     local.replicate_to(&remote).await.unwrap();
 
@@ -231,7 +237,6 @@ async fn already_synced_noop() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn replicate_memory_to_redb() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.redb");
@@ -404,7 +409,7 @@ async fn replicate_delete_and_recreate() {
         .await
         .unwrap();
     local.replicate_to(&remote).await.unwrap();
-    local.remove("doc1", &r1.rev.unwrap()).await.unwrap();
+    assert!(local.remove("doc1", &r1.rev.unwrap()).await.unwrap().ok);
     local.replicate_to(&remote).await.unwrap();
 
     assert!(remote.get("doc1").await.is_err());
@@ -414,14 +419,17 @@ async fn replicate_delete_and_recreate() {
     let doc1_change = changes.results.iter().find(|r| r.id == "doc1").unwrap();
     let tombstone_rev = &doc1_change.changes[0].rev;
 
-    local
-        .update(
-            "doc1",
-            tombstone_rev,
-            serde_json::json!({"v": "resurrected"}),
-        )
-        .await
-        .unwrap();
+    assert!(
+        local
+            .update(
+                "doc1",
+                tombstone_rev,
+                serde_json::json!({"v": "resurrected"}),
+            )
+            .await
+            .unwrap()
+            .ok
+    );
 
     local.replicate_to(&remote).await.unwrap();
 
@@ -479,7 +487,6 @@ async fn replicate_couchdb_to_redb() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn replicate_redb_bidirectional_memory() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.redb");
@@ -498,8 +505,11 @@ async fn replicate_redb_bidirectional_memory() {
     assert!(push.ok);
     assert!(pull.ok);
 
-    let _ = redb.get("from_mem").await.unwrap();
-    let _ = memory.get("from_redb").await.unwrap();
+    assert_eq!(redb.get("from_mem").await.unwrap().data["source"], "memory");
+    assert_eq!(
+        memory.get("from_redb").await.unwrap().data["source"],
+        "redb"
+    );
 
     let redb_info = redb.info().await.unwrap();
     let mem_info = memory.info().await.unwrap();
@@ -615,10 +625,13 @@ async fn replicate_remote_updates_back_to_local() {
 
     let remote_doc = remote.get("doc1").await.unwrap();
     let remote_rev = remote_doc.rev.unwrap().to_string();
-    remote
-        .update("doc1", &remote_rev, serde_json::json!({"v": 2}))
-        .await
-        .unwrap();
+    assert!(
+        remote
+            .update("doc1", &remote_rev, serde_json::json!({"v": 2}))
+            .await
+            .unwrap()
+            .ok
+    );
 
     local.replicate_from(&remote).await.unwrap();
 
@@ -643,7 +656,7 @@ async fn replicate_remote_deletes_back_to_local() {
 
     let remote_doc = remote.get("doc1").await.unwrap();
     let remote_rev = remote_doc.rev.unwrap().to_string();
-    remote.remove("doc1", &remote_rev).await.unwrap();
+    assert!(remote.remove("doc1", &remote_rev).await.unwrap().ok);
 
     local.replicate_from(&remote).await.unwrap();
 
@@ -674,18 +687,24 @@ async fn sync_interleaved_updates() {
 
     let remote_doc = remote.get("doc1").await.unwrap();
     let remote_rev = remote_doc.rev.unwrap().to_string();
-    remote
-        .update("doc1", &remote_rev, serde_json::json!({"v": 3}))
-        .await
-        .unwrap();
+    assert!(
+        remote
+            .update("doc1", &remote_rev, serde_json::json!({"v": 3}))
+            .await
+            .unwrap()
+            .ok
+    );
     local.sync(&remote).await.unwrap();
 
     let local_doc = local.get("doc1").await.unwrap();
     let local_rev = local_doc.rev.unwrap().to_string();
-    local
-        .update("doc1", &local_rev, serde_json::json!({"v": 4}))
-        .await
-        .unwrap();
+    assert!(
+        local
+            .update("doc1", &local_rev, serde_json::json!({"v": 4}))
+            .await
+            .unwrap()
+            .ok
+    );
     local.sync(&remote).await.unwrap();
 
     let final_local = local.get("doc1").await.unwrap();
@@ -719,22 +738,28 @@ async fn sync_many_docs_diverse_operations() {
 
     // Update even-numbered docs
     for i in (0..10).step_by(2) {
-        local
-            .update(
-                &format!("doc{:02}", i),
-                &revs[i],
-                serde_json::json!({"i": i, "updated": true}),
-            )
-            .await
-            .unwrap();
+        assert!(
+            local
+                .update(
+                    &format!("doc{:02}", i),
+                    &revs[i],
+                    serde_json::json!({"i": i, "updated": true}),
+                )
+                .await
+                .unwrap()
+                .ok
+        );
     }
 
     // Delete odd-numbered docs
     for i in (1..10).step_by(2) {
-        local
-            .remove(&format!("doc{:02}", i), &revs[i])
-            .await
-            .unwrap();
+        assert!(
+            local
+                .remove(&format!("doc{:02}", i), &revs[i])
+                .await
+                .unwrap()
+                .ok
+        );
     }
 
     local.sync(&remote).await.unwrap();

@@ -6,6 +6,25 @@ This project follows [Semantic Versioning](https://semver.org/). Since we are pr
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- **HTTPS uses rustls by default instead of native-tls/OpenSSL.** `rouchdb` and `rouchdb-adapter-http` now expose the TLS backend as Cargo features: `rustls-tls` (default, bundled Mozilla roots), `rustls-tls-native-roots` (rustls with the OS certificate store) and `native-tls` (the previous behavior: OpenSSL on Linux). Building no longer needs OpenSSL headers on Linux. If you connect to a CouchDB whose certificate is signed by a private CA installed in the OS trust store, enable `rustls-tls-native-roots` or `native-tls`:
+  ```toml
+  rouchdb = { version = "…", default-features = false, features = ["native-tls"] }
+  ```
+- **The minimum supported Rust version is now declared: 1.88** (`rust-version`) and checked in CI. Development and CI use the toolchain pinned in `rust-toolchain.toml`.
+
+### Internal
+
+- CI runs the `#[ignore]`d CouchDB integration suite against a `couchdb:3` service container, checks the MSRV and the TLS feature combinations, builds the benchmarks, and runs a non-blocking clippy on stable/beta.
+- New `rouchdb-bench` crate with criterion benchmarks (`cargo bench -p rouchdb-bench`); a manual `Benchmarks` workflow runs them on GitHub.
+- Tests: tautological assertions replaced by real ones, inline-attachment tests use documents captured from CouchDB 3.5, and the memory↔redb replication tests run in the default suite.
+- Docs: installation snippets show `0.4`, and CI fails if README/book snippets drift from the workspace version.
+
+---
+
 ## [0.4.0] — 2026-06-09
 
 Correctness release. A deep audit fixed **44 bugs** across every crate. There are no new features, but several fixes change observable behavior (HTTP status codes, replication checkpoints) or public type shapes — **read the migration guide before upgrading.**

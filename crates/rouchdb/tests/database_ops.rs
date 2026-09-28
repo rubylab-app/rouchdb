@@ -34,9 +34,12 @@ async fn database_compact_http() {
         .update("doc1", &r1.rev.unwrap(), serde_json::json!({"v": 2}))
         .await
         .unwrap();
-    db.update("doc1", &r2.rev.unwrap(), serde_json::json!({"v": 3}))
-        .await
-        .unwrap();
+    assert!(
+        db.update("doc1", &r2.rev.unwrap(), serde_json::json!({"v": 3}))
+            .await
+            .unwrap()
+            .ok
+    );
 
     db.compact().await.unwrap();
 

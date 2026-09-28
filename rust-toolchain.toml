@@ -1,0 +1,10 @@
+# Toolchain for local development and the blocking CI jobs (fmt, clippy,
+# tests, benches). Pinned so a new stable release cannot break CI with new
+# lints overnight: bump it on purpose and fix the new lints in the same PR.
+# The non-blocking `latest` CI job gives early warning about the next
+# stable/beta. The minimum supported Rust version is `rust-version` in the
+# root Cargo.toml and is checked by the `msrv` CI job.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

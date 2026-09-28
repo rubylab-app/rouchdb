@@ -28,7 +28,10 @@ async fn error_update_wrong_rev() {
     let result = db
         .update("doc1", "1-bogusrevisionhash", serde_json::json!({"v": 2}))
         .await;
-    assert!(result.is_err() || !result.unwrap().ok);
+    // CouchDB rejects the write with a 409, surfaced as a conflict error.
+    assert!(matches!(result, Err(RouchError::Conflict)), "{result:?}");
+    // The stored document is left untouched.
+    assert_eq!(db.get("doc1").await.unwrap().data["v"], 1);
 
     delete_remote_db(&url).await;
 }
@@ -42,7 +45,10 @@ async fn error_delete_wrong_rev() {
     db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
 
     let result = db.remove("doc1", "1-bogusrevisionhash").await;
-    assert!(result.is_err() || !result.unwrap().ok);
+    // CouchDB rejects the write with a 409, surfaced as a conflict error.
+    assert!(matches!(result, Err(RouchError::Conflict)), "{result:?}");
+    // The stored document is left untouched.
+    assert_eq!(db.get("doc1").await.unwrap().data["v"], 1);
 
     delete_remote_db(&url).await;
 }
@@ -56,7 +62,10 @@ async fn error_put_existing_without_rev() {
     db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
 
     let result = db.put("doc1", serde_json::json!({"v": 2})).await;
-    assert!(result.is_err() || !result.unwrap().ok);
+    // CouchDB rejects the write with a 409, surfaced as a conflict error.
+    assert!(matches!(result, Err(RouchError::Conflict)), "{result:?}");
+    // The stored document is left untouched.
+    assert_eq!(db.get("doc1").await.unwrap().data["v"], 1);
 
     delete_remote_db(&url).await;
 }
@@ -68,7 +77,7 @@ async fn error_get_deleted_doc() {
     let db = Database::http(&url);
 
     let r1 = db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
-    db.remove("doc1", &r1.rev.unwrap()).await.unwrap();
+    assert!(db.remove("doc1", &r1.rev.unwrap()).await.unwrap().ok);
 
     let result = db.get("doc1").await;
     assert!(matches!(result, Err(RouchError::NotFound(_))));
