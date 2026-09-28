@@ -1236,7 +1236,6 @@ version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64",
- "md-5",
  "rouchdb-core",
  "serde_json",
  "tokio",
@@ -1249,7 +1248,6 @@ version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64",
- "md-5",
  "redb",
  "rouchdb-core",
  "serde",
@@ -1289,6 +1287,7 @@ version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64",
+ "md-5",
  "serde",
  "serde_json",
  "thiserror",

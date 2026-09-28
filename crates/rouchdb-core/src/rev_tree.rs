@@ -158,10 +158,14 @@ pub fn rev_exists(tree: &RevTree, pos: u64, hash: &str) -> bool {
 
 /// Build a single-path `RevPath` from a list of revision hashes.
 ///
-/// `revs` is oldest-first: `[oldest_hash, ..., newest_hash]`.
+/// `revs` is **newest-first** (the order of CouchDB's `_revisions.ids`):
+/// `[newest_hash, parent_hash, ..., oldest_hash]`.
 /// `pos` is the generation of the *newest* (leaf) revision.
 /// `opts` are the metadata flags for the *leaf* node.
 /// `status` is applied to the leaf; all ancestors are `Missing`.
+///
+/// This does not validate its input; use [`path_from_revisions`] for
+/// untrusted `_revisions` data.
 pub fn build_path_from_revs(
     pos: u64,
     revs: &[String],
@@ -210,6 +214,41 @@ pub fn build_path_from_revs(
     }
 }
 
+/// Build the path for an incoming revision from its CouchDB `_revisions`
+/// ancestry (`start` = generation of the newest rev, `ids` newest-first),
+/// validating that the history is consistent with `rev`.
+///
+/// Rejects an empty `ids` list, a `start` that does not match the rev
+/// generation, a newest id that does not match the rev hash, and more ids
+/// than there are generations.
+pub fn path_from_revisions(
+    rev: &crate::document::Revision,
+    start: u64,
+    ids: &[String],
+    opts: NodeOpts,
+    status: RevStatus,
+) -> crate::error::Result<RevPath> {
+    let invalid = |why: &str| {
+        crate::error::RouchError::BadRequest(format!("invalid _revisions for {}: {}", rev, why))
+    };
+    if ids.is_empty() {
+        return Err(invalid("ids must not be empty"));
+    }
+    if start != rev.pos {
+        return Err(invalid("start does not match the revision generation"));
+    }
+    if ids[0] != rev.hash {
+        return Err(invalid("first id does not match the revision hash"));
+    }
+    if ids.len() as u64 > start {
+        return Err(invalid("more ids than generations"));
+    }
+    if ids.iter().any(|id| id.is_empty()) {
+        return Err(invalid("ids must not be empty strings"));
+    }
+    Ok(build_path_from_revs(start, ids, opts, status))
+}
+
 // ---------------------------------------------------------------------------
 // Ancestry lookup (for replication — provides _revisions data)
 // ---------------------------------------------------------------------------
@@ -226,6 +265,63 @@ pub fn find_rev_ancestry(
     for path in tree {
         if let Some(chain) = find_chain_in_node(&path.tree, path.pos, target_pos, target_hash) {
             return Some(chain);
+        }
+    }
+    None
+}
+
+/// `revs_info` for a revision: the revision and its ancestors (newest
+/// first) with their CouchDB status (`available`, `missing` or `deleted`).
+///
+/// Only the requested revision's own branch is listed, not the whole tree.
+/// Returns `None` if the revision is not in the tree.
+pub fn revs_info(
+    tree: &RevTree,
+    target_pos: u64,
+    target_hash: &str,
+) -> Option<Vec<crate::document::RevInfo>> {
+    fn walk<'a>(
+        node: &'a RevNode,
+        pos: u64,
+        target_pos: u64,
+        target_hash: &str,
+        chain: &mut Vec<(u64, &'a RevNode)>,
+    ) -> bool {
+        chain.push((pos, node));
+        if pos == target_pos && node.hash == target_hash {
+            return true;
+        }
+        if pos < target_pos {
+            for child in &node.children {
+                if walk(child, pos + 1, target_pos, target_hash, chain) {
+                    return true;
+                }
+            }
+        }
+        chain.pop();
+        false
+    }
+
+    for path in tree {
+        let mut chain = Vec::new();
+        if walk(&path.tree, path.pos, target_pos, target_hash, &mut chain) {
+            return Some(
+                chain
+                    .into_iter()
+                    .rev()
+                    .map(|(pos, node)| crate::document::RevInfo {
+                        rev: format!("{}-{}", pos, node.hash),
+                        status: if node.status == RevStatus::Missing {
+                            "missing"
+                        } else if node.opts.deleted {
+                            "deleted"
+                        } else {
+                            "available"
+                        }
+                        .to_string(),
+                    })
+                    .collect(),
+            );
         }
     }
     None
@@ -350,6 +446,100 @@ mod tests {
         assert_eq!(ancestry, vec!["a"]);
 
         assert!(find_rev_ancestry(&tree, 3, "z").is_none());
+    }
+
+    #[test]
+    fn revs_info_lists_only_the_requested_branch() {
+        // 1-a -> 2-b (deleted) ; 1-a -> 2-c ; 1-a missing
+        let tree = vec![RevPath {
+            pos: 1,
+            tree: RevNode {
+                hash: "a".into(),
+                status: RevStatus::Missing,
+                opts: NodeOpts::default(),
+                children: vec![
+                    RevNode {
+                        hash: "b".into(),
+                        status: RevStatus::Available,
+                        opts: NodeOpts { deleted: true },
+                        children: vec![],
+                    },
+                    leaf("c"),
+                ],
+            },
+        }];
+        let info = revs_info(&tree, 2, "c").unwrap();
+        let got: Vec<(String, String)> = info.into_iter().map(|i| (i.rev, i.status)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("2-c".to_string(), "available".to_string()),
+                ("1-a".to_string(), "missing".to_string())
+            ]
+        );
+        assert_eq!(revs_info(&tree, 2, "b").unwrap()[0].status, "deleted");
+        assert!(revs_info(&tree, 3, "z").is_none());
+    }
+
+    #[test]
+    fn path_from_revisions_validates_history() {
+        let rev = |s: &str| s.parse::<crate::document::Revision>().unwrap();
+        // Valid: 3-c with ancestry [c, b, a].
+        let path = path_from_revisions(
+            &rev("3-c"),
+            3,
+            &["c".into(), "b".into(), "a".into()],
+            NodeOpts::default(),
+            RevStatus::Available,
+        )
+        .unwrap();
+        assert_eq!(path.pos, 1);
+        assert_eq!(path.tree.hash, "a");
+
+        // Empty ids: rejected instead of creating a degenerate node.
+        assert!(
+            path_from_revisions(
+                &rev("3-c"),
+                3,
+                &[],
+                NodeOpts::default(),
+                RevStatus::Available
+            )
+            .is_err()
+        );
+        // `start` inconsistent with the rev generation.
+        assert!(
+            path_from_revisions(
+                &rev("3-c"),
+                2,
+                &["c".into(), "b".into()],
+                NodeOpts::default(),
+                RevStatus::Available
+            )
+            .is_err()
+        );
+        // More ids than generations.
+        assert!(
+            path_from_revisions(
+                &rev("2-c"),
+                2,
+                &["c".into(), "b".into(), "a".into(), "z".into()],
+                NodeOpts::default(),
+                RevStatus::Available
+            )
+            .is_err()
+        );
+        // Newest id does not match the rev hash.
+        assert!(
+            path_from_revisions(
+                &rev("2-c"),
+                2,
+                &["x".into(), "b".into()],
+                NodeOpts::default(),
+                RevStatus::Available
+            )
+            .is_err()
+        );
     }
 
     #[test]
