@@ -524,10 +524,7 @@ pub fn get_nested_field<'a>(
 ) -> Option<&'a serde_json::Value> {
     let mut current = doc;
     for part in path.split('.') {
-        match current.get(part) {
-            Some(v) => current = v,
-            None => return None,
-        }
+        current = current.get(part)?;
     }
     Some(current)
 }
