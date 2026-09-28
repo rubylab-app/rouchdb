@@ -291,4 +291,14 @@ GitHub Actions (`.github/workflows/ci.yml`) runs these jobs on every pull reques
 
 `minimal-versions.yml` resolves every direct dependency to the lowest version its `Cargo.toml` requirement allows (`cargo +nightly update -Z direct-minimal-versions`) and builds, when a manifest changes and weekly. When it fails, raise the requirement to the version the code actually needs, in every crate that declares it.
 
+Three more workflows measure test quality. They never block a merge:
+
+| Workflow | When | What |
+|----------|------|------|
+| `coverage.yml` | push to `main` | Line coverage (cargo-llvm-cov) of the unit tests, doctests and CouchDB suite: job summary plus an lcov artifact |
+| `mutants.yml` | pull requests that change `crates/*/src` | `cargo mutants --in-diff` on the changed code (`--timeout 120`): mutants no test catches are listed in the job summary |
+| `nightly.yml` | daily, or by hand | Flaky-test detection: `scripts/repeat-tests.sh` runs the unit suite (Linux and macOS) and the CouchDB suite 5 times and lists every test that failed in any run |
+
+`bash scripts/repeat-tests.sh 5 bash scripts/test-couchdb.sh` does the same locally.
+
 The blocking jobs use the toolchain pinned in `rust-toolchain.toml`. To move to a newer Rust, bump it there and fix any new lints in the same PR. The benchmarks can be run on a GitHub runner from the Actions tab (the manual "Benchmarks" workflow); shared runners are noisy, so use those numbers for trends only.
