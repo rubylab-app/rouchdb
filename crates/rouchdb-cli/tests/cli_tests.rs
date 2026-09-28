@@ -126,9 +126,12 @@ async fn get_with_specific_rev() {
             .await
             .unwrap();
         rev1 = r1.rev.unwrap();
-        db.update("doc1", &rev1, serde_json::json!({"version": 2}))
-            .await
-            .unwrap();
+        assert!(
+            db.update("doc1", &rev1, serde_json::json!({"version": 2}))
+                .await
+                .unwrap()
+                .ok
+        );
     }
 
     let output = rouchdb_cmd()

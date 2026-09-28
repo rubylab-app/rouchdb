@@ -259,22 +259,30 @@ async fn live_changes_handle_cancel() {
         ..Default::default()
     });
 
-    // Receive first event
-    let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    // Receive the change for the existing doc.
+    let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
-        .unwrap();
+        .expect("timed out waiting for the first change")
+        .expect("channel closed before the first change");
+    assert_eq!(first.id, "doc1");
 
-    // Cancel
     handle.cancel();
 
-    // After cancel, the channel should eventually close
-    let result = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
-    // Either we get None (channel closed) or timeout (background not yet stopped)
-    match result {
-        Ok(None) => {}    // Channel closed — good
-        Ok(Some(_)) => {} // May still have buffered events — OK
-        Err(_) => {}      // Timeout — OK, background task is stopping
-    }
+    // After cancel the background task must stop and close the channel. No
+    // other document was written, so nothing else may be delivered.
+    let extra = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut extra = Vec::new();
+        while let Some(event) = rx.recv().await {
+            extra.push(event.id);
+        }
+        extra
+    })
+    .await
+    .expect("channel should close after cancel");
+    assert!(
+        extra.is_empty(),
+        "unexpected events after cancel: {extra:?}"
+    );
 }
 
 // =========================================================================
@@ -358,7 +366,7 @@ async fn changes_shows_deleted_docs() {
     let db = Database::memory("test");
     let r1 = db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
     db.put("doc2", serde_json::json!({"v": 2})).await.unwrap();
-    db.remove("doc1", &r1.rev.unwrap()).await.unwrap();
+    assert!(db.remove("doc1", &r1.rev.unwrap()).await.unwrap().ok);
 
     let changes = db.changes(ChangesOptions::default()).await.unwrap();
     let deleted = changes.results.iter().find(|r| r.id == "doc1").unwrap();

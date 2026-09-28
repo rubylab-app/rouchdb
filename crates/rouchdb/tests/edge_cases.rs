@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rouchdb::{
-    AllDocsOptions, BulkDocsOptions, ChangesOptions, ChangesStreamOptions, Database,
+    AllDocsOptions, BulkDocsOptions, ChangesEvent, ChangesOptions, ChangesStreamOptions, Database,
     DesignDocument, DocResult, Document, FindOptions, Plugin, ReduceFn, ReplicationFilter,
     ReplicationOptions, Result, RouchError, SortField, ViewQueryOptions, query_view,
 };
@@ -83,9 +83,21 @@ async fn concurrent_updates_same_doc_produces_conflicts() {
         db2.update("doc1", &rev2, serde_json::json!({"v": "b"}))
     );
 
-    // At least one should succeed
-    let success_count = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
-    assert!(success_count >= 1, "At least one update should succeed");
+    // Both calls complete (a conflict is reported per document, not as Err),
+    // but exactly one of them may win: the other must be rejected as a
+    // conflict instead of silently overwriting the first (lost update).
+    let r1 = r1.unwrap();
+    let r2 = r2.unwrap();
+    let (winner, loser, winning_value) = match (r1.ok, r2.ok) {
+        (true, false) => (r1, r2, "a"),
+        (false, true) => (r2, r1, "b"),
+        _ => panic!("exactly one update should succeed: {r1:?} / {r2:?}"),
+    };
+    assert_eq!(loser.error.as_deref(), Some("conflict"), "{loser:?}");
+
+    let doc = db.get("doc1").await.unwrap();
+    assert_eq!(doc.data["v"], winning_value);
+    assert_eq!(doc.rev.unwrap().to_string(), winner.rev.unwrap());
 }
 
 // =========================================================================
@@ -112,12 +124,17 @@ async fn bulk_docs_with_duplicate_ids_in_same_batch() {
         },
     ];
 
-    let results = db.bulk_docs(docs, BulkDocsOptions::new()).await;
-    // Should not panic. Implementation decides whether both succeed or second conflicts.
-    assert!(results.is_ok() || results.is_err());
-    // Document should exist either way
+    // CouchDB/PouchDB semantics: the first doc is created and the second one,
+    // which carries no `_rev`, is rejected as a conflict with the first.
+    let results = db.bulk_docs(docs, BulkDocsOptions::new()).await.unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results[0].ok, "{:?}", results[0]);
+    assert!(!results[1].ok, "{:?}", results[1]);
+    assert_eq!(results[1].error.as_deref(), Some("conflict"));
+
     let doc = db.get("same").await.unwrap();
-    assert!(doc.data["v"] == 1 || doc.data["v"] == 2);
+    assert_eq!(doc.data["v"], 1);
+    assert_eq!(doc.rev.unwrap().pos, 1);
 }
 
 // =========================================================================
@@ -352,7 +369,7 @@ async fn index_returns_correct_results_after_delete() {
     assert_eq!(found.docs.len(), 2);
 
     // Delete Bob
-    db.remove("bob", &bob_result.rev.unwrap()).await.unwrap();
+    assert!(db.remove("bob", &bob_result.rev.unwrap()).await.unwrap().ok);
 
     // Only Alice should remain
     let found = db
@@ -394,13 +411,16 @@ async fn index_updates_on_field_value_change() {
     assert_eq!(found.docs.len(), 1);
 
     // Update to "complete"
-    db.update(
-        "doc1",
-        &r.rev.unwrap(),
-        serde_json::json!({"status": "complete", "v": 2}),
-    )
-    .await
-    .unwrap();
+    assert!(
+        db.update(
+            "doc1",
+            &r.rev.unwrap(),
+            serde_json::json!({"status": "complete", "v": 2}),
+        )
+        .await
+        .unwrap()
+        .ok
+    );
 
     // Should NOT find "pending" anymore
     let found = db
@@ -667,19 +687,30 @@ async fn live_changes_events_cancel_stops_stream() {
         ..Default::default()
     });
 
-    // Get first event
-    let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+    // The first event is the change for the existing doc.
+    match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+        Ok(Some(ChangesEvent::Change(change))) => assert_eq!(change.id, "doc1"),
+        other => panic!("expected the doc1 change first, got {other:?}"),
+    }
 
-    // Cancel
     handle.cancel();
 
-    // After cancel, channel should eventually close
-    let result = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
-    match result {
-        Ok(None) => {}    // Closed — good
-        Ok(Some(_)) => {} // Buffered — OK
-        Err(_) => {}      // Timeout — OK, stopping
-    }
+    // After cancel the stream must report Complete and close the channel.
+    // Events buffered before the cancel was observed (e.g. Paused) may still
+    // arrive first, so drain until the channel closes.
+    let drained = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .expect("channel should close after cancel");
+    assert!(
+        matches!(drained.last(), Some(ChangesEvent::Complete { .. })),
+        "expected Complete as the last event, got {drained:?}"
+    );
 }
 
 // =========================================================================
@@ -799,7 +830,7 @@ async fn changes_selector_on_deleted_doc() {
     .unwrap();
 
     // Delete user1
-    db.remove("user1", &r.rev.unwrap()).await.unwrap();
+    assert!(db.remove("user1", &r.rev.unwrap()).await.unwrap().ok);
 
     // Changes with selector for type=user — should include the deletion
     let changes = db
@@ -869,13 +900,15 @@ async fn compact_preserves_latest_revisions() {
 #[tokio::test]
 async fn close_then_operations_behave_gracefully() {
     let db = Database::memory("test");
-    db.put("doc1", serde_json::json!({})).await.unwrap();
+    db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
     db.close().await.unwrap();
 
-    // Memory adapter — operations may still work after close (it's a no-op)
-    // The important thing: no panic
-    let _ = db.get("doc1").await;
-    let _ = db.info().await;
+    // close() is a no-op for the memory adapter: the data stays readable and
+    // intact afterwards.
+    let doc = db.get("doc1").await.unwrap();
+    assert_eq!(doc.data["v"], 1);
+    let info = db.info().await.unwrap();
+    assert_eq!(info.doc_count, 1);
 }
 
 // =========================================================================

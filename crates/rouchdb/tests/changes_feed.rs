@@ -92,10 +92,13 @@ async fn changes_after_updates_and_deletes() {
     db.put("doc2", serde_json::json!({"v": 1})).await.unwrap();
     let r3 = db.put("doc3", serde_json::json!({"v": 1})).await.unwrap();
 
-    db.update("doc1", &r1.rev.unwrap(), serde_json::json!({"v": 2}))
-        .await
-        .unwrap();
-    db.remove("doc3", &r3.rev.unwrap()).await.unwrap();
+    assert!(
+        db.update("doc1", &r1.rev.unwrap(), serde_json::json!({"v": 2}))
+            .await
+            .unwrap()
+            .ok
+    );
+    assert!(db.remove("doc3", &r3.rev.unwrap()).await.unwrap().ok);
 
     let changes = db.changes(ChangesOptions::default()).await.unwrap();
 

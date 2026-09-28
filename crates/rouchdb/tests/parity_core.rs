@@ -496,7 +496,7 @@ async fn info_reflects_all_operations() {
     let info = db.info().await.unwrap();
     assert_eq!(info.doc_count, 2);
 
-    db.remove("doc2", &r.rev.unwrap()).await.unwrap();
+    assert!(db.remove("doc2", &r.rev.unwrap()).await.unwrap().ok);
     let info = db.info().await.unwrap();
     assert_eq!(info.doc_count, 1);
 }
@@ -509,9 +509,12 @@ async fn info_reflects_all_operations() {
 async fn compact_does_not_lose_data() {
     let db = Database::memory("test");
     let r1 = db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
-    db.update("doc1", &r1.rev.unwrap(), serde_json::json!({"v": 2}))
-        .await
-        .unwrap();
+    assert!(
+        db.update("doc1", &r1.rev.unwrap(), serde_json::json!({"v": 2}))
+            .await
+            .unwrap()
+            .ok
+    );
 
     db.compact().await.unwrap();
 
