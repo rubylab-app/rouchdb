@@ -111,12 +111,99 @@ pub trait Adapter: Send + Sync {
     }
 
     /// Get the security document for this database.
+    ///
+    /// The default returns an empty document (no admins or members), which
+    /// is what an adapter without security support effectively enforces.
     async fn get_security(&self) -> Result<crate::document::SecurityDocument> {
         Ok(crate::document::SecurityDocument::default())
     }
 
     /// Set the security document for this database.
+    ///
+    /// The default returns an error: an adapter that cannot store the
+    /// document must not report success and silently drop it.
     async fn put_security(&self, _doc: crate::document::SecurityDocument) -> Result<()> {
-        Ok(())
+        Err(crate::error::RouchError::BadRequest(
+            "put_security not supported".into(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::RouchError;
+
+    /// An adapter that only implements the required methods.
+    struct Minimal;
+
+    #[async_trait]
+    impl Adapter for Minimal {
+        async fn info(&self) -> Result<DbInfo> {
+            unimplemented!()
+        }
+        async fn get(&self, _: &str, _: GetOptions) -> Result<Document> {
+            unimplemented!()
+        }
+        async fn bulk_docs(&self, _: Vec<Document>, _: BulkDocsOptions) -> Result<Vec<DocResult>> {
+            unimplemented!()
+        }
+        async fn all_docs(&self, _: AllDocsOptions) -> Result<AllDocsResponse> {
+            unimplemented!()
+        }
+        async fn changes(&self, _: ChangesOptions) -> Result<ChangesResponse> {
+            unimplemented!()
+        }
+        async fn revs_diff(&self, _: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
+            unimplemented!()
+        }
+        async fn bulk_get(&self, _: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
+            unimplemented!()
+        }
+        async fn put_attachment(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Vec<u8>,
+            _: &str,
+        ) -> Result<DocResult> {
+            unimplemented!()
+        }
+        async fn get_attachment(
+            &self,
+            _: &str,
+            _: &str,
+            _: GetAttachmentOptions,
+        ) -> Result<Vec<u8>> {
+            unimplemented!()
+        }
+        async fn remove_attachment(&self, _: &str, _: &str, _: &str) -> Result<DocResult> {
+            unimplemented!()
+        }
+        async fn get_local(&self, _: &str) -> Result<serde_json::Value> {
+            unimplemented!()
+        }
+        async fn put_local(&self, _: &str, _: serde_json::Value) -> Result<()> {
+            unimplemented!()
+        }
+        async fn remove_local(&self, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn compact(&self) -> Result<()> {
+            unimplemented!()
+        }
+        async fn destroy(&self) -> Result<()> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn default_put_security_is_not_a_silent_success() {
+        // An adapter that cannot store a security document must say so
+        // instead of reporting success and dropping it.
+        let res = Minimal.put_security(SecurityDocument::default()).await;
+        assert!(matches!(res, Err(RouchError::BadRequest(_))), "{:?}", res);
+        assert!(Minimal.purge(HashMap::new()).await.is_err());
     }
 }
