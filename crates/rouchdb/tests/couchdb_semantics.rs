@@ -75,3 +75,70 @@ async fn push_to_couchdb_carries_conflict_branches() {
 
     delete_remote_db(&url).await;
 }
+
+// =========================================================================
+// Attachments through _bulk_get (F04)
+// =========================================================================
+
+/// Create `doc1` with a `hi.txt` attachment directly in CouchDB.
+async fn couch_doc_with_attachment(url: &str) -> String {
+    let resp: serde_json::Value = reqwest::Client::new()
+        .put(format!("{}/doc1", url))
+        .json(&serde_json::json!({
+            "v": 1,
+            "_attachments": {"hi.txt": {"content_type": "text/plain", "data": "aGkh"}}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    resp["rev"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+#[ignore]
+async fn http_bulk_get_returns_attachment_bytes() {
+    let url = fresh_remote_db("bulk_get_atts").await;
+    let rev = couch_doc_with_attachment(&url).await;
+    let remote = Database::http(&url);
+
+    let resp = remote
+        .adapter()
+        .bulk_get(vec![rouchdb::BulkGetItem {
+            id: "doc1".into(),
+            rev: Some(rev),
+        }])
+        .await
+        .unwrap();
+    let doc = resp.results[0].docs[0].ok.clone().unwrap();
+    assert_eq!(doc["_attachments"]["hi.txt"]["data"], "aGkh");
+
+    let parsed = Document::from_json(doc).unwrap();
+    assert_eq!(
+        parsed.attachments["hi.txt"].data.as_deref(),
+        Some(&b"hi!"[..])
+    );
+
+    delete_remote_db(&url).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn pull_from_couchdb_carries_attachment_bytes() {
+    let url = fresh_remote_db("pull_atts").await;
+    couch_doc_with_attachment(&url).await;
+    let remote = Database::http(&url);
+    let local = Database::memory("local");
+
+    let result = local.replicate_from(&remote).await.unwrap();
+    assert!(result.ok, "{:?}", result.errors);
+    assert_eq!(result.docs_written, 1);
+    assert_eq!(
+        local.get_attachment("doc1", "hi.txt").await.unwrap(),
+        b"hi!"
+    );
+
+    delete_remote_db(&url).await;
+}

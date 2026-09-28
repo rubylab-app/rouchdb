@@ -530,9 +530,15 @@ impl Adapter for HttpAdapter {
                 .collect(),
         };
 
+        // Like PouchDB: inline the attachment bytes (without them a pulled
+        // doc only carries stubs and the data never reaches the target) and
+        // follow a superseded rev to its latest leaf. JSON is requested
+        // explicitly since attachments otherwise make CouchDB reply
+        // multipart.
         let resp = self
             .client
-            .post(self.url("_bulk_get?revs=true"))
+            .post(self.url("_bulk_get?revs=true&attachments=true&latest=true"))
+            .header(reqwest::header::ACCEPT, "application/json")
             .json(&request)
             .send()
             .await
@@ -554,7 +560,7 @@ impl Adapter for HttpAdapter {
                         .docs
                         .into_iter()
                         .map(|d| BulkGetDoc {
-                            ok: d.ok,
+                            ok: d.ok.map(fill_inline_attachment_lengths),
                             error: d.error.map(|e| BulkGetError {
                                 id: e.id,
                                 rev: e.rev,
@@ -780,6 +786,25 @@ impl Adapter for HttpAdapter {
     }
 }
 
+/// CouchDB omits `length` (and `stub`) on attachments inlined with
+/// `attachments=true`; fill in the decoded length so the attachment is not
+/// rejected as malformed when the document is parsed.
+fn fill_inline_attachment_lengths(mut doc: serde_json::Value) -> serde_json::Value {
+    if let Some(atts) = doc.get_mut("_attachments").and_then(|a| a.as_object_mut()) {
+        for meta in atts.values_mut() {
+            if let Some(meta) = meta.as_object_mut()
+                && !meta.contains_key("length")
+                && let Some(data) = meta.get("data").and_then(|d| d.as_str())
+            {
+                let padding = data.bytes().rev().take_while(|&b| b == b'=').count();
+                let length = (data.len() / 4 * 3).saturating_sub(padding);
+                meta.insert("length".into(), serde_json::json!(length));
+            }
+        }
+    }
+    doc
+}
+
 /// Percent-encode a CouchDB document or attachment ID for safe URL use.
 ///
 /// Encodes all characters except unreserved ones (alphanumeric, `-`, `_`, `.`, `~`).
@@ -820,7 +845,10 @@ fn encode_query_key(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CouchDbAllDocsResponse, encode_doc_id, encode_query_key, urlencoded};
+    use super::{
+        CouchDbAllDocsResponse, encode_doc_id, encode_query_key, fill_inline_attachment_lengths,
+        urlencoded,
+    };
 
     #[test]
     fn design_and_local_ids_keep_prefix_slash() {
@@ -863,5 +891,27 @@ mod tests {
         assert_eq!(resp.rows.len(), 2);
         assert_eq!(resp.rows[0].id.as_deref(), Some("a"));
         assert!(resp.rows[1].id.is_none() && resp.rows[1].value.is_none());
+    }
+
+    #[test]
+    fn bulk_get_inline_attachments_parse() {
+        // Verbatim CouchDB 3 `_bulk_get?attachments=true` doc: inline data
+        // with no `length` or `stub`.
+        let doc: serde_json::Value = serde_json::from_str(
+            r#"{"_id":"doc1","_rev":"1-ab5b0978671b42f37de2b4485c8386ff","v":1,
+            "_revisions":{"start":1,"ids":["ab5b0978671b42f37de2b4485c8386ff"]},
+            "_attachments":{
+                "hi.txt":{"content_type":"text/plain","revpos":1,"digest":"md5-O9yO4zjoapsrEQwYrCDNZw==","data":"aGkh"},
+                "one.bin":{"content_type":"application/octet-stream","revpos":1,"digest":"md5-x","data":"AQ=="},
+                "two.bin":{"content_type":"application/octet-stream","revpos":1,"digest":"md5-y","data":"AQI="}
+            }}"#,
+        )
+        .unwrap();
+        let doc = rouchdb_core::document::Document::from_json(fill_inline_attachment_lengths(doc))
+            .unwrap();
+        assert_eq!(doc.attachments["hi.txt"].data.as_deref(), Some(&b"hi!"[..]));
+        assert_eq!(doc.attachments["hi.txt"].length, 3);
+        assert_eq!(doc.attachments["one.bin"].length, 1);
+        assert_eq!(doc.attachments["two.bin"].length, 2);
     }
 }
