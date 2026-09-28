@@ -11,15 +11,6 @@ use rouchdb_core::error::RouchError;
 use crate::error::AppError;
 use crate::state::AppState;
 
-fn validate_db(db: &str, state: &AppState) -> Result<(), AppError> {
-    if db != state.db_name {
-        return Err(AppError(rouchdb_core::error::RouchError::NotFound(
-            format!("Database does not exist: {db}"),
-        )));
-    }
-    Ok(())
-}
-
 /// CouchDB's `_find` limit when the request does not set one.
 const DEFAULT_FIND_LIMIT: u64 = 25;
 
@@ -43,7 +34,7 @@ pub async fn find(
     Path(db): Path<String>,
     Json(mut body): Json<serde_json::Value>,
 ) -> Result<Response, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     let offset = match body.as_object_mut().and_then(|o| o.remove("bookmark")) {
         None | Some(serde_json::Value::Null) => None,
@@ -282,7 +273,7 @@ pub async fn create_index(
     Path(db): Path<String>,
     Json(body): Json<CreateIndexBody>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     let fields = body.index.fields;
     if fields.is_empty() || !fields.iter().all(valid_field) {
@@ -331,7 +322,7 @@ pub async fn get_indexes(
     State(state): State<AppState>,
     Path(db): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     // Always include the special _all_docs index
     let mut all_indexes = vec![serde_json::json!({
@@ -379,7 +370,7 @@ pub async fn delete_index(
     State(state): State<AppState>,
     Path((db, ddoc, itype, name)): Path<(String, String, String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     if itype != "json" {
         return Err(missing());
     }
@@ -424,7 +415,7 @@ pub async fn bulk_delete_indexes(
     Path(db): Path<String>,
     Json(body): Json<BulkDeleteIndexBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     let mut success = Vec::new();
     let mut fail = Vec::new();
@@ -472,7 +463,7 @@ pub async fn explain(
     Path(db): Path<String>,
     Json(opts): Json<FindOptions>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     let response = state.db.explain(opts).await;
     Ok(Json(serde_json::to_value(&response).unwrap()))
 }

@@ -111,12 +111,8 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
 
 /// Build the Axum router with all routes and middleware.
 pub fn build_router(db: Arc<Database>, config: &ServerConfig) -> Router {
-    let state = AppState {
-        db,
-        db_name: config.db_name.clone(),
-        auth: config.admin.clone().map(|admin| Arc::new(Auth::new(admin))),
-        writes: Arc::new(tokio::sync::watch::Sender::new(0)),
-    };
+    let auth = config.admin.clone().map(|admin| Arc::new(Auth::new(admin)));
+    let state = AppState::new(db, config.db_name.clone(), auth);
 
     let router = routes::build_routes(state.clone())
         .layer(axum::middleware::from_fn_with_state(

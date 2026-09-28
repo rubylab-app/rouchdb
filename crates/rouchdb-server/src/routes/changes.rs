@@ -61,15 +61,6 @@ struct ChangesRequest {
     heartbeat: Option<Duration>,
 }
 
-fn validate_db(db: &str, state: &AppState) -> Result<(), AppError> {
-    if db != state.db_name {
-        return Err(AppError(rouchdb_core::error::RouchError::NotFound(
-            format!("Database does not exist: {db}"),
-        )));
-    }
-    Ok(())
-}
-
 fn bad_request(reason: &str) -> AppError {
     AppError(RouchError::BadRequest(reason.to_string()))
 }
@@ -405,6 +396,15 @@ async fn run_feed(
         }
 
         writes.borrow_and_update();
+        // A deleted database ends the feed.
+        if !state.db_exists() {
+            if feed == Feed::Longpoll {
+                let body = normal_body(&[], &req.opts.since);
+                let _ = tx.send(Bytes::from(body.to_string())).await;
+                return;
+            }
+            break;
+        }
         let mut opts = req.opts.clone();
         opts.limit = remaining;
         batch = match fetch(&state, &opts, req.design_only).await {
@@ -441,7 +441,7 @@ pub async fn get_changes(
     Path(db): Path<String>,
     Query(query): Query<ChangesQuery>,
 ) -> Result<Response, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     let req = parse_request(&state, query, None).await?;
     changes_response(state, req).await
 }
@@ -453,7 +453,7 @@ pub async fn post_changes(
     Query(query): Query<ChangesQuery>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     let req = parse_request(&state, query, Some(&body)).await?;
     changes_response(state, req).await
 }

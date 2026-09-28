@@ -10,11 +10,7 @@ pub async fn compact(
     State(state): State<AppState>,
     Path(db): Path<String>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    if db != state.db_name {
-        return Err(AppError(rouchdb_core::error::RouchError::NotFound(
-            format!("Database does not exist: {db}"),
-        )));
-    }
+    state.check_db(&db)?;
 
     state.db.compact().await?;
     Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"ok": true}))))

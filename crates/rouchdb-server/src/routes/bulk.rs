@@ -25,11 +25,7 @@ pub async fn bulk_docs(
     Path(db): Path<String>,
     Json(body): Json<BulkDocsBody>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    if db != state.db_name {
-        return Err(AppError(rouchdb_core::error::RouchError::NotFound(
-            format!("Database does not exist: {db}"),
-        )));
-    }
+    state.check_db(&db)?;
 
     let docs: Vec<Document> = body
         .docs

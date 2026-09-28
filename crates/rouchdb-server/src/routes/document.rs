@@ -33,15 +33,6 @@ pub struct DeleteDocQuery {
     pub rev: Option<String>,
 }
 
-fn validate_db(db: &str, state: &AppState) -> Result<(), AppError> {
-    if db != state.db_name {
-        return Err(AppError(rouchdb_core::error::RouchError::NotFound(
-            format!("Database does not exist: {db}"),
-        )));
-    }
-    Ok(())
-}
-
 /// Strip the quotes (and a weak `W/` prefix) from an ETag header value.
 fn etag_value(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
     let raw = headers.get(name)?.to_str().ok()?.trim();
@@ -84,7 +75,7 @@ pub async fn get_doc(
     Query(query): Query<GetDocQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     if let Some(open_revs) = query.open_revs.as_deref() {
         return Ok(get_open_revs(&state, &docid, open_revs, &query)
@@ -196,7 +187,7 @@ pub async fn put_doc(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     let mut body = serde_json::Value::Object(super::json_object_body(&body)?);
 
     // Honor a `_deleted: true` body (CouchDB delete-via-PUT).
@@ -267,7 +258,7 @@ pub async fn delete_doc(
     Query(query): Query<DeleteDocQuery>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     // Without any revision CouchDB reports a conflict.
     let rev = resolve_rev(query.rev, None, &headers)?.ok_or(AppError(RouchError::Conflict))?;

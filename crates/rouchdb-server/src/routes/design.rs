@@ -13,21 +13,12 @@ pub struct DesignDeleteQuery {
     pub rev: Option<String>,
 }
 
-fn validate_db(db: &str, state: &AppState) -> Result<(), AppError> {
-    if db != state.db_name {
-        return Err(AppError(rouchdb_core::error::RouchError::NotFound(
-            format!("Database does not exist: {db}"),
-        )));
-    }
-    Ok(())
-}
-
 /// GET /{db}/_design/{ddoc} — get a design document.
 pub async fn get_design(
     State(state): State<AppState>,
     Path((db, ddoc)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     let design = state.db.get_design(&ddoc).await?;
     Ok(Json(design.to_json()))
@@ -41,7 +32,7 @@ pub async fn put_design(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     let mut obj = super::json_object_body(&body)?;
 
     // Parse the body as a design document, injecting _id and the revision
@@ -81,7 +72,7 @@ pub async fn delete_design(
     Query(query): Query<DesignDeleteQuery>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     // Without any revision CouchDB reports a conflict.
     let rev = resolve_rev(query.rev, None, &headers)?

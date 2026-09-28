@@ -16,15 +16,6 @@ pub struct AttachmentQuery {
     pub rev: Option<String>,
 }
 
-fn validate_db(db: &str, state: &AppState) -> Result<(), AppError> {
-    if db != state.db_name {
-        return Err(AppError(rouchdb_core::error::RouchError::NotFound(
-            format!("Database does not exist: {db}"),
-        )));
-    }
-    Ok(())
-}
-
 /// GET /{db}/{docid}/{attname}?rev=... — download an attachment.
 ///
 /// The attachment name may contain `/`.
@@ -33,7 +24,7 @@ pub async fn get_attachment(
     Path((db, docid, attname)): Path<(String, String, String)>,
     Query(query): Query<AttachmentQuery>,
 ) -> Result<Response, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     // Resolve the revision once (the requested one, or the winner) and read
     // both the metadata and the bytes from that same revision, so the
@@ -88,7 +79,7 @@ pub async fn put_attachment(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, axum::Json<serde_json::Value>), AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     let content_type = headers
         .get("content-type")
@@ -135,7 +126,7 @@ pub async fn delete_attachment(
     Query(query): Query<AttachmentQuery>,
     headers: HeaderMap,
 ) -> Result<axum::Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     // Without any revision CouchDB reports a conflict.
     let rev = resolve_rev(query.rev, None, &headers)?.ok_or(AppError(RouchError::Conflict))?;

@@ -107,15 +107,6 @@ impl AllDocsQuery {
     }
 }
 
-fn validate_db(db: &str, state: &AppState) -> Result<(), AppError> {
-    if db != state.db_name {
-        return Err(AppError(rouchdb_core::error::RouchError::NotFound(
-            format!("Database does not exist: {db}"),
-        )));
-    }
-    Ok(())
-}
-
 async fn run_all_docs(
     state: &AppState,
     query: AllDocsQuery,
@@ -147,7 +138,7 @@ pub async fn get_all_docs(
     Path(db): Path<String>,
     Query(query): Query<AllDocsQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     run_all_docs(&state, query, None).await
 }
 
@@ -158,7 +149,7 @@ pub async fn post_all_docs(
     Query(query): Query<AllDocsQuery>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     let keys = match body.get("keys") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::Array(arr)) => Some(string_keys(arr)),

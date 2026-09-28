@@ -14,15 +14,6 @@ pub struct LocalQuery {
     pub rev: Option<String>,
 }
 
-fn validate_db(db: &str, state: &AppState) -> Result<(), AppError> {
-    if db != state.db_name {
-        return Err(AppError(RouchError::NotFound(format!(
-            "Database does not exist: {db}"
-        ))));
-    }
-    Ok(())
-}
-
 fn missing() -> AppError {
     AppError(RouchError::NotFound("missing".into()))
 }
@@ -39,7 +30,7 @@ pub async fn get_local(
     State(state): State<AppState>,
     Path((db, id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     let stored = match state.db.adapter().get_local(&id).await {
         Ok(doc) => doc,
         Err(RouchError::NotFound(_)) => return Err(missing()),
@@ -72,7 +63,7 @@ pub async fn put_local(
     Query(query): Query<LocalQuery>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     let mut obj = super::json_object_body(&body)?;
 
     let body_rev = obj
@@ -107,7 +98,7 @@ pub async fn delete_local(
     State(state): State<AppState>,
     Path((db, id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     match state.db.adapter().remove_local(&id).await {
         Ok(()) => Ok(Json(serde_json::json!({
             "ok": true,
