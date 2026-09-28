@@ -1419,9 +1419,11 @@ async fn replicate_with_rejected_docs_exits_non_zero() {
             .iter()
             .all(|e| e.as_str().unwrap().contains("rejected by validator"))
     );
+    // Forbidden docs are reported but, as in PouchDB, do not block progress:
+    // the checkpoint moves past them so the replication cannot wedge.
     assert_eq!(
-        v["last_seq"], 0,
-        "checkpoint must not pass the failed batch"
+        v["last_seq"], 2,
+        "checkpoint moves past docs the target forbids"
     );
     assert!(stderr_str(&output).contains("replication"));
 }
