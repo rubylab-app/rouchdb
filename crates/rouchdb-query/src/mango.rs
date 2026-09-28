@@ -1536,4 +1536,134 @@ mod tests {
             serde_json::json!({"address": {"city": "NYC"}, "tags": {"0": "rust"}})
         );
     }
+
+    // --- Index candidates ---
+
+    fn age_index() -> IndexDefinition {
+        IndexDefinition {
+            name: "by-age".into(),
+            fields: vec![SortField::Simple("age".into())],
+            ddoc: None,
+        }
+    }
+
+    /// An adapter holding `a`..`e` with ages 1..5, `none` without an age
+    /// and a design document.
+    async fn aged_adapter() -> rouchdb_adapter_memory::MemoryAdapter {
+        use rouchdb_core::document::{BulkDocsOptions, Document};
+        let db = rouchdb_adapter_memory::MemoryAdapter::new("index");
+        let mut docs = vec![
+            serde_json::json!({"_id": "none", "name": "x"}),
+            serde_json::json!({"_id": "_design/app", "age": 3}),
+        ];
+        for (id, age) in [("c", 3), ("a", 1), ("e", 5), ("b", 2), ("d", 4)] {
+            docs.push(serde_json::json!({"_id": id, "age": age}));
+        }
+        let docs = docs
+            .into_iter()
+            .map(|d| Document::from_json(d).unwrap())
+            .collect();
+        db.bulk_docs(docs, BulkDocsOptions::new()).await.unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn index_candidates_are_narrowed_by_the_first_field() {
+        // Only $eq, $gt, $gte, $lt and $lte on the first field narrow the
+        // candidates (in index order: key, then id). A missing field is
+        // indexed as null and design documents are not indexed.
+        let db = aged_adapter().await;
+        let index = build_index(&db, &age_index()).await.unwrap();
+        let cases = [
+            (serde_json::json!({}), vec!["none", "a", "b", "c", "d", "e"]),
+            (serde_json::json!({"age": 3}), vec!["c"]),
+            (serde_json::json!({"age": {"$eq": 3}}), vec!["c"]),
+            (serde_json::json!({"age": {"$gt": 3}}), vec!["d", "e"]),
+            (serde_json::json!({"age": {"$gte": 3}}), vec!["c", "d", "e"]),
+            (
+                serde_json::json!({"age": {"$lt": 3}}),
+                vec!["none", "a", "b"],
+            ),
+            (
+                serde_json::json!({"age": {"$lte": 3}}),
+                vec!["none", "a", "b", "c"],
+            ),
+            (
+                serde_json::json!({"age": {"$gt": 1, "$lte": 4}}),
+                vec!["b", "c", "d"],
+            ),
+            (serde_json::json!({"age": {"$gt": 4, "$lt": 2}}), vec![]),
+            (
+                serde_json::json!({"age": {"$ne": 3}}),
+                vec!["none", "a", "b", "c", "d", "e"],
+            ),
+            (
+                serde_json::json!({"name": "x"}),
+                vec!["none", "a", "b", "c", "d", "e"],
+            ),
+        ];
+        for (selector, expected) in cases {
+            assert_eq!(index.find_matching(&selector), expected, "{selector}");
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_changes_drops_deleted_and_design_documents() {
+        use rouchdb_core::document::{ChangeRev, Seq};
+        let db = aged_adapter().await;
+        let mut index = build_index(&db, &age_index()).await.unwrap();
+        let change =
+            |seq: u64, id: &str, deleted: bool, doc: Option<serde_json::Value>| ChangeEvent {
+                seq: Seq::Num(seq),
+                id: id.into(),
+                changes: vec![ChangeRev {
+                    rev: format!("{seq}-x"),
+                }],
+                deleted,
+                doc,
+                conflicts: None,
+            };
+        index.apply_changes(&[
+            // Deleted: leaves the index even though its tombstone has a body.
+            change(
+                10,
+                "c",
+                true,
+                Some(serde_json::json!({"_id": "c", "_deleted": true})),
+            ),
+            change(
+                11,
+                "_design/other",
+                false,
+                Some(serde_json::json!({"age": 3})),
+            ),
+            // Updated twice in one batch: only the last version counts.
+            change(
+                12,
+                "a",
+                false,
+                Some(serde_json::json!({"_id": "a", "age": 7})),
+            ),
+            change(
+                13,
+                "a",
+                false,
+                Some(serde_json::json!({"_id": "a", "age": 6})),
+            ),
+            change(
+                14,
+                "f",
+                false,
+                Some(serde_json::json!({"_id": "f", "age": 3})),
+            ),
+        ]);
+        assert_eq!(
+            index.find_matching(&serde_json::json!({})),
+            ["none", "b", "f", "d", "e", "a"]
+        );
+        assert_eq!(index.find_matching(&serde_json::json!({"age": 3})), ["f"]);
+        // An empty batch changes nothing.
+        index.apply_changes(&[]);
+        assert_eq!(index.find_matching(&serde_json::json!({"age": 6})), ["a"]);
+    }
 }
