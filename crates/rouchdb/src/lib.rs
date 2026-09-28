@@ -1901,6 +1901,27 @@ mod tests {
         assert!(matches!(events.last(), Some(ReplicationEvent::Complete(_))));
     }
 
+    /// Waits until `id` is readable on `db`, draining the replication
+    /// events meanwhile.
+    async fn wait_for_doc(
+        db: &Database,
+        id: &str,
+        rx: &mut tokio::sync::mpsc::Receiver<ReplicationEvent>,
+    ) -> Document {
+        let wait = async {
+            loop {
+                while rx.try_recv().is_ok() {}
+                if let Ok(doc) = db.get(id).await {
+                    return doc;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .unwrap_or_else(|_| panic!("live replication did not copy {id}"))
+    }
+
     #[tokio::test]
     async fn database_live_replication() {
         let local = Database::memory("local");
@@ -1921,35 +1942,19 @@ mod tests {
             },
         );
 
-        // Wait for initial replication to complete
-        let mut got_complete = false;
-        let timeout = tokio::time::sleep(std::time::Duration::from_secs(2));
-        tokio::pin!(timeout);
-        loop {
-            tokio::select! {
-                event = rx.recv() => {
-                    match event {
-                        Some(ReplicationEvent::Complete(r)) => {
-                            if r.docs_written > 0 {
-                                got_complete = true;
-                                break;
-                            }
-                        }
-                        // No changes — check whether the doc was replicated.
-                        Some(ReplicationEvent::Paused) if remote.get("doc1").await.is_ok() => {
-                            got_complete = true;
-                            break;
-                        }
-                        None => break,
-                        _ => {}
-                    }
-                }
-                _ = &mut timeout => break,
-            }
-        }
+        // The existing document is copied, and so is one written while the
+        // replication is running.
+        let doc1 = wait_for_doc(&remote, "doc1", &mut rx).await;
+        assert_eq!(doc1.data, serde_json::json!({"v": 1}));
+        let r2 = local
+            .put("doc2", serde_json::json!({"v": 2}))
+            .await
+            .unwrap();
+        let doc2 = wait_for_doc(&remote, "doc2", &mut rx).await;
+        assert_eq!(doc2.rev.unwrap().to_string(), r2.rev.unwrap());
+        assert_eq!(doc2.data, serde_json::json!({"v": 2}));
 
         handle.cancel();
-        assert!(got_complete || remote.get("doc1").await.is_ok());
     }
 
     #[tokio::test]
