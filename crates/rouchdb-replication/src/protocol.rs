@@ -223,13 +223,15 @@ async fn run_replication(
     emit(events, ReplicationEvent::Active).await;
 
     loop {
-        // Step 2: Fetch changes from source
+        // Step 2: Fetch changes from source. `all_docs` style lists every
+        // leaf, so conflicting branches are replicated, not just the winner.
         let changes = source
             .changes(ChangesOptions {
                 since: current_seq.clone(),
                 limit: Some(opts.batch_size),
                 include_docs: false,
                 doc_ids: filter_doc_ids.clone(),
+                style: ChangesStyle::AllDocs,
                 ..Default::default()
             })
             .await?;
@@ -504,6 +506,77 @@ mod tests {
             .bulk_docs(vec![doc], BulkDocsOptions::new())
             .await
             .unwrap();
+    }
+
+    /// Write one revision with its full ancestry, as replication does.
+    async fn put_rev(adapter: &dyn Adapter, id: &str, ids: &[&str], data: serde_json::Value) {
+        let start = ids.len() as u64;
+        let mut json = data;
+        json["_id"] = serde_json::json!(id);
+        json["_rev"] = serde_json::json!(format!("{}-{}", start, ids[0]));
+        json["_revisions"] = serde_json::json!({"start": start, "ids": ids});
+        let doc = Document::from_json(json).unwrap();
+        let res = adapter
+            .bulk_docs(vec![doc], BulkDocsOptions::replication())
+            .await
+            .unwrap();
+        assert!(res.iter().all(|r| r.ok), "{res:?}");
+    }
+
+    async fn conflicts_of(adapter: &dyn Adapter, id: &str) -> Vec<String> {
+        let doc = adapter
+            .get(
+                id,
+                GetOptions {
+                    conflicts: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        doc.data["_conflicts"]
+            .as_array()
+            .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn replicate_propagates_conflict_branches() {
+        let source = MemoryAdapter::new("source");
+        let target = MemoryAdapter::new("target");
+
+        // Two leaves under 1-aaa: 2-ccc wins, 2-bbb is the conflict.
+        put_rev(&source, "d", &["bbb", "aaa"], serde_json::json!({"v": "b"})).await;
+        put_rev(&source, "d", &["ccc", "aaa"], serde_json::json!({"v": "c"})).await;
+        assert_eq!(conflicts_of(&source, "d").await, vec!["2-bbb"]);
+
+        let result = replicate(&source, &target, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert!(result.ok);
+
+        assert_eq!(conflicts_of(&target, "d").await, vec!["2-bbb"]);
+    }
+
+    #[tokio::test]
+    async fn push_then_pull_converges_on_conflicts() {
+        let a = MemoryAdapter::new("a");
+        let b = MemoryAdapter::new("b");
+
+        // A edits to 2-bbb (the winner), B to 2-aaa (the loser).
+        put_rev(&a, "d", &["bbb", "111"], serde_json::json!({"side": "a"})).await;
+        put_rev(&b, "d", &["aaa", "111"], serde_json::json!({"side": "b"})).await;
+
+        replicate(&a, &b, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(conflicts_of(&b, "d").await, vec!["2-aaa"]);
+
+        // Pulling back must bring B's losing branch to A as well.
+        replicate(&b, &a, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(conflicts_of(&a, "d").await, vec!["2-aaa"]);
     }
 
     #[tokio::test]
