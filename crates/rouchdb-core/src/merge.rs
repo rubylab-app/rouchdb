@@ -5,7 +5,9 @@
 /// - Determine the winning revision deterministically
 /// - Stem (prune) old revisions beyond a configurable limit
 use crate::document::Revision;
-use crate::rev_tree::{RevNode, RevPath, RevStatus, RevTree, collect_leaves};
+use crate::rev_tree::{
+    NodeOpts, RevNode, RevPath, RevStatus, RevTree, collect_leaves, rev_exists, root_to_leaf,
+};
 
 /// Result of merging a new path into the tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,268 +23,147 @@ pub enum MergeResult {
 /// Merge a new revision path into the existing tree.
 ///
 /// Returns the updated tree and a `MergeResult` indicating what happened.
+/// This is a port of `pouchdb-merge`'s `merge()`: the path is merged into
+/// every root it overlaps (`doMerge`), then the tree is stemmed to
+/// `rev_limit` revisions per root-to-leaf path, which also collapses roots
+/// that became duplicates.
 pub fn merge_tree(tree: &RevTree, new_path: &RevPath, rev_limit: u64) -> (RevTree, MergeResult) {
-    let mut result_tree = tree.clone();
-    let merge_result = do_merge(&mut result_tree, new_path);
+    let (mut result_tree, merge_result) = do_merge(tree, new_path, false);
 
-    // Apply stemming if we have a rev_limit
-    if rev_limit > 0 {
-        let _stemmed = stem(&mut result_tree, rev_limit);
-    }
+    // Always re-normalize through stem (an unlimited depth when there is no
+    // rev_limit) so overlapping roots merged above are collapsed into one.
+    let depth = if rev_limit > 0 { rev_limit } else { u64::MAX };
+    let _stemmed = stem(&mut result_tree, depth);
 
     (result_tree, merge_result)
 }
 
-/// Core merge logic. Tries to merge `new_path` into `tree`, modifying it
-/// in place.
-fn do_merge(tree: &mut RevTree, new_path: &RevPath) -> MergeResult {
-    // Try to merge the new path into each existing root
-    for existing in tree.iter_mut() {
-        let result = try_merge_path(existing, new_path);
-        if let Some(merge_result) = result {
-            return merge_result;
-        }
-    }
-
-    // No overlap found — this is a completely new branch
-    tree.push(new_path.clone());
-    MergeResult::NewBranch
-}
-
-/// Try to merge `new_path` into a single existing `RevPath`.
+/// Core merge logic (`doMerge` in pouchdb-merge).
 ///
-/// Returns `None` if the paths don't share any common ancestor (no overlap),
-/// meaning the new path should be tried against other roots or added as a
-/// new root.
-fn try_merge_path(existing: &mut RevPath, new_path: &RevPath) -> Option<MergeResult> {
-    // Find the overlap point between the two paths
-    let overlap = find_overlap(existing, new_path);
+/// `new_path` is merged into every existing root it overlaps, whether the
+/// overlap is at the same root, deeper in an existing root, or deeper in the
+/// incoming path (in which case the incoming path becomes the new root and
+/// keeps its older ancestors). When `dont_expand` is set (used while
+/// re-merging stemmed paths), only roots starting at the same revision merge.
+fn do_merge(tree: &RevTree, new_path: &RevPath, dont_expand: bool) -> (RevTree, MergeResult) {
+    if tree.is_empty() {
+        return (vec![new_path.clone()], MergeResult::NewLeaf);
+    }
 
-    match overlap {
-        None => None, // No common point, can't merge here
-        Some(OverlapInfo {
-            existing_node_path,
-            new_remainder,
-            is_exact_match,
-        }) => {
-            if is_exact_match && new_remainder.is_empty() {
-                // The new path's leaf already exists in the tree
-                return Some(MergeResult::InternalNode);
+    let mut restree: RevTree = Vec::with_capacity(tree.len() + 1);
+    let mut conflicts: Option<MergeResult> = None;
+    let mut merged = false;
+    // The incoming path absorbs existing roots that start below its root, so
+    // later roots are compared against the grown path.
+    let mut path = new_path.clone();
+
+    for branch in tree {
+        if branch.pos == path.pos && branch.tree.hash == path.tree.hash {
+            // Same root: merge the two trees node by node.
+            let mut branch = branch.clone();
+            let res = merge_nodes(&mut branch.tree, &path.tree);
+            conflicts = conflicts.or(res);
+            restree.push(branch);
+            merged = true;
+        } else if !dont_expand && branch.pos < path.pos {
+            // The incoming path starts deeper: find its root inside the branch.
+            let mut branch = branch.clone();
+            if let Some(target) =
+                find_at_depth_mut(&mut branch.tree, path.pos - branch.pos, &path.tree.hash)
+            {
+                let res = merge_nodes(target, &path.tree);
+                conflicts = conflicts.or(res);
+                merged = true;
             }
-
-            // Navigate to the overlap point and graft the new nodes
-            let target = navigate_to_mut(&mut existing.tree, &existing_node_path);
-
-            if new_remainder.is_empty() {
-                // Leaf already exists
-                Some(MergeResult::InternalNode)
-            } else {
-                // Check if this extends an existing branch or creates a new one
-                let result = graft_nodes(target, &new_remainder);
-                Some(result)
+            restree.push(branch);
+        } else if !dont_expand && branch.pos > path.pos {
+            // The existing branch starts deeper: graft it into the incoming
+            // path, which becomes the root and keeps its older ancestors.
+            let diff = branch.pos - path.pos;
+            match find_at_depth_mut(&mut path.tree, diff, &branch.tree.hash) {
+                Some(target) => {
+                    // Classify from the incoming side: what does the path add
+                    // below the branch root?
+                    let mut probe = branch.tree.clone();
+                    let res = merge_nodes(&mut probe, target);
+                    merge_nodes(target, &branch.tree);
+                    conflicts = conflicts.or(res);
+                    restree.push(path.clone());
+                    merged = true;
+                }
+                None => restree.push(branch.clone()),
             }
-        }
-    }
-}
-
-struct OverlapInfo {
-    /// Path of indices to navigate from the existing root to the overlap node.
-    existing_node_path: Vec<usize>,
-    /// Remaining new nodes to graft after the overlap point.
-    new_remainder: Vec<RevNode>,
-    /// Whether the overlap was an exact hash match (vs. positional).
-    is_exact_match: bool,
-}
-
-/// Find where `new_path` overlaps with `existing`.
-fn find_overlap(existing: &RevPath, new_path: &RevPath) -> Option<OverlapInfo> {
-    // Flatten the new path into a linear chain of hashes with positions
-    let new_chain = flatten_chain(&new_path.tree, new_path.pos);
-
-    // Try to find any node in the new chain that exists in the existing tree
-    for (i, (new_pos, new_hash)) in new_chain.iter().enumerate() {
-        if let Some(path_indices) = find_node_path(&existing.tree, existing.pos, *new_pos, new_hash)
-        {
-            // Build the remainder: nodes in the new chain after this overlap point
-            let remainder = build_remainder_from_chain(&new_chain, i, &new_path.tree, new_path.pos);
-
-            return Some(OverlapInfo {
-                existing_node_path: path_indices,
-                new_remainder: remainder,
-                is_exact_match: true,
-            });
-        }
-    }
-
-    // Check if the new path starts right after where the existing tree ends,
-    // or if there's a positional overlap we can use
-    // Check if the new path's root is a child-level continuation of any leaf
-    let existing_leaves = collect_leaf_positions(existing);
-    let new_root_pos = new_path.pos;
-    let new_root_hash = &new_path.tree.hash;
-
-    // Check if the new path starts exactly where an existing leaf is
-    for (leaf_pos, leaf_hash, leaf_path) in &existing_leaves {
-        // Does the new chain start with this leaf's hash at this position?
-        if *leaf_pos == new_root_pos && leaf_hash == new_root_hash {
-            let remainder = if new_path.tree.children.is_empty() {
-                vec![]
-            } else {
-                new_path.tree.children.clone()
-            };
-            return Some(OverlapInfo {
-                existing_node_path: leaf_path.clone(),
-                new_remainder: remainder,
-                is_exact_match: true,
-            });
-        }
-    }
-
-    None
-}
-
-/// Flatten a tree node into a linear chain of (pos, hash) pairs.
-fn flatten_chain(node: &RevNode, start_pos: u64) -> Vec<(u64, String)> {
-    let mut chain = Vec::new();
-    fn walk(node: &RevNode, pos: u64, chain: &mut Vec<(u64, String)>) {
-        chain.push((pos, node.hash.clone()));
-        // Follow first child only (linear chain for the new path)
-        if let Some(child) = node.children.first() {
-            walk(child, pos + 1, chain);
-        }
-    }
-    walk(node, start_pos, &mut chain);
-    chain
-}
-
-/// Find the index path to a node with the given position and hash.
-fn find_node_path(
-    node: &RevNode,
-    current_pos: u64,
-    target_pos: u64,
-    target_hash: &str,
-) -> Option<Vec<usize>> {
-    if current_pos == target_pos && node.hash == target_hash {
-        return Some(vec![]);
-    }
-
-    for (i, child) in node.children.iter().enumerate() {
-        if let Some(mut path) = find_node_path(child, current_pos + 1, target_pos, target_hash) {
-            path.insert(0, i);
-            return Some(path);
-        }
-    }
-
-    None
-}
-
-/// Collect all leaf nodes with their positions and index paths.
-fn collect_leaf_positions(path: &RevPath) -> Vec<(u64, String, Vec<usize>)> {
-    let mut leaves = Vec::new();
-    fn walk(
-        node: &RevNode,
-        pos: u64,
-        current_path: &mut Vec<usize>,
-        leaves: &mut Vec<(u64, String, Vec<usize>)>,
-    ) {
-        if node.children.is_empty() {
-            leaves.push((pos, node.hash.clone(), current_path.clone()));
-        }
-        for (i, child) in node.children.iter().enumerate() {
-            current_path.push(i);
-            walk(child, pos + 1, current_path, leaves);
-            current_path.pop();
-        }
-    }
-    let mut current = Vec::new();
-    walk(&path.tree, path.pos, &mut current, &mut leaves);
-    leaves
-}
-
-/// Build the remaining nodes after the overlap point from the new chain.
-fn build_remainder_from_chain(
-    _chain: &[(u64, String)],
-    overlap_index: usize,
-    original_tree: &RevNode,
-    _original_pos: u64,
-) -> Vec<RevNode> {
-    // Navigate to the overlap point in the original tree, then return
-    // everything after it
-    let depth_to_overlap = overlap_index;
-
-    fn get_subtree_at_depth(node: &RevNode, depth: usize) -> Option<&RevNode> {
-        if depth == 0 {
-            return Some(node);
-        }
-        if let Some(child) = node.children.first() {
-            get_subtree_at_depth(child, depth - 1)
         } else {
-            None
+            restree.push(branch.clone());
         }
     }
 
-    if let Some(overlap_node) = get_subtree_at_depth(original_tree, depth_to_overlap) {
-        overlap_node.children.clone()
-    } else {
-        vec![]
+    if !merged {
+        // No overlap with any root: a disjoint new root, i.e. a new branch.
+        restree.push(path);
+        conflicts = Some(MergeResult::NewBranch);
     }
+
+    restree.sort_by_key(|p| p.pos);
+
+    (restree, conflicts.unwrap_or(MergeResult::InternalNode))
 }
 
-/// Navigate to a node in the tree using a path of child indices.
-fn navigate_to_mut<'a>(node: &'a mut RevNode, path: &[usize]) -> &'a mut RevNode {
-    let mut current = node;
-    for &idx in path {
-        current = &mut current.children[idx];
-    }
-    current
+/// Merge `incoming` into `existing` (`mergeTree` in pouchdb-merge). Both nodes
+/// must be the same revision. Returns what the merge added, if anything.
+fn merge_nodes(existing: &mut RevNode, incoming: &RevNode) -> Option<MergeResult> {
+    let mut conflicts = None;
+    merge_nodes_into(existing, incoming, &mut conflicts);
+    conflicts
 }
 
-/// Graft new nodes onto a target node. Returns whether this created a new
-/// branch (conflict), extended an existing one, or was a no-op.
-fn graft_nodes(target: &mut RevNode, new_nodes: &[RevNode]) -> MergeResult {
-    let mut is_new_branch = false;
-    let mut added_anything = false;
+fn merge_nodes_into(
+    existing: &mut RevNode,
+    incoming: &RevNode,
+    conflicts: &mut Option<MergeResult>,
+) {
+    // A revision is available if either side has its body.
+    if incoming.status == RevStatus::Available {
+        existing.status = RevStatus::Available;
+    }
 
-    for new_node in new_nodes {
-        // Check if a child with this hash already exists
-        let existing_child = target.children.iter_mut().find(|c| c.hash == new_node.hash);
+    for child in &incoming.children {
+        if existing.children.is_empty() {
+            // Extending a leaf.
+            *conflicts = Some(MergeResult::NewLeaf);
+            existing.children.push(child.clone());
+            continue;
+        }
 
-        match existing_child {
-            Some(existing) => {
-                // Recursively merge children
-                for grandchild in &new_node.children {
-                    let sub_nodes = vec![grandchild.clone()];
-                    let result = graft_nodes(existing, &sub_nodes);
-                    match result {
-                        MergeResult::NewBranch => {
-                            is_new_branch = true;
-                            added_anything = true;
-                        }
-                        MergeResult::NewLeaf => {
-                            added_anything = true;
-                        }
-                        MergeResult::InternalNode => {}
-                    }
-                }
-            }
-            None => {
-                // New child — this is either extending a leaf or creating a branch
-                if !target.children.is_empty() {
-                    is_new_branch = true;
-                }
-                target.children.push(new_node.clone());
-                added_anything = true;
+        let mut found = false;
+        for existing_child in existing.children.iter_mut() {
+            if existing_child.hash == child.hash {
+                merge_nodes_into(existing_child, child, conflicts);
+                found = true;
             }
         }
+        if !found {
+            // A sibling of existing children: a new conflicting branch.
+            *conflicts = Some(MergeResult::NewBranch);
+            let idx = existing
+                .children
+                .partition_point(|c| c.hash.as_str() < child.hash.as_str());
+            existing.children.insert(idx, child.clone());
+        }
     }
+}
 
-    if !added_anything {
-        MergeResult::InternalNode
-    } else if is_new_branch {
-        MergeResult::NewBranch
-    } else {
-        MergeResult::NewLeaf
+/// Find the node exactly `depth` levels below `node` whose hash is `hash`.
+fn find_at_depth_mut<'a>(node: &'a mut RevNode, depth: u64, hash: &str) -> Option<&'a mut RevNode> {
+    if depth == 0 {
+        return if node.hash == hash { Some(node) } else { None };
     }
+    for child in node.children.iter_mut() {
+        if let Some(found) = find_at_depth_mut(child, depth - 1, hash) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +207,7 @@ pub fn collect_conflicts(tree: &RevTree) -> Vec<Revision> {
 // ---------------------------------------------------------------------------
 
 /// Maximum number of edges from `node` to its deepest descendant leaf.
+#[cfg(test)]
 fn max_depth(node: &RevNode) -> u64 {
     if node.children.is_empty() {
         return 0;
@@ -337,64 +219,66 @@ fn max_depth(node: &RevNode) -> u64 {
         .unwrap_or(0)
 }
 
-/// Prune revisions beyond `depth` from each leaf. Returns the list of
-/// revision hashes that were removed.
+/// Prune revisions so every root-to-leaf path keeps at most `depth`
+/// revisions. Returns the list of revision hashes that were removed.
 ///
-/// Stemming is applied per branch: when a branch point sits above the cut
-/// line, the common ancestor is dropped and each child subtree is re-rooted
-/// into its own `RevPath`, mirroring `pouchdb-merge`. This is why a `RevTree`
-/// is a list of roots.
+/// This is a port of `pouchdb-merge`'s `stem()`: the tree is decomposed into
+/// root-to-leaf paths, each path is cut independently, and the cut paths are
+/// merged back together. A shared ancestor is therefore only removed when no
+/// remaining path still needs it (a short branch keeps its full ancestry even
+/// when a sibling branch is deep). This is why a `RevTree` is a list of roots.
 pub fn stem(tree: &mut RevTree, depth: u64) -> Vec<String> {
-    let mut stemmed = Vec::new();
-    let mut new_roots: RevTree = Vec::new();
-    for path in tree.drain(..) {
-        new_roots.extend(stem_path(path, depth, &mut stemmed));
+    let depth = depth.max(1);
+    let mut stemmed: Vec<(u64, String)> = Vec::new();
+    let mut result: RevTree = Vec::new();
+
+    for (pos, ids) in root_to_leaf(tree) {
+        let len = ids.len() as u64;
+        let cut = len.saturating_sub(depth) as usize;
+        for (i, (hash, _, _)) in ids.iter().take(cut).enumerate() {
+            let rev = (pos + i as u64, hash.clone());
+            if !stemmed.contains(&rev) {
+                stemmed.push(rev);
+            }
+        }
+        let path = RevPath {
+            pos: pos + cut as u64,
+            tree: path_to_tree(&ids[cut..]),
+        };
+        if is_empty_node(&path.tree) {
+            continue;
+        }
+        result = if result.is_empty() {
+            vec![path]
+        } else {
+            do_merge(&result, &path, true).0
+        };
     }
-    // Remove any paths that became empty
-    new_roots.retain(|p| !is_empty_node(&p.tree));
-    *tree = new_roots;
-    stemmed
+
+    // A revision removed from one path may still live on another one.
+    stemmed.retain(|(pos, hash)| !rev_exists(&result, *pos, hash));
+
+    *tree = result;
+    stemmed.into_iter().map(|(_, hash)| hash).collect()
 }
 
-/// Stem one rooted path, returning one or more re-rooted paths so every
-/// root-to-leaf chain keeps at most `depth` revisions.
-fn stem_path(path: RevPath, depth: u64, stemmed: &mut Vec<String>) -> Vec<RevPath> {
-    let mut pos = path.pos;
-    let mut node = path.tree;
-    loop {
-        if max_depth(&node) < depth {
-            // The deepest leaf is already within the limit — keep as-is.
-            return vec![RevPath { pos, tree: node }];
-        }
-        if node.children.len() <= 1 {
-            // Linear prefix: drop the root and descend into the only child.
-            stemmed.push(node.hash.clone());
-            match node.children.pop() {
-                Some(child) => {
-                    node = child;
-                    pos += 1;
-                }
-                None => return vec![], // Tree emptied
-            }
-        } else {
-            // Branch point above the cut line: drop it and re-root each child,
-            // stemming each subtree independently.
-            stemmed.push(node.hash.clone());
-            let children = std::mem::take(&mut node.children);
-            let mut out = Vec::new();
-            for child in children {
-                out.extend(stem_path(
-                    RevPath {
-                        pos: pos + 1,
-                        tree: child,
-                    },
-                    depth,
-                    stemmed,
-                ));
-            }
-            return out;
-        }
+/// Rebuild a linear chain (root first) produced by `root_to_leaf`.
+fn path_to_tree(ids: &[(String, NodeOpts, RevStatus)]) -> RevNode {
+    let mut node: Option<RevNode> = None;
+    for (hash, opts, status) in ids.iter().rev() {
+        node = Some(RevNode {
+            hash: hash.clone(),
+            status: status.clone(),
+            opts: opts.clone(),
+            children: node.into_iter().collect(),
+        });
     }
+    node.unwrap_or(RevNode {
+        hash: String::new(),
+        status: RevStatus::Missing,
+        opts: NodeOpts::default(),
+        children: vec![],
+    })
 }
 
 fn is_empty_node(node: &RevNode) -> bool {
@@ -517,7 +401,7 @@ fn find_first_available_leaf(node: &RevNode, pos: u64) -> Option<Revision> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rev_tree::{NodeOpts, RevNode, RevPath, build_path_from_revs};
+    use crate::rev_tree::{RevNode, RevPath, build_path_from_revs};
 
     fn leaf(hash: &str) -> RevNode {
         RevNode {
@@ -793,13 +677,20 @@ mod tests {
         }];
 
         let stemmed = stem(&mut tree, 2);
-        // a, c, d are pruned; each leaf keeps at most 2 revisions.
-        assert!(stemmed.contains(&"a".to_string()));
-        assert!(stemmed.contains(&"c".to_string()));
-        assert!(stemmed.contains(&"d".to_string()));
+        // Stemming is per root-to-leaf path (pouchdb-merge): the short branch
+        // 1-a -> 2-b already fits the limit, so 1-a survives on it and only
+        // 2-c and 3-d are pruned from the deep branch.
+        let mut stemmed_sorted = stemmed.clone();
+        stemmed_sorted.sort();
+        assert_eq!(stemmed_sorted, vec!["c".to_string(), "d".to_string()]);
 
-        // Roots become [2-b] and [4-e -> 5-f].
+        // Roots become [1-a -> 2-b] and [4-e -> 5-f].
         assert_eq!(tree.len(), 2);
+        assert_eq!(tree[0].pos, 1);
+        assert_eq!(tree[0].tree.hash, "a");
+        assert_eq!(tree[0].tree.children[0].hash, "b");
+        assert_eq!(tree[1].pos, 4);
+        assert_eq!(tree[1].tree.hash, "e");
         for path in &tree {
             assert!(max_depth(&path.tree) < 2, "every chain must fit the limit");
         }
@@ -807,6 +698,146 @@ mod tests {
         let winner = winning_rev(&tree).unwrap();
         assert_eq!(winner.pos, 5);
         assert_eq!(winner.hash, "f");
+        // The short branch keeps its full ancestry.
+        assert_eq!(
+            crate::rev_tree::find_rev_ancestry(&tree, 2, "b").unwrap(),
+            vec!["b", "a"]
+        );
+    }
+
+    // --- doMerge fidelity (F20, F21, F22) ---
+
+    #[test]
+    fn merge_into_all_overlapping_roots() {
+        // Tree has two roots: [1-a -> 2-b] and a stray [3-c] (e.g. 3-c arrived
+        // without _revisions). 4-d then arrives with the full ancestry
+        // [d, c, b, a]: it overlaps BOTH roots, so 3-c must stop being a leaf.
+        let tree = vec![
+            RevPath {
+                pos: 1,
+                tree: node("a", vec![leaf("b")]),
+            },
+            RevPath {
+                pos: 3,
+                tree: leaf("c"),
+            },
+        ];
+        let new_path = build_path_from_revs(
+            4,
+            &["d".into(), "c".into(), "b".into(), "a".into()],
+            NodeOpts::default(),
+            RevStatus::Available,
+        );
+        let (merged, result) = merge_tree(&tree, &new_path, 1000);
+        assert_eq!(result, MergeResult::NewLeaf);
+        let leaves: Vec<String> = collect_leaves(&merged)
+            .iter()
+            .map(|l| l.rev_string())
+            .collect();
+        assert_eq!(leaves, vec!["4-d"]);
+        assert!(collect_conflicts(&merged).is_empty());
+        assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn merge_keeps_older_incoming_ancestors() {
+        // Local tree only knows [3-c]; 4-d arrives with [d, c, b, a]. The
+        // incoming path starts earlier, so it must become the root and keep
+        // 1-a and 2-b instead of dropping them.
+        let tree = vec![RevPath {
+            pos: 3,
+            tree: leaf("c"),
+        }];
+        let new_path = build_path_from_revs(
+            4,
+            &["d".into(), "c".into(), "b".into(), "a".into()],
+            NodeOpts::default(),
+            RevStatus::Available,
+        );
+        let (merged, result) = merge_tree(&tree, &new_path, 1000);
+        assert_eq!(result, MergeResult::NewLeaf);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].pos, 1);
+        assert_eq!(
+            crate::rev_tree::find_rev_ancestry(&merged, 4, "d").unwrap(),
+            vec!["d", "c", "b", "a"]
+        );
+        // The existing 3-c keeps its stored status.
+        assert_eq!(
+            merged[0].tree.children[0].children[0].status,
+            RevStatus::Available
+        );
+    }
+
+    #[test]
+    fn merge_into_empty_tree_is_new_leaf() {
+        let new_path =
+            build_path_from_revs(1, &["a".into()], NodeOpts::default(), RevStatus::Available);
+        let (merged, result) = merge_tree(&Vec::new(), &new_path, 1000);
+        assert_eq!(result, MergeResult::NewLeaf);
+        assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn merge_existing_rev_promotes_missing_status() {
+        // 1-a -> 2-b where 2-b is only known as a missing ancestor; re-sending
+        // 2-b with its body is an internal-node merge that makes it available.
+        let tree = vec![RevPath {
+            pos: 1,
+            tree: node(
+                "a",
+                vec![RevNode {
+                    hash: "b".into(),
+                    status: RevStatus::Missing,
+                    opts: NodeOpts::default(),
+                    children: vec![leaf("c")],
+                }],
+            ),
+        }];
+        let new_path = build_path_from_revs(
+            2,
+            &["b".into(), "a".into()],
+            NodeOpts::default(),
+            RevStatus::Available,
+        );
+        let (merged, result) = merge_tree(&tree, &new_path, 1000);
+        assert_eq!(result, MergeResult::InternalNode);
+        assert_eq!(merged[0].tree.children[0].status, RevStatus::Available);
+    }
+
+    #[test]
+    fn merge_is_idempotent_and_order_independent() {
+        // Two conflicting branches merged in either order give the same tree.
+        let p1 = build_path_from_revs(
+            3,
+            &["c".into(), "b".into(), "a".into()],
+            NodeOpts::default(),
+            RevStatus::Available,
+        );
+        let p2 = build_path_from_revs(
+            2,
+            &["x".into(), "a".into()],
+            NodeOpts::default(),
+            RevStatus::Available,
+        );
+        let (t1, _) = merge_tree(&Vec::new(), &p1, 1000);
+        let (t1, r1) = merge_tree(&t1, &p2, 1000);
+        let (t2, _) = merge_tree(&Vec::new(), &p2, 1000);
+        let (t2, r2) = merge_tree(&t2, &p1, 1000);
+        assert_eq!(r1, MergeResult::NewBranch);
+        assert_eq!(r2, MergeResult::NewBranch);
+        let leaves = |t: &RevTree| {
+            let mut v: Vec<String> = collect_leaves(t).iter().map(|l| l.rev_string()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(leaves(&t1), leaves(&t2));
+        assert_eq!(t1.len(), 1);
+        assert_eq!(t2.len(), 1);
+        // Re-merging a path that is already present changes nothing.
+        let (t3, r3) = merge_tree(&t1, &p1, 1000);
+        assert_eq!(r3, MergeResult::InternalNode);
+        assert_eq!(leaves(&t3), leaves(&t1));
     }
 
     #[test]

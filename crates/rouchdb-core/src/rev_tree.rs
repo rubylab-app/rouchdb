@@ -158,10 +158,14 @@ pub fn rev_exists(tree: &RevTree, pos: u64, hash: &str) -> bool {
 
 /// Build a single-path `RevPath` from a list of revision hashes.
 ///
-/// `revs` is oldest-first: `[oldest_hash, ..., newest_hash]`.
+/// `revs` is **newest-first** (the order of CouchDB's `_revisions.ids`):
+/// `[newest_hash, parent_hash, ..., oldest_hash]`.
 /// `pos` is the generation of the *newest* (leaf) revision.
 /// `opts` are the metadata flags for the *leaf* node.
 /// `status` is applied to the leaf; all ancestors are `Missing`.
+///
+/// This does not validate its input; use [`path_from_revisions`] for
+/// untrusted `_revisions` data.
 pub fn build_path_from_revs(
     pos: u64,
     revs: &[String],
@@ -208,6 +212,41 @@ pub fn build_path_from_revs(
         pos: root_pos,
         tree: node.expect("node must exist after building from non-empty revs"),
     }
+}
+
+/// Build the path for an incoming revision from its CouchDB `_revisions`
+/// ancestry (`start` = generation of the newest rev, `ids` newest-first),
+/// validating that the history is consistent with `rev`.
+///
+/// Rejects an empty `ids` list, a `start` that does not match the rev
+/// generation, a newest id that does not match the rev hash, and more ids
+/// than there are generations.
+pub fn path_from_revisions(
+    rev: &crate::document::Revision,
+    start: u64,
+    ids: &[String],
+    opts: NodeOpts,
+    status: RevStatus,
+) -> crate::error::Result<RevPath> {
+    let invalid = |why: &str| {
+        crate::error::RouchError::BadRequest(format!("invalid _revisions for {}: {}", rev, why))
+    };
+    if ids.is_empty() {
+        return Err(invalid("ids must not be empty"));
+    }
+    if start != rev.pos {
+        return Err(invalid("start does not match the revision generation"));
+    }
+    if ids[0] != rev.hash {
+        return Err(invalid("first id does not match the revision hash"));
+    }
+    if ids.len() as u64 > start {
+        return Err(invalid("more ids than generations"));
+    }
+    if ids.iter().any(|id| id.is_empty()) {
+        return Err(invalid("ids must not be empty strings"));
+    }
+    Ok(build_path_from_revs(start, ids, opts, status))
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +389,67 @@ mod tests {
         assert_eq!(ancestry, vec!["a"]);
 
         assert!(find_rev_ancestry(&tree, 3, "z").is_none());
+    }
+
+    #[test]
+    fn path_from_revisions_validates_history() {
+        let rev = |s: &str| s.parse::<crate::document::Revision>().unwrap();
+        // Valid: 3-c with ancestry [c, b, a].
+        let path = path_from_revisions(
+            &rev("3-c"),
+            3,
+            &["c".into(), "b".into(), "a".into()],
+            NodeOpts::default(),
+            RevStatus::Available,
+        )
+        .unwrap();
+        assert_eq!(path.pos, 1);
+        assert_eq!(path.tree.hash, "a");
+
+        // Empty ids: rejected instead of creating a degenerate node.
+        assert!(
+            path_from_revisions(
+                &rev("3-c"),
+                3,
+                &[],
+                NodeOpts::default(),
+                RevStatus::Available
+            )
+            .is_err()
+        );
+        // `start` inconsistent with the rev generation.
+        assert!(
+            path_from_revisions(
+                &rev("3-c"),
+                2,
+                &["c".into(), "b".into()],
+                NodeOpts::default(),
+                RevStatus::Available
+            )
+            .is_err()
+        );
+        // More ids than generations.
+        assert!(
+            path_from_revisions(
+                &rev("2-c"),
+                2,
+                &["c".into(), "b".into(), "a".into(), "z".into()],
+                NodeOpts::default(),
+                RevStatus::Available
+            )
+            .is_err()
+        );
+        // Newest id does not match the rev hash.
+        assert!(
+            path_from_revisions(
+                &rev("2-c"),
+                2,
+                &["x".into(), "b".into()],
+                NodeOpts::default(),
+                RevStatus::Available
+            )
+            .is_err()
+        );
     }
 
     #[test]
