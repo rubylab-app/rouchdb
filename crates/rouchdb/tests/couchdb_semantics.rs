@@ -193,3 +193,29 @@ async fn push_skips_docs_denied_by_validate_doc_update() {
 
     delete_remote_db(&url).await;
 }
+
+// =========================================================================
+// Replication ids (F98)
+// =========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn http_id_is_server_uuid_plus_db_name() {
+    let url = fresh_remote_db("repl_id").await;
+    let db_name = url.rsplit('/').next().unwrap().to_string();
+    let root: serde_json::Value = reqwest::get(common::couchdb_url())
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let uuid = root["uuid"].as_str().unwrap();
+
+    let id = Database::http(&url).adapter().id().await.unwrap();
+    assert_eq!(id, format!("{}{}", uuid, db_name));
+    // Another URL for the same database maps to the same id.
+    let alias = url.replace("localhost", "127.0.0.1");
+    assert_eq!(Database::http(&alias).adapter().id().await.unwrap(), id);
+
+    delete_remote_db(&url).await;
+}

@@ -237,11 +237,9 @@ async fn new_checkpointer(
     target: &dyn Adapter,
     filter: &Option<ReplicationFilter>,
 ) -> Result<Checkpointer> {
-    let source_info = source.info().await?;
-    let target_info = target.info().await?;
     Ok(Checkpointer::new(
-        &source_info.db_name,
-        &target_info.db_name,
+        &source.id().await?,
+        &target.id().await?,
         &filter_fingerprint(filter),
     ))
 }
@@ -706,6 +704,104 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(conflicts_of(&a, "d").await, vec!["2-aaa"]);
+    }
+
+    /// A memory adapter reporting a custom `id()`, like two remote
+    /// databases that share a name on different servers.
+    struct NamedAt(MemoryAdapter, &'static str);
+
+    #[async_trait::async_trait]
+    impl Adapter for NamedAt {
+        async fn info(&self) -> Result<DbInfo> {
+            self.0.info().await
+        }
+        async fn id(&self) -> Result<String> {
+            Ok(self.1.to_string())
+        }
+        async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
+            self.0.get(id, opts).await
+        }
+        async fn bulk_docs(
+            &self,
+            docs: Vec<Document>,
+            opts: BulkDocsOptions,
+        ) -> Result<Vec<DocResult>> {
+            self.0.bulk_docs(docs, opts).await
+        }
+        async fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
+            self.0.all_docs(opts).await
+        }
+        async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
+            self.0.changes(opts).await
+        }
+        async fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
+            self.0.revs_diff(revs).await
+        }
+        async fn bulk_get(&self, docs: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
+            self.0.bulk_get(docs).await
+        }
+        async fn put_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            rev: &str,
+            data: Vec<u8>,
+            content_type: &str,
+        ) -> Result<DocResult> {
+            self.0
+                .put_attachment(doc_id, att_id, rev, data, content_type)
+                .await
+        }
+        async fn get_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            opts: GetAttachmentOptions,
+        ) -> Result<Vec<u8>> {
+            self.0.get_attachment(doc_id, att_id, opts).await
+        }
+        async fn remove_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            rev: &str,
+        ) -> Result<DocResult> {
+            self.0.remove_attachment(doc_id, att_id, rev).await
+        }
+        async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
+            self.0.get_local(id).await
+        }
+        async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
+            self.0.put_local(id, doc).await
+        }
+        async fn remove_local(&self, id: &str) -> Result<()> {
+            self.0.remove_local(id).await
+        }
+        async fn compact(&self) -> Result<()> {
+            self.0.compact().await
+        }
+        async fn destroy(&self) -> Result<()> {
+            self.0.destroy().await
+        }
+    }
+
+    #[tokio::test]
+    async fn same_named_peers_get_distinct_replication_ids() {
+        let source = MemoryAdapter::new("local");
+        let a = NamedAt(MemoryAdapter::new("userdb"), "http://a.example/userdb");
+        let b = NamedAt(MemoryAdapter::new("userdb"), "http://b.example/userdb");
+
+        let id_a = new_checkpointer(&source, &a, &None).await.unwrap();
+        let id_b = new_checkpointer(&source, &b, &None).await.unwrap();
+        assert_ne!(id_a.replication_id(), id_b.replication_id());
+
+        // Local adapters keep deriving it from the name, so their existing
+        // checkpoints stay valid.
+        let local = new_checkpointer(&source, &MemoryAdapter::new("userdb"), &None)
+            .await
+            .unwrap();
+        let before = Checkpointer::new("local", "userdb", "nofilter");
+        assert_eq!(local.replication_id(), before.replication_id());
     }
 
     #[tokio::test]

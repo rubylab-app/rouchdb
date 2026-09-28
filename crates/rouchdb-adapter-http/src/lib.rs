@@ -254,6 +254,27 @@ impl Adapter for HttpAdapter {
         })
     }
 
+    async fn id(&self) -> Result<String> {
+        // Like PouchDB: the server's uuid plus the database name, so every
+        // URL of the same database maps to one replication id (and same-named
+        // databases on different servers do not); otherwise the URL without
+        // credentials.
+        let (server, db) = self
+            .base_url
+            .rsplit_once('/')
+            .unwrap_or((self.base_url.as_str(), ""));
+        let uuid = async {
+            let resp = self.client.get(server).send().await.ok()?;
+            let root: serde_json::Value = resp.error_for_status().ok()?.json().await.ok()?;
+            root.get("uuid")?.as_str().map(String::from)
+        }
+        .await;
+        Ok(match uuid {
+            Some(uuid) => format!("{}{}", uuid, db),
+            None => url_without_credentials(&self.base_url),
+        })
+    }
+
     async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
         let mut url = self.url(&encode_doc_id(id));
         let mut params = Vec::new();
@@ -786,6 +807,18 @@ impl Adapter for HttpAdapter {
     }
 }
 
+/// `url` with any `user:password@` removed.
+fn url_without_credentials(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        Err(_) => url.to_string(),
+    }
+}
+
 /// CouchDB omits `length` (and `stub`) on attachments inlined with
 /// `attachments=true`; fill in the decoded length so the attachment is not
 /// rejected as malformed when the document is parsed.
@@ -846,9 +879,10 @@ fn encode_query_key(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CouchDbAllDocsResponse, encode_doc_id, encode_query_key, fill_inline_attachment_lengths,
-        urlencoded,
+        CouchDbAllDocsResponse, HttpAdapter, encode_doc_id, encode_query_key,
+        fill_inline_attachment_lengths, urlencoded,
     };
+    use rouchdb_core::adapter::Adapter;
 
     #[test]
     fn design_and_local_ids_keep_prefix_slash() {
@@ -913,5 +947,15 @@ mod tests {
         assert_eq!(doc.attachments["hi.txt"].length, 3);
         assert_eq!(doc.attachments["one.bin"].length, 1);
         assert_eq!(doc.attachments["two.bin"].length, 2);
+    }
+
+    #[tokio::test]
+    async fn id_without_server_uuid_is_the_url_without_credentials() {
+        // Nothing listens on port 1: the uuid lookup fails fast.
+        let a = HttpAdapter::new("http://admin:secret@127.0.0.1:1/userdb");
+        let b = HttpAdapter::new("http://127.0.0.1:2/userdb");
+        let id_a = a.id().await.unwrap();
+        assert_eq!(id_a, "http://127.0.0.1:1/userdb");
+        assert_ne!(id_a, b.id().await.unwrap());
     }
 }

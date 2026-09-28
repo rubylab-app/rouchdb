@@ -1228,6 +1228,7 @@ dependencies = [
  "rouchdb-core",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
