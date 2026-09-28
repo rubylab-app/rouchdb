@@ -5,11 +5,14 @@
 //! key-value pairs, then optionally reduces them.
 
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap};
+
+use serde_json::Value;
 
 use rouchdb_core::adapter::Adapter;
 use rouchdb_core::collation::collate;
-use rouchdb_core::document::AllDocsOptions;
-use rouchdb_core::error::Result;
+use rouchdb_core::document::{AllDocsOptions, GetOptions};
+use rouchdb_core::error::{Result, RouchError};
 
 /// A key-value pair emitted by a map function.
 #[derive(Debug, Clone)]
@@ -21,13 +24,16 @@ pub struct EmittedRow {
 
 /// Built-in reduce functions matching CouchDB's built-ins.
 pub enum ReduceFn {
-    /// Sum all numeric values.
+    /// Sum numeric values (arrays element-wise, objects field by field).
     Sum,
     /// Count the number of rows.
     Count,
     /// Compute statistics (sum, count, min, max, sumsqr).
     Stats,
-    /// Custom reduce function.
+    /// Custom reduce function, called as `f(keys, values, rereduce)`.
+    ///
+    /// As in CouchDB, each key is a `[key, doc_id]` pair. All the values of
+    /// a group are reduced in one call, so `rereduce` is always `false`.
     #[allow(clippy::type_complexity)]
     Custom(Box<dyn Fn(&[serde_json::Value], &[serde_json::Value], bool) -> serde_json::Value>),
 }
@@ -51,15 +57,20 @@ pub struct ViewQueryOptions {
     pub skip: u64,
     /// Maximum number of rows.
     pub limit: Option<u64>,
-    /// Include the full document in each row.
+    /// Include the full document in each row. A value of the form
+    /// `{"_id": ...}` (optionally with `_rev`) includes that document
+    /// instead. Not allowed together with reduce.
     pub include_docs: bool,
-    /// Whether to run the reduce function.
+    /// Whether to run the reduce function, if one is given. `new()` turns
+    /// it on, like CouchDB's default.
     pub reduce: bool,
     /// Group by key (requires reduce).
     pub group: bool,
     /// Group to this many array elements of the key.
     pub group_level: Option<u64>,
-    /// Use stale index without rebuilding.
+    /// Use stale index without rebuilding. Only persistent views
+    /// (`ViewEngine::query`) have an index; ad-hoc `query_view` always
+    /// reads the current documents.
     pub stale: StaleOption,
 }
 
@@ -76,9 +87,11 @@ pub enum StaleOption {
 }
 
 impl ViewQueryOptions {
+    /// CouchDB's defaults: `inclusive_end` and `reduce` are on.
     pub fn new() -> Self {
         Self {
             inclusive_end: true,
+            reduce: true,
             ..Default::default()
         }
     }
@@ -87,7 +100,11 @@ impl ViewQueryOptions {
 /// Result of querying a view.
 #[derive(Debug, Clone)]
 pub struct ViewResult {
+    /// Rows in the whole view (for a reduce query, the number of reduced rows
+    /// before skip/limit).
     pub total_rows: u64,
+    /// Position of the first returned row in the view (for a reduce query,
+    /// the skip).
     pub offset: u64,
     pub rows: Vec<ViewRow>,
 }
@@ -104,12 +121,16 @@ pub struct ViewRow {
 /// Run a temporary (ad-hoc) map/reduce query.
 ///
 /// The `map_fn` receives a document JSON and returns emitted key-value pairs.
+/// Design documents are not passed to the map function, as in CouchDB.
 pub async fn query_view(
     adapter: &dyn Adapter,
     map_fn: &dyn Fn(&serde_json::Value) -> Vec<(serde_json::Value, serde_json::Value)>,
     reduce_fn: Option<&ReduceFn>,
     opts: ViewQueryOptions,
 ) -> Result<ViewResult> {
+    // Reject invalid option combinations before scanning.
+    reducer(reduce_fn, &opts)?;
+
     // Run map over all documents
     let all = adapter
         .all_docs(AllDocsOptions {
@@ -119,82 +140,107 @@ pub async fn query_view(
         .await?;
 
     let mut emitted: Vec<EmittedRow> = Vec::new();
+    let mut docs: HashMap<String, Value> = HashMap::new();
 
-    for row in &all.rows {
-        if let Some(ref doc_json) = row.doc {
-            let pairs = map_fn(doc_json);
-            for (key, value) in pairs {
+    for row in all.rows {
+        if row.id.starts_with("_design/") {
+            continue;
+        }
+        if let Some(doc_json) = row.doc {
+            for (key, value) in map_fn(&doc_json) {
                 emitted.push(EmittedRow {
                     id: row.id.clone(),
                     key,
                     value,
                 });
             }
-        }
-    }
-
-    // Sort by key using CouchDB collation
-    emitted.sort_by(|a, b| {
-        let cmp = collate(&a.key, &b.key);
-        if cmp == Ordering::Equal {
-            a.id.cmp(&b.id)
-        } else {
-            cmp
-        }
-    });
-
-    if opts.descending {
-        emitted.reverse();
-    }
-
-    // Filter by keys (multi-key lookup) or by key range
-    let emitted = if let Some(ref keys) = opts.keys {
-        let mut ordered_rows = Vec::new();
-        for search_key in keys {
-            for row in &emitted {
-                if collate(&row.key, search_key) == Ordering::Equal {
-                    ordered_rows.push(row.clone());
-                }
+            if opts.include_docs {
+                docs.insert(row.id, doc_json);
             }
         }
-        ordered_rows
-    } else {
-        filter_by_range(emitted, &opts)
-    };
+    }
 
-    let total_rows = emitted.len() as u64;
+    let mut result = query_emitted(emitted, reduce_fn, &opts)?;
+    if opts.include_docs {
+        attach_docs_from(adapter, &mut result.rows, &docs).await?;
+    }
+    Ok(result)
+}
 
-    // Reduce
-    if opts.reduce
-        && let Some(reduce) = reduce_fn
-    {
-        // group_level == Some(0) means a single global group (no grouping),
-        // matching CouchDB where group_level overrides group.
-        let grouped = opts.group_level.map(|l| l > 0).unwrap_or(opts.group);
-        let rows = if grouped {
-            group_reduce(&emitted, reduce, opts.group_level)
-        } else if emitted.is_empty() {
-            // An empty reduce yields no rows (CouchDB returns {"rows":[]}),
-            // not a spurious zero row.
-            Vec::new()
+/// Run a view query over the rows emitted by a map function: sort them,
+/// select the requested keys or key range, reduce or group, and apply skip
+/// and limit.
+///
+/// The returned rows have no `doc`; use [`attach_docs`] for `include_docs`.
+pub fn query_emitted(
+    mut rows: Vec<EmittedRow>,
+    reduce_fn: Option<&ReduceFn>,
+    opts: &ViewQueryOptions,
+) -> Result<ViewResult> {
+    sort_emitted(&mut rows);
+    query_sorted(&rows, reduce_fn, opts)
+}
+
+/// Sort emitted rows in view order: by key (CouchDB collation), then doc id.
+pub fn sort_emitted(rows: &mut [EmittedRow]) {
+    rows.sort_by(|a, b| collate(&a.key, &b.key).then_with(|| a.id.cmp(&b.id)));
+}
+
+/// Like [`query_emitted`], for rows already in view order (see
+/// [`sort_emitted`]); only the selected rows are copied.
+pub fn query_sorted(
+    rows: &[EmittedRow],
+    reduce_fn: Option<&ReduceFn>,
+    opts: &ViewQueryOptions,
+) -> Result<ViewResult> {
+    let reduce = reducer(reduce_fn, opts)?;
+    let total = rows.len();
+
+    // Grouping level: group_level overrides group, and 0 means no grouping.
+    let grouped = opts.group_level.map(|l| l > 0).unwrap_or(opts.group);
+
+    if let Some(reduce) = reduce {
+        let groups = if let Some(ref keys) = opts.keys {
+            // One reduced row per requested key.
+            let mut groups = Vec::new();
+            for key in keys {
+                let (lo, hi) = equal_range(rows, key);
+                if lo < hi {
+                    groups.extend(group_reduce(&rows[lo..hi], reduce, opts.group_level)?);
+                }
+            }
+            if opts.descending {
+                groups.reverse();
+            }
+            groups
         } else {
-            let keys: Vec<serde_json::Value> = emitted.iter().map(|r| r.key.clone()).collect();
-            let values: Vec<serde_json::Value> = emitted.iter().map(|r| r.value.clone()).collect();
-            let result = apply_reduce(reduce, &keys, &values, false);
-            vec![ViewRow {
-                id: None,
-                key: serde_json::Value::Null,
-                value: result,
-                doc: None,
-            }]
+            let (lo, hi) = range_bounds(rows, opts);
+            let selected = &rows[lo..hi];
+            if grouped {
+                let mut groups = group_reduce(selected, reduce, opts.group_level)?;
+                if opts.descending {
+                    groups.reverse();
+                }
+                groups
+            } else if selected.is_empty() {
+                // An empty reduce yields no rows (CouchDB returns {"rows":[]}),
+                // not a spurious zero row.
+                Vec::new()
+            } else {
+                vec![ViewRow {
+                    id: None,
+                    key: Value::Null,
+                    value: apply_reduce(reduce, selected)?,
+                    doc: None,
+                }]
+            }
         };
 
         // Apply skip/limit to the reduced/grouped rows as well.
-        let reduced_total = rows.len() as u64;
-        let skip = opts.skip as usize;
-        let rows: Vec<ViewRow> = rows
+        let reduced_total = groups.len() as u64;
+        let rows: Vec<ViewRow> = groups
             .into_iter()
-            .skip(skip)
+            .skip(opts.skip as usize)
             .take(opts.limit.unwrap_or(u64::MAX) as usize)
             .collect();
 
@@ -205,112 +251,233 @@ pub async fn query_view(
         });
     }
 
-    // Apply skip and limit
+    // Select the page of rows (in query order) and the position of the first
+    // selected row in the view, which CouchDB reports as the offset. Only the
+    // returned rows are copied.
     let skip = opts.skip as usize;
-    let rows: Vec<ViewRow> = emitted
+    let limit = opts.limit.map_or(usize::MAX, |l| l as usize);
+    let (page, first_position): (Vec<&EmittedRow>, usize) = if let Some(ref keys) = opts.keys {
+        let mut positions: Vec<usize> = Vec::new();
+        for key in keys {
+            let (lo, hi) = equal_range(rows, key);
+            positions.extend(lo..hi);
+        }
+        if opts.descending {
+            positions.reverse();
+        }
+        let first = positions
+            .first()
+            .map_or(total, |&i| if opts.descending { total - 1 - i } else { i });
+        let page = positions
+            .into_iter()
+            .skip(skip)
+            .take(limit)
+            .map(|i| &rows[i])
+            .collect();
+        (page, first)
+    } else {
+        let (lo, hi) = range_bounds(rows, opts);
+        let selected = &rows[lo..hi];
+        if opts.descending {
+            let page = selected.iter().rev().skip(skip).take(limit).collect();
+            (page, total - hi)
+        } else {
+            (selected.iter().skip(skip).take(limit).collect(), lo)
+        }
+    };
+
+    let rows: Vec<ViewRow> = page
         .into_iter()
-        .skip(skip)
-        .take(opts.limit.unwrap_or(u64::MAX) as usize)
         .map(|r| ViewRow {
-            id: Some(r.id),
-            key: r.key,
-            value: r.value,
+            id: Some(r.id.clone()),
+            key: r.key.clone(),
+            value: r.value.clone(),
             doc: None,
         })
         .collect();
 
     Ok(ViewResult {
-        total_rows,
-        offset: opts.skip,
+        total_rows: total as u64,
+        offset: first_position.saturating_add(skip).min(total) as u64,
         rows,
     })
 }
 
-fn filter_by_range(rows: Vec<EmittedRow>, opts: &ViewQueryOptions) -> Vec<EmittedRow> {
-    rows.into_iter()
-        .filter(|r| {
-            if let Some(ref key) = opts.key {
-                return collate(&r.key, key) == Ordering::Equal;
-            }
-
-            if let Some(ref start) = opts.start_key {
-                if opts.descending {
-                    if collate(&r.key, start) == Ordering::Greater {
-                        return false;
-                    }
-                } else if collate(&r.key, start) == Ordering::Less {
-                    return false;
-                }
-            }
-
-            if let Some(ref end) = opts.end_key {
-                if opts.descending {
-                    let cmp = collate(&r.key, end);
-                    if opts.inclusive_end {
-                        if cmp == Ordering::Less {
-                            return false;
-                        }
-                    } else if cmp != Ordering::Greater {
-                        return false;
-                    }
-                } else {
-                    let cmp = collate(&r.key, end);
-                    if opts.inclusive_end {
-                        if cmp == Ordering::Greater {
-                            return false;
-                        }
-                    } else if cmp != Ordering::Less {
-                        return false;
-                    }
-                }
-            }
-
-            true
-        })
-        .collect()
+/// The reduce function to run for these options, if any, after checking
+/// the option combinations CouchDB rejects.
+fn reducer<'a>(
+    reduce_fn: Option<&'a ReduceFn>,
+    opts: &ViewQueryOptions,
+) -> Result<Option<&'a ReduceFn>> {
+    let reduce = reduce_fn.filter(|_| opts.reduce);
+    if reduce.is_some() {
+        if opts.include_docs {
+            return Err(RouchError::BadRequest(
+                "`include_docs` is invalid for reduce".into(),
+            ));
+        }
+        let grouped = opts.group_level.map(|l| l > 0).unwrap_or(opts.group);
+        if opts.keys.is_some() && !grouped {
+            return Err(RouchError::BadRequest(
+                "multi-key fetches for reduce views must use `group=true`".into(),
+            ));
+        }
+    }
+    Ok(reduce)
 }
 
-fn group_reduce(rows: &[EmittedRow], reduce: &ReduceFn, group_level: Option<u64>) -> Vec<ViewRow> {
-    if rows.is_empty() {
-        return vec![];
+/// Index range `[lo, hi)` of the rows (sorted ascending) whose key equals `key`.
+fn equal_range(rows: &[EmittedRow], key: &Value) -> (usize, usize) {
+    (lower_bound(rows, key), upper_bound(rows, key))
+}
+
+/// First row whose key is not less than `key`.
+fn lower_bound(rows: &[EmittedRow], key: &Value) -> usize {
+    rows.partition_point(|r| collate(&r.key, key) == Ordering::Less)
+}
+
+/// First row whose key is greater than `key`.
+fn upper_bound(rows: &[EmittedRow], key: &Value) -> usize {
+    rows.partition_point(|r| collate(&r.key, key) != Ordering::Greater)
+}
+
+/// Index range `[lo, hi)`, in ascending order, selected by `key` or by
+/// `start_key`/`end_key` (which are swapped roles when descending).
+fn range_bounds(rows: &[EmittedRow], opts: &ViewQueryOptions) -> (usize, usize) {
+    if let Some(ref key) = opts.key {
+        return equal_range(rows, key);
     }
+    let (mut lo, mut hi) = (0, rows.len());
+    if opts.descending {
+        if let Some(ref start) = opts.start_key {
+            hi = upper_bound(rows, start);
+        }
+        if let Some(ref end) = opts.end_key {
+            lo = if opts.inclusive_end {
+                lower_bound(rows, end)
+            } else {
+                upper_bound(rows, end)
+            };
+        }
+    } else {
+        if let Some(ref start) = opts.start_key {
+            lo = lower_bound(rows, start);
+        }
+        if let Some(ref end) = opts.end_key {
+            hi = if opts.inclusive_end {
+                upper_bound(rows, end)
+            } else {
+                lower_bound(rows, end)
+            };
+        }
+    }
+    (lo, hi.max(lo))
+}
 
-    let mut result = Vec::new();
-    let mut current_key = group_key(&rows[0].key, group_level);
-    let mut keys = vec![rows[0].key.clone()];
-    let mut values = vec![rows[0].value.clone()];
+/// Fill in `doc` for the rows of a map query (`include_docs`), reading the
+/// documents from the adapter.
+///
+/// A row whose value is an object with an `_id` (and optionally a `_rev`)
+/// gets that linked document instead, as in CouchDB. Rows whose document
+/// does not exist keep `doc: None`.
+pub async fn attach_docs(adapter: &dyn Adapter, rows: &mut [ViewRow]) -> Result<()> {
+    attach_docs_from(adapter, rows, &HashMap::new()).await
+}
 
-    for row in &rows[1..] {
-        let gk = group_key(&row.key, group_level);
-        if collate(&gk, &current_key) == Ordering::Equal {
-            keys.push(row.key.clone());
-            values.push(row.value.clone());
-        } else {
-            // Emit group
-            let reduced = apply_reduce(reduce, &keys, &values, false);
-            result.push(ViewRow {
-                id: None,
-                key: current_key,
-                value: reduced,
-                doc: None,
-            });
+/// Like [`attach_docs`], taking current documents from `loaded` when present.
+async fn attach_docs_from(
+    adapter: &dyn Adapter,
+    rows: &mut [ViewRow],
+    loaded: &HashMap<String, Value>,
+) -> Result<()> {
+    // The (id, rev) each row includes.
+    let targets: Vec<Option<(String, Option<String>)>> = rows
+        .iter()
+        .map(|row| {
+            let linked = row.value.get("_id").and_then(Value::as_str);
+            match linked {
+                Some(id) => Some((
+                    id.to_string(),
+                    row.value
+                        .get("_rev")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                )),
+                None => row.id.clone().map(|id| (id, None)),
+            }
+        })
+        .collect();
 
-            current_key = gk;
-            keys = vec![row.key.clone()];
-            values = vec![row.value.clone()];
+    // Current revisions not already loaded are fetched in one call.
+    let mut missing: Vec<String> = targets
+        .iter()
+        .flatten()
+        .filter(|(id, rev)| rev.is_none() && !loaded.contains_key(id))
+        .map(|(id, _)| id.clone())
+        .collect();
+    missing.sort();
+    missing.dedup();
+    let mut fetched: HashMap<String, Value> = HashMap::new();
+    if !missing.is_empty() {
+        let response = adapter
+            .all_docs(AllDocsOptions {
+                keys: Some(missing),
+                include_docs: true,
+                ..AllDocsOptions::new()
+            })
+            .await?;
+        for row in response.rows {
+            if let Some(doc) = row.doc {
+                fetched.insert(row.id, doc);
+            }
         }
     }
 
-    // Emit last group
-    let reduced = apply_reduce(reduce, &keys, &values, false);
-    result.push(ViewRow {
-        id: None,
-        key: current_key,
-        value: reduced,
-        doc: None,
-    });
+    for (row, target) in rows.iter_mut().zip(targets) {
+        row.doc = match target {
+            None => None,
+            Some((id, Some(rev))) => {
+                let opts = GetOptions {
+                    rev: Some(rev),
+                    ..Default::default()
+                };
+                match adapter.get(&id, opts).await {
+                    Ok(doc) => Some(doc.to_json()),
+                    Err(RouchError::NotFound(_)) => None,
+                    Err(e) => return Err(e),
+                }
+            }
+            Some((id, None)) => loaded.get(&id).or_else(|| fetched.get(&id)).cloned(),
+        };
+    }
+    Ok(())
+}
 
-    result
+/// Reduce consecutive rows with the same (group-level truncated) key.
+fn group_reduce(
+    rows: &[EmittedRow],
+    reduce: &ReduceFn,
+    group_level: Option<u64>,
+) -> Result<Vec<ViewRow>> {
+    let mut result = Vec::new();
+    let mut start = 0;
+    while start < rows.len() {
+        let key = group_key(&rows[start].key, group_level);
+        let mut end = start + 1;
+        while end < rows.len()
+            && collate(&group_key(&rows[end].key, group_level), &key) == Ordering::Equal
+        {
+            end += 1;
+        }
+        result.push(ViewRow {
+            id: None,
+            key,
+            value: apply_reduce(reduce, &rows[start..end])?,
+            doc: None,
+        });
+        start = end;
+    }
+    Ok(result)
 }
 
 fn group_key(key: &serde_json::Value, group_level: Option<u64>) -> serde_json::Value {
@@ -328,40 +495,282 @@ fn group_key(key: &serde_json::Value, group_level: Option<u64>) -> serde_json::V
     }
 }
 
-fn apply_reduce(
-    reduce: &ReduceFn,
-    keys: &[serde_json::Value],
-    values: &[serde_json::Value],
-    rereduce: bool,
-) -> serde_json::Value {
+fn apply_reduce(reduce: &ReduceFn, rows: &[EmittedRow]) -> Result<Value> {
+    let values = || rows.iter().map(|r| &r.value);
     match reduce {
-        ReduceFn::Sum => {
-            let sum: f64 = values.iter().filter_map(|v| v.as_f64()).sum();
-            serde_json::json!(sum)
+        ReduceFn::Sum => builtin_sum(values()),
+        ReduceFn::Count => Ok(serde_json::json!(rows.len())),
+        ReduceFn::Stats => builtin_stats(values()),
+        ReduceFn::Custom(f) => {
+            let keys: Vec<Value> = rows
+                .iter()
+                .map(|r| serde_json::json!([r.key, r.id]))
+                .collect();
+            let values: Vec<Value> = values().cloned().collect();
+            Ok(f(&keys, &values, false))
         }
-        ReduceFn::Count => {
-            serde_json::json!(values.len())
-        }
-        ReduceFn::Stats => {
-            let nums: Vec<f64> = values.iter().filter_map(|v| v.as_f64()).collect();
-            let count = nums.len();
-            if count == 0 {
-                return serde_json::json!({"sum": 0, "count": 0, "min": 0, "max": 0, "sumsqr": 0});
-            }
-            let sum: f64 = nums.iter().sum();
-            let min = nums.iter().copied().fold(f64::INFINITY, f64::min);
-            let max = nums.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let sumsqr: f64 = nums.iter().map(|n| n * n).sum();
-            serde_json::json!({
-                "sum": sum,
-                "count": count,
-                "min": min,
-                "max": max,
-                "sumsqr": sumsqr
-            })
-        }
-        ReduceFn::Custom(f) => f(keys, values, rereduce),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in reduce functions
+// ---------------------------------------------------------------------------
+
+/// A number that stays an integer while every input is one (like Erlang).
+#[derive(Debug, Clone, Copy)]
+enum Num {
+    Int(i128),
+    Float(f64),
+}
+
+impl Num {
+    fn from_json(value: &Value) -> Option<Num> {
+        let n = value.as_number()?;
+        Some(if let Some(i) = n.as_i64() {
+            Num::Int(i.into())
+        } else if let Some(u) = n.as_u64() {
+            Num::Int(u.into())
+        } else {
+            Num::Float(n.as_f64()?)
+        })
+    }
+
+    fn as_f64(self) -> f64 {
+        match self {
+            Num::Int(i) => i as f64,
+            Num::Float(f) => f,
+        }
+    }
+
+    fn add(self, other: Num) -> Num {
+        match (self, other) {
+            (Num::Int(a), Num::Int(b)) => a
+                .checked_add(b)
+                .map_or(Num::Float(a as f64 + b as f64), Num::Int),
+            _ => Num::Float(self.as_f64() + other.as_f64()),
+        }
+    }
+
+    fn square(self) -> Num {
+        match self {
+            Num::Int(a) => a
+                .checked_mul(a)
+                .map_or(Num::Float((a as f64).powi(2)), Num::Int),
+            Num::Float(f) => Num::Float(f * f),
+        }
+    }
+
+    fn min(self, other: Num) -> Num {
+        if self.compare(other) == Ordering::Greater {
+            other
+        } else {
+            self
+        }
+    }
+
+    fn max(self, other: Num) -> Num {
+        if self.compare(other) == Ordering::Less {
+            other
+        } else {
+            self
+        }
+    }
+
+    fn compare(self, other: Num) -> Ordering {
+        collate(&self.to_json(), &other.to_json())
+    }
+
+    fn to_json(self) -> Value {
+        match self {
+            Num::Int(i) => {
+                if let Ok(i) = i64::try_from(i) {
+                    Value::from(i)
+                } else if let Ok(u) = u64::try_from(i) {
+                    Value::from(u)
+                } else {
+                    Value::from(i as f64)
+                }
+            }
+            Num::Float(f) => Value::from(f),
+        }
+    }
+}
+
+fn sum_error() -> RouchError {
+    RouchError::BadRequest(
+        "builtin_reduce_error: the _sum function requires that map values be numbers, \
+         arrays of numbers, or objects (not mixed with other data structures)"
+            .into(),
+    )
+}
+
+/// Partial `_sum`: a number, an array of numbers, or an object of sums.
+enum Sum {
+    Num(Num),
+    Array(Vec<Num>),
+    Object(BTreeMap<String, Sum>),
+}
+
+impl Sum {
+    fn from_json(value: &Value) -> Result<Sum> {
+        match value {
+            Value::Number(_) => Ok(Sum::Num(Num::from_json(value).ok_or_else(sum_error)?)),
+            Value::Array(items) => Ok(Sum::Array(numbers(items)?)),
+            Value::Object(map) => map
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), Sum::from_json(v)?)))
+                .collect::<Result<_>>()
+                .map(Sum::Object),
+            _ => Err(sum_error()),
+        }
+    }
+
+    fn add(self, other: Sum) -> Result<Sum> {
+        match (self, other) {
+            (Sum::Num(a), Sum::Num(b)) => Ok(Sum::Num(a.add(b))),
+            // A number is added to the first element of an array.
+            (Sum::Num(a), Sum::Array(b)) | (Sum::Array(b), Sum::Num(a)) => {
+                Ok(Sum::Array(add_arrays(vec![a], b)))
+            }
+            (Sum::Array(a), Sum::Array(b)) => Ok(Sum::Array(add_arrays(a, b))),
+            (Sum::Object(mut a), Sum::Object(b)) => {
+                for (k, v) in b {
+                    let sum = match a.remove(&k) {
+                        Some(acc) => acc.add(v)?,
+                        None => v,
+                    };
+                    a.insert(k, sum);
+                }
+                Ok(Sum::Object(a))
+            }
+            _ => Err(sum_error()),
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        match self {
+            Sum::Num(n) => n.to_json(),
+            Sum::Array(items) => Value::Array(items.iter().map(|n| n.to_json()).collect()),
+            Sum::Object(map) => {
+                Value::Object(map.iter().map(|(k, v)| (k.clone(), v.to_json())).collect())
+            }
+        }
+    }
+}
+
+fn numbers(items: &[Value]) -> Result<Vec<Num>> {
+    items
+        .iter()
+        .map(|v| Num::from_json(v).ok_or_else(sum_error))
+        .collect()
+}
+
+/// Element-wise sum; the shorter array is padded with zeros.
+fn add_arrays(mut a: Vec<Num>, b: Vec<Num>) -> Vec<Num> {
+    for (i, n) in b.into_iter().enumerate() {
+        match a.get_mut(i) {
+            Some(acc) => *acc = acc.add(n),
+            None => a.push(n),
+        }
+    }
+    a
+}
+
+/// CouchDB's `_sum`: integers stay integers, arrays of numbers are summed
+/// element-wise, objects field by field; anything else is an error.
+fn builtin_sum<'a>(mut values: impl Iterator<Item = &'a Value>) -> Result<Value> {
+    let Some(first) = values.next() else {
+        return Ok(serde_json::json!(0));
+    };
+    let mut sum = Sum::from_json(first)?;
+    for value in values {
+        sum = sum.add(Sum::from_json(value)?)?;
+    }
+    Ok(sum.to_json())
+}
+
+#[derive(Clone, Copy)]
+struct Stats {
+    sum: Num,
+    count: u64,
+    min: Num,
+    max: Num,
+    sumsqr: Num,
+}
+
+impl Stats {
+    fn new(n: Num) -> Stats {
+        Stats {
+            sum: n,
+            count: 1,
+            min: n,
+            max: n,
+            sumsqr: n.square(),
+        }
+    }
+
+    fn push(&mut self, n: Num) {
+        self.sum = self.sum.add(n);
+        self.count += 1;
+        self.min = self.min.min(n);
+        self.max = self.max.max(n);
+        self.sumsqr = self.sumsqr.add(n.square());
+    }
+
+    fn to_json(self) -> Value {
+        serde_json::json!({
+            "sum": self.sum.to_json(),
+            "count": self.count,
+            "min": self.min.to_json(),
+            "max": self.max.to_json(),
+            "sumsqr": self.sumsqr.to_json(),
+        })
+    }
+}
+
+/// CouchDB's `_stats` over numbers, or element-wise over arrays of numbers
+/// of the same length; anything else is an error.
+fn builtin_stats<'a>(values: impl Iterator<Item = &'a Value>) -> Result<Value> {
+    let error = |v: &Value| {
+        RouchError::BadRequest(format!(
+            "builtin_reduce_error: the _stats function requires that map values be numbers \
+             or arrays of numbers, not {v}"
+        ))
+    };
+    let mut scalar: Option<Stats> = None;
+    let mut columns: Option<Vec<Stats>> = None;
+    for value in values {
+        match value {
+            Value::Number(_) if columns.is_none() => {
+                let n = Num::from_json(value).ok_or_else(|| error(value))?;
+                match scalar {
+                    Some(ref mut s) => s.push(n),
+                    None => scalar = Some(Stats::new(n)),
+                }
+            }
+            Value::Array(items) if scalar.is_none() => {
+                let nums = items
+                    .iter()
+                    .map(|v| Num::from_json(v).ok_or_else(|| error(v)))
+                    .collect::<Result<Vec<_>>>()?;
+                match columns {
+                    Some(ref mut cols) if cols.len() == nums.len() => {
+                        for (s, n) in cols.iter_mut().zip(nums) {
+                            s.push(n);
+                        }
+                    }
+                    Some(_) => return Err(error(value)),
+                    None => columns = Some(nums.into_iter().map(Stats::new).collect()),
+                }
+            }
+            _ => return Err(error(value)),
+        }
+    }
+    Ok(match (scalar, columns) {
+        (Some(s), _) => s.to_json(),
+        (None, Some(cols)) => Value::Array(cols.into_iter().map(Stats::to_json).collect()),
+        (None, None) => Stats::new(Num::Int(0)).to_json(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -520,7 +929,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0].value, serde_json::json!(90.0)); // 30 + 25 + 35
+        assert_eq!(result.rows[0].value, serde_json::json!(90)); // 30 + 25 + 35
     }
 
     #[tokio::test]
@@ -647,5 +1056,349 @@ mod tests {
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0].key, "Bob");
         assert_eq!(result.rows[1].key, "Charlie");
+    }
+
+    // --- Regression tests for audited findings ---
+
+    fn by_city(doc: &serde_json::Value) -> Vec<(serde_json::Value, serde_json::Value)> {
+        match doc.get("city") {
+            Some(c) => vec![(c.clone(), doc["age"].clone())],
+            None => vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn include_docs_fills_row_docs() {
+        // F16: include_docs returns each row's document.
+        let db = setup_db().await;
+        let result = query_view(
+            &db,
+            &by_city,
+            None,
+            ViewQueryOptions {
+                include_docs: true,
+                ..ViewQueryOptions::new()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.rows.len(), 3);
+        for row in &result.rows {
+            let doc = row.doc.as_ref().expect("doc included");
+            assert_eq!(doc["_id"], serde_json::json!(row.id.clone().unwrap()));
+            assert!(doc["_rev"].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn include_docs_follows_linked_ids() {
+        // F16: a value {"_id": X} includes document X instead.
+        let db = setup_db().await;
+        let result = query_view(
+            &db,
+            &|doc| match doc["_id"].as_str() {
+                Some("alice") => vec![(serde_json::json!(1), serde_json::json!({"_id": "bob"}))],
+                Some("bob") => vec![(serde_json::json!(2), serde_json::json!({"_id": "nobody"}))],
+                _ => vec![],
+            },
+            None,
+            ViewQueryOptions {
+                include_docs: true,
+                ..ViewQueryOptions::new()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.rows[0].doc.as_ref().unwrap()["name"], "Bob");
+        assert!(result.rows[1].doc.is_none());
+    }
+
+    #[tokio::test]
+    async fn include_docs_is_invalid_for_reduce() {
+        let db = setup_db().await;
+        let err = query_view(
+            &db,
+            &by_city,
+            Some(&ReduceFn::Count),
+            ViewQueryOptions {
+                include_docs: true,
+                ..ViewQueryOptions::new()
+            },
+        )
+        .await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn design_docs_are_not_mapped() {
+        // F50: like CouchDB (and ViewEngine), map functions skip _design/ docs.
+        let db = setup_db().await;
+        db.bulk_docs(
+            vec![Document {
+                id: "_design/app".into(),
+                rev: None,
+                deleted: false,
+                data: serde_json::json!({"views": {}}),
+                attachments: HashMap::new(),
+            }],
+            BulkDocsOptions::new(),
+        )
+        .await
+        .unwrap();
+        let result = query_view(
+            &db,
+            &|doc| vec![(doc["_id"].clone(), serde_json::json!(1))],
+            Some(&ReduceFn::Count),
+            ViewQueryOptions::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.rows[0].value, serde_json::json!(3));
+    }
+
+    #[tokio::test]
+    async fn total_rows_and_offset_describe_the_whole_view() {
+        // F53: total_rows counts every row of the view and offset is the
+        // position of the first returned row.
+        let db = setup_db().await;
+        let q = |opts: ViewQueryOptions| {
+            let db = &db;
+            async move { query_view(db, &by_city, None, opts).await.unwrap() }
+        };
+        // Sorted rows: LA/bob, NYC/alice, NYC/charlie
+        let r = q(ViewQueryOptions {
+            key: Some(serde_json::json!("NYC")),
+            ..ViewQueryOptions::new()
+        })
+        .await;
+        assert_eq!((r.total_rows, r.offset, r.rows.len()), (3, 1, 2));
+        let r = q(ViewQueryOptions {
+            start_key: Some(serde_json::json!("NYC")),
+            descending: true,
+            ..ViewQueryOptions::new()
+        })
+        .await;
+        assert_eq!((r.total_rows, r.offset, r.rows.len()), (3, 0, 3));
+        let r = q(ViewQueryOptions {
+            start_key: Some(serde_json::json!("LA")),
+            end_key: Some(serde_json::json!("LA")),
+            descending: true,
+            ..ViewQueryOptions::new()
+        })
+        .await;
+        assert_eq!((r.total_rows, r.offset, r.rows.len()), (3, 2, 1));
+        let r = q(ViewQueryOptions {
+            key: Some(serde_json::json!("NYC")),
+            skip: 5,
+            ..ViewQueryOptions::new()
+        })
+        .await;
+        assert_eq!((r.total_rows, r.offset, r.rows.len()), (3, 3, 0));
+    }
+
+    #[tokio::test]
+    async fn builtin_sum_and_stats_follow_couchdb() {
+        // F54: integers stay integers, arrays and objects are summed
+        // element-wise, and non-numeric values are an error.
+        let db = setup_db().await;
+        let run = |map: fn(&serde_json::Value) -> Vec<(serde_json::Value, serde_json::Value)>,
+                   reduce: ReduceFn| {
+            let db = &db;
+            async move { query_view(db, &map, Some(&reduce), ViewQueryOptions::new()).await }
+        };
+        let r = run(
+            |d| vec![(serde_json::Value::Null, d["age"].clone())],
+            ReduceFn::Sum,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.rows[0].value, serde_json::json!(90));
+        let r = run(
+            |d| vec![(serde_json::Value::Null, serde_json::json!([d["age"], 1]))],
+            ReduceFn::Sum,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.rows[0].value, serde_json::json!([90, 3]));
+        let r = run(
+            |d| {
+                vec![(
+                    serde_json::Value::Null,
+                    serde_json::json!({"a": d["age"], "n": {"x": 0.5}}),
+                )]
+            },
+            ReduceFn::Sum,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r.rows[0].value,
+            serde_json::json!({"a": 90, "n": {"x": 1.5}})
+        );
+        assert!(
+            run(
+                |d| vec![(serde_json::Value::Null, d["name"].clone())],
+                ReduceFn::Sum
+            )
+            .await
+            .is_err()
+        );
+
+        let r = run(
+            |d| vec![(serde_json::Value::Null, d["age"].clone())],
+            ReduceFn::Stats,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r.rows[0].value,
+            serde_json::json!({"sum": 90, "count": 3, "min": 25, "max": 35, "sumsqr": 2750})
+        );
+        let r = run(
+            |d| vec![(serde_json::Value::Null, serde_json::json!([d["age"], 2]))],
+            ReduceFn::Stats,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.rows[0].value[1]["sumsqr"], serde_json::json!(12));
+        assert!(
+            run(
+                |d| vec![(serde_json::Value::Null, d["name"].clone())],
+                ReduceFn::Stats
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn new_options_reduce_by_default() {
+        // F104: like CouchDB, a view with a reduce function reduces unless
+        // reduce=false is asked for.
+        let db = setup_db().await;
+        let r = query_view(
+            &db,
+            &by_city,
+            Some(&ReduceFn::Count),
+            ViewQueryOptions::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].value, serde_json::json!(3));
+        let r = query_view(
+            &db,
+            &by_city,
+            Some(&ReduceFn::Count),
+            ViewQueryOptions {
+                reduce: false,
+                ..ViewQueryOptions::new()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.rows.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn custom_reduce_receives_key_and_id_pairs() {
+        // F105: like CouchDB, keys are [key, doc_id] pairs.
+        let db = setup_db().await;
+        let reduce = ReduceFn::Custom(Box::new(|keys, _values, _rereduce| {
+            serde_json::Value::Array(keys.to_vec())
+        }));
+        let r = query_view(
+            &db,
+            &by_city,
+            Some(&reduce),
+            ViewQueryOptions {
+                group: true,
+                ..ViewQueryOptions::new()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.rows[0].value, serde_json::json!([["LA", "bob"]]));
+    }
+
+    #[tokio::test]
+    async fn keys_queries_keep_key_order_and_duplicates() {
+        // F106: keys are looked up by binary search; results follow the
+        // order of `keys` (reversed when descending), duplicates included.
+        let db = setup_db().await;
+        let keys = Some(vec![
+            serde_json::json!("NYC"),
+            serde_json::json!("nope"),
+            serde_json::json!("LA"),
+            serde_json::json!("LA"),
+        ]);
+        let r = query_view(
+            &db,
+            &by_city,
+            None,
+            ViewQueryOptions {
+                keys: keys.clone(),
+                ..ViewQueryOptions::new()
+            },
+        )
+        .await
+        .unwrap();
+        let ids: Vec<_> = r.rows.iter().map(|r| r.id.clone().unwrap()).collect();
+        assert_eq!(ids, ["alice", "charlie", "bob", "bob"]);
+        let r = query_view(
+            &db,
+            &by_city,
+            None,
+            ViewQueryOptions {
+                keys: keys.clone(),
+                descending: true,
+                ..ViewQueryOptions::new()
+            },
+        )
+        .await
+        .unwrap();
+        let ids: Vec<_> = r.rows.iter().map(|r| r.id.clone().unwrap()).collect();
+        assert_eq!(ids, ["bob", "bob", "charlie", "alice"]);
+
+        // With a reduce, multi-key queries need grouping and give one row
+        // per requested key.
+        let r = query_view(
+            &db,
+            &by_city,
+            Some(&ReduceFn::Count),
+            ViewQueryOptions {
+                keys: keys.clone(),
+                group: true,
+                ..ViewQueryOptions::new()
+            },
+        )
+        .await
+        .unwrap();
+        let rows: Vec<_> = r
+            .rows
+            .iter()
+            .map(|r| (r.key.clone(), r.value.clone()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (serde_json::json!("NYC"), serde_json::json!(2)),
+                (serde_json::json!("LA"), serde_json::json!(1)),
+                (serde_json::json!("LA"), serde_json::json!(1)),
+            ]
+        );
+        assert!(
+            query_view(
+                &db,
+                &by_city,
+                Some(&ReduceFn::Count),
+                ViewQueryOptions {
+                    keys,
+                    ..ViewQueryOptions::new()
+                },
+            )
+            .await
+            .is_err()
+        );
     }
 }

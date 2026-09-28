@@ -54,9 +54,9 @@ pub use rouchdb_changes::{
     LiveChangesStream, live_changes, live_changes_events,
 };
 pub use rouchdb_query::{
-    BuiltIndex, CreateIndexResponse, ExplainIndex, ExplainResponse, FindOptions, FindResponse,
-    IndexDefinition, IndexFields, IndexInfo, ReduceFn, SortField, StaleOption, ViewQueryOptions,
-    ViewResult, build_index, find, matches_selector, query_view,
+    BuiltIndex, CompiledSelector, CreateIndexResponse, ExplainIndex, ExplainResponse, FindOptions,
+    FindResponse, IndexDefinition, IndexFields, IndexInfo, ReduceFn, SortField, StaleOption,
+    ViewQueryOptions, ViewResult, build_index, find, find_in_docs, matches_selector, query_view,
 };
 pub use rouchdb_views::{DesignDocument, PersistentViewIndex, ViewDef, ViewEngine};
 
@@ -296,8 +296,38 @@ impl Adapter for PluginAdapter {
 /// Provides a user-friendly API similar to PouchDB's JavaScript interface.
 pub struct Database {
     adapter: Arc<dyn Adapter>,
-    indexes: Arc<RwLock<HashMap<String, BuiltIndex>>>,
+    /// Set for `http()` databases, whose Mango queries and indexes run on
+    /// the server.
+    remote: Option<Arc<HttpAdapter>>,
+    indexes: Arc<RwLock<HashMap<String, MangoIndex>>>,
     plugins: Vec<Arc<dyn Plugin>>,
+}
+
+/// A Mango index kept up to date from the changes feed.
+struct MangoIndex {
+    built: BuiltIndex,
+    /// Sequence of the last change applied to the index.
+    last_seq: Seq,
+}
+
+/// Name of an index whose first field the selector constrains (the one
+/// with the smallest name if several are usable).
+fn usable_index(
+    indexes: &HashMap<String, MangoIndex>,
+    selector: &serde_json::Value,
+) -> Option<String> {
+    indexes
+        .iter()
+        .filter(|(_, index)| {
+            index.built.def.fields.first().is_some_and(|first| {
+                first
+                    .try_field_and_direction()
+                    .is_ok_and(|(field, _)| selector.get(field).is_some())
+            })
+        })
+        .map(|(name, _)| name)
+        .min()
+        .cloned()
 }
 
 impl Database {
@@ -305,6 +335,7 @@ impl Database {
     pub fn memory(name: &str) -> Self {
         Self {
             adapter: Arc::new(MemoryAdapter::new(name)),
+            remote: None,
             indexes: Arc::new(RwLock::new(HashMap::new())),
             plugins: Vec::new(),
         }
@@ -315,26 +346,32 @@ impl Database {
         let adapter = RedbAdapter::open(path, name)?;
         Ok(Self {
             adapter: Arc::new(adapter),
+            remote: None,
             indexes: Arc::new(RwLock::new(HashMap::new())),
             plugins: Vec::new(),
         })
     }
 
     /// Connect to a remote CouchDB instance.
+    ///
+    /// Mango queries and indexes (`find`, `create_index`, `get_indexes`,
+    /// `delete_index`, `explain`) run on the server.
     pub fn http(url: &str) -> Self {
-        Self {
-            adapter: Arc::new(HttpAdapter::new(url)),
-            indexes: Arc::new(RwLock::new(HashMap::new())),
-            plugins: Vec::new(),
-        }
+        Self::remote(HttpAdapter::new(url))
     }
 
     /// Connect to a remote CouchDB instance using an authenticated client.
     ///
     /// The `AuthClient` should have been logged in via `auth.login()` first.
     pub fn http_with_auth(url: &str, auth: &AuthClient) -> Self {
+        Self::remote(HttpAdapter::with_auth_client(url, auth))
+    }
+
+    fn remote(adapter: HttpAdapter) -> Self {
+        let adapter = Arc::new(adapter);
         Self {
-            adapter: Arc::new(HttpAdapter::with_auth_client(url, auth)),
+            adapter: adapter.clone(),
+            remote: Some(adapter),
             indexes: Arc::new(RwLock::new(HashMap::new())),
             plugins: Vec::new(),
         }
@@ -344,6 +381,7 @@ impl Database {
     pub fn from_adapter(adapter: Arc<dyn Adapter>) -> Self {
         Self {
             adapter,
+            remote: None,
             indexes: Arc::new(RwLock::new(HashMap::new())),
             plugins: Vec::new(),
         }
@@ -511,30 +549,58 @@ impl Database {
     ///
     /// If `opts.selector` is set, changes are fetched with `include_docs: true`
     /// internally and filtered by the Mango selector. Only matching changes are
-    /// returned.
+    /// returned; `limit` counts matching changes, and when it is reached
+    /// `last_seq` is the sequence of the last change returned. An invalid
+    /// selector returns `BadRequest`.
     pub async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
-        if let Some(ref selector) = opts.selector {
-            let selector = selector.clone();
-            let user_wants_docs = opts.include_docs;
-            let mut fetch_opts = opts;
-            fetch_opts.include_docs = true;
-            fetch_opts.selector = None; // Don't pass to adapter
-            let mut response = self.adapter.changes(fetch_opts).await?;
-            response.results.retain(|event| {
-                event
-                    .doc
-                    .as_ref()
-                    .is_some_and(|d| matches_selector(d, &selector))
-            });
-            if !user_wants_docs {
-                for event in &mut response.results {
-                    event.doc = None;
+        let Some(ref selector) = opts.selector else {
+            return self.adapter.changes(opts).await;
+        };
+        let selector = CompiledSelector::new(selector)?;
+        let user_wants_docs = opts.include_docs;
+        let limit = opts.limit;
+        let since = opts.since.clone();
+        let mut fetch_opts = ChangesOptions {
+            include_docs: true,
+            selector: None, // Don't pass to adapter
+            ..opts
+        };
+        // The limit applies after filtering, so read in batches until it is
+        // reached (descending feeds cannot be resumed, so read them whole).
+        fetch_opts.limit = match limit {
+            Some(l) if !fetch_opts.descending => Some(l.max(SELECTOR_CHANGES_BATCH)),
+            _ => None,
+        };
+
+        let mut results = Vec::new();
+        let last_seq = loop {
+            let response = self.adapter.changes(fetch_opts.clone()).await?;
+            let fetched = response.results.len() as u64;
+            for event in response.results {
+                if limit.is_some_and(|l| results.len() as u64 >= l) {
+                    break;
+                }
+                if event.doc.as_ref().is_some_and(|d| selector.matches(d)) {
+                    results.push(event);
                 }
             }
-            Ok(response)
-        } else {
-            self.adapter.changes(opts).await
+            if limit.is_some_and(|l| results.len() as u64 >= l) {
+                break results
+                    .last()
+                    .map_or(since, |event: &ChangeEvent| event.seq.clone());
+            }
+            match fetch_opts.limit {
+                Some(batch) if fetched >= batch => fetch_opts.since = response.last_seq,
+                _ => break response.last_seq,
+            }
+        };
+
+        if !user_wants_docs {
+            for event in &mut results {
+                event.doc = None;
+            }
         }
+        Ok(ChangesResponse { results, last_seq })
     }
 
     /// Start a live (continuous) changes feed.
@@ -619,116 +685,90 @@ impl Database {
     ///
     /// If a matching index exists (created via `create_index()`), it will be
     /// used to avoid a full table scan. Otherwise falls back to scanning all
-    /// documents.
+    /// documents. The index is brought up to date incrementally from the
+    /// changes feed; invalid selectors or sort fields return `BadRequest`.
+    ///
+    /// On an `http()` database the query runs on the server (`_find`); only
+    /// when the server has no index for the requested sort are the
+    /// documents fetched and queried locally.
     pub async fn find(&self, opts: FindOptions) -> Result<FindResponse> {
-        // Check if we have a usable index
-        let mut indexes = self.indexes.write().await;
+        if let Some(ref remote) = self.remote
+            && let Some(response) = remote_find(remote, &opts).await?
+        {
+            return Ok(response);
+        }
 
-        // Find the name of a usable index (if any)
-        let usable_name = indexes
-            .iter()
-            .find(|(_, idx)| {
-                if idx.def.fields.is_empty() {
-                    return false;
-                }
-                let (first_field, _) = idx.def.fields[0].field_and_direction();
-                opts.selector.get(first_field).is_some()
+        // Validate the query before doing any work.
+        CompiledSelector::new(&opts.selector)?;
+        for sort_field in opts.sort.iter().flatten() {
+            sort_field.try_field_and_direction()?;
+        }
+
+        let usable = usable_index(&*self.indexes.read().await, &opts.selector);
+        let candidate_ids = match usable {
+            Some(name) => self.index_candidates(&name, &opts.selector).await?,
+            None => None,
+        };
+        let Some(candidate_ids) = candidate_ids else {
+            // No usable index — full table scan
+            return find(self.adapter.as_ref(), opts).await;
+        };
+
+        // Fetch only the candidate docs
+        let all = self
+            .adapter
+            .all_docs(AllDocsOptions {
+                include_docs: true,
+                keys: Some(candidate_ids),
+                ..AllDocsOptions::new()
             })
-            .map(|(name, _)| name.clone());
+            .await?;
+        find_in_docs(all.rows.into_iter().filter_map(|row| row.doc), &opts)
+    }
 
-        if let Some(name) = usable_name {
-            // Rebuild the index lazily to pick up any document changes
-            let def = indexes[&name].def.clone();
-            let rebuilt = build_index(self.adapter.as_ref(), &def).await?;
-            indexes.insert(name.clone(), rebuilt);
-
-            let candidate_ids = indexes[&name].find_matching(&opts.selector);
-            drop(indexes);
-
-            // Fetch only the candidate docs
-            let all = self
+    /// Bring index `name` up to date with the changes feed and return the
+    /// ids of the documents that may match `selector`, or `None` if the index
+    /// no longer exists.
+    ///
+    /// Changes are read without holding the lock; the write lock is only
+    /// taken to apply them.
+    async fn index_candidates(
+        &self,
+        name: &str,
+        selector: &serde_json::Value,
+    ) -> Result<Option<Vec<String>>> {
+        loop {
+            let since = match self.indexes.read().await.get(name) {
+                Some(index) => index.last_seq.clone(),
+                None => return Ok(None),
+            };
+            let changes = self
                 .adapter
-                .all_docs(AllDocsOptions {
+                .changes(ChangesOptions {
+                    since: since.clone(),
                     include_docs: true,
-                    keys: Some(candidate_ids),
-                    ..AllDocsOptions::new()
+                    ..Default::default()
                 })
                 .await?;
 
-            let mut matched: Vec<serde_json::Value> = Vec::new();
-            for row in &all.rows {
-                if let Some(ref doc_json) = row.doc
-                    && matches_selector(doc_json, &opts.selector)
-                {
-                    matched.push(doc_json.clone());
-                }
+            if changes.results.is_empty() {
+                let indexes = self.indexes.read().await;
+                return Ok(indexes
+                    .get(name)
+                    .map(|index| index.built.find_matching(selector)));
             }
 
-            // Sort
-            if let Some(ref sort_fields) = opts.sort {
-                matched.sort_by(|a, b| {
-                    use rouchdb_core::collation::collate;
-                    use rouchdb_query::SortDirection;
-                    for sf in sort_fields {
-                        let (field, direction) = sf.field_and_direction();
-                        // Resolve dotted/nested paths (e.g. "address.city")
-                        // identically to the full-scan path in mango::find.
-                        let va = rouchdb_query::get_nested_field(a, field)
-                            .unwrap_or(&serde_json::Value::Null);
-                        let vb = rouchdb_query::get_nested_field(b, field)
-                            .unwrap_or(&serde_json::Value::Null);
-                        let cmp = collate(va, vb);
-                        let cmp = if direction == SortDirection::Desc {
-                            cmp.reverse()
-                        } else {
-                            cmp
-                        };
-                        if cmp != std::cmp::Ordering::Equal {
-                            return cmp;
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
+            let mut indexes = self.indexes.write().await;
+            let Some(index) = indexes.get_mut(name) else {
+                return Ok(None);
+            };
+            // Another query applied changes meanwhile: catch up from there.
+            if index.last_seq != since {
+                continue;
             }
-
-            // Skip
-            if let Some(skip) = opts.skip {
-                matched = matched.into_iter().skip(skip as usize).collect();
-            }
-
-            // Limit
-            if let Some(limit) = opts.limit {
-                matched.truncate(limit as usize);
-            }
-
-            // Field projection
-            if let Some(ref fields) = opts.fields {
-                matched = matched
-                    .into_iter()
-                    .map(|doc| {
-                        let mut result = serde_json::Map::new();
-                        if let serde_json::Value::Object(map) = &doc {
-                            for field in fields {
-                                if let Some(val) = map.get(field) {
-                                    result.insert(field.clone(), val.clone());
-                                }
-                            }
-                            if let Some(id) = map.get("_id") {
-                                result
-                                    .entry("_id".to_string())
-                                    .or_insert_with(|| id.clone());
-                            }
-                        }
-                        serde_json::Value::Object(result)
-                    })
-                    .collect();
-            }
-
-            Ok(FindResponse { docs: matched })
-        } else {
-            drop(indexes);
-            // No usable index — full table scan
-            find(self.adapter.as_ref(), opts).await
+            index.built.apply_changes(&changes.results);
+            index.last_seq = changes.last_seq;
+            return Ok(Some(index.built.find_matching(selector)));
         }
     }
 
@@ -739,8 +779,13 @@ impl Database {
     /// Create a Mango index for faster queries.
     ///
     /// Equivalent to PouchDB's `db.createIndex()`. Builds the index
-    /// immediately by scanning all documents.
+    /// immediately by scanning all documents; later finds keep it up to date
+    /// from the changes feed. On an `http()` database the index is created
+    /// on the server (`_index`).
     pub async fn create_index(&self, def: IndexDefinition) -> Result<CreateIndexResponse> {
+        for sort_field in &def.fields {
+            sort_field.try_field_and_direction()?;
+        }
         let name = if def.name.is_empty() {
             // Auto-generate name from fields
             let field_names: Vec<&str> = def
@@ -756,12 +801,16 @@ impl Database {
             def.name.clone()
         };
 
-        let mut indexes = self.indexes.write().await;
-        if indexes.contains_key(&name) {
-            return Ok(CreateIndexResponse {
-                result: "exists".to_string(),
-                name,
-            });
+        if let Some(ref remote) = self.remote {
+            return remote_create_index(remote, name, def).await;
+        }
+
+        let exists = || CreateIndexResponse {
+            result: "exists".to_string(),
+            name: name.clone(),
+        };
+        if self.indexes.read().await.contains_key(&name) {
+            return Ok(exists());
         }
 
         let index_def = IndexDefinition {
@@ -770,8 +819,32 @@ impl Database {
             ddoc: def.ddoc,
         };
 
-        let built = build_index(self.adapter.as_ref(), &index_def).await?;
-        indexes.insert(name.clone(), built);
+        // Build from the changes feed, so the index knows the sequence it is
+        // up to date with.
+        let changes = self
+            .adapter
+            .changes(ChangesOptions {
+                include_docs: true,
+                ..Default::default()
+            })
+            .await?;
+        let mut built = BuiltIndex {
+            def: index_def,
+            entries: Vec::new(),
+        };
+        built.apply_changes(&changes.results);
+
+        let mut indexes = self.indexes.write().await;
+        if indexes.contains_key(&name) {
+            return Ok(exists());
+        }
+        indexes.insert(
+            name.clone(),
+            MangoIndex {
+                built,
+                last_seq: changes.last_seq,
+            },
+        );
 
         Ok(CreateIndexResponse {
             result: "created".to_string(),
@@ -780,15 +853,28 @@ impl Database {
     }
 
     /// Get all indexes defined on this database.
+    ///
+    /// On an `http()` database these are the server's JSON indexes (none if
+    /// the server cannot be reached).
     pub async fn get_indexes(&self) -> Vec<IndexInfo> {
+        if let Some(ref remote) = self.remote {
+            let mut result: Vec<IndexInfo> = remote_indexes(remote)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, info)| info)
+                .collect();
+            result.sort_by(|a, b| a.name.cmp(&b.name));
+            return result;
+        }
         let indexes = self.indexes.read().await;
         let mut result: Vec<IndexInfo> = indexes
             .values()
             .map(|idx| IndexInfo {
-                name: idx.def.name.clone(),
-                ddoc: idx.def.ddoc.clone(),
+                name: idx.built.def.name.clone(),
+                ddoc: idx.built.def.ddoc.clone(),
                 def: IndexFields {
-                    fields: idx.def.fields.clone(),
+                    fields: idx.built.def.fields.clone(),
                 },
             })
             .collect();
@@ -800,27 +886,28 @@ impl Database {
     ///
     /// Returns which index would be used and the query plan.
     pub async fn explain(&self, opts: FindOptions) -> ExplainResponse {
-        let indexes = self.indexes.read().await;
-        let usable = indexes.values().find(|idx| {
-            if idx.def.fields.is_empty() {
-                return false;
-            }
-            let (first_field, _) = idx.def.fields[0].field_and_direction();
-            opts.selector.get(first_field).is_some()
-        });
+        if let Some(ref remote) = self.remote
+            && let Some(explained) = remote_explain(remote, &opts).await
+        {
+            return explained;
+        }
+        let usable = {
+            let indexes = self.indexes.read().await;
+            usable_index(&indexes, &opts.selector)
+                .and_then(|name| indexes.get(&name))
+                .map(|index| index.built.def.clone())
+        };
 
         let dbname = self.info().await.map(|i| i.db_name).unwrap_or_default();
 
-        if let Some(index) = usable {
+        if let Some(def) = usable {
             ExplainResponse {
                 dbname,
                 index: ExplainIndex {
-                    ddoc: index.def.ddoc.clone(),
-                    name: index.def.name.clone(),
+                    ddoc: def.ddoc,
+                    name: def.name,
                     index_type: "json".into(),
-                    def: IndexFields {
-                        fields: index.def.fields.clone(),
-                    },
+                    def: IndexFields { fields: def.fields },
                 },
                 selector: opts.selector,
                 fields: opts.fields,
@@ -842,6 +929,9 @@ impl Database {
 
     /// Delete an index by name.
     pub async fn delete_index(&self, name: &str) -> Result<()> {
+        if let Some(ref remote) = self.remote {
+            return remote_delete_index(remote, name).await;
+        }
         let mut indexes = self.indexes.write().await;
         indexes
             .remove(name)
@@ -854,11 +944,29 @@ impl Database {
     // -----------------------------------------------------------------
 
     /// Store a design document.
+    ///
+    /// `DesignDocument` only models JavaScript views and a few fields. When
+    /// updating (`ddoc.rev` is set), everything else in the revision being
+    /// replaced (`views.lib`, Mango index views, view and ddoc `options`,
+    /// custom fields) is carried over, so a `get_design` + `put_design`
+    /// round trip does not drop it.
     pub async fn put_design(&self, ddoc: DesignDocument) -> Result<DocResult> {
-        let json = ddoc.to_json();
+        let mut json = ddoc.to_json();
+        if let Some(ref rev) = ddoc.rev {
+            let opts = GetOptions {
+                rev: Some(rev.clone()),
+                ..Default::default()
+            };
+            match self.adapter.get(&ddoc.id, opts).await {
+                Ok(parent) => keep_unmodeled_design_fields(&mut json, &parent.to_json()),
+                // A missing or stale revision is reported by the write.
+                Err(RouchError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
         let doc = Document::from_json(json)?;
-        let mut results = self.bulk_docs(vec![doc], BulkDocsOptions::new()).await?;
-        Ok(results.remove(0))
+        let results = self.bulk_docs(vec![doc], BulkDocsOptions::new()).await?;
+        first_result(results)
     }
 
     /// Retrieve a design document by name.
@@ -886,12 +994,11 @@ impl Database {
 
     /// Remove orphaned view indexes.
     ///
-    /// Scans all design documents and removes any cached indexes
-    /// that no longer have a corresponding design document view.
+    /// This is a no-op: a `Database` keeps no view indexes (persistent views
+    /// live in a `ViewEngine`, which drops unused ones with
+    /// `ViewEngine::remove_indexes_not_in`, and Mango indexes are removed
+    /// with `delete_index`). It exists for PouchDB API compatibility.
     pub async fn view_cleanup(&self) -> Result<()> {
-        // This is a no-op in the base implementation since we don't
-        // store persistent view indexes in the Database struct itself.
-        // The ViewEngine handles its own cleanup.
         Ok(())
     }
 
@@ -1011,12 +1118,14 @@ impl Database {
         self.adapter.compact().await
     }
 
-    /// Destroy the database and all its data.
+    /// Destroy the database and all its data, including its Mango indexes.
     pub async fn destroy(&self) -> Result<()> {
         for plugin in &self.plugins {
             plugin.on_destroy().await?;
         }
-        self.adapter.destroy().await
+        self.adapter.destroy().await?;
+        self.indexes.write().await.clear();
+        Ok(())
     }
 
     /// Permanently remove document revisions.
@@ -1105,16 +1214,35 @@ fn regex_escape(s: &str) -> String {
 
 impl Partition<'_> {
     /// Query all documents in this partition.
+    ///
+    /// Key ranges are clamped to the partition, and `key`/`keys` outside it
+    /// return no rows.
     pub async fn all_docs(&self, mut opts: AllDocsOptions) -> Result<AllDocsResponse> {
         let prefix = format!("{}:", self.name);
-        let end = format!("{}:\u{ffff}", self.name);
-        if opts.start_key.is_none() {
-            opts.start_key = Some(prefix);
+        // Every id of the partition sorts between these (byte order).
+        let first = prefix.clone();
+        let last = format!("{}:{}", self.name, char::MAX);
+
+        if let Some(ref mut keys) = opts.keys {
+            keys.retain(|k| k.starts_with(&prefix));
         }
-        if opts.end_key.is_none() {
-            opts.end_key = Some(end);
+        if opts.key.as_ref().is_some_and(|k| !k.starts_with(&prefix)) {
+            opts.key = None;
+            opts.keys = Some(Vec::new());
         }
-        self.db.all_docs(opts).await
+
+        // The start key is the upper bound when descending.
+        let (low, high) = if opts.descending {
+            (&mut opts.end_key, &mut opts.start_key)
+        } else {
+            (&mut opts.start_key, &mut opts.end_key)
+        };
+        *low = Some(low.take().map_or(first.clone(), |k| k.max(first)));
+        *high = Some(high.take().map_or(last.clone(), |k| k.min(last)));
+
+        let mut response = self.db.all_docs(opts).await?;
+        response.rows.retain(|row| row.id.starts_with(&prefix));
+        Ok(response)
     }
 
     /// Run a Mango find query scoped to this partition.
@@ -1147,6 +1275,230 @@ impl Partition<'_> {
             format!("{}:{}", self.name, id)
         };
         self.db.put(&full_id, data).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mango on a remote CouchDB
+// ---------------------------------------------------------------------------
+
+/// `limit` sent to `_find` when the caller wants every match (CouchDB
+/// returns 25 documents by default).
+const REMOTE_FIND_NO_LIMIT: u64 = (1 << 53) - 1;
+
+/// Turn an error response from CouchDB into a `RouchError`.
+fn remote_error(status: u16, body: &serde_json::Value) -> RouchError {
+    let reason = body
+        .get("reason")
+        .and_then(|r| r.as_str())
+        .unwrap_or_default()
+        .to_string();
+    match status {
+        400 => RouchError::BadRequest(reason),
+        401 => RouchError::Unauthorized,
+        403 => RouchError::Forbidden(reason),
+        404 => RouchError::NotFound(reason),
+        409 => RouchError::Conflict,
+        _ => RouchError::DatabaseError(format!("HTTP {status}: {body}")),
+    }
+}
+
+/// Send a request and return the JSON body of a successful response, or
+/// the status and body of an error response.
+async fn remote_request(
+    remote: &HttpAdapter,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<std::result::Result<serde_json::Value, (u16, serde_json::Value)>> {
+    let (status, response) = remote.request_json(method, path, body).await?;
+    Ok(if (200..300).contains(&status) {
+        Ok(response)
+    } else {
+        Err((status, response))
+    })
+}
+
+/// The `_find`/`_explain` request body for a query.
+fn remote_query_body(opts: &FindOptions) -> Result<serde_json::Value> {
+    let mut body = serde_json::to_value(opts)?;
+    body["limit"] = serde_json::json!(opts.limit.unwrap_or(REMOTE_FIND_NO_LIMIT));
+    Ok(body)
+}
+
+/// Run a query with `_find`; `None` if the server has no index for the
+/// requested sort (the caller then queries locally).
+async fn remote_find(remote: &HttpAdapter, opts: &FindOptions) -> Result<Option<FindResponse>> {
+    let body = remote_query_body(opts)?;
+    match remote_request(remote, "POST", "_find", Some(&body)).await? {
+        Ok(response) => {
+            let docs = match response.get("docs") {
+                Some(serde_json::Value::Array(docs)) => docs.clone(),
+                _ => Vec::new(),
+            };
+            Ok(Some(FindResponse { docs }))
+        }
+        Err((400, body)) if body["error"] == "no_usable_index" => Ok(None),
+        Err((status, body)) => Err(remote_error(status, &body)),
+    }
+}
+
+async fn remote_create_index(
+    remote: &HttpAdapter,
+    name: String,
+    def: IndexDefinition,
+) -> Result<CreateIndexResponse> {
+    let mut body = serde_json::json!({
+        "index": {"fields": def.fields},
+        "name": name,
+        "type": "json",
+    });
+    if let Some(ddoc) = def.ddoc {
+        body["ddoc"] = serde_json::json!(ddoc);
+    }
+    match remote_request(remote, "POST", "_index", Some(&body)).await? {
+        Ok(response) => Ok(CreateIndexResponse {
+            result: response["result"].as_str().unwrap_or("created").to_string(),
+            name: response["name"].as_str().unwrap_or(&name).to_string(),
+        }),
+        Err((status, body)) => Err(remote_error(status, &body)),
+    }
+}
+
+/// The server's JSON indexes, with the id of their design document.
+async fn remote_indexes(remote: &HttpAdapter) -> Result<Vec<(String, IndexInfo)>> {
+    let response = remote_request(remote, "GET", "_index", None)
+        .await?
+        .map_err(|(status, body)| remote_error(status, &body))?;
+    let mut result = Vec::new();
+    for index in response["indexes"].as_array().into_iter().flatten() {
+        if index["type"] != "json" {
+            continue;
+        }
+        let ddoc = index["ddoc"].as_str().unwrap_or_default().to_string();
+        let fields = serde_json::from_value(index["def"]["fields"].clone()).unwrap_or_default();
+        result.push((
+            ddoc.clone(),
+            IndexInfo {
+                name: index["name"].as_str().unwrap_or_default().to_string(),
+                ddoc: Some(ddoc),
+                def: IndexFields { fields },
+            },
+        ));
+    }
+    Ok(result)
+}
+
+async fn remote_delete_index(remote: &HttpAdapter, name: &str) -> Result<()> {
+    let ddoc = remote_indexes(remote)
+        .await?
+        .into_iter()
+        .find(|(_, info)| info.name == name)
+        .map(|(ddoc, _)| ddoc)
+        .ok_or_else(|| RouchError::NotFound(format!("index {}", name)))?;
+    let ddoc = ddoc.strip_prefix("_design/").unwrap_or(&ddoc);
+    let path = format!(
+        "_index/{}/json/{}",
+        encode_path_segment(ddoc),
+        encode_path_segment(name)
+    );
+    remote_request(remote, "DELETE", &path, None)
+        .await?
+        .map(|_| ())
+        .map_err(|(status, body)| remote_error(status, &body))
+}
+
+/// Ask the server how it would run a query; `None` if that fails.
+async fn remote_explain(remote: &HttpAdapter, opts: &FindOptions) -> Option<ExplainResponse> {
+    let body = remote_query_body(opts).ok()?;
+    let response = remote_request(remote, "POST", "_explain", Some(&body))
+        .await
+        .ok()?
+        .ok()?;
+    let index = &response["index"];
+    Some(ExplainResponse {
+        dbname: response["dbname"].as_str().unwrap_or_default().to_string(),
+        index: ExplainIndex {
+            ddoc: index["ddoc"].as_str().map(str::to_string),
+            name: index["name"].as_str().unwrap_or_default().to_string(),
+            index_type: index["type"].as_str().unwrap_or_default().to_string(),
+            def: IndexFields {
+                fields: serde_json::from_value(index["def"]["fields"].clone()).unwrap_or_default(),
+            },
+        },
+        selector: opts.selector.clone(),
+        fields: opts.fields.clone(),
+    })
+}
+
+/// Percent-encode a URL path segment (everything but RFC 3986 unreserved
+/// characters).
+fn encode_path_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+/// Batch size for reading a changes feed filtered by a selector.
+const SELECTOR_CHANGES_BATCH: u64 = 500;
+
+/// Fields of a design document that `DesignDocument` models.
+const MODELED_DESIGN_FIELDS: [&str; 9] = [
+    "_id",
+    "_rev",
+    "views",
+    "filters",
+    "validate_doc_update",
+    "shows",
+    "lists",
+    "updates",
+    "language",
+];
+
+/// Copy into `new` (a serialized `DesignDocument`) what `DesignDocument`
+/// cannot represent from the `parent` revision: unknown top-level fields,
+/// views it skips (`lib`, Mango indexes with a non-string `map`) and extra
+/// fields of view definitions (such as `options`).
+fn keep_unmodeled_design_fields(new: &mut serde_json::Value, parent: &serde_json::Value) {
+    let (Some(new), Some(parent)) = (new.as_object_mut(), parent.as_object()) else {
+        return;
+    };
+    for (key, value) in parent {
+        if !key.starts_with('_') && !MODELED_DESIGN_FIELDS.contains(&key.as_str()) {
+            new.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+
+    let Some(parent_views) = parent.get("views").and_then(|v| v.as_object()) else {
+        return;
+    };
+    let views = new.entry("views").or_insert_with(|| serde_json::json!({}));
+    let Some(views) = views.as_object_mut() else {
+        return;
+    };
+    for (name, def) in parent_views {
+        let modeled = name != "lib" && def.get("map").is_some_and(|m| m.is_string());
+        match views.get_mut(name) {
+            // Extra fields of a view that is still defined.
+            Some(serde_json::Value::Object(view)) if modeled => {
+                for (field, value) in def.as_object().into_iter().flatten() {
+                    if field != "map" && field != "reduce" {
+                        view.entry(field.clone()).or_insert_with(|| value.clone());
+                    }
+                }
+            }
+            // A view removed through the struct stays removed.
+            _ if modeled => {}
+            _ => {
+                views.entry(name.clone()).or_insert_with(|| def.clone());
+            }
+        }
     }
 }
 
@@ -1822,5 +2174,362 @@ mod tests {
             .map(|d| d["address"]["city"].as_str().unwrap())
             .collect();
         assert_eq!(cities, vec!["Amsterdam", "Madrid", "Zurich"]);
+    }
+
+    /// Adapter wrapper that counts full `all_docs` scans.
+    struct CountingAdapter {
+        inner: MemoryAdapter,
+        full_scans: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Adapter for CountingAdapter {
+        async fn info(&self) -> Result<DbInfo> {
+            self.inner.info().await
+        }
+        async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
+            self.inner.get(id, opts).await
+        }
+        async fn bulk_docs(
+            &self,
+            docs: Vec<Document>,
+            opts: BulkDocsOptions,
+        ) -> Result<Vec<DocResult>> {
+            self.inner.bulk_docs(docs, opts).await
+        }
+        async fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
+            if opts.keys.is_none() && opts.key.is_none() {
+                self.full_scans
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.all_docs(opts).await
+        }
+        async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
+            self.inner.changes(opts).await
+        }
+        async fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
+            self.inner.revs_diff(revs).await
+        }
+        async fn bulk_get(&self, docs: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
+            self.inner.bulk_get(docs).await
+        }
+        async fn put_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            rev: &str,
+            data: Vec<u8>,
+            content_type: &str,
+        ) -> Result<DocResult> {
+            self.inner
+                .put_attachment(doc_id, att_id, rev, data, content_type)
+                .await
+        }
+        async fn get_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            opts: GetAttachmentOptions,
+        ) -> Result<Vec<u8>> {
+            self.inner.get_attachment(doc_id, att_id, opts).await
+        }
+        async fn remove_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            rev: &str,
+        ) -> Result<DocResult> {
+            self.inner.remove_attachment(doc_id, att_id, rev).await
+        }
+        async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
+            self.inner.get_local(id).await
+        }
+        async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
+            self.inner.put_local(id, doc).await
+        }
+        async fn remove_local(&self, id: &str) -> Result<()> {
+            self.inner.remove_local(id).await
+        }
+        async fn compact(&self) -> Result<()> {
+            self.inner.compact().await
+        }
+        async fn destroy(&self) -> Result<()> {
+            self.inner.destroy().await
+        }
+    }
+
+    #[tokio::test]
+    async fn indexed_find_updates_index_incrementally() {
+        // F47: an indexed find must not rebuild the index (a full scan of
+        // every document) on each query, and must still see every write.
+        let adapter = Arc::new(CountingAdapter {
+            inner: MemoryAdapter::new("test"),
+            full_scans: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let db = Database::from_adapter(adapter.clone());
+        for i in 0..20 {
+            db.put(&format!("d{i:02}"), serde_json::json!({"age": i}))
+                .await
+                .unwrap();
+        }
+        db.create_index(IndexDefinition {
+            name: String::new(),
+            fields: vec![SortField::Simple("age".into())],
+            ddoc: None,
+        })
+        .await
+        .unwrap();
+        let scans = || adapter.full_scans.load(std::sync::atomic::Ordering::SeqCst);
+        let before = scans();
+
+        let find = |selector: serde_json::Value| {
+            let db = &db;
+            async move {
+                let mut ids: Vec<String> = db
+                    .find(FindOptions {
+                        selector,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap()
+                    .docs
+                    .iter()
+                    .map(|d| d["_id"].as_str().unwrap().to_string())
+                    .collect();
+                ids.sort();
+                ids
+            }
+        };
+        assert_eq!(
+            find(serde_json::json!({"age": {"$gte": 18}})).await,
+            ["d18", "d19"]
+        );
+
+        // Writes after the index was built are picked up.
+        let rev = db.get("d19").await.unwrap().rev.unwrap().to_string();
+        db.update("d19", &rev, serde_json::json!({"age": 1}))
+            .await
+            .unwrap();
+        let rev = db.get("d18").await.unwrap().rev.unwrap().to_string();
+        db.remove("d18", &rev).await.unwrap();
+        db.put("new", serde_json::json!({"age": 50})).await.unwrap();
+        assert_eq!(
+            find(serde_json::json!({"age": {"$gte": 18}})).await,
+            ["new"]
+        );
+        assert_eq!(find(serde_json::json!({"age": 1})).await, ["d01", "d19"]);
+        assert_eq!(find(serde_json::json!({"age": {"$lt": 1}})).await, ["d00"]);
+
+        assert_eq!(
+            scans(),
+            before,
+            "indexed finds must not rescan every document"
+        );
+    }
+
+    #[tokio::test]
+    async fn indexed_find_matches_full_scan() {
+        // F47: the index only narrows candidates; results must be the same
+        // as a full scan for any selector touching the indexed field.
+        let db = Database::memory("test");
+        let values = [
+            serde_json::json!(null),
+            serde_json::json!(1),
+            serde_json::json!(2.5),
+            serde_json::json!(-3),
+            serde_json::json!("a"),
+            serde_json::json!("b"),
+            serde_json::json!([1, 2]),
+            serde_json::json!({"x": 1}),
+        ];
+        for (i, v) in values.iter().enumerate() {
+            db.put(&format!("v{i}"), serde_json::json!({"f": v, "g": i}))
+                .await
+                .unwrap();
+        }
+        db.put("missing", serde_json::json!({"g": 99}))
+            .await
+            .unwrap();
+        db.create_index(IndexDefinition {
+            name: "by-f".into(),
+            fields: vec![SortField::Simple("f".into())],
+            ddoc: None,
+        })
+        .await
+        .unwrap();
+
+        let mut selectors = vec![
+            serde_json::json!({"f": {"$exists": false}}),
+            serde_json::json!({"f": {"$ne": 1}}),
+            serde_json::json!({"f": {"$in": [1, "a"]}}),
+            serde_json::json!({"f": {"x": 1}}),
+            serde_json::json!({"f": {"$gt": 1, "$lt": "b"}}),
+            serde_json::json!({"f": {"$type": "array"}}),
+        ];
+        for v in &values {
+            for op in ["$eq", "$gt", "$gte", "$lt", "$lte"] {
+                selectors.push(serde_json::json!({"f": {op: v}}));
+            }
+            selectors.push(serde_json::json!({"f": v}));
+        }
+        for selector in selectors {
+            let opts = FindOptions {
+                selector: selector.clone(),
+                sort: Some(vec![SortField::Simple("g".into())]),
+                ..Default::default()
+            };
+            let indexed = db.find(opts.clone()).await.unwrap().docs;
+            let scanned = find(db.adapter(), opts).await.unwrap().docs;
+            assert_eq!(indexed, scanned, "{selector}");
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_indexed_finds_see_all_writes() {
+        let db = Arc::new(Database::memory("test"));
+        db.create_index(IndexDefinition {
+            name: String::new(),
+            fields: vec![SortField::Simple("n".into())],
+            ddoc: None,
+        })
+        .await
+        .unwrap();
+        let mut tasks = Vec::new();
+        for t in 0..4 {
+            let db = db.clone();
+            tasks.push(tokio::spawn(async move {
+                for i in 0..25 {
+                    db.put(&format!("t{t}-{i}"), serde_json::json!({"n": i}))
+                        .await
+                        .unwrap();
+                    db.find(FindOptions {
+                        selector: serde_json::json!({"n": {"$gte": 0}}),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let all = db
+            .find(FindOptions {
+                selector: serde_json::json!({"n": {"$gte": 0}}),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(all.docs.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn changes_with_selector_applies_limit_after_filtering() {
+        // F58: limit counts matching changes, and last_seq is the seq of the
+        // last one returned.
+        let db = Database::memory("test");
+        for i in 0..10 {
+            db.put(&format!("b{i}"), serde_json::json!({"type": "b"}))
+                .await
+                .unwrap();
+        }
+        for i in 0..10 {
+            db.put(&format!("a{i}"), serde_json::json!({"type": "a"}))
+                .await
+                .unwrap();
+        }
+        let changes = db
+            .changes(ChangesOptions {
+                selector: Some(serde_json::json!({"type": "a"})),
+                limit: Some(5),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let ids: Vec<_> = changes.results.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["a0", "a1", "a2", "a3", "a4"]);
+        assert_eq!(changes.last_seq, Seq::Num(15));
+
+        // Continuing from last_seq returns the rest.
+        let rest = db
+            .changes(ChangesOptions {
+                since: changes.last_seq,
+                selector: Some(serde_json::json!({"type": "a"})),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rest.results.len(), 5);
+        assert_eq!(rest.last_seq, Seq::Num(20));
+
+        // Invalid selectors are rejected.
+        assert!(
+            db.changes(ChangesOptions {
+                selector: Some(serde_json::json!({"type": {"$regex": "["}})),
+                ..Default::default()
+            })
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn partition_all_docs_is_scoped_to_the_partition() {
+        // F60: descending, key/keys and astral ids stay inside the partition.
+        let db = Database::memory("test");
+        for id in [
+            "orders:1",
+            "users:1",
+            "users:2",
+            "users:\u{1F600}",
+            "usersx:1",
+        ] {
+            db.put(id, serde_json::json!({})).await.unwrap();
+        }
+        let users = db.partition("users");
+        let ids = |r: AllDocsResponse| r.rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+
+        let all = ids(users.all_docs(AllDocsOptions::new()).await.unwrap());
+        assert_eq!(all, ["users:1", "users:2", "users:\u{1F600}"]);
+
+        let desc = ids(users
+            .all_docs(AllDocsOptions {
+                descending: true,
+                ..AllDocsOptions::new()
+            })
+            .await
+            .unwrap());
+        assert_eq!(desc, ["users:\u{1F600}", "users:2", "users:1"]);
+
+        let keyed = ids(users
+            .all_docs(AllDocsOptions {
+                keys: Some(vec!["orders:1".into(), "users:2".into()]),
+                ..AllDocsOptions::new()
+            })
+            .await
+            .unwrap());
+        assert_eq!(keyed, ["users:2"]);
+
+        let foreign = ids(users
+            .all_docs(AllDocsOptions {
+                key: Some("orders:1".into()),
+                ..AllDocsOptions::new()
+            })
+            .await
+            .unwrap());
+        assert!(foreign.is_empty());
+
+        // A range reaching outside the partition is clamped to it.
+        let clamped = ids(users
+            .all_docs(AllDocsOptions {
+                start_key: Some("a".into()),
+                end_key: Some("users:1".into()),
+                ..AllDocsOptions::new()
+            })
+            .await
+            .unwrap());
+        assert_eq!(clamped, ["users:1"]);
     }
 }

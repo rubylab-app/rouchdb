@@ -33,6 +33,10 @@ fn type_rank(v: &Value) -> u8 {
 // ---------------------------------------------------------------------------
 
 /// Compare two JSON values using CouchDB collation order.
+///
+/// Strings compare by UTF-16 code units, like PouchDB (JavaScript). CouchDB
+/// itself uses ICU collation for strings (e.g. `"apple" < "Banana"`), which
+/// is not implemented here.
 pub fn collate(a: &Value, b: &Value) -> Ordering {
     let rank_a = type_rank(a);
     let rank_b = type_rank(b);
@@ -45,7 +49,7 @@ pub fn collate(a: &Value, b: &Value) -> Ordering {
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
         (Value::Number(a), Value::Number(b)) => compare_numbers(a, b),
-        (Value::String(a), Value::String(b)) => a.cmp(b),
+        (Value::String(a), Value::String(b)) => compare_strings(a, b),
         (Value::Array(a), Value::Array(b)) => {
             // Element-by-element, shorter arrays sort first
             for (ea, eb) in a.iter().zip(b.iter()) {
@@ -57,19 +61,15 @@ pub fn collate(a: &Value, b: &Value) -> Ordering {
             a.len().cmp(&b.len())
         }
         (Value::Object(a), Value::Object(b)) => {
-            // Key-by-key comparison; fewer keys sort first.
-            // Keys are sorted before comparison.
-            let mut keys_a: Vec<&String> = a.keys().collect();
-            let mut keys_b: Vec<&String> = b.keys().collect();
-            keys_a.sort();
-            keys_b.sort();
-
-            for (ka, kb) in keys_a.iter().zip(keys_b.iter()) {
-                match ka.cmp(kb) {
+            // Key-by-key comparison in map order; fewer keys sort first.
+            // CouchDB uses the document's key order, but serde_json (without
+            // `preserve_order`) keeps keys sorted, so that is the order here.
+            for ((ka, va), (kb, vb)) in a.iter().zip(b.iter()) {
+                match compare_strings(ka, kb) {
                     Ordering::Equal => {}
                     other => return other,
                 }
-                match collate(&a[*ka], &b[*kb]) {
+                match collate(va, vb) {
                     Ordering::Equal => continue,
                     other => return other,
                 }
@@ -80,46 +80,94 @@ pub fn collate(a: &Value, b: &Value) -> Ordering {
     }
 }
 
-/// Compare two JSON numbers without losing precision on large integers.
+/// Compare two strings by UTF-16 code units (JavaScript string order).
+///
+/// UTF-8 byte order is code point order, which only differs from UTF-16
+/// order when a supplementary character (a surrogate pair in UTF-16) meets
+/// a character in U+E000..=U+FFFF, so only the first differing characters
+/// need to be looked at.
+fn compare_strings(a: &str, b: &str) -> Ordering {
+    let common = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+    // The shared prefix is identical in both, so a char boundary in `a` is
+    // one in `b` too.
+    let mut start = common;
+    while !a.is_char_boundary(start) {
+        start -= 1;
+    }
+    match (a[start..].chars().next(), b[start..].chars().next()) {
+        (Some(x), Some(y)) => utf16_units(x).cmp(&utf16_units(y)),
+        (x, y) => x.is_some().cmp(&y.is_some()),
+    }
+}
+
+/// The UTF-16 code units of a character, as a comparable pair.
+fn utf16_units(c: char) -> (u16, u16) {
+    let mut buf = [0u16; 2];
+    match c.encode_utf16(&mut buf) {
+        [unit] => (*unit, 0),
+        [high, low] => (*high, *low),
+        _ => unreachable!("a char is one or two UTF-16 units"),
+    }
+}
+
+/// Compare two JSON numbers exactly.
 ///
 /// `serde_json::Number` can hold `u64`, `i64`, or `f64`. Converting straight
 /// to `f64` (as a naive implementation does) collapses integers larger than
 /// 2^53 onto the same float, making distinct values compare `Equal` and
-/// breaking Mango `$eq`/range queries. When both operands are integers we
-/// compare them exactly via `i128`; otherwise we fall back to `f64`.
+/// breaking Mango `$eq`/range queries. Integers are compared via `i128`, an
+/// integer and a float are compared exactly, and `-0.0` equals `0`.
 fn compare_numbers(a: &serde_json::Number, b: &serde_json::Number) -> Ordering {
-    fn as_i128(n: &serde_json::Number) -> Option<i128> {
-        if let Some(i) = n.as_i64() {
-            Some(i as i128)
-        } else {
-            n.as_u64().map(|u| u as i128)
+    match (as_i128(a), as_i128(b)) {
+        (Some(ia), Some(ib)) => ia.cmp(&ib),
+        (Some(ia), None) => compare_int_float(ia, b.as_f64().unwrap_or(0.0)),
+        (None, Some(ib)) => compare_int_float(ib, a.as_f64().unwrap_or(0.0)).reverse(),
+        (None, None) => {
+            let fa = a.as_f64().unwrap_or(0.0);
+            let fb = b.as_f64().unwrap_or(0.0);
+            // JSON numbers are finite, so only -0.0 vs 0.0 needs care, and
+            // partial_cmp treats them as equal.
+            fa.partial_cmp(&fb).unwrap_or(Ordering::Equal)
         }
     }
+}
 
-    if let (Some(ia), Some(ib)) = (as_i128(a), as_i128(b)) {
-        return ia.cmp(&ib);
+fn as_i128(n: &serde_json::Number) -> Option<i128> {
+    if let Some(i) = n.as_i64() {
+        Some(i as i128)
+    } else {
+        n.as_u64().map(|u| u as i128)
     }
-    let fa = a.as_f64().unwrap_or(0.0);
-    let fb = b.as_f64().unwrap_or(0.0);
-    // total_cmp gives a well-defined ordering for all f64 values including NaN
-    // (which shouldn't appear in JSON but be safe).
-    fa.total_cmp(&fb)
+}
+
+/// Compare an integer with a finite float without rounding either.
+fn compare_int_float(i: i128, f: f64) -> Ordering {
+    let whole = f.trunc();
+    // Saturates beyond the i128 range, where the integer part alone decides.
+    match i.cmp(&(whole as i128)) {
+        Ordering::Equal => whole.partial_cmp(&f).unwrap_or(Ordering::Equal),
+        other => other,
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Indexable string encoding
 // ---------------------------------------------------------------------------
 
-/// Encode a JSON value into a string that sorts lexicographically in CouchDB
-/// collation order. Used as keys in the storage engine.
+/// Encode a JSON value into a string whose byte order is the CouchDB
+/// collation order of the values (`a.cmp(&b)` on the encodings equals
+/// `collate(a, b)`), usable as a key in a sorted store.
 ///
-/// Format:
+/// Every encoded value starts with its type rank and ends with a `\0`
+/// terminator, so an array or object that is a prefix of another sorts
+/// first:
 /// - Null:    `"1"`
 /// - Bool:    `"2F"` / `"2T"`
-/// - Number:  `"3"` + encoded number
-/// - String:  `"4"` + string value
-/// - Array:   `"5"` + encoded elements separated by null byte
-/// - Object:  `"6"` + encoded key-value pairs
+/// - Number:  `"3"` + encoded number (exact, see below)
+/// - String:  `"4"` + UTF-16 code units remapped so that byte order is
+///   UTF-16 order, with `\0`, `\1`, `\2` escaped as in pouchdb-collate
+/// - Array:   `"5"` + encoded elements
+/// - Object:  `"6"` + encoded keys and values
 pub fn to_indexable_string(v: &Value) -> String {
     let mut s = String::new();
     encode_value(v, &mut s);
@@ -135,90 +183,102 @@ fn encode_value(v: &Value, out: &mut String) {
         }
         Value::Number(n) => {
             out.push('3');
-            encode_number(n.as_f64().unwrap_or(0.0), out);
+            encode_number(n, out);
         }
         Value::String(s) => {
             out.push('4');
-            out.push_str(s);
+            encode_string(s, out);
         }
         Value::Array(arr) => {
             out.push('5');
-            for (i, elem) in arr.iter().enumerate() {
-                if i > 0 {
-                    out.push('\0');
-                }
+            for elem in arr {
                 encode_value(elem, out);
             }
         }
         Value::Object(obj) => {
             out.push('6');
-            let mut keys: Vec<&String> = obj.keys().collect();
-            keys.sort();
-            for (i, key) in keys.iter().enumerate() {
-                if i > 0 {
-                    out.push('\0');
-                }
-                out.push_str(key);
+            for (key, value) in obj {
+                out.push('4');
+                encode_string(key, out);
                 out.push('\0');
-                encode_value(&obj[*key], out);
+                encode_value(value, out);
             }
         }
     }
+    out.push('\0');
 }
 
-/// Encode a number such that the resulting string sorts lexicographically
-/// in numeric order.
+/// Encode a string so that byte order is UTF-16 code unit order.
 ///
-/// Scheme (matching PouchDB's `numToIndexableString`):
-/// - Negative numbers: `0` + inverted representation
-/// - Zero: `1`
-/// - Positive numbers: `2` + magnitude (zero-padded to 3 digits) + mantissa
-fn encode_number(n: f64, out: &mut String) {
-    if n.is_nan() {
-        out.push('0'); // Sort NaN before all real numbers
-        return;
+/// Units below the surrogates map to themselves; surrogates and
+/// U+E000..=U+FFFF are moved above U+FFFF (in that order), so they keep
+/// their relative UTF-16 order. `\0`, `\1` and `\2` are escaped to keep
+/// `\0` free for the terminator.
+fn encode_string(s: &str, out: &mut String) {
+    for unit in s.encode_utf16() {
+        let code = match unit {
+            0 => {
+                out.push_str("\u{1}\u{1}");
+                continue;
+            }
+            1 => {
+                out.push_str("\u{1}\u{2}");
+                continue;
+            }
+            2 => {
+                out.push_str("\u{2}\u{2}");
+                continue;
+            }
+            0xD800..=0xDFFF => 0x1_0000 + u32::from(unit - 0xD800),
+            0xE000..=0xFFFF => 0x1_0800 + u32::from(unit - 0xE000),
+            _ => u32::from(unit),
+        };
+        out.push(char::from_u32(code).expect("remapped unit is a valid char"));
     }
-    if n == f64::NEG_INFINITY {
-        out.push('0');
-        out.push_str("00000");
-        return;
-    }
-    if n == f64::INFINITY {
-        out.push('2');
-        out.push_str("99999");
-        return;
-    }
-    if n == 0.0 {
+}
+
+/// Encode a number exactly, so that lexicographic order is numeric order:
+/// - Zero (including `-0.0`): `1`
+/// - Positive: `2` + (exponent + 500, 3 digits) + significant digits
+/// - Negative: `0` + (500 - exponent, 3 digits) + nines' complement of the
+///   significant digits + `:` (which sorts after every digit)
+///
+/// Integers (and integral floats) use their exact decimal digits; other
+/// floats use the shortest representation that round-trips, which orders
+/// like the float itself.
+fn encode_number(n: &serde_json::Number, out: &mut String) {
+    let (negative, digits) = if let Some(i) = as_i128(n) {
+        (i < 0, i.unsigned_abs().to_string())
+    } else {
+        let f = n.as_f64().unwrap_or(0.0);
+        let digits = if f.fract() == 0.0 {
+            format!("{:.0}", f.abs())
+        } else {
+            format!("{:e}", f.abs())
+        };
+        (f < 0.0, digits)
+    };
+
+    // Split into significant digits and a decimal exponent (d.ddd × 10^exp).
+    let (mantissa, exp) = match digits.split_once('e') {
+        Some((m, e)) => (m.replace('.', ""), e.parse::<i32>().unwrap_or(0)),
+        None => (digits.clone(), digits.len() as i32 - 1),
+    };
+    let significant = mantissa.trim_end_matches('0');
+    if significant.is_empty() {
         out.push('1');
         return;
     }
 
-    let is_negative = n < 0.0;
-    let abs_n = n.abs();
-
-    // Represent as: mantissa * 10^exponent
-    // where 1 <= mantissa < 10
-    let exponent = abs_n.log10().floor() as i64;
-    let mantissa = abs_n / 10f64.powi(exponent as i32);
-
-    // We offset the exponent by 10000 so it's always positive and
-    // zero-pad to 5 digits for consistent lexicographic ordering.
-    if is_negative {
-        // For negatives: invert so larger (closer to zero) sorts first
-        // Prefix with '0', then (10000 - exponent), then (10 - mantissa)
+    if negative {
         out.push('0');
-        let inv_exp = 10000 - exponent;
-        out.push_str(&format!("{:0>5}", inv_exp));
-        let inv_mantissa = 10.0 - mantissa;
-        let m_str = format!("{:.10}", inv_mantissa);
-        out.push_str(m_str.trim_end_matches('0'));
+        out.push_str(&format!("{:03}", 500 - exp));
+        out.extend(significant.bytes().map(|d| char::from(b'9' - (d - b'0'))));
+        out.push(':');
     } else {
-        // For positives: prefix with '2', then (exponent + 10000), then mantissa
         out.push('2');
-        let adj_exp = exponent + 10000;
-        out.push_str(&format!("{:0>5}", adj_exp));
-        let m_str = format!("{:.10}", mantissa);
-        out.push_str(m_str.trim_end_matches('0'));
+        out.push_str(&format!("{:03}", 500 + exp));
+        out.push_str(significant);
     }
 }
 
@@ -359,5 +419,114 @@ mod tests {
         let zero = to_indexable_string(&json!(0));
         assert!(small < big, "-100 should sort before -1");
         assert!(big < zero, "-1 should sort before 0");
+    }
+
+    #[test]
+    fn negative_zero_equals_zero() {
+        // F79: -0.0 and 0 are the same number.
+        assert_eq!(collate(&json!(-0.0), &json!(0)), Ordering::Equal);
+        assert_eq!(collate(&json!(-0.0), &json!(0.0)), Ordering::Equal);
+        assert_eq!(collate(&json!(-0.0), &json!(-1)), Ordering::Greater);
+    }
+
+    #[test]
+    fn integer_float_comparison_is_exact() {
+        // F79: 2^53 + 1 is greater than the float 2^53.
+        let int = json!(9_007_199_254_740_993_i64);
+        let float = json!(9_007_199_254_740_992.0);
+        assert_eq!(collate(&int, &float), Ordering::Greater);
+        assert_eq!(collate(&float, &int), Ordering::Less);
+        assert_eq!(collate(&json!(3), &json!(3.0)), Ordering::Equal);
+        assert_eq!(collate(&json!(3), &json!(2.5)), Ordering::Greater);
+        assert_eq!(collate(&json!(-3), &json!(-2.5)), Ordering::Less);
+        assert_eq!(collate(&json!(u64::MAX), &json!(1e300)), Ordering::Less);
+        assert_eq!(collate(&json!(i64::MIN), &json!(-1e300)), Ordering::Greater);
+    }
+
+    #[test]
+    fn strings_compare_by_utf16_code_units() {
+        // F78: like PouchDB (JavaScript), a supplementary character (a
+        // surrogate pair) sorts before U+E000..U+FFFF.
+        assert_eq!(
+            collate(&json!("\u{1F600}"), &json!("\u{FF21}")),
+            Ordering::Less
+        );
+        assert_eq!(
+            collate(&json!("a\u{1F600}"), &json!("a\u{E000}")),
+            Ordering::Less
+        );
+        assert_eq!(
+            collate(&json!("\u{1F600}"), &json!("\u{1F601}")),
+            Ordering::Less
+        );
+        assert_eq!(collate(&json!("z"), &json!("\u{E9}")), Ordering::Less);
+        assert_eq!(collate(&json!("ab"), &json!("a")), Ordering::Greater);
+    }
+
+    #[test]
+    fn indexable_string_matches_collate() {
+        // F81: the encoding must order (and equate) values exactly like
+        // `collate`.
+        let values = vec![
+            json!(null),
+            json!(false),
+            json!(true),
+            json!(-1e300),
+            json!(i64::MIN),
+            json!(-1.9),
+            json!(-1.5),
+            json!(-1),
+            json!(-1e-300),
+            json!(-0.0),
+            json!(0),
+            json!(0.0),
+            json!(1e-300),
+            json!(1),
+            json!(1.0),
+            json!(1.00000000001),
+            json!(9.5),
+            json!(9.99999999999),
+            json!(10),
+            json!(100),
+            json!(1_152_921_504_606_846_976_u64),
+            json!(1_152_921_504_606_846_976.0),
+            json!(9_007_199_254_740_992_u64),
+            json!(9_007_199_254_740_992.0),
+            json!(9_007_199_254_740_993_u64),
+            json!(u64::MAX),
+            json!(1e300),
+            json!(""),
+            json!("\u{0}"),
+            json!("\u{1}"),
+            json!("\u{2}"),
+            json!("B"),
+            json!("a"),
+            json!("a\u{0}b"),
+            json!("ab"),
+            json!("b"),
+            json!("\u{E9}"),
+            json!("\u{1F600}"),
+            json!("\u{FF21}"),
+            json!([]),
+            json!([1]),
+            json!([[1], 2]),
+            json!([[1, 2]]),
+            json!([1, 2]),
+            json!(["a"]),
+            json!({}),
+            json!({"a": 1}),
+            json!({"a": 1, "b": 2}),
+            json!({"a": 2}),
+            json!({"b": 1}),
+        ];
+        for a in &values {
+            for b in &values {
+                assert_eq!(
+                    to_indexable_string(a).cmp(&to_indexable_string(b)),
+                    collate(a, b),
+                    "{a} vs {b}"
+                );
+            }
+        }
     }
 }

@@ -582,7 +582,8 @@ async fn find_with_fields() {
     let docs = v["docs"].as_array().unwrap();
     assert_eq!(docs.len(), 1);
     assert!(docs[0].get("name").is_some());
-    assert!(docs[0].get("_id").is_some());
+    // Like CouchDB, only the requested fields are returned (no implicit _id).
+    assert!(docs[0].get("_id").is_none());
     // age and city should not be present
     assert!(docs[0].get("age").is_none());
     assert!(docs[0].get("city").is_none());
