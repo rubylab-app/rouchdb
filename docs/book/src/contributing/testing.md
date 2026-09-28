@@ -278,15 +278,17 @@ Results depend heavily on the machine; compare runs on the same machine only.
 
 ## Continuous Integration
 
-GitHub Actions (`.github/workflows/ci.yml`) runs these jobs on every pull request:
+GitHub Actions (`.github/workflows/ci.yml`) runs these jobs on every pull request, each with a `timeout-minutes`:
 
 | Job | What it runs |
 |-----|--------------|
-| Check & Lint | `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, and the TLS feature combinations |
-| Tests | `cargo test --workspace` |
-| CouchDB integration tests | `scripts/test-couchdb.sh` against a `couchdb:3` service container |
-| Benchmarks (build only) | `cargo bench --no-run` |
+| Check & Lint | `cargo fmt --check`, every `#[ignore]` has a known reason, `cargo clippy --all-targets -D warnings`, and the TLS feature combinations |
+| Tests | `cargo test --workspace --no-fail-fast` (including the README examples as doctests) |
+| CouchDB integration tests | `scripts/test-couchdb.sh` against a `couchdb:3.5.1` service container (account lockout off), the non-blocking `scripts/test-blocked.sh` xfail check, and a check that no database was left behind |
+| Benchmarks (build + smoke run) | `cargo bench --no-run`, then every benchmark once in criterion's `--test` mode on 1000 documents |
 | MSRV (1.88) | `cargo check --all-targets --all-features` on Rust 1.88 |
 | Clippy on stable/beta | Non-blocking early warning about lints from newer toolchains |
+
+`minimal-versions.yml` resolves every direct dependency to the lowest version its `Cargo.toml` requirement allows (`cargo +nightly update -Z direct-minimal-versions`) and builds, when a manifest changes and weekly. When it fails, raise the requirement to the version the code actually needs, in every crate that declares it.
 
 The blocking jobs use the toolchain pinned in `rust-toolchain.toml`. To move to a newer Rust, bump it there and fix any new lints in the same PR. The benchmarks can be run on a GitHub runner from the Actions tab (the manual "Benchmarks" workflow); shared runners are noisy, so use those numbers for trends only.

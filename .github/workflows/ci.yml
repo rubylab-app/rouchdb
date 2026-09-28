@@ -23,6 +23,7 @@ jobs:
   check:
     name: Check & Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -70,6 +71,7 @@ jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -78,12 +80,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # --no-fail-fast: report every failing test binary, not just the first.
       - name: Run unit tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
 
   couchdb:
     name: CouchDB integration tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       couchdb:
         # Pinned, like docker-compose.yml.
@@ -148,6 +152,7 @@ jobs:
   bench:
     name: Benchmarks (build + smoke run)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -171,6 +176,7 @@ jobs:
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       # Overrides rust-toolchain.toml. Keep in sync with `rust-version` in
       # the root Cargo.toml.
@@ -190,6 +196,7 @@ jobs:
   latest:
     name: Clippy on ${{ matrix.toolchain }} (early warning)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Non-blocking: reports lints from the next toolchains before the pin in
     # rust-toolchain.toml is bumped.
     continue-on-error: true
