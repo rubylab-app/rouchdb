@@ -564,3 +564,314 @@ async fn view_reduce_stats() {
     assert_eq!(stats["min"], 10.0);
     assert_eq!(stats["max"], 30.0);
 }
+
+// =========================================================================
+// Regression tests for audited findings
+// =========================================================================
+
+fn engine_by_val() -> ViewEngine {
+    let mut engine = ViewEngine::new();
+    engine.register_map("app", "by_val", |doc| match doc.get("val") {
+        Some(v) => vec![(v.clone(), serde_json::json!(1))],
+        None => vec![],
+    });
+    engine
+}
+
+#[tokio::test]
+async fn view_engine_reregistering_map_rebuilds_index() {
+    // F51: a new map function must not be mixed with rows of the old one.
+    let db = Database::memory("test");
+    db.put("doc1", serde_json::json!({"val": 1, "other": "x"}))
+        .await
+        .unwrap();
+    let mut engine = engine_by_val();
+    engine
+        .update_index(db.adapter(), "app", "by_val")
+        .await
+        .unwrap();
+
+    engine.register_map("app", "by_val", |doc| match doc.get("other") {
+        Some(v) => vec![(v.clone(), serde_json::json!(2))],
+        None => vec![],
+    });
+    engine
+        .update_index(db.adapter(), "app", "by_val")
+        .await
+        .unwrap();
+    let index = engine.get_index("app", "by_val").unwrap();
+    assert_eq!(
+        index.entries["doc1"],
+        vec![(serde_json::json!("x"), serde_json::json!(2))]
+    );
+}
+
+#[tokio::test]
+async fn view_engine_drops_purged_docs() {
+    // F52: purged documents leave no change behind, but must leave the index.
+    let db = Database::memory("test");
+    let r1 = db.put("doc1", serde_json::json!({"val": 1})).await.unwrap();
+    db.put("doc2", serde_json::json!({"val": 2})).await.unwrap();
+    let mut engine = engine_by_val();
+    engine
+        .update_index(db.adapter(), "app", "by_val")
+        .await
+        .unwrap();
+    assert_eq!(engine.get_index("app", "by_val").unwrap().entries.len(), 2);
+
+    db.purge("doc1", vec![r1.rev.unwrap()]).await.unwrap();
+    engine
+        .update_index(db.adapter(), "app", "by_val")
+        .await
+        .unwrap();
+    let index = engine.get_index("app", "by_val").unwrap();
+    assert!(!index.entries.contains_key("doc1"));
+    assert!(index.entries.contains_key("doc2"));
+}
+
+#[tokio::test]
+async fn view_engine_resets_after_database_recreated() {
+    // F52: a destroyed and recreated database starts its sequence again.
+    let db = Database::memory("test");
+    for i in 0..5 {
+        db.put(&format!("old{i}"), serde_json::json!({"val": i}))
+            .await
+            .unwrap();
+    }
+    let mut engine = engine_by_val();
+    engine
+        .update_index(db.adapter(), "app", "by_val")
+        .await
+        .unwrap();
+
+    db.destroy().await.unwrap();
+    db.put("new", serde_json::json!({"val": 42})).await.unwrap();
+    engine
+        .update_index(db.adapter(), "app", "by_val")
+        .await
+        .unwrap();
+    let index = engine.get_index("app", "by_val").unwrap();
+    assert_eq!(index.entries.keys().collect::<Vec<_>>(), vec!["new"]);
+
+    // Recreated again with more updates than the index has seen.
+    db.destroy().await.unwrap();
+    for i in 0..8 {
+        db.put(&format!("n{i}"), serde_json::json!({"val": i}))
+            .await
+            .unwrap();
+    }
+    engine
+        .update_index(db.adapter(), "app", "by_val")
+        .await
+        .unwrap();
+    let index = engine.get_index("app", "by_val").unwrap();
+    assert_eq!(index.entries.len(), 8);
+    assert!(index.entries.keys().all(|k| k.starts_with('n')));
+}
+
+#[tokio::test]
+async fn view_engine_query_uses_the_index() {
+    // F56: ViewEngine can be queried with the same options as query_view.
+    let db = Database::memory("test");
+    for (id, val) in [("a", 3), ("b", 1), ("c", 2)] {
+        db.put(id, serde_json::json!({"val": val})).await.unwrap();
+    }
+    let mut engine = engine_by_val();
+
+    let result = engine
+        .query(
+            db.adapter(),
+            "app",
+            "by_val",
+            None,
+            ViewQueryOptions {
+                start_key: Some(serde_json::json!(2)),
+                include_docs: true,
+                ..ViewQueryOptions::new()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.total_rows, 3);
+    assert_eq!(result.offset, 1);
+    let ids: Vec<_> = result.rows.iter().map(|r| r.id.clone().unwrap()).collect();
+    assert_eq!(ids, ["c", "a"]);
+    assert_eq!(result.rows[0].doc.as_ref().unwrap()["val"], 2);
+
+    let result = engine
+        .query(
+            db.adapter(),
+            "app",
+            "by_val",
+            Some(&ReduceFn::Sum),
+            ViewQueryOptions::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows[0].value, serde_json::json!(3));
+}
+
+#[tokio::test]
+async fn view_engine_query_honors_stale() {
+    // F56: stale=ok serves the index as it is; update_after refreshes it
+    // after answering; the default brings it up to date first.
+    let db = Database::memory("test");
+    db.put("a", serde_json::json!({"val": 1})).await.unwrap();
+    let mut engine = engine_by_val();
+    let count = |r: &rouchdb::ViewResult| r.rows.len();
+
+    let r = engine
+        .query(db.adapter(), "app", "by_val", None, ViewQueryOptions::new())
+        .await
+        .unwrap();
+    assert_eq!(count(&r), 1);
+
+    db.put("b", serde_json::json!({"val": 2})).await.unwrap();
+    let stale = |stale| ViewQueryOptions {
+        stale,
+        ..ViewQueryOptions::new()
+    };
+    let r = engine
+        .query(
+            db.adapter(),
+            "app",
+            "by_val",
+            None,
+            stale(rouchdb::StaleOption::Ok),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count(&r), 1);
+    let r = engine
+        .query(
+            db.adapter(),
+            "app",
+            "by_val",
+            None,
+            stale(rouchdb::StaleOption::UpdateAfter),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count(&r), 1);
+    let r = engine
+        .query(
+            db.adapter(),
+            "app",
+            "by_val",
+            None,
+            stale(rouchdb::StaleOption::Ok),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count(&r), 2);
+
+    db.put("c", serde_json::json!({"val": 3})).await.unwrap();
+    let r = engine
+        .query(db.adapter(), "app", "by_val", None, ViewQueryOptions::new())
+        .await
+        .unwrap();
+    assert_eq!(count(&r), 3);
+}
+
+#[tokio::test]
+async fn destroy_clears_mango_indexes() {
+    // F56: destroying the database also drops its Mango indexes.
+    let db = Database::memory("test");
+    db.put("a", serde_json::json!({"age": 1})).await.unwrap();
+    db.create_index(rouchdb::IndexDefinition {
+        name: "by-age".into(),
+        fields: vec![rouchdb::SortField::Simple("age".into())],
+        ddoc: None,
+    })
+    .await
+    .unwrap();
+    db.destroy().await.unwrap();
+    assert!(db.get_indexes().await.is_empty());
+    let plan = db
+        .explain(rouchdb::FindOptions {
+            selector: serde_json::json!({"age": 1}),
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(plan.index.name, "_all_docs");
+}
+
+#[tokio::test]
+async fn design_document_roundtrip_keeps_unmodeled_fields() {
+    // F55: get_design + put_design must not drop what DesignDocument does
+    // not model (views.lib, Mango index views, options, custom fields).
+    let db = Database::memory("test");
+    let raw = serde_json::json!({
+        "language": "javascript",
+        "views": {
+            "lib": {"util": "exports.x = 1;"},
+            "by_type": {"map": "function(doc){ emit(doc.type); }", "options": {"collation": "raw"}},
+            "mango-idx": {"map": {"fields": {"age": "asc"}}, "reduce": "_count", "options": {"def": {"fields": ["age"]}}}
+        },
+        "options": {"partitioned": false},
+        "autoupdate": false,
+        "custom": {"anything": [1, 2]}
+    });
+    db.put("_design/app", raw.clone()).await.unwrap();
+
+    let mut ddoc = db.get_design("app").await.unwrap();
+    ddoc.views.insert(
+        "all".into(),
+        ViewDef {
+            map: "function(doc){ emit(doc._id); }".into(),
+            reduce: None,
+        },
+    );
+    db.put_design(ddoc).await.unwrap();
+
+    let stored = db.get("_design/app").await.unwrap().data;
+    assert_eq!(stored["views"]["lib"], raw["views"]["lib"]);
+    assert_eq!(stored["views"]["mango-idx"], raw["views"]["mango-idx"]);
+    assert_eq!(
+        stored["views"]["by_type"]["options"],
+        raw["views"]["by_type"]["options"]
+    );
+    assert!(stored["views"]["all"]["map"].is_string());
+    assert_eq!(stored["options"], raw["options"]);
+    assert_eq!(stored["autoupdate"], raw["autoupdate"]);
+    assert_eq!(stored["custom"], raw["custom"]);
+
+    // A view removed through the struct is really removed.
+    let mut ddoc = db.get_design("app").await.unwrap();
+    ddoc.views.remove("by_type");
+    db.put_design(ddoc).await.unwrap();
+    let stored = db.get("_design/app").await.unwrap().data;
+    assert!(stored["views"].get("by_type").is_none());
+    assert_eq!(stored["views"]["lib"], raw["views"]["lib"]);
+}
+
+struct DropEverything;
+
+#[async_trait::async_trait]
+impl rouchdb::Plugin for DropEverything {
+    fn name(&self) -> &str {
+        "drop-everything"
+    }
+    async fn before_write(&self, docs: &mut Vec<rouchdb::Document>) -> rouchdb::Result<()> {
+        docs.clear();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn put_design_does_not_panic_when_a_plugin_drops_it() {
+    // F107: results.remove(0) panicked on an empty result list.
+    let db = Database::memory("test").with_plugin(std::sync::Arc::new(DropEverything));
+    let ddoc = DesignDocument {
+        id: "_design/app".into(),
+        rev: None,
+        views: HashMap::new(),
+        filters: HashMap::new(),
+        validate_doc_update: None,
+        shows: HashMap::new(),
+        lists: HashMap::new(),
+        updates: HashMap::new(),
+        language: None,
+    };
+    assert!(db.put_design(ddoc).await.is_err());
+}

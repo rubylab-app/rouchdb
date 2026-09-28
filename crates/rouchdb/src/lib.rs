@@ -691,11 +691,29 @@ impl Database {
     // -----------------------------------------------------------------
 
     /// Store a design document.
+    ///
+    /// `DesignDocument` only models JavaScript views and a few fields. When
+    /// updating (`ddoc.rev` is set), everything else in the revision being
+    /// replaced (`views.lib`, Mango index views, view and ddoc `options`,
+    /// custom fields) is carried over, so a `get_design` + `put_design`
+    /// round trip does not drop it.
     pub async fn put_design(&self, ddoc: DesignDocument) -> Result<DocResult> {
-        let json = ddoc.to_json();
+        let mut json = ddoc.to_json();
+        if let Some(ref rev) = ddoc.rev {
+            let opts = GetOptions {
+                rev: Some(rev.clone()),
+                ..Default::default()
+            };
+            match self.adapter.get(&ddoc.id, opts).await {
+                Ok(parent) => keep_unmodeled_design_fields(&mut json, &parent.to_json()),
+                // A missing or stale revision is reported by the write.
+                Err(RouchError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
         let doc = Document::from_json(json)?;
-        let mut results = self.bulk_docs(vec![doc], BulkDocsOptions::new()).await?;
-        Ok(results.remove(0))
+        let results = self.bulk_docs(vec![doc], BulkDocsOptions::new()).await?;
+        first_result(results)
     }
 
     /// Retrieve a design document by name.
@@ -723,12 +741,11 @@ impl Database {
 
     /// Remove orphaned view indexes.
     ///
-    /// Scans all design documents and removes any cached indexes
-    /// that no longer have a corresponding design document view.
+    /// This is a no-op: a `Database` keeps no view indexes (persistent views
+    /// live in a `ViewEngine`, which drops unused ones with
+    /// `ViewEngine::remove_indexes_not_in`, and Mango indexes are removed
+    /// with `delete_index`). It exists for PouchDB API compatibility.
     pub async fn view_cleanup(&self) -> Result<()> {
-        // This is a no-op in the base implementation since we don't
-        // store persistent view indexes in the Database struct itself.
-        // The ViewEngine handles its own cleanup.
         Ok(())
     }
 
@@ -820,12 +837,14 @@ impl Database {
         self.adapter.compact().await
     }
 
-    /// Destroy the database and all its data.
+    /// Destroy the database and all its data, including its Mango indexes.
     pub async fn destroy(&self) -> Result<()> {
         for plugin in &self.plugins {
             plugin.on_destroy().await?;
         }
-        self.adapter.destroy().await
+        self.adapter.destroy().await?;
+        self.indexes.write().await.clear();
+        Ok(())
     }
 
     /// Permanently remove document revisions.
@@ -940,6 +959,60 @@ impl Partition<'_> {
             format!("{}:{}", self.name, id)
         };
         self.db.put(&full_id, data).await
+    }
+}
+
+/// Fields of a design document that `DesignDocument` models.
+const MODELED_DESIGN_FIELDS: [&str; 9] = [
+    "_id",
+    "_rev",
+    "views",
+    "filters",
+    "validate_doc_update",
+    "shows",
+    "lists",
+    "updates",
+    "language",
+];
+
+/// Copy into `new` (a serialized `DesignDocument`) what `DesignDocument`
+/// cannot represent from the `parent` revision: unknown top-level fields,
+/// views it skips (`lib`, Mango indexes with a non-string `map`) and extra
+/// fields of view definitions (such as `options`).
+fn keep_unmodeled_design_fields(new: &mut serde_json::Value, parent: &serde_json::Value) {
+    let (Some(new), Some(parent)) = (new.as_object_mut(), parent.as_object()) else {
+        return;
+    };
+    for (key, value) in parent {
+        if !key.starts_with('_') && !MODELED_DESIGN_FIELDS.contains(&key.as_str()) {
+            new.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+
+    let Some(parent_views) = parent.get("views").and_then(|v| v.as_object()) else {
+        return;
+    };
+    let views = new.entry("views").or_insert_with(|| serde_json::json!({}));
+    let Some(views) = views.as_object_mut() else {
+        return;
+    };
+    for (name, def) in parent_views {
+        let modeled = name != "lib" && def.get("map").is_some_and(|m| m.is_string());
+        match views.get_mut(name) {
+            // Extra fields of a view that is still defined.
+            Some(serde_json::Value::Object(view)) if modeled => {
+                for (field, value) in def.as_object().into_iter().flatten() {
+                    if field != "map" && field != "reduce" {
+                        view.entry(field.clone()).or_insert_with(|| value.clone());
+                    }
+                }
+            }
+            // A view removed through the struct stays removed.
+            _ if modeled => {}
+            _ => {
+                views.entry(name.clone()).or_insert_with(|| def.clone());
+            }
+        }
     }
 }
 

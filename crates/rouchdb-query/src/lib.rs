@@ -17,5 +17,5 @@ pub use mango::{
 };
 pub use mapreduce::{
     EmittedRow, ReduceFn, StaleOption, ViewQueryOptions, ViewResult, ViewRow, attach_docs,
-    query_emitted, query_view,
+    query_emitted, query_sorted, query_view, sort_emitted,
 };

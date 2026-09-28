@@ -177,10 +177,23 @@ pub fn query_emitted(
     reduce_fn: Option<&ReduceFn>,
     opts: &ViewQueryOptions,
 ) -> Result<ViewResult> {
-    let reduce = reducer(reduce_fn, opts)?;
+    sort_emitted(&mut rows);
+    query_sorted(&rows, reduce_fn, opts)
+}
 
-    // Sort by key using CouchDB collation, then by doc id
+/// Sort emitted rows in view order: by key (CouchDB collation), then doc id.
+pub fn sort_emitted(rows: &mut [EmittedRow]) {
     rows.sort_by(|a, b| collate(&a.key, &b.key).then_with(|| a.id.cmp(&b.id)));
+}
+
+/// Like [`query_emitted`], for rows already in view order (see
+/// [`sort_emitted`]); only the selected rows are copied.
+pub fn query_sorted(
+    rows: &[EmittedRow],
+    reduce_fn: Option<&ReduceFn>,
+    opts: &ViewQueryOptions,
+) -> Result<ViewResult> {
+    let reduce = reducer(reduce_fn, opts)?;
     let total = rows.len();
 
     // Grouping level: group_level overrides group, and 0 means no grouping.
@@ -191,7 +204,7 @@ pub fn query_emitted(
             // One reduced row per requested key.
             let mut groups = Vec::new();
             for key in keys {
-                let (lo, hi) = equal_range(&rows, key);
+                let (lo, hi) = equal_range(rows, key);
                 if lo < hi {
                     groups.extend(group_reduce(&rows[lo..hi], reduce, opts.group_level)?);
                 }
@@ -201,13 +214,14 @@ pub fn query_emitted(
             }
             groups
         } else {
-            let (lo, hi) = range_bounds(&rows, opts);
-            let mut selected: Vec<EmittedRow> = rows.drain(lo..hi).collect();
-            if opts.descending {
-                selected.reverse();
-            }
+            let (lo, hi) = range_bounds(rows, opts);
+            let selected = &rows[lo..hi];
             if grouped {
-                group_reduce(&selected, reduce, opts.group_level)?
+                let mut groups = group_reduce(selected, reduce, opts.group_level)?;
+                if opts.descending {
+                    groups.reverse();
+                }
+                groups
             } else if selected.is_empty() {
                 // An empty reduce yields no rows (CouchDB returns {"rows":[]}),
                 // not a spurious zero row.
@@ -216,7 +230,7 @@ pub fn query_emitted(
                 vec![ViewRow {
                     id: None,
                     key: Value::Null,
-                    value: apply_reduce(reduce, &selected)?,
+                    value: apply_reduce(reduce, selected)?,
                     doc: None,
                 }]
             }
@@ -237,43 +251,47 @@ pub fn query_emitted(
         });
     }
 
-    // Select rows (in query order) and the position of the first one in the
-    // view, which CouchDB reports as the offset.
-    let (selected, first_position) = if let Some(ref keys) = opts.keys {
-        let mut indexes: Vec<usize> = Vec::new();
+    // Select the page of rows (in query order) and the position of the first
+    // selected row in the view, which CouchDB reports as the offset. Only the
+    // returned rows are copied.
+    let skip = opts.skip as usize;
+    let limit = opts.limit.map_or(usize::MAX, |l| l as usize);
+    let (page, first_position): (Vec<&EmittedRow>, usize) = if let Some(ref keys) = opts.keys {
+        let mut positions: Vec<usize> = Vec::new();
         for key in keys {
-            let (lo, hi) = equal_range(&rows, key);
-            indexes.extend(lo..hi);
+            let (lo, hi) = equal_range(rows, key);
+            positions.extend(lo..hi);
         }
         if opts.descending {
-            indexes.reverse();
+            positions.reverse();
         }
-        let first = indexes
+        let first = positions
             .first()
             .map_or(total, |&i| if opts.descending { total - 1 - i } else { i });
-        let selected: Vec<EmittedRow> = indexes.into_iter().map(|i| rows[i].clone()).collect();
-        (selected, first)
+        let page = positions
+            .into_iter()
+            .skip(skip)
+            .take(limit)
+            .map(|i| &rows[i])
+            .collect();
+        (page, first)
     } else {
-        let (lo, hi) = range_bounds(&rows, opts);
-        let mut selected: Vec<EmittedRow> = rows.drain(lo..hi).collect();
+        let (lo, hi) = range_bounds(rows, opts);
+        let selected = &rows[lo..hi];
         if opts.descending {
-            selected.reverse();
-            (selected, total - hi)
+            let page = selected.iter().rev().skip(skip).take(limit).collect();
+            (page, total - hi)
         } else {
-            (selected, lo)
+            (selected.iter().skip(skip).take(limit).collect(), lo)
         }
     };
 
-    // Apply skip and limit
-    let skip = opts.skip as usize;
-    let rows: Vec<ViewRow> = selected
+    let rows: Vec<ViewRow> = page
         .into_iter()
-        .skip(skip)
-        .take(opts.limit.unwrap_or(u64::MAX) as usize)
         .map(|r| ViewRow {
-            id: Some(r.id),
-            key: r.key,
-            value: r.value,
+            id: Some(r.id.clone()),
+            key: r.key.clone(),
+            value: r.value.clone(),
             doc: None,
         })
         .collect();
