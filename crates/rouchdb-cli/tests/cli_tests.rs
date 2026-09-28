@@ -1616,6 +1616,52 @@ fn write_commands_create_missing_file() {
     assert!(post_path.exists());
 }
 
+// ─── USAGE ERRORS ───────────────────────────────────────────────────────────
+
+#[test]
+fn usage_errors_exit_2_with_empty_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.redb");
+    let p = path_str(&path);
+
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        (vec![], "Usage: rouchdb [OPTIONS] <COMMAND>"),
+        (
+            vec!["frobnicate"],
+            "error: unrecognized subcommand 'frobnicate'",
+        ),
+        (
+            vec!["info"],
+            "error: the following required arguments were not provided:\n  <PATH>",
+        ),
+        (
+            vec!["info", p, "--bogus"],
+            "error: unexpected argument '--bogus' found",
+        ),
+        (vec!["find", p], "\n  --selector <SELECTOR>\n"),
+        (vec!["delete", p, "doc1"], "\n  --rev <REV>\n"),
+        (vec!["put", p, "doc1"], "\n  <BODY>\n"),
+        (vec!["replicate", p], "\n  <TARGET>\n"),
+        (
+            vec!["all-docs", p, "--limit", "many"],
+            "error: invalid value 'many' for '--limit <LIMIT>'",
+        ),
+    ];
+    for (args, message) in cases {
+        let output = run(&args);
+        let stderr = stderr_str(&output);
+        assert_eq!(output.status.code(), Some(2), "{:?}: {}", args, stderr);
+        assert!(
+            output.stdout.is_empty(),
+            "{:?} wrote to stdout: {}",
+            args,
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(stderr.contains(message), "{:?}: {}", args, stderr);
+        assert!(!path.exists(), "{:?} created the database file", args);
+    }
+}
+
 // ─── PUT / POST / DELETE ────────────────────────────────────────────────────
 
 #[tokio::test]
