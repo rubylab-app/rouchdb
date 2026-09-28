@@ -30,6 +30,7 @@ futures-util = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 http-body-util = "0.1"
+rouchdb-replication = { path = "../rouchdb-replication" }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
