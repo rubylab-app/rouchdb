@@ -1228,6 +1228,7 @@ dependencies = [
  "rouchdb-core",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1236,7 +1237,6 @@ version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64",
- "md-5",
  "rouchdb-core",
  "serde_json",
  "tokio",
@@ -1249,7 +1249,6 @@ version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64",
- "md-5",
  "redb",
  "rouchdb-core",
  "serde",
@@ -1263,8 +1262,10 @@ dependencies = [
 name = "rouchdb-changes"
 version = "0.4.0"
 dependencies = [
+ "async-trait",
  "rouchdb-adapter-memory",
  "rouchdb-core",
+ "rouchdb-query",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -1290,6 +1291,7 @@ version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64",
+ "md-5",
  "serde",
  "serde_json",
  "thiserror",
