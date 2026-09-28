@@ -86,6 +86,10 @@ pub fn build_routes(state: AppState) -> Router {
             "/{db}/_index/{ddoc}/{itype}/{name}",
             delete(query::delete_index),
         )
+        .route(
+            "/{db}/_index/_design/{ddoc}/{itype}/{name}",
+            delete(query::delete_index),
+        )
         .route("/{db}/_explain", post(query::explain))
         .route("/{db}/_compact", post(compact::compact))
         // Replication protocol

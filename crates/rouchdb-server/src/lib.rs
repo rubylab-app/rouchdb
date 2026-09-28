@@ -13,6 +13,7 @@ use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 
 pub use crate::auth::AdminCredentials;
 use crate::auth::Auth;
+pub use crate::routes::query::restore_indexes;
 use crate::state::AppState;
 
 /// Configuration for the RouchDB HTTP server.
@@ -147,6 +148,10 @@ fn is_loopback(host: &str) -> bool {
 
 /// Start the HTTP server and block until shutdown.
 pub async fn start_server(db: Arc<Database>, config: ServerConfig) -> std::io::Result<()> {
+    // Mango indexes live in memory; rebuild them from their design documents.
+    if let Err(e) = restore_indexes(&db).await {
+        eprintln!("WARNING: could not rebuild Mango indexes: {e}");
+    }
     let router = build_router(db, &config);
 
     let addr = format!("{}:{}", config.host, config.port);
