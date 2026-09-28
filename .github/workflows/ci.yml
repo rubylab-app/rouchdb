@@ -146,7 +146,7 @@ jobs:
           fi
 
   bench:
-    name: Benchmarks (build only)
+    name: Benchmarks (build + smoke run)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -156,9 +156,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Running them is manual: see the Benchmarks workflow (bench.yml).
       - name: Build benchmarks
         run: cargo bench --workspace --locked --no-run
+
+      # Criterion's --test mode runs every benchmark once, on a small
+      # dataset: it executes the benches' own assertions (results, query
+      # plans) but measures nothing. Measuring is manual: see bench.yml.
+      # --workspace plus the bench names reuses the build above.
+      - name: Smoke-run benchmarks
+        env:
+          ROUCHDB_BENCH_N: "1000"
+        run: cargo bench --workspace --locked --bench core_ops --bench revtree -- --test
 
   msrv:
     name: MSRV (1.88)

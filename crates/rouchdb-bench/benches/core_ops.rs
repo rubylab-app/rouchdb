@@ -206,6 +206,20 @@ fn bench_find(c: &mut Criterion) {
             };
             let scanned = rt.block_on(fx.db.find(opts.clone())).expect("find").docs;
             assert!(!scanned.is_empty(), "find/{name} matched nothing");
+            // Check the query plans, so that no_index really scans and
+            // with_index really uses the index.
+            let plan = rt.block_on(fx.db.explain(opts.clone()));
+            assert_eq!(plan.index.name, "_all_docs", "find/{name}/no_index plan");
+            let plan = rt.block_on(indexed.explain(opts.clone()));
+            let expected = if index_applies {
+                "idx-group"
+            } else {
+                "_all_docs"
+            };
+            assert_eq!(
+                plan.index.name, expected,
+                "find/{name} plan on the indexed handle"
+            );
             g.bench_function(BenchmarkId::new(format!("{name}/no_index"), n), |b| {
                 b.iter(|| rt.block_on(fx.db.find(opts.clone())).expect("find"))
             });
