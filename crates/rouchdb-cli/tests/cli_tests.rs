@@ -591,6 +591,69 @@ async fn compact_nonexistent_fails() {
         .stderr(predicate::str::contains("Error"));
 }
 
+// ─── MISSING DATABASE FILES ─────────────────────────────────────────────────
+
+#[test]
+fn read_commands_on_missing_file_fail_without_creating_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("prod.rdb");
+    let p = path_str(&missing);
+
+    let cases: Vec<Vec<&str>> = vec![
+        vec!["info", p],
+        vec!["get", p, "doc1"],
+        vec!["all-docs", p],
+        vec!["find", p, "--selector", "{}"],
+        vec!["changes", p],
+        vec!["dump", p],
+        vec!["compact", p],
+        vec!["delete", p, "doc1", "--rev", "1-abc"],
+    ];
+    for args in cases {
+        let output = run(&args);
+        assert!(
+            !output.status.success(),
+            "{:?} must fail on a missing file, stdout: {}",
+            args,
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            stderr_str(&output).contains("does not exist"),
+            "{:?} stderr: {}",
+            args,
+            stderr_str(&output)
+        );
+        assert!(!missing.exists(), "{:?} must not create the file", args);
+    }
+}
+
+#[tokio::test]
+async fn replicate_from_missing_redb_source_fails_without_creating_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.redb");
+    let target = dir.path().join("target.redb");
+
+    let output = run(&["replicate", path_str(&missing), path_str(&target)]);
+    assert!(!output.status.success());
+    assert!(stderr_str(&output).contains("does not exist"));
+    assert!(!missing.exists());
+}
+
+#[test]
+fn write_commands_create_missing_file() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let put_path = dir.path().join("put.redb");
+    let output = run(&["put", path_str(&put_path), "doc1", r#"{"x":1}"#]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert!(put_path.exists());
+
+    let post_path = dir.path().join("post.redb");
+    let output = run(&["post", path_str(&post_path), r#"{"x":1}"#]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert!(post_path.exists());
+}
+
 // ─── PUT / POST / DELETE ────────────────────────────────────────────────────
 
 #[tokio::test]

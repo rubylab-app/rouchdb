@@ -128,7 +128,7 @@ enum Commands {
 
     /// Replicate between a redb file and CouchDB (or two redb files)
     Replicate {
-        /// Source: path to .redb file or CouchDB URL
+        /// Source: path to an existing .redb file or CouchDB URL
         source: String,
         /// Target: path to .redb file or CouchDB URL
         target: String,
@@ -229,9 +229,22 @@ fn open_db(path: &str, name: Option<&str>) -> Database {
     }
 }
 
-fn open_source_or_target(path_or_url: &str, name: Option<&str>) -> Database {
+/// Open a database file that must already exist. Commands that only read (or
+/// modify existing docs) use this so a mistyped path fails instead of
+/// silently creating an empty database.
+fn open_existing_db(path: &str, name: Option<&str>) -> Database {
+    if !std::path::Path::new(path).exists() {
+        eprintln!("Error: database file '{}' does not exist", path);
+        process::exit(1);
+    }
+    open_db(path, name)
+}
+
+fn open_source_or_target(path_or_url: &str, name: Option<&str>, must_exist: bool) -> Database {
     if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
         Database::http(path_or_url)
+    } else if must_exist {
+        open_existing_db(path_or_url, name)
     } else {
         open_db(path_or_url, name)
     }
@@ -289,7 +302,7 @@ async fn main() {
 async fn run(cli: Cli) -> rouchdb::Result<()> {
     match cli.command {
         Commands::Info { path, db_name } => {
-            let db = open_db(&path, db_name.as_deref());
+            let db = open_existing_db(&path, db_name.as_deref());
             let info = db.info().await?;
             print_json(&serde_json::to_value(&info).unwrap(), cli.pretty);
         }
@@ -301,7 +314,7 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
             conflicts,
             db_name,
         } => {
-            let db = open_db(&path, db_name.as_deref());
+            let db = open_existing_db(&path, db_name.as_deref());
             let doc = db
                 .get_with_opts(
                     &doc_id,
@@ -325,7 +338,7 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
             descending,
             db_name,
         } => {
-            let db = open_db(&path, db_name.as_deref());
+            let db = open_existing_db(&path, db_name.as_deref());
             let response = db
                 .all_docs(AllDocsOptions {
                     include_docs,
@@ -350,7 +363,7 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
             skip,
             db_name,
         } => {
-            let db = open_db(&path, db_name.as_deref());
+            let db = open_existing_db(&path, db_name.as_deref());
             let selector: serde_json::Value = serde_json::from_str(&selector).map_err(|e| {
                 rouchdb::RouchError::BadRequest(format!("invalid selector JSON: {}", e))
             })?;
@@ -391,7 +404,7 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
             descending,
             db_name,
         } => {
-            let db = open_db(&path, db_name.as_deref());
+            let db = open_existing_db(&path, db_name.as_deref());
             let response = db
                 .changes(ChangesOptions {
                     since: since.into(),
@@ -405,7 +418,7 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
         }
 
         Commands::Dump { path, db_name } => {
-            let db = open_db(&path, db_name.as_deref());
+            let db = open_existing_db(&path, db_name.as_deref());
             let all = db
                 .all_docs(AllDocsOptions {
                     include_docs: true,
@@ -426,8 +439,8 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
             source_name,
             target_name,
         } => {
-            let source_db = open_source_or_target(&source, source_name.as_deref());
-            let target_db = open_source_or_target(&target, target_name.as_deref());
+            let source_db = open_source_or_target(&source, source_name.as_deref(), true);
+            let target_db = open_source_or_target(&target, target_name.as_deref(), false);
 
             let selector_value = selector
                 .map(|s| {
@@ -455,7 +468,7 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
         }
 
         Commands::Compact { path, db_name } => {
-            let db = open_db(&path, db_name.as_deref());
+            let db = open_existing_db(&path, db_name.as_deref());
             db.compact().await?;
             print_json(&serde_json::json!({"ok": true}), cli.pretty);
         }
@@ -510,7 +523,7 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
             rev,
             db_name,
         } => {
-            let db = open_db(&path, db_name.as_deref());
+            let db = open_existing_db(&path, db_name.as_deref());
             let result = db.remove(&doc_id, &rev).await?;
             check_doc_result(&result)?;
             print_json(
