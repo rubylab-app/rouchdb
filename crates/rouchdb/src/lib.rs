@@ -54,9 +54,9 @@ pub use rouchdb_changes::{
     LiveChangesStream, live_changes, live_changes_events,
 };
 pub use rouchdb_query::{
-    BuiltIndex, CreateIndexResponse, ExplainIndex, ExplainResponse, FindOptions, FindResponse,
-    IndexDefinition, IndexFields, IndexInfo, ReduceFn, SortField, StaleOption, ViewQueryOptions,
-    ViewResult, build_index, find, matches_selector, query_view,
+    BuiltIndex, CompiledSelector, CreateIndexResponse, ExplainIndex, ExplainResponse, FindOptions,
+    FindResponse, IndexDefinition, IndexFields, IndexInfo, ReduceFn, SortField, StaleOption,
+    ViewQueryOptions, ViewResult, build_index, find, find_in_docs, matches_selector, query_view,
 };
 pub use rouchdb_views::{DesignDocument, PersistentViewIndex, ViewDef, ViewEngine};
 
@@ -91,8 +91,35 @@ pub trait Plugin: Send + Sync {
 /// Provides a user-friendly API similar to PouchDB's JavaScript interface.
 pub struct Database {
     adapter: Arc<dyn Adapter>,
-    indexes: Arc<RwLock<HashMap<String, BuiltIndex>>>,
+    indexes: Arc<RwLock<HashMap<String, MangoIndex>>>,
     plugins: Vec<Arc<dyn Plugin>>,
+}
+
+/// A Mango index kept up to date from the changes feed.
+struct MangoIndex {
+    built: BuiltIndex,
+    /// Sequence of the last change applied to the index.
+    last_seq: Seq,
+}
+
+/// Name of an index whose first field the selector constrains (the one
+/// with the smallest name if several are usable).
+fn usable_index(
+    indexes: &HashMap<String, MangoIndex>,
+    selector: &serde_json::Value,
+) -> Option<String> {
+    indexes
+        .iter()
+        .filter(|(_, index)| {
+            index.built.def.fields.first().is_some_and(|first| {
+                first
+                    .try_field_and_direction()
+                    .is_ok_and(|(field, _)| selector.get(field).is_some())
+            })
+        })
+        .map(|(name, _)| name)
+        .min()
+        .cloned()
 }
 
 impl Database {
@@ -456,116 +483,80 @@ impl Database {
     ///
     /// If a matching index exists (created via `create_index()`), it will be
     /// used to avoid a full table scan. Otherwise falls back to scanning all
-    /// documents.
+    /// documents. The index is brought up to date incrementally from the
+    /// changes feed; invalid selectors or sort fields return `BadRequest`.
     pub async fn find(&self, opts: FindOptions) -> Result<FindResponse> {
-        // Check if we have a usable index
-        let mut indexes = self.indexes.write().await;
+        // Validate the query before doing any work.
+        CompiledSelector::new(&opts.selector)?;
+        for sort_field in opts.sort.iter().flatten() {
+            sort_field.try_field_and_direction()?;
+        }
 
-        // Find the name of a usable index (if any)
-        let usable_name = indexes
-            .iter()
-            .find(|(_, idx)| {
-                if idx.def.fields.is_empty() {
-                    return false;
-                }
-                let (first_field, _) = idx.def.fields[0].field_and_direction();
-                opts.selector.get(first_field).is_some()
+        let usable = usable_index(&*self.indexes.read().await, &opts.selector);
+        let candidate_ids = match usable {
+            Some(name) => self.index_candidates(&name, &opts.selector).await?,
+            None => None,
+        };
+        let Some(candidate_ids) = candidate_ids else {
+            // No usable index — full table scan
+            return find(self.adapter.as_ref(), opts).await;
+        };
+
+        // Fetch only the candidate docs
+        let all = self
+            .adapter
+            .all_docs(AllDocsOptions {
+                include_docs: true,
+                keys: Some(candidate_ids),
+                ..AllDocsOptions::new()
             })
-            .map(|(name, _)| name.clone());
+            .await?;
+        find_in_docs(all.rows.into_iter().filter_map(|row| row.doc), &opts)
+    }
 
-        if let Some(name) = usable_name {
-            // Rebuild the index lazily to pick up any document changes
-            let def = indexes[&name].def.clone();
-            let rebuilt = build_index(self.adapter.as_ref(), &def).await?;
-            indexes.insert(name.clone(), rebuilt);
-
-            let candidate_ids = indexes[&name].find_matching(&opts.selector);
-            drop(indexes);
-
-            // Fetch only the candidate docs
-            let all = self
+    /// Bring index `name` up to date with the changes feed and return the
+    /// ids of the documents that may match `selector`, or `None` if the index
+    /// no longer exists.
+    ///
+    /// Changes are read without holding the lock; the write lock is only
+    /// taken to apply them.
+    async fn index_candidates(
+        &self,
+        name: &str,
+        selector: &serde_json::Value,
+    ) -> Result<Option<Vec<String>>> {
+        loop {
+            let since = match self.indexes.read().await.get(name) {
+                Some(index) => index.last_seq.clone(),
+                None => return Ok(None),
+            };
+            let changes = self
                 .adapter
-                .all_docs(AllDocsOptions {
+                .changes(ChangesOptions {
+                    since: since.clone(),
                     include_docs: true,
-                    keys: Some(candidate_ids),
-                    ..AllDocsOptions::new()
+                    ..Default::default()
                 })
                 .await?;
 
-            let mut matched: Vec<serde_json::Value> = Vec::new();
-            for row in &all.rows {
-                if let Some(ref doc_json) = row.doc
-                    && matches_selector(doc_json, &opts.selector)
-                {
-                    matched.push(doc_json.clone());
-                }
+            if changes.results.is_empty() {
+                let indexes = self.indexes.read().await;
+                return Ok(indexes
+                    .get(name)
+                    .map(|index| index.built.find_matching(selector)));
             }
 
-            // Sort
-            if let Some(ref sort_fields) = opts.sort {
-                matched.sort_by(|a, b| {
-                    use rouchdb_core::collation::collate;
-                    use rouchdb_query::SortDirection;
-                    for sf in sort_fields {
-                        let (field, direction) = sf.field_and_direction();
-                        // Resolve dotted/nested paths (e.g. "address.city")
-                        // identically to the full-scan path in mango::find.
-                        let va = rouchdb_query::get_nested_field(a, field)
-                            .unwrap_or(&serde_json::Value::Null);
-                        let vb = rouchdb_query::get_nested_field(b, field)
-                            .unwrap_or(&serde_json::Value::Null);
-                        let cmp = collate(va, vb);
-                        let cmp = if direction == SortDirection::Desc {
-                            cmp.reverse()
-                        } else {
-                            cmp
-                        };
-                        if cmp != std::cmp::Ordering::Equal {
-                            return cmp;
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
+            let mut indexes = self.indexes.write().await;
+            let Some(index) = indexes.get_mut(name) else {
+                return Ok(None);
+            };
+            // Another query applied changes meanwhile: catch up from there.
+            if index.last_seq != since {
+                continue;
             }
-
-            // Skip
-            if let Some(skip) = opts.skip {
-                matched = matched.into_iter().skip(skip as usize).collect();
-            }
-
-            // Limit
-            if let Some(limit) = opts.limit {
-                matched.truncate(limit as usize);
-            }
-
-            // Field projection
-            if let Some(ref fields) = opts.fields {
-                matched = matched
-                    .into_iter()
-                    .map(|doc| {
-                        let mut result = serde_json::Map::new();
-                        if let serde_json::Value::Object(map) = &doc {
-                            for field in fields {
-                                if let Some(val) = map.get(field) {
-                                    result.insert(field.clone(), val.clone());
-                                }
-                            }
-                            if let Some(id) = map.get("_id") {
-                                result
-                                    .entry("_id".to_string())
-                                    .or_insert_with(|| id.clone());
-                            }
-                        }
-                        serde_json::Value::Object(result)
-                    })
-                    .collect();
-            }
-
-            Ok(FindResponse { docs: matched })
-        } else {
-            drop(indexes);
-            // No usable index — full table scan
-            find(self.adapter.as_ref(), opts).await
+            index.built.apply_changes(&changes.results);
+            index.last_seq = changes.last_seq;
+            return Ok(Some(index.built.find_matching(selector)));
         }
     }
 
@@ -576,8 +567,12 @@ impl Database {
     /// Create a Mango index for faster queries.
     ///
     /// Equivalent to PouchDB's `db.createIndex()`. Builds the index
-    /// immediately by scanning all documents.
+    /// immediately by scanning all documents; later finds keep it up to date
+    /// from the changes feed.
     pub async fn create_index(&self, def: IndexDefinition) -> Result<CreateIndexResponse> {
+        for sort_field in &def.fields {
+            sort_field.try_field_and_direction()?;
+        }
         let name = if def.name.is_empty() {
             // Auto-generate name from fields
             let field_names: Vec<&str> = def
@@ -593,12 +588,12 @@ impl Database {
             def.name.clone()
         };
 
-        let mut indexes = self.indexes.write().await;
-        if indexes.contains_key(&name) {
-            return Ok(CreateIndexResponse {
-                result: "exists".to_string(),
-                name,
-            });
+        let exists = || CreateIndexResponse {
+            result: "exists".to_string(),
+            name: name.clone(),
+        };
+        if self.indexes.read().await.contains_key(&name) {
+            return Ok(exists());
         }
 
         let index_def = IndexDefinition {
@@ -607,8 +602,32 @@ impl Database {
             ddoc: def.ddoc,
         };
 
-        let built = build_index(self.adapter.as_ref(), &index_def).await?;
-        indexes.insert(name.clone(), built);
+        // Build from the changes feed, so the index knows the sequence it is
+        // up to date with.
+        let changes = self
+            .adapter
+            .changes(ChangesOptions {
+                include_docs: true,
+                ..Default::default()
+            })
+            .await?;
+        let mut built = BuiltIndex {
+            def: index_def,
+            entries: Vec::new(),
+        };
+        built.apply_changes(&changes.results);
+
+        let mut indexes = self.indexes.write().await;
+        if indexes.contains_key(&name) {
+            return Ok(exists());
+        }
+        indexes.insert(
+            name.clone(),
+            MangoIndex {
+                built,
+                last_seq: changes.last_seq,
+            },
+        );
 
         Ok(CreateIndexResponse {
             result: "created".to_string(),
@@ -622,10 +641,10 @@ impl Database {
         let mut result: Vec<IndexInfo> = indexes
             .values()
             .map(|idx| IndexInfo {
-                name: idx.def.name.clone(),
-                ddoc: idx.def.ddoc.clone(),
+                name: idx.built.def.name.clone(),
+                ddoc: idx.built.def.ddoc.clone(),
                 def: IndexFields {
-                    fields: idx.def.fields.clone(),
+                    fields: idx.built.def.fields.clone(),
                 },
             })
             .collect();
@@ -637,27 +656,23 @@ impl Database {
     ///
     /// Returns which index would be used and the query plan.
     pub async fn explain(&self, opts: FindOptions) -> ExplainResponse {
-        let indexes = self.indexes.read().await;
-        let usable = indexes.values().find(|idx| {
-            if idx.def.fields.is_empty() {
-                return false;
-            }
-            let (first_field, _) = idx.def.fields[0].field_and_direction();
-            opts.selector.get(first_field).is_some()
-        });
+        let usable = {
+            let indexes = self.indexes.read().await;
+            usable_index(&indexes, &opts.selector)
+                .and_then(|name| indexes.get(&name))
+                .map(|index| index.built.def.clone())
+        };
 
         let dbname = self.info().await.map(|i| i.db_name).unwrap_or_default();
 
-        if let Some(index) = usable {
+        if let Some(def) = usable {
             ExplainResponse {
                 dbname,
                 index: ExplainIndex {
-                    ddoc: index.def.ddoc.clone(),
-                    name: index.def.name.clone(),
+                    ddoc: def.ddoc,
+                    name: def.name,
                     index_type: "json".into(),
-                    def: IndexFields {
-                        fields: index.def.fields.clone(),
-                    },
+                    def: IndexFields { fields: def.fields },
                 },
                 selector: opts.selector,
                 fields: opts.fields,
@@ -1636,5 +1651,253 @@ mod tests {
             .map(|d| d["address"]["city"].as_str().unwrap())
             .collect();
         assert_eq!(cities, vec!["Amsterdam", "Madrid", "Zurich"]);
+    }
+
+    /// Adapter wrapper that counts full `all_docs` scans.
+    struct CountingAdapter {
+        inner: MemoryAdapter,
+        full_scans: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Adapter for CountingAdapter {
+        async fn info(&self) -> Result<DbInfo> {
+            self.inner.info().await
+        }
+        async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
+            self.inner.get(id, opts).await
+        }
+        async fn bulk_docs(
+            &self,
+            docs: Vec<Document>,
+            opts: BulkDocsOptions,
+        ) -> Result<Vec<DocResult>> {
+            self.inner.bulk_docs(docs, opts).await
+        }
+        async fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
+            if opts.keys.is_none() && opts.key.is_none() {
+                self.full_scans
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.all_docs(opts).await
+        }
+        async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
+            self.inner.changes(opts).await
+        }
+        async fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
+            self.inner.revs_diff(revs).await
+        }
+        async fn bulk_get(&self, docs: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
+            self.inner.bulk_get(docs).await
+        }
+        async fn put_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            rev: &str,
+            data: Vec<u8>,
+            content_type: &str,
+        ) -> Result<DocResult> {
+            self.inner
+                .put_attachment(doc_id, att_id, rev, data, content_type)
+                .await
+        }
+        async fn get_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            opts: GetAttachmentOptions,
+        ) -> Result<Vec<u8>> {
+            self.inner.get_attachment(doc_id, att_id, opts).await
+        }
+        async fn remove_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            rev: &str,
+        ) -> Result<DocResult> {
+            self.inner.remove_attachment(doc_id, att_id, rev).await
+        }
+        async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
+            self.inner.get_local(id).await
+        }
+        async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
+            self.inner.put_local(id, doc).await
+        }
+        async fn remove_local(&self, id: &str) -> Result<()> {
+            self.inner.remove_local(id).await
+        }
+        async fn compact(&self) -> Result<()> {
+            self.inner.compact().await
+        }
+        async fn destroy(&self) -> Result<()> {
+            self.inner.destroy().await
+        }
+    }
+
+    #[tokio::test]
+    async fn indexed_find_updates_index_incrementally() {
+        // F47: an indexed find must not rebuild the index (a full scan of
+        // every document) on each query, and must still see every write.
+        let adapter = Arc::new(CountingAdapter {
+            inner: MemoryAdapter::new("test"),
+            full_scans: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let db = Database::from_adapter(adapter.clone());
+        for i in 0..20 {
+            db.put(&format!("d{i:02}"), serde_json::json!({"age": i}))
+                .await
+                .unwrap();
+        }
+        db.create_index(IndexDefinition {
+            name: String::new(),
+            fields: vec![SortField::Simple("age".into())],
+            ddoc: None,
+        })
+        .await
+        .unwrap();
+        let scans = || adapter.full_scans.load(std::sync::atomic::Ordering::SeqCst);
+        let before = scans();
+
+        let find = |selector: serde_json::Value| {
+            let db = &db;
+            async move {
+                let mut ids: Vec<String> = db
+                    .find(FindOptions {
+                        selector,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap()
+                    .docs
+                    .iter()
+                    .map(|d| d["_id"].as_str().unwrap().to_string())
+                    .collect();
+                ids.sort();
+                ids
+            }
+        };
+        assert_eq!(
+            find(serde_json::json!({"age": {"$gte": 18}})).await,
+            ["d18", "d19"]
+        );
+
+        // Writes after the index was built are picked up.
+        let rev = db.get("d19").await.unwrap().rev.unwrap().to_string();
+        db.update("d19", &rev, serde_json::json!({"age": 1}))
+            .await
+            .unwrap();
+        let rev = db.get("d18").await.unwrap().rev.unwrap().to_string();
+        db.remove("d18", &rev).await.unwrap();
+        db.put("new", serde_json::json!({"age": 50})).await.unwrap();
+        assert_eq!(
+            find(serde_json::json!({"age": {"$gte": 18}})).await,
+            ["new"]
+        );
+        assert_eq!(find(serde_json::json!({"age": 1})).await, ["d01", "d19"]);
+        assert_eq!(find(serde_json::json!({"age": {"$lt": 1}})).await, ["d00"]);
+
+        assert_eq!(
+            scans(),
+            before,
+            "indexed finds must not rescan every document"
+        );
+    }
+
+    #[tokio::test]
+    async fn indexed_find_matches_full_scan() {
+        // F47: the index only narrows candidates; results must be the same
+        // as a full scan for any selector touching the indexed field.
+        let db = Database::memory("test");
+        let values = [
+            serde_json::json!(null),
+            serde_json::json!(1),
+            serde_json::json!(2.5),
+            serde_json::json!(-3),
+            serde_json::json!("a"),
+            serde_json::json!("b"),
+            serde_json::json!([1, 2]),
+            serde_json::json!({"x": 1}),
+        ];
+        for (i, v) in values.iter().enumerate() {
+            db.put(&format!("v{i}"), serde_json::json!({"f": v, "g": i}))
+                .await
+                .unwrap();
+        }
+        db.put("missing", serde_json::json!({"g": 99}))
+            .await
+            .unwrap();
+        db.create_index(IndexDefinition {
+            name: "by-f".into(),
+            fields: vec![SortField::Simple("f".into())],
+            ddoc: None,
+        })
+        .await
+        .unwrap();
+
+        let mut selectors = vec![
+            serde_json::json!({"f": {"$exists": false}}),
+            serde_json::json!({"f": {"$ne": 1}}),
+            serde_json::json!({"f": {"$in": [1, "a"]}}),
+            serde_json::json!({"f": {"x": 1}}),
+            serde_json::json!({"f": {"$gt": 1, "$lt": "b"}}),
+            serde_json::json!({"f": {"$type": "array"}}),
+        ];
+        for v in &values {
+            for op in ["$eq", "$gt", "$gte", "$lt", "$lte"] {
+                selectors.push(serde_json::json!({"f": {op: v}}));
+            }
+            selectors.push(serde_json::json!({"f": v}));
+        }
+        for selector in selectors {
+            let opts = FindOptions {
+                selector: selector.clone(),
+                sort: Some(vec![SortField::Simple("g".into())]),
+                ..Default::default()
+            };
+            let indexed = db.find(opts.clone()).await.unwrap().docs;
+            let scanned = find(db.adapter(), opts).await.unwrap().docs;
+            assert_eq!(indexed, scanned, "{selector}");
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_indexed_finds_see_all_writes() {
+        let db = Arc::new(Database::memory("test"));
+        db.create_index(IndexDefinition {
+            name: String::new(),
+            fields: vec![SortField::Simple("n".into())],
+            ddoc: None,
+        })
+        .await
+        .unwrap();
+        let mut tasks = Vec::new();
+        for t in 0..4 {
+            let db = db.clone();
+            tasks.push(tokio::spawn(async move {
+                for i in 0..25 {
+                    db.put(&format!("t{t}-{i}"), serde_json::json!({"n": i}))
+                        .await
+                        .unwrap();
+                    db.find(FindOptions {
+                        selector: serde_json::json!({"n": {"$gte": 0}}),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let all = db
+            .find(FindOptions {
+                selector: serde_json::json!({"n": {"$gte": 0}}),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(all.docs.len(), 100);
     }
 }
