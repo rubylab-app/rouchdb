@@ -264,9 +264,10 @@ async fn purge_partial_revs() {
         .unwrap();
     let _rev2 = r2.rev.unwrap();
 
-    // Purge only the first revision — doc should still exist with rev2
+    // Purging a non-leaf revision is ignored (CouchDB reports it with an
+    // empty list); the document is untouched.
     let purge_result = db.purge("doc1", vec![rev1]).await.unwrap();
-    assert!(purge_result.purged.contains_key("doc1"));
+    assert_eq!(purge_result.purged["doc1"], Vec::<String>::new());
 
     // Doc should still be accessible via latest rev
     let doc = db.get("doc1").await.unwrap();
@@ -977,9 +978,12 @@ async fn update_with_wrong_rev_fails() {
 
     let result = db
         .update("doc1", "1-wronghash", serde_json::json!({"v": 2}))
-        .await
-        .unwrap();
-    assert!(!result.ok, "Update with wrong rev should fail");
+        .await;
+    assert!(
+        matches!(result, Err(rouchdb::RouchError::Conflict)),
+        "Update with wrong rev should fail: {:?}",
+        result
+    );
 }
 
 #[tokio::test]
@@ -987,8 +991,12 @@ async fn remove_with_wrong_rev_fails() {
     let db = Database::memory("test");
     db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
 
-    let result = db.remove("doc1", "1-wronghash").await.unwrap();
-    assert!(!result.ok, "Remove with wrong rev should fail");
+    let result = db.remove("doc1", "1-wronghash").await;
+    assert!(
+        matches!(result, Err(rouchdb::RouchError::Conflict)),
+        "Remove with wrong rev should fail: {:?}",
+        result
+    );
 }
 
 // =========================================================================

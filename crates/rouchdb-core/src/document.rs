@@ -100,67 +100,35 @@ impl Document {
     /// Create a new document from a JSON value.
     ///
     /// Extracts `_id`, `_rev`, `_deleted`, and `_attachments` from the value
-    /// and puts the remaining fields in `data`.
+    /// and puts the remaining fields in `data`. Other underscore members
+    /// (`_revisions`, `_conflicts`, ...) are left in `data` so read paths can
+    /// surface them; [`Document::prepare_for_write`] strips or rejects them
+    /// before a write.
+    ///
+    /// Attachments may be stubs (`{"stub": true, "digest": ...}`) or inline
+    /// (`{"content_type": ..., "data": "<base64>"}`); `digest` and `length`
+    /// are optional for inline data and computed from the decoded bytes.
     pub fn from_json(mut value: serde_json::Value) -> Result<Self> {
         let obj = value
             .as_object_mut()
             .ok_or_else(|| RouchError::BadRequest("document must be a JSON object".into()))?;
 
-        let id = obj
-            .remove("_id")
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_default();
+        let id = match obj.remove("_id") {
+            None => String::new(),
+            Some(v) => parse_doc_id(v)?,
+        };
 
-        let rev = obj
-            .remove("_rev")
-            .and_then(|v| v.as_str().map(String::from))
-            .map(|s| s.parse::<Revision>())
-            .transpose()?;
+        let rev = obj.remove("_rev").map(parse_rev_value).transpose()?;
 
-        let deleted = obj
-            .remove("_deleted")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let deleted = match obj.remove("_deleted") {
+            None => false,
+            Some(v) => parse_deleted_value(v)?,
+        };
 
-        let mut attachments: HashMap<String, AttachmentMeta> = HashMap::new();
-        if let Some(att_val) = obj.remove("_attachments")
-            && let Some(att_obj) = att_val.as_object()
-        {
-            for (name, meta) in att_obj {
-                // Strip inline Base64 `data` string before serde parsing
-                // (serde expects Vec<u8> as an array, not a string).
-                let mut meta_for_parse = meta.clone();
-                let inline_b64 = if let Some(obj) = meta_for_parse.as_object_mut() {
-                    match obj.remove("data") {
-                        Some(serde_json::Value::String(s)) => Some(s),
-                        Some(other) => {
-                            obj.insert("data".to_string(), other);
-                            None
-                        }
-                        None => None,
-                    }
-                } else {
-                    None
-                };
-
-                if let Ok(mut att) = serde_json::from_value::<AttachmentMeta>(meta_for_parse) {
-                    // Decode inline Base64 data if present
-                    if att.data.is_none()
-                        && let Some(ref data_str) = inline_b64
-                    {
-                        use base64::Engine;
-                        if let Ok(bytes) =
-                            base64::engine::general_purpose::STANDARD.decode(data_str)
-                        {
-                            att.length = bytes.len() as u64;
-                            att.data = Some(bytes);
-                            att.stub = false;
-                        }
-                    }
-                    attachments.insert(name.clone(), att);
-                }
-            }
-        }
+        let attachments = match obj.remove("_attachments") {
+            None => HashMap::new(),
+            Some(v) => parse_attachments(&v)?,
+        };
 
         Ok(Document {
             id,
@@ -169,6 +137,82 @@ impl Document {
             data: value,
             attachments,
         })
+    }
+
+    /// Normalize a document before a `new_edits=true` write, the way CouchDB
+    /// treats special members:
+    ///
+    /// - the body must be a JSON object;
+    /// - `_id`, `_rev`, `_deleted` and `_attachments` left in `data` are
+    ///   interpreted (explicit `Document` fields win when both are set);
+    /// - read-only metadata (`_conflicts`, `_deleted_conflicts`, `_revs_info`,
+    ///   `_revisions`, `_local_seq`) is dropped;
+    /// - any other underscore member is rejected, as are ids that start with
+    ///   `_` other than `_design/` and `_local/`.
+    pub fn prepare_for_write(&mut self) -> Result<()> {
+        let obj = self
+            .data
+            .as_object_mut()
+            .ok_or_else(|| RouchError::BadRequest("Document must be a JSON object".into()))?;
+
+        let special: Vec<String> = obj.keys().filter(|k| k.starts_with('_')).cloned().collect();
+        for key in special {
+            let value = obj.remove(&key).unwrap_or_default();
+            match key.as_str() {
+                "_id" => {
+                    let id = parse_doc_id(value)?;
+                    if self.id.is_empty() {
+                        self.id = id;
+                    }
+                }
+                "_rev" => {
+                    let rev = parse_rev_value(value)?;
+                    if self.rev.is_none() {
+                        self.rev = Some(rev);
+                    }
+                }
+                "_deleted" => {
+                    if parse_deleted_value(value)? {
+                        self.deleted = true;
+                    }
+                }
+                "_attachments" => {
+                    let atts = parse_attachments(&value)?;
+                    if self.attachments.is_empty() {
+                        self.attachments = atts;
+                    }
+                }
+                k if METADATA_MEMBERS.contains(&k) => {}
+                other => {
+                    return Err(RouchError::BadRequest(format!(
+                        "Bad special document member: {}",
+                        other
+                    )));
+                }
+            }
+        }
+
+        if self.id.starts_with('_')
+            && !self.id.starts_with("_design/")
+            && !self.id.starts_with("_local/")
+        {
+            return Err(RouchError::BadRequest(
+                "Only reserved document ids may start with underscore.".into(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Drop read-only metadata members (`_conflicts`, `_revisions`, ...) from
+    /// the body without validating anything else. Used for replicated writes,
+    /// which must accept whatever the source stored.
+    pub fn strip_metadata_members(&mut self) {
+        if let Some(obj) = self.data.as_object_mut() {
+            for key in METADATA_MEMBERS {
+                obj.remove(key);
+            }
+        }
     }
 
     /// Convert back to a JSON value with CouchDB underscore fields.
@@ -212,6 +256,150 @@ impl Document {
 
         serde_json::Value::Object(obj)
     }
+}
+
+/// Underscore members CouchDB accepts on write but never stores in the body.
+const METADATA_MEMBERS: [&str; 5] = [
+    "_conflicts",
+    "_deleted_conflicts",
+    "_revs_info",
+    "_revisions",
+    "_local_seq",
+];
+
+fn parse_doc_id(value: serde_json::Value) -> Result<String> {
+    match value {
+        serde_json::Value::String(s) if s.is_empty() => Err(RouchError::BadRequest(
+            "Document id must not be empty".into(),
+        )),
+        serde_json::Value::String(s) => Ok(s),
+        _ => Err(RouchError::BadRequest(
+            "Document id must be a string".into(),
+        )),
+    }
+}
+
+fn parse_rev_value(value: serde_json::Value) -> Result<Revision> {
+    match value {
+        serde_json::Value::String(s) => s.parse(),
+        _ => Err(RouchError::BadRequest("Invalid rev format".into())),
+    }
+}
+
+fn parse_deleted_value(value: serde_json::Value) -> Result<bool> {
+    value
+        .as_bool()
+        .ok_or_else(|| RouchError::BadRequest("Bad special document member: _deleted".into()))
+}
+
+/// Parse a CouchDB `_attachments` object.
+fn parse_attachments(value: &serde_json::Value) -> Result<HashMap<String, AttachmentMeta>> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| RouchError::BadRequest("_attachments must be a JSON object".into()))?;
+    let mut attachments = HashMap::with_capacity(obj.len());
+    for (name, meta) in obj {
+        attachments.insert(name.clone(), parse_attachment(name, meta)?);
+    }
+    Ok(attachments)
+}
+
+/// Parse one attachment entry: inline (`data` as base64, with `digest` and
+/// `length` optional) or a stub (`stub: true` or a bare `digest`).
+fn parse_attachment(name: &str, meta: &serde_json::Value) -> Result<AttachmentMeta> {
+    let invalid =
+        |why: &str| RouchError::BadRequest(format!("Invalid attachment {}: {}", name, why));
+    let obj = meta
+        .as_object()
+        .ok_or_else(|| invalid("must be a JSON object"))?;
+
+    let content_type = match obj.get("content_type") {
+        None | Some(serde_json::Value::Null) => "application/octet-stream".to_string(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(_) => return Err(invalid("content_type must be a string")),
+    };
+
+    if let Some(data) = obj.get("data") {
+        use base64::Engine;
+        let encoded = data
+            .as_str()
+            .ok_or_else(|| invalid("data must be a base64 string"))?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| invalid("data is not valid base64"))?;
+        return Ok(AttachmentMeta {
+            content_type,
+            digest: attachment_digest(&bytes),
+            length: bytes.len() as u64,
+            stub: false,
+            data: Some(bytes),
+        });
+    }
+
+    if obj.get("follows").and_then(|v| v.as_bool()) == Some(true) {
+        return Err(invalid("multipart attachments (follows) are not supported"));
+    }
+
+    let is_stub = obj.get("stub").and_then(|v| v.as_bool()).unwrap_or(false);
+    match obj.get("digest").and_then(|v| v.as_str()) {
+        Some(digest) => Ok(AttachmentMeta {
+            content_type,
+            digest: digest.to_string(),
+            length: obj.get("length").and_then(|v| v.as_u64()).unwrap_or(0),
+            stub: true,
+            data: None,
+        }),
+        None if is_stub => Err(invalid("stub has no digest")),
+        None => Err(invalid("neither data nor a stub")),
+    }
+}
+
+/// CouchDB attachment digest: `md5-` followed by the base64 MD5 of the bytes.
+pub fn attachment_digest(data: &[u8]) -> String {
+    use base64::Engine;
+    use md5::{Digest, Md5};
+    let hash = Md5::digest(data);
+    format!(
+        "md5-{}",
+        base64::engine::general_purpose::STANDARD.encode(hash)
+    )
+}
+
+/// Generate the hash part of a new revision id.
+///
+/// The hash covers the parent revision, the deleted flag, the body and the
+/// final attachment set (name, digest, content type), so two replicas that
+/// make different edits from the same parent (including attachment-only
+/// edits) never produce the same revision id. Documents without attachments
+/// hash exactly as before attachments were included.
+pub fn generate_rev_hash(
+    doc_data: &serde_json::Value,
+    deleted: bool,
+    prev_rev: Option<&str>,
+    attachments: &HashMap<String, AttachmentMeta>,
+) -> String {
+    use md5::{Digest, Md5};
+    let mut hasher = Md5::new();
+    if let Some(prev) = prev_rev {
+        hasher.update(prev.as_bytes());
+    }
+    hasher.update(if deleted { b"1" } else { b"0" });
+    let serialized = serde_json::to_string(doc_data).unwrap_or_default();
+    hasher.update(serialized.as_bytes());
+    if !attachments.is_empty() {
+        let mut names: Vec<&String> = attachments.keys().collect();
+        names.sort();
+        for name in names {
+            let att = &attachments[name];
+            hasher.update(b"\0");
+            hasher.update(name.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(att.digest.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(att.content_type.as_bytes());
+        }
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 // ---------------------------------------------------------------------------
@@ -744,6 +932,212 @@ mod tests {
         assert!(doc.deleted);
         assert_eq!(doc.attachments.len(), 1);
         assert_eq!(doc.attachments["photo.jpg"].content_type, "image/jpeg");
+    }
+
+    // --- F03: CouchDB/PouchDB inline attachments ---
+
+    #[test]
+    fn from_json_minimal_inline_attachment() {
+        // The minimal inline form PouchDB and CouchDB accept: no digest/length.
+        let doc = Document::from_json(serde_json::json!({
+            "_id": "d",
+            "_attachments": {"hi.txt": {"content_type": "text/plain", "data": "aGkh"}}
+        }))
+        .unwrap();
+        let att = &doc.attachments["hi.txt"];
+        assert_eq!(att.data.as_deref(), Some(&b"hi!"[..]));
+        assert_eq!(att.length, 3);
+        assert!(!att.stub);
+        assert_eq!(att.digest, attachment_digest(b"hi!"));
+        assert_eq!(att.content_type, "text/plain");
+    }
+
+    #[test]
+    fn from_json_couchdb_inline_attachment_without_length() {
+        // GET ?attachments=true from CouchDB omits `length` for inline data.
+        let doc = Document::from_json(serde_json::json!({
+            "_id": "d",
+            "_attachments": {"hi.txt": {
+                "content_type": "text/plain",
+                "revpos": 1,
+                "digest": "md5-3Qbt4MdZDzgyIUxhEaH08A==",
+                "data": "aGkh"
+            }}
+        }))
+        .unwrap();
+        assert_eq!(doc.attachments["hi.txt"].length, 3);
+        assert_eq!(doc.attachments["hi.txt"].data.as_deref(), Some(&b"hi!"[..]));
+    }
+
+    #[test]
+    fn from_json_attachment_defaults_content_type() {
+        let doc = Document::from_json(serde_json::json!({
+            "_attachments": {"blob": {"data": "aGkh"}}
+        }))
+        .unwrap();
+        assert_eq!(
+            doc.attachments["blob"].content_type,
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn from_json_attachment_stub_without_data() {
+        let doc = Document::from_json(serde_json::json!({
+            "_attachments": {"a.txt": {
+                "content_type": "text/plain", "revpos": 2, "digest": "md5-x",
+                "length": 7, "stub": true
+            }}
+        }))
+        .unwrap();
+        let att = &doc.attachments["a.txt"];
+        assert!(att.stub);
+        assert!(att.data.is_none());
+        assert_eq!(att.digest, "md5-x");
+        assert_eq!(att.length, 7);
+    }
+
+    #[test]
+    fn from_json_rejects_invalid_attachments() {
+        // Invalid base64.
+        assert!(
+            Document::from_json(serde_json::json!({
+                "_attachments": {"a": {"content_type": "text/plain", "data": "!!!"}}
+            }))
+            .is_err()
+        );
+        // Neither data nor a stub.
+        assert!(
+            Document::from_json(serde_json::json!({
+                "_attachments": {"a": {"content_type": "text/plain"}}
+            }))
+            .is_err()
+        );
+        // Not an object.
+        assert!(Document::from_json(serde_json::json!({"_attachments": 5})).is_err());
+        assert!(Document::from_json(serde_json::json!({"_attachments": {"a": 5}})).is_err());
+    }
+
+    // --- F24: wrongly typed special fields ---
+
+    #[test]
+    fn from_json_rejects_wrongly_typed_special_fields() {
+        assert!(Document::from_json(serde_json::json!({"_id": 42})).is_err());
+        assert!(Document::from_json(serde_json::json!({"_id": ""})).is_err());
+        assert!(Document::from_json(serde_json::json!({"_rev": 5})).is_err());
+        assert!(Document::from_json(serde_json::json!({"_deleted": "true"})).is_err());
+        // Well-typed values still work.
+        let doc = Document::from_json(serde_json::json!({"_id": "x", "_deleted": false})).unwrap();
+        assert_eq!(doc.id, "x");
+        assert!(!doc.deleted);
+    }
+
+    // --- F07 / F64: normalization before a new_edits write ---
+
+    fn doc_with(data: serde_json::Value) -> Document {
+        Document {
+            id: "d".into(),
+            rev: None,
+            deleted: false,
+            data,
+            attachments: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn prepare_for_write_interprets_special_members() {
+        let mut doc = doc_with(serde_json::json!({
+            "_deleted": true,
+            "_rev": "1-abc",
+            "_attachments": {"a.txt": {"content_type": "text/plain", "data": "aGkh"}},
+            "_conflicts": ["2-x"],
+            "_deleted_conflicts": ["2-y"],
+            "_revs_info": [],
+            "_revisions": {"start": 1, "ids": ["abc"]},
+            "_local_seq": 3,
+            "x": 1
+        }));
+        doc.prepare_for_write().unwrap();
+        assert!(doc.deleted);
+        assert_eq!(doc.rev.as_ref().unwrap().to_string(), "1-abc");
+        assert_eq!(doc.attachments["a.txt"].length, 3);
+        assert_eq!(doc.data, serde_json::json!({"x": 1}));
+    }
+
+    #[test]
+    fn prepare_for_write_keeps_explicit_fields() {
+        // Explicit Document fields win over leftovers in the body.
+        let mut doc = doc_with(serde_json::json!({"_id": "other", "_rev": "9-zzz", "x": 1}));
+        doc.rev = Some("2-abc".parse().unwrap());
+        doc.prepare_for_write().unwrap();
+        assert_eq!(doc.id, "d");
+        assert_eq!(doc.rev.as_ref().unwrap().to_string(), "2-abc");
+        assert_eq!(doc.data, serde_json::json!({"x": 1}));
+    }
+
+    #[test]
+    fn prepare_for_write_rejects_unknown_special_member() {
+        let mut doc = doc_with(serde_json::json!({"_foo": 1}));
+        let err = doc.prepare_for_write().unwrap_err();
+        assert!(err.to_string().contains("_foo"), "{}", err);
+    }
+
+    #[test]
+    fn prepare_for_write_rejects_non_object_body() {
+        let mut doc = doc_with(serde_json::json!([1, 2, 3]));
+        assert!(doc.prepare_for_write().is_err());
+        let mut doc = doc_with(serde_json::json!("text"));
+        assert!(doc.prepare_for_write().is_err());
+    }
+
+    #[test]
+    fn prepare_for_write_validates_reserved_ids() {
+        let mut doc = doc_with(serde_json::json!({}));
+        doc.id = "_bad".into();
+        assert!(doc.prepare_for_write().is_err());
+        let mut doc = doc_with(serde_json::json!({}));
+        doc.id = "_design/app".into();
+        assert!(doc.prepare_for_write().is_ok());
+    }
+
+    // --- F06: the rev hash covers attachments ---
+
+    #[test]
+    fn rev_hash_depends_on_attachments() {
+        let body = serde_json::json!({"a": 1});
+        let meta = |digest: &str| AttachmentMeta {
+            content_type: "text/plain".into(),
+            digest: digest.into(),
+            length: 3,
+            stub: true,
+            data: None,
+        };
+        let none = generate_rev_hash(&body, false, Some("1-x"), &HashMap::new());
+        let a: HashMap<_, _> = [("f".to_string(), meta("md5-AAA"))].into();
+        let b: HashMap<_, _> = [("f".to_string(), meta("md5-BBB"))].into();
+        let ha = generate_rev_hash(&body, false, Some("1-x"), &a);
+        let hb = generate_rev_hash(&body, false, Some("1-x"), &b);
+        assert_ne!(ha, hb);
+        assert_ne!(ha, none);
+        // Deterministic.
+        assert_eq!(ha, generate_rev_hash(&body, false, Some("1-x"), &a));
+    }
+
+    #[test]
+    fn rev_hash_without_attachments_is_unchanged() {
+        // Documents without attachments keep the historical hash so replicas
+        // on different versions still agree on revision ids.
+        use md5::{Digest, Md5};
+        let body = serde_json::json!({"name": "Alice"});
+        let mut hasher = Md5::new();
+        hasher.update(b"1-abc");
+        hasher.update(b"0");
+        hasher.update(serde_json::to_string(&body).unwrap().as_bytes());
+        let expected = format!("{:x}", hasher.finalize());
+        assert_eq!(
+            generate_rev_hash(&body, false, Some("1-abc"), &HashMap::new()),
+            expected
+        );
     }
 
     #[test]

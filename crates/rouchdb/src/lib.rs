@@ -394,51 +394,72 @@ impl Database {
 
     /// Create a new document with an auto-generated ID.
     ///
-    /// Equivalent to PouchDB's `db.post(doc)`. Generates a UUID v4 as the
-    /// document ID and calls `put()`.
+    /// Equivalent to PouchDB's `db.post(doc)`. Uses the body's `_id` when it
+    /// has one, otherwise generates a UUID v4.
     pub async fn post(&self, data: serde_json::Value) -> Result<DocResult> {
-        let id = uuid::Uuid::new_v4().to_string();
-        self.put(&id, data).await
+        let mut doc = Document {
+            id: String::new(),
+            rev: None,
+            deleted: false,
+            data,
+            attachments: HashMap::new(),
+        };
+        doc.prepare_for_write()?;
+        if doc.id.is_empty() {
+            doc.id = uuid::Uuid::new_v4().to_string();
+        }
+        self.write_one(doc).await
     }
 
     /// Create or update a document.
     ///
-    /// If the document doesn't exist, creates it.
-    /// If it does exist, you must provide the current `_rev` in `opts_rev`
-    /// to avoid conflicts.
+    /// If the document doesn't exist, creates it. To update an existing
+    /// document, include its current `_rev` in `data` (or use `update`).
+    /// Special members in `data` are interpreted like CouchDB does
+    /// (`_rev`, `_deleted`, `_attachments`); read-only metadata such as
+    /// `_conflicts` is ignored and any other `_`-prefixed member is rejected.
+    ///
+    /// A failed write (conflict, invalid document, ...) is returned as an
+    /// error, never as `Ok` with `ok: false`.
     pub async fn put(&self, id: &str, data: serde_json::Value) -> Result<DocResult> {
         if id.is_empty() {
             return Err(RouchError::MissingId);
         }
-        let doc = Document {
+        let mut doc = Document {
             id: id.to_string(),
             rev: None,
             deleted: false,
             data,
             attachments: HashMap::new(),
         };
-        let results = self.bulk_docs(vec![doc], BulkDocsOptions::new()).await?;
-        first_result(results)
+        doc.prepare_for_write()?;
+        self.write_one(doc).await
     }
 
     /// Update an existing document (requires providing the current rev).
+    ///
+    /// Returns `RouchError::Conflict` if `rev` is not a current leaf
+    /// revision of the document.
     pub async fn update(&self, id: &str, rev: &str, data: serde_json::Value) -> Result<DocResult> {
         if id.is_empty() {
             return Err(RouchError::MissingId);
         }
         let revision: Revision = rev.parse()?;
-        let doc = Document {
+        let mut doc = Document {
             id: id.to_string(),
             rev: Some(revision),
             deleted: false,
             data,
             attachments: HashMap::new(),
         };
-        let results = self.bulk_docs(vec![doc], BulkDocsOptions::new()).await?;
-        first_result(results)
+        doc.prepare_for_write()?;
+        self.write_one(doc).await
     }
 
     /// Delete a document (requires the current rev).
+    ///
+    /// Returns `RouchError::Conflict` if `rev` is not a current leaf
+    /// revision of the document.
     pub async fn remove(&self, id: &str, rev: &str) -> Result<DocResult> {
         if id.is_empty() {
             return Err(RouchError::MissingId);
@@ -451,8 +472,18 @@ impl Database {
             data: serde_json::json!({}),
             attachments: HashMap::new(),
         };
+        self.write_one(doc).await
+    }
+
+    /// Write a single document and turn a failed `DocResult` into an error.
+    async fn write_one(&self, doc: Document) -> Result<DocResult> {
         let results = self.bulk_docs(vec![doc], BulkDocsOptions::new()).await?;
-        first_result(results)
+        let result = first_result(results)?;
+        if result.ok {
+            Ok(result)
+        } else {
+            Err(doc_result_error(result))
+        }
     }
 
     /// Write multiple documents at once.
@@ -1041,6 +1072,22 @@ fn first_result(results: Vec<DocResult>) -> Result<DocResult> {
     })
 }
 
+/// Map a failed per-document write result to the matching error.
+fn doc_result_error(result: DocResult) -> RouchError {
+    let reason = result
+        .reason
+        .clone()
+        .or_else(|| result.error.clone())
+        .unwrap_or_else(|| "document write failed".into());
+    match result.error.as_deref() {
+        Some("conflict") => RouchError::Conflict,
+        Some("not_found") => RouchError::NotFound(result.id),
+        Some("unauthorized") => RouchError::Unauthorized,
+        Some("forbidden") => RouchError::Forbidden(reason),
+        _ => RouchError::BadRequest(reason),
+    }
+}
+
 /// Escape regex metacharacters in a string for safe use in a regex pattern.
 fn regex_escape(s: &str) -> String {
     let mut escaped = String::with_capacity(s.len() * 2);
@@ -1355,8 +1402,19 @@ mod tests {
         let r1 = db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
         let rev = r1.rev.unwrap();
 
-        // remove_attachment creates a new revision even though attachment
-        // tracking in the memory adapter is simplified
+        // Removing an attachment the document does not have is an error and
+        // writes nothing.
+        assert!(matches!(
+            db.remove_attachment("doc1", "photo.jpg", &rev).await,
+            Err(RouchError::NotFound(_))
+        ));
+
+        let rev = db
+            .put_attachment("doc1", "photo.jpg", &rev, vec![1, 2, 3], "image/jpeg")
+            .await
+            .unwrap()
+            .rev
+            .unwrap();
         let r2 = db
             .remove_attachment("doc1", "photo.jpg", &rev)
             .await
@@ -1364,6 +1422,7 @@ mod tests {
         assert!(r2.ok);
         assert!(r2.rev.is_some());
         assert_ne!(r2.rev.as_deref().unwrap(), rev);
+        assert!(db.get_attachment("doc1", "photo.jpg").await.is_err());
     }
 
     #[tokio::test]
