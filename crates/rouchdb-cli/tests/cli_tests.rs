@@ -758,6 +758,21 @@ async fn info_empty_database() {
 }
 
 #[tokio::test]
+async fn info_db_name_defaults_to_file_stem_and_can_be_overridden() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("inventory.redb");
+    let p = path_str(&path);
+    assert!(run(&["put", p, "a", "{}"]).status.success());
+
+    assert_eq!(stdout_json(&run(&["info", p]))["db_name"], "inventory");
+    let output = run(&["info", p, "--db-name", "warehouse"]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let v = stdout_json(&output);
+    assert_eq!(v["db_name"], "warehouse");
+    assert_eq!(v["doc_count"], 1);
+}
+
+#[tokio::test]
 async fn info_nonexistent_path_fails() {
     // Use a path under a nonexistent directory so redb can't create the file
     rouchdb_cmd()
@@ -842,6 +857,45 @@ async fn get_with_specific_rev() {
     let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(v["_rev"], rev1);
     assert_eq!(v["version"], 1);
+}
+
+#[tokio::test]
+async fn get_conflicts_lists_losing_leaves_only_with_flag() {
+    let (_dir, db_path) = setup_db(&[]).await;
+    let [a, b, c] = ['a', 'b', 'c'].map(|h| format!("1-{}", h.to_string().repeat(32)));
+    {
+        // Three conflicting leaves, written the way replication does.
+        let db = rouchdb::Database::open(&db_path, "test").unwrap();
+        let leaves = [(&a, "a"), (&c, "c"), (&b, "b")]
+            .into_iter()
+            .map(|(rev, v)| rouchdb::Document {
+                id: "doc".into(),
+                rev: Some(rev.parse().unwrap()),
+                deleted: false,
+                data: serde_json::json!({ "v": v }),
+                attachments: HashMap::new(),
+            })
+            .collect();
+        let results = db
+            .bulk_docs(leaves, rouchdb::BulkDocsOptions::replication())
+            .await
+            .unwrap();
+        assert!(results.iter().all(|r| r.ok), "{:?}", results);
+    }
+    let p = path_str(&db_path);
+
+    // CouchDB 3.5.1 answers exactly this: the highest rev wins and the
+    // other leaves follow, highest first.
+    let output = run(&["get", p, "doc", "--conflicts"]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({"_id": "doc", "_rev": c, "v": "c", "_conflicts": [b, a]})
+    );
+    assert_eq!(
+        stdout_json(&run(&["get", p, "doc"])),
+        serde_json::json!({"_id": "doc", "_rev": c, "v": "c"})
+    );
 }
 
 // ─── ALL-DOCS ───────────────────────────────────────────────────────────────
@@ -1001,10 +1055,73 @@ async fn find_with_selector() {
     assert!(output.status.success());
     let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let docs = v["docs"].as_array().unwrap();
-    assert_eq!(docs.len(), 2);
-    let names: Vec<&str> = docs.iter().map(|d| d["name"].as_str().unwrap()).collect();
-    assert!(names.contains(&"Apple"));
-    assert!(names.contains(&"Banana"));
+    // Without a sort, matches come in _id order.
+    let found: Vec<(&str, &str)> = docs
+        .iter()
+        .map(|d| (d["_id"].as_str().unwrap(), d["name"].as_str().unwrap()))
+        .collect();
+    assert_eq!(found, [("apple", "Apple"), ("banana", "Banana")]);
+}
+
+/// Ids of the documents in a `find` output, in order.
+fn found_ids(output: &Output) -> Vec<String> {
+    assert!(output.status.success(), "{}", stderr_str(output));
+    stdout_json(output)["docs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn find_sort_skip_and_limit_return_exact_ordered_ids() {
+    let (_dir, db_path) = setup_db(&[
+        ("p1", serde_json::json!({"name": "Carol", "age": 35})),
+        ("p2", serde_json::json!({"name": "Alice", "age": 30})),
+        ("p3", serde_json::json!({"name": "Bob", "age": 25})),
+        ("p4", serde_json::json!({"name": "Dave", "age": 40})),
+        ("other", serde_json::json!({"kind": "no age"})),
+    ])
+    .await;
+    let p = path_str(&db_path);
+    let find = |extra: &[&str]| {
+        let mut args = vec!["find", p, "--selector", r#"{"age": {"$gt": 0}}"#];
+        args.extend_from_slice(extra);
+        found_ids(&run(&args))
+    };
+
+    assert_eq!(find(&[]), ["p1", "p2", "p3", "p4"]);
+    assert_eq!(
+        find(&["--sort", r#"[{"age": "asc"}]"#]),
+        ["p3", "p2", "p1", "p4"]
+    );
+    assert_eq!(
+        find(&["--sort", r#"[{"age": "desc"}]"#]),
+        ["p4", "p1", "p2", "p3"]
+    );
+    assert_eq!(find(&["--sort", r#"["name"]"#]), ["p2", "p3", "p1", "p4"]);
+    assert_eq!(find(&["--skip", "1"]), ["p2", "p3", "p4"]);
+    assert_eq!(
+        find(&[
+            "--sort",
+            r#"[{"age": "desc"}]"#,
+            "--skip",
+            "1",
+            "--limit",
+            "2"
+        ]),
+        ["p1", "p2"]
+    );
+    assert_eq!(find(&["--skip", "4"]), Vec::<String>::new());
+
+    let output = run(&["find", p, "--selector", "{}", "--sort", "not json"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr_str(&output).contains("invalid sort JSON"),
+        "{}",
+        stderr_str(&output)
+    );
 }
 
 #[tokio::test]
@@ -1057,65 +1174,145 @@ async fn find_invalid_selector_fails() {
 
 // ─── CHANGES ────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn changes_returns_all() {
-    let (_dir, db_path) = setup_db(&[
+/// a, b and c, then a new revision of a: the feed order is b, c, a.
+async fn setup_changes_db() -> (TempDir, PathBuf) {
+    let (dir, db_path) = setup_db(&[
         ("a", serde_json::json!({"x": 1})),
         ("b", serde_json::json!({"x": 2})),
         ("c", serde_json::json!({"x": 3})),
     ])
     .await;
-
-    let output = rouchdb_cmd()
-        .args(["changes", db_path.to_str().unwrap()])
-        .output()
+    {
+        let db = rouchdb::Database::open(&db_path, "test").unwrap();
+        let a = db.get("a").await.unwrap();
+        db.update(
+            "a",
+            &a.rev.unwrap().to_string(),
+            serde_json::json!({"x": 10}),
+        )
+        .await
         .unwrap();
+    }
+    (dir, db_path)
+}
 
-    assert!(output.status.success());
-    let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let results = v["results"].as_array().unwrap();
-    assert_eq!(results.len(), 3);
-    assert!(v["last_seq"].as_u64().unwrap() > 0);
+/// `(id, seq)` of the rows of a `changes` output, in order, and `last_seq`.
+fn change_rows(output: &Output) -> (Vec<(String, u64)>, serde_json::Value) {
+    assert!(output.status.success(), "{}", stderr_str(output));
+    let v = stdout_json(output);
+    let rows = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["id"].as_str().unwrap().to_string(),
+                r["seq"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    (rows, v["last_seq"].clone())
+}
+
+fn rows(expected: &[(&str, u64)]) -> Vec<(String, u64)> {
+    expected
+        .iter()
+        .map(|(id, seq)| (id.to_string(), *seq))
+        .collect()
+}
+
+#[tokio::test]
+async fn changes_returns_all() {
+    let (_dir, db_path) = setup_changes_db().await;
+    let p = path_str(&db_path);
+
+    assert_eq!(
+        change_rows(&run(&["changes", p])),
+        (rows(&[("b", 2), ("c", 3), ("a", 4)]), serde_json::json!(4))
+    );
 }
 
 #[tokio::test]
 async fn changes_with_limit() {
-    let (_dir, db_path) = setup_db(&[
-        ("a", serde_json::json!({})),
-        ("b", serde_json::json!({})),
-        ("c", serde_json::json!({})),
-    ])
-    .await;
+    let (_dir, db_path) = setup_changes_db().await;
+    let p = path_str(&db_path);
 
-    let output = rouchdb_cmd()
-        .args(["changes", db_path.to_str().unwrap(), "--limit", "2"])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let results = v["results"].as_array().unwrap();
-    assert_eq!(results.len(), 2);
+    assert_eq!(
+        change_rows(&run(&["changes", p, "--limit", "2"])),
+        (rows(&[("b", 2), ("c", 3)]), serde_json::json!(3))
+    );
 }
 
 #[tokio::test]
 async fn changes_with_since() {
-    let (_dir, db_path) = setup_db(&[
-        ("a", serde_json::json!({})),
-        ("b", serde_json::json!({})),
-        ("c", serde_json::json!({})),
-    ])
-    .await;
+    let (_dir, db_path) = setup_changes_db().await;
+    let p = path_str(&db_path);
 
-    let output = rouchdb_cmd()
-        .args(["changes", db_path.to_str().unwrap(), "--since", "2"])
-        .output()
-        .unwrap();
+    assert_eq!(
+        change_rows(&run(&["changes", p, "--since", "2"])),
+        (rows(&[("c", 3), ("a", 4)]), serde_json::json!(4))
+    );
+    assert_eq!(
+        change_rows(&run(&["changes", p, "--since", "4"])),
+        (rows(&[]), serde_json::json!(4))
+    );
+}
 
-    assert!(output.status.success());
-    let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let results = v["results"].as_array().unwrap();
-    assert_eq!(results.len(), 1);
+#[tokio::test]
+async fn changes_descending_lists_newest_first() {
+    let (_dir, db_path) = setup_changes_db().await;
+    let p = path_str(&db_path);
+
+    // As in CouchDB, last_seq is the seq of the last row returned.
+    assert_eq!(
+        change_rows(&run(&["changes", p, "--descending"])),
+        (rows(&[("a", 4), ("c", 3), ("b", 2)]), serde_json::json!(2))
+    );
+    assert_eq!(
+        change_rows(&run(&["changes", p, "--descending", "--limit", "2"])),
+        (rows(&[("a", 4), ("c", 3)]), serde_json::json!(3))
+    );
+}
+
+#[tokio::test]
+async fn changes_include_docs_adds_bodies() {
+    let (_dir, db_path) = setup_changes_db().await;
+    let p = path_str(&db_path);
+    let rev_b = stdout_json(&run(&["get", p, "b"]))["_rev"].clone();
+    let rev_a = stdout_json(&run(&["get", p, "a"]))["_rev"].clone();
+    let rev_c = stdout_json(&run(&["get", p, "c"]))["_rev"].clone();
+    let rev_c2 = rev_of(&run(&["delete", p, "c", "--rev", rev_c.as_str().unwrap()]));
+
+    let output = run(&["changes", p, "--include-docs"]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({
+            "last_seq": 5,
+            "results": [
+                {"seq": 2, "id": "b", "changes": [{"rev": rev_b}], "deleted": false,
+                 "doc": {"_id": "b", "_rev": rev_b, "x": 2}},
+                {"seq": 4, "id": "a", "changes": [{"rev": rev_a}], "deleted": false,
+                 "doc": {"_id": "a", "_rev": rev_a, "x": 10}},
+                {"seq": 5, "id": "c", "changes": [{"rev": rev_c2}], "deleted": true,
+                 "doc": {"_id": "c", "_rev": rev_c2, "_deleted": true}},
+            ]
+        })
+    );
+
+    // Without the flag the rows are the same minus the bodies.
+    let output = run(&["changes", p]);
+    let results = stdout_json(&output)["results"].clone();
+    let ids: Vec<&str> = results
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["b", "a", "c"]);
+    for row in results.as_array().unwrap() {
+        assert!(row.get("doc").is_none(), "{}", row);
+    }
 }
 
 // ─── DUMP ───────────────────────────────────────────────────────────────────
@@ -1192,6 +1389,114 @@ async fn replicate_redb_to_redb() {
 
     let info: serde_json::Value = serde_json::from_slice(&output2.stdout).unwrap();
     assert_eq!(info["doc_count"], 3);
+}
+
+/// Every live document (`_id`, `_rev` and body), via `all-docs --include-docs`.
+fn all_docs_with_bodies(path: &Path) -> Vec<serde_json::Value> {
+    let output = run(&["all-docs", path_str(path), "--include-docs"]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    stdout_json(&output)["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["doc"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn replicate_selector_copies_only_matching_docs() {
+    let (_src_dir, src_path) = setup_db(&[
+        ("apple", serde_json::json!({"type": "fruit"})),
+        ("banana", serde_json::json!({"type": "fruit"})),
+        ("carrot", serde_json::json!({"type": "vegetable"})),
+        ("rock", serde_json::json!({})),
+    ])
+    .await;
+    let tgt_dir = tempfile::tempdir().unwrap();
+    let tgt_path = tgt_dir.path().join("target.redb");
+    let (s, t) = (path_str(&src_path), path_str(&tgt_path));
+    let source_docs = all_docs_with_bodies(&src_path);
+    let doc = |id: &str| source_docs.iter().find(|d| d["_id"] == id).unwrap().clone();
+
+    let output = run(&["replicate", s, t, "--selector", r#"{"type": "fruit"}"#]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({
+            "ok": true, "docs_read": 4, "docs_written": 2, "errors": [], "last_seq": 4
+        })
+    );
+    assert_eq!(
+        all_docs_with_bodies(&tgt_path),
+        [doc("apple"), doc("banana")]
+    );
+
+    // Another selector has its own checkpoint, so it scans the feed again.
+    let output = run(&["replicate", s, t, "--selector", r#"{"type": "vegetable"}"#]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({
+            "ok": true, "docs_read": 4, "docs_written": 1, "errors": [], "last_seq": 4
+        })
+    );
+    assert_eq!(
+        all_docs_with_bodies(&tgt_path),
+        [doc("apple"), doc("banana"), doc("carrot")]
+    );
+
+    let output = run(&["replicate", s, t, "--selector", "{not json"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        stderr_str(&output).contains("invalid selector JSON"),
+        "{}",
+        stderr_str(&output)
+    );
+}
+
+#[tokio::test]
+async fn replicate_source_and_target_names_select_the_checkpoint() {
+    // The replication id, and so the checkpoint, is derived from both
+    // database names, which default to the file stems ("test", "target").
+    let (_src_dir, src_path) = setup_db(&[
+        ("a", serde_json::json!({"x": 1})),
+        ("b", serde_json::json!({"x": 2})),
+    ])
+    .await;
+    let tgt_dir = tempfile::tempdir().unwrap();
+    let tgt_path = tgt_dir.path().join("target.redb");
+    let replicate = |names: &[&str]| {
+        let mut args = vec!["replicate", path_str(&src_path), path_str(&tgt_path)];
+        args.extend_from_slice(names);
+        let output = run(&args);
+        assert!(output.status.success(), "{}", stderr_str(&output));
+        let v = stdout_json(&output);
+        (v["docs_read"].clone(), v["docs_written"].clone())
+    };
+
+    assert_eq!(replicate(&[]), (2.into(), 2.into()));
+    assert_eq!(
+        replicate(&[]),
+        (0.into(), 0.into()),
+        "resumes from the checkpoint"
+    );
+    assert_eq!(
+        replicate(&["--source-name", "other"]),
+        (2.into(), 0.into()),
+        "another source name is another replication"
+    );
+    assert_eq!(replicate(&["--source-name", "other"]), (0.into(), 0.into()));
+    assert_eq!(
+        replicate(&["--target-name", "other"]),
+        (2.into(), 0.into()),
+        "another target name is another replication"
+    );
+    assert_eq!(
+        replicate(&["--source-name", "test", "--target-name", "target"]),
+        (0.into(), 0.into()),
+        "the default names are the file stems"
+    );
 }
 
 #[ignore]
