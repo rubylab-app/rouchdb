@@ -114,9 +114,14 @@ pub fn build_router(db: Arc<Database>, config: &ServerConfig) -> Router {
         db,
         db_name: config.db_name.clone(),
         auth: config.admin.clone().map(|admin| Arc::new(Auth::new(admin))),
+        writes: Arc::new(tokio::sync::watch::Sender::new(0)),
     };
 
     let router = routes::build_routes(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            routes::changes::notify_writes,
+        ))
         .layer(DefaultBodyLimit::max(config.max_request_size))
         .layer(axum::middleware::map_response(error::json_errors))
         .layer(axum::middleware::from_fn_with_state(
