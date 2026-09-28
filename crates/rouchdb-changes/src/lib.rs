@@ -5,6 +5,8 @@
 /// - One-shot mode: fetch changes since a sequence and return
 /// - Live/continuous mode: keep polling for new changes
 /// - Filtering by document IDs
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +15,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use rouchdb_core::adapter::Adapter;
-use rouchdb_core::document::{ChangeEvent, ChangesOptions, ChangesStyle, Seq};
+use rouchdb_core::document::{ChangeEvent, ChangesOptions, ChangesResponse, ChangesStyle, Seq};
 
 /// A filter function for changes events.
 pub type ChangesFilter = Arc<dyn Fn(&ChangeEvent) -> bool + Send + Sync>;
@@ -257,7 +259,12 @@ pub struct LiveChangesStream {
     paused: bool,
     /// Consecutive failed fetches.
     failures: u32,
+    /// A fetch in flight, kept here so that dropping `next_event()` midway
+    /// resumes it on the next call instead of aborting it.
+    pending_fetch: Option<PendingFetch>,
 }
+
+type PendingFetch = Pin<Box<dyn Future<Output = Result<ChangesResponse>> + Send>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiveStreamState {
@@ -301,6 +308,7 @@ impl LiveChangesStream {
             next_heartbeat,
             paused: false,
             failures: 0,
+            pending_fetch: None,
         }
     }
 
@@ -309,26 +317,36 @@ impl LiveChangesStream {
         &self.last_seq
     }
 
-    /// Fetch changes since `last_seq` and buffer them.
+    /// Fetch changes since `last_seq` and buffer them (resuming a fetch
+    /// left in flight by a dropped call).
     async fn fetch_changes(&mut self) -> Result<()> {
-        let changes_opts = ChangesOptions {
-            since: self.last_seq.clone(),
-            // A post-fetch filter decides what counts toward the limit, so the
-            // adapter must not cap the batch (it would under-deliver).
-            limit: match self.opts.filter {
-                Some(_) => None,
-                None => self.opts.limit.map(|l| l.saturating_sub(self.count)),
-            },
-            descending: false,
-            include_docs: self.opts.include_docs,
-            live: false,
-            doc_ids: self.opts.doc_ids.clone(),
-            conflicts: self.opts.conflicts,
-            style: self.opts.style.clone(),
-            ..Default::default()
-        };
-
-        let response = self.adapter.changes(changes_opts).await?;
+        if self.pending_fetch.is_none() {
+            let changes_opts = ChangesOptions {
+                since: self.last_seq.clone(),
+                // A post-fetch filter decides what counts toward the limit, so
+                // the adapter must not cap the batch (it would under-deliver).
+                limit: match self.opts.filter {
+                    Some(_) => None,
+                    None => self.opts.limit.map(|l| l.saturating_sub(self.count)),
+                },
+                descending: false,
+                include_docs: self.opts.include_docs,
+                live: false,
+                doc_ids: self.opts.doc_ids.clone(),
+                conflicts: self.opts.conflicts,
+                style: self.opts.style.clone(),
+                ..Default::default()
+            };
+            let adapter = self.adapter.clone();
+            self.pending_fetch = Some(Box::pin(async move { adapter.changes(changes_opts).await }));
+        }
+        let fetched = self
+            .pending_fetch
+            .as_mut()
+            .expect("pending fetch set above")
+            .await;
+        self.pending_fetch = None;
+        let response = fetched?;
         self.buffer = response.results;
         self.buffer_idx = 0;
         self.buffer_last_seq = response.last_seq;
@@ -486,44 +504,15 @@ impl LiveChangesStream {
                     }
 
                     // Sleep until the next poll, heartbeat or deadline (or a
-                    // notification). Deadlines live in `self`, so dropping
-                    // this future mid-wait loses nothing.
-                    let polling = self.receiver.is_none() || self.failures > 0;
-                    let wake = [
-                        if polling { self.next_poll } else { None },
-                        self.next_heartbeat,
-                        self.idle_deadline,
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .min();
-                    let notified = match (&mut self.receiver, wake) {
-                        (Some(receiver), wake) if !polling => {
-                            tokio::select! {
-                                n = receiver.recv() => match n {
-                                    Some(_) => true,
-                                    None => {
-                                        // Channel closed.
-                                        self.state = LiveStreamState::Done;
-                                        continue;
-                                    }
-                                },
-                                _ = sleep_until(wake) => false,
-                            }
-                        }
-                        (_, wake) => {
-                            sleep_until(wake).await;
-                            false
-                        }
-                    };
-
-                    let now = Instant::now();
-                    let poll_due = polling && self.next_poll.is_some_and(|p| now >= p);
-                    if !notified && !poll_due {
-                        continue; // heartbeat or deadline: handled above
+                    // notification), unless a fetch was left in flight.
+                    // Deadlines and the fetch live in `self`, so dropping this
+                    // future at any point loses nothing.
+                    if self.pending_fetch.is_none() && !self.wait_for_fetch().await {
+                        continue;
                     }
-                    self.next_poll = Some(now + self.opts.poll_interval);
-                    if let Err(e) = self.fetch_changes().await {
+                    let fetched = self.fetch_changes().await;
+                    self.next_poll = Some(Instant::now() + self.opts.poll_interval);
+                    if let Err(e) = fetched {
                         return Some(self.fetch_failed(e));
                     }
                     if let Some(event) = self.resume_if_changed() {
@@ -542,6 +531,40 @@ impl LiveChangesStream {
                     });
                 }
                 LiveStreamState::Finished => return None,
+            }
+        }
+    }
+
+    /// Wait until a fetch is due (poll time or notification). Returns false
+    /// when woken for something else (heartbeat, deadline, closed channel),
+    /// which the caller re-evaluates.
+    async fn wait_for_fetch(&mut self) -> bool {
+        let polling = self.receiver.is_none() || self.failures > 0;
+        let wake = [
+            if polling { self.next_poll } else { None },
+            self.next_heartbeat,
+            self.idle_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        match &mut self.receiver {
+            Some(receiver) if !polling => {
+                tokio::select! {
+                    n = receiver.recv() => {
+                        if n.is_none() {
+                            // Channel closed.
+                            self.state = LiveStreamState::Done;
+                            return false;
+                        }
+                        true
+                    }
+                    _ = sleep_until(wake) => false,
+                }
+            }
+            _ => {
+                sleep_until(wake).await;
+                self.next_poll.is_some_and(|p| Instant::now() >= p)
             }
         }
     }
@@ -884,6 +907,8 @@ mod tests {
         inner: MemoryAdapter,
         fail: AtomicBool,
         calls: AtomicUsize,
+        /// How long each `changes()` call takes, in milliseconds.
+        latency_ms: std::sync::atomic::AtomicU64,
     }
 
     impl Flaky {
@@ -892,6 +917,7 @@ mod tests {
                 inner: MemoryAdapter::new("flaky"),
                 fail: AtomicBool::new(fail),
                 calls: AtomicUsize::new(0),
+                latency_ms: std::sync::atomic::AtomicU64::new(0),
             })
         }
     }
@@ -916,6 +942,10 @@ mod tests {
         }
         async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            let latency = self.latency_ms.load(Ordering::SeqCst);
+            if latency > 0 {
+                tokio::time::sleep(Duration::from_millis(latency)).await;
+            }
             if self.fail.load(Ordering::SeqCst) {
                 return Err(rouchdb_core::error::RouchError::DatabaseError(
                     "connection refused".into(),
@@ -1288,5 +1318,44 @@ mod tests {
             };
             drop(handle);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn next_event_survives_being_dropped_mid_fetch() {
+        let db = Flaky::new(false);
+        db.latency_ms.store(50, Ordering::SeqCst);
+        let mut stream = LiveChangesStream::new(
+            db.clone(),
+            None,
+            ChangesStreamOptions {
+                live: true,
+                poll_interval: Duration::from_millis(500),
+                ..Default::default()
+            },
+        );
+        let mut ticks = tokio::time::interval(Duration::from_millis(20));
+        let mut written = false;
+
+        // A caller racing next_event() against its own timer drops the
+        // future, sometimes in the middle of a fetch.
+        let delivered = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                tokio::select! {
+                    event = stream.next_event() => match event {
+                        Some(ChangesEvent::Change(c)) if c.id == "late" => return true,
+                        Some(ChangesEvent::Paused) if !written => {
+                            written = true;
+                            put_doc(&db.inner, "late", serde_json::json!({})).await;
+                        }
+                        None => return false,
+                        _ => {}
+                    },
+                    _ = ticks.tick() => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(delivered, "change never delivered");
     }
 }
