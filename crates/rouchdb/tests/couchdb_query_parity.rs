@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{Database, FindOptions, ReduceFn, ViewQueryOptions, query_view};
 use serde_json::{Value, json};
 
@@ -164,7 +164,6 @@ async fn mango_selectors_match_couchdb() {
         }
     }
 
-    delete_remote_db(&url).await;
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
@@ -488,7 +487,6 @@ async fn views_match_couchdb() {
     .await;
     assert!(err.is_err());
 
-    delete_remote_db(&url).await;
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
@@ -606,6 +604,4 @@ async fn http_database_runs_mango_on_couchdb() {
     remote.delete_index("idx-name").await.unwrap();
     assert!(remote.get_indexes().await.is_empty());
     assert!(remote.delete_index("idx-name").await.is_err());
-
-    delete_remote_db(&url).await;
 }

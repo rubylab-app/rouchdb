@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{ChangesOptions, ChangesStreamOptions, Database};
 
 #[tokio::test]
@@ -28,8 +28,6 @@ async fn changes_since_sequence() {
         .unwrap();
 
     assert!(partial.results.len() < 3);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -53,8 +51,6 @@ async fn changes_with_limit() {
         .unwrap();
 
     assert_eq!(changes.results.len(), 3);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -78,8 +74,6 @@ async fn changes_include_docs() {
     assert_eq!(changes.results.len(), 1);
     let doc = changes.results[0].doc.as_ref().unwrap();
     assert_eq!(doc["name"], "Alice");
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -109,8 +103,6 @@ async fn changes_after_updates_and_deletes() {
 
     let doc3_change = changes.results.iter().find(|r| r.id == "doc3").unwrap();
     assert!(doc3_change.deleted);
-
-    delete_remote_db(&url).await;
 }
 
 // =========================================================================
@@ -153,8 +145,6 @@ async fn changes_with_selector_filter() {
         let doc = event.doc.as_ref().unwrap();
         assert_eq!(doc["type"], "user");
     }
-
-    delete_remote_db(&url).await;
 }
 
 // =========================================================================
@@ -193,5 +183,4 @@ async fn live_changes_picks_up_new_docs() {
     assert_eq!(event.id, "new1");
 
     handle.cancel();
-    delete_remote_db(&url).await;
 }

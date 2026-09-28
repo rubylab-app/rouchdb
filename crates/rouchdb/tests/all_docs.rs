@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{AllDocsOptions, Database};
 
 #[tokio::test]
@@ -30,8 +30,6 @@ async fn all_docs_include_docs() {
     assert!(result.rows[0].doc.is_some());
     let doc_json = result.rows[0].doc.as_ref().unwrap();
     assert!(doc_json.get("name").is_some());
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -61,8 +59,6 @@ async fn all_docs_key_range() {
     assert!(ids.contains(&"date"));
     assert!(!ids.contains(&"apple"));
     assert!(!ids.contains(&"elderberry"));
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -87,8 +83,6 @@ async fn all_docs_descending() {
     assert_eq!(result.rows[0].id, "ccc");
     assert_eq!(result.rows[1].id, "bbb");
     assert_eq!(result.rows[2].id, "aaa");
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -113,8 +107,6 @@ async fn all_docs_skip_and_limit() {
     assert_eq!(result.rows.len(), 2);
     assert_eq!(result.rows[0].id, "b");
     assert_eq!(result.rows[1].id, "c");
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -126,6 +118,4 @@ async fn all_docs_empty_database() {
     let result = db.all_docs(AllDocsOptions::new()).await.unwrap();
     assert_eq!(result.total_rows, 0);
     assert_eq!(result.rows.len(), 0);
-
-    delete_remote_db(&url).await;
 }

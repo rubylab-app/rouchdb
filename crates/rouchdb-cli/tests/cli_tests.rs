@@ -10,6 +10,11 @@ use base64::Engine;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
+// CouchDB settings and the guard that deletes test databases, shared with
+// the rouchdb integration tests.
+#[path = "../../rouchdb/tests/common/mod.rs"]
+mod common;
+
 async fn setup_db(docs: &[(&str, serde_json::Value)]) -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.redb");
@@ -268,10 +273,6 @@ fn couch_request(method: &str, url: &str, body: Option<&str>) -> (u16, String) {
         .map(|(_, b)| b.to_string())
         .unwrap_or_default();
     (status, body)
-}
-
-fn couchdb_url() -> String {
-    std::env::var("COUCHDB_URL").unwrap_or_else(|_| "http://admin:password@localhost:15984".into())
 }
 
 // ─── INFO ───────────────────────────────────────────────────────────────────
@@ -750,9 +751,8 @@ async fn replicate_redb_to_redb() {
 #[ignore]
 #[tokio::test]
 async fn replicate_to_couchdb() {
-    let couchdb_url = std::env::var("COUCHDB_URL")
-        .unwrap_or_else(|_| "http://admin:password@localhost:15984".to_string());
-    let target_url = format!("{}/rouchdb_cli_test_{}", couchdb_url, std::process::id());
+    // The replication creates the target database; the guard deletes it.
+    let target = common::unique_remote_db("cli_replicate");
 
     let (_src_dir, src_path) = setup_db(&[
         ("a", serde_json::json!({"x": 1})),
@@ -761,7 +761,7 @@ async fn replicate_to_couchdb() {
     .await;
 
     let output = rouchdb_cmd()
-        .args(["replicate", src_path.to_str().unwrap(), &target_url])
+        .args(["replicate", src_path.to_str().unwrap(), target.url()])
         .output()
         .unwrap();
 
@@ -769,6 +769,10 @@ async fn replicate_to_couchdb() {
     let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(v["ok"], true);
     assert_eq!(v["docs_written"], 2);
+    let (status, body) = couch_request("GET", target.url(), None);
+    assert_eq!(status, 200, "{}", body);
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(info["doc_count"], 2);
 }
 
 // ─── COMPACT ────────────────────────────────────────────────────────────────
@@ -1435,9 +1439,7 @@ async fn replicate_with_rejected_docs_exits_non_zero() {
 #[ignore]
 #[tokio::test]
 async fn replicate_rejected_by_couchdb_validator_exits_non_zero() {
-    let db_url = format!("{}/rouchdb_cli_vdu_{}", couchdb_url(), std::process::id());
-    let (status, body) = couch_request("PUT", &db_url, None);
-    assert!(status == 201 || status == 202, "{} {}", status, body);
+    let db_url = common::fresh_remote_db("cli_vdu").await;
     let (status, body) = couch_request(
         "PUT",
         &format!("{}/_design/v", db_url),
@@ -1452,8 +1454,7 @@ async fn replicate_rejected_by_couchdb_validator_exits_non_zero() {
         ("evil", serde_json::json!({"bad": true})),
     ])
     .await;
-    let output = run(&["replicate", path_str(&src_path), &db_url]);
-    couch_request("DELETE", &db_url, None);
+    let output = run(&["replicate", path_str(&src_path), db_url.url()]);
 
     assert_eq!(output.status.code(), Some(1), "{}", stderr_str(&output));
     let v = stdout_json(&output);
@@ -1542,18 +1543,10 @@ async fn replicate_url_credentials_take_precedence_over_env() {
 #[ignore]
 #[tokio::test]
 async fn replicate_to_couchdb_with_env_credentials() {
-    let admin_url = couchdb_url();
-    let db_name = format!("rouchdb_cli_env_auth_{}", std::process::id());
-    let admin_db_url = format!("{}/{}", admin_url, db_name);
+    let couch = common::couchdb();
+    let db = common::fresh_remote_db("cli_env_auth").await;
     // The same URL without credentials; they come from the environment.
-    let (scheme, rest) = admin_url.split_once("://").unwrap();
-    let (userinfo, host) = rest.rsplit_once('@').expect("COUCHDB_URL has credentials");
-    let (user, password) = userinfo.split_once(':').unwrap();
-    let plain_db_url = format!("{}://{}/{}", scheme, host, db_name);
-
-    // Database::http does not create the remote database; do it up front.
-    let (status, body) = couch_request("PUT", &admin_db_url, None);
-    assert!(status == 201 || status == 202, "{} {}", status, body);
+    let plain_db_url = db.anonymous_url();
 
     let (_src_dir, src_path) = setup_db(&[
         ("a", serde_json::json!({"x": 1})),
@@ -1569,11 +1562,10 @@ async fn replicate_to_couchdb_with_env_credentials() {
         .unwrap();
     let with_env = rouchdb_cmd()
         .args(["replicate", path_str(&src_path), &plain_db_url])
-        .env("ROUCHDB_USER", user)
-        .env("ROUCHDB_PASSWORD", password)
+        .env("ROUCHDB_USER", &couch.user)
+        .env("ROUCHDB_PASSWORD", &couch.password)
         .output()
         .unwrap();
-    couch_request("DELETE", &admin_db_url, None);
 
     assert_eq!(without_env.status.code(), Some(1));
     assert!(stderr_str(&without_env).contains("unauthorized"));

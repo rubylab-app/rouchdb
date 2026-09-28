@@ -4,7 +4,7 @@ mod common;
 
 use std::collections::HashMap;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{Database, FindOptions, IndexDefinition, SortField};
 
 #[tokio::test]
@@ -60,8 +60,6 @@ async fn mango_equality_and_inequality() {
         .unwrap();
     assert_eq!(result.docs.len(), 1);
     assert_eq!(result.docs[0]["name"], "Bob");
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -125,8 +123,6 @@ async fn mango_comparison_operators() {
         .await
         .unwrap();
     assert_eq!(result.docs.len(), 2);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -187,8 +183,6 @@ async fn mango_in_nin_exists() {
         .unwrap();
     assert_eq!(result.docs.len(), 1);
     assert_eq!(result.docs[0]["color"], "green");
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -254,8 +248,6 @@ async fn mango_logical_operators() {
         .unwrap();
     assert_eq!(result.docs.len(), 1);
     assert_eq!(result.docs[0]["x"], 3);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -306,8 +298,6 @@ async fn mango_nested_field_query() {
         .await
         .unwrap();
     assert_eq!(result.docs.len(), 1);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -359,8 +349,6 @@ async fn mango_regex_and_type() {
         .await
         .unwrap();
     assert_eq!(result.docs.len(), 1);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -411,8 +399,6 @@ async fn mango_array_operators() {
         .await
         .unwrap();
     assert_eq!(result.docs.len(), 1);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -505,8 +491,6 @@ async fn mango_sort_skip_limit_projection() {
     assert_eq!(result.docs[0]["name"], "Alice");
     assert_eq!(result.docs[0]["age"], 30);
     assert!(result.docs[0].get("city").is_none());
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -530,8 +514,6 @@ async fn mango_empty_selector_matches_all() {
         .await
         .unwrap();
     assert_eq!(result.docs.len(), 3);
-
-    delete_remote_db(&url).await;
 }
 
 // =========================================================================
@@ -609,8 +591,6 @@ async fn mango_create_index_and_query() {
 
     // Deleting nonexistent returns error
     assert!(local.delete_index("nonexistent").await.is_err());
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -659,8 +639,6 @@ async fn mango_index_with_sort_and_limit() {
     assert_eq!(found.docs[0]["score"], 60);
     assert_eq!(found.docs[1]["score"], 65);
     assert_eq!(found.docs[2]["score"], 70);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -716,6 +694,4 @@ async fn mango_multi_field_index() {
         .await
         .unwrap();
     assert_eq!(found.docs.len(), 2);
-
-    delete_remote_db(&url).await;
 }

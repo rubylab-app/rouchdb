@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{Database, RouchError};
 
 #[tokio::test]
@@ -13,8 +13,6 @@ async fn error_get_nonexistent_doc() {
 
     let result = db.get("does_not_exist").await;
     assert!(matches!(result, Err(RouchError::NotFound(_))));
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -32,8 +30,6 @@ async fn error_update_wrong_rev() {
     assert!(matches!(result, Err(RouchError::Conflict)), "{result:?}");
     // The stored document is left untouched.
     assert_eq!(db.get("doc1").await.unwrap().data["v"], 1);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -49,8 +45,6 @@ async fn error_delete_wrong_rev() {
     assert!(matches!(result, Err(RouchError::Conflict)), "{result:?}");
     // The stored document is left untouched.
     assert_eq!(db.get("doc1").await.unwrap().data["v"], 1);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -66,8 +60,6 @@ async fn error_put_existing_without_rev() {
     assert!(matches!(result, Err(RouchError::Conflict)), "{result:?}");
     // The stored document is left untouched.
     assert_eq!(db.get("doc1").await.unwrap().data["v"], 1);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -81,6 +73,4 @@ async fn error_get_deleted_doc() {
 
     let result = db.get("doc1").await;
     assert!(matches!(result, Err(RouchError::NotFound(_))));
-
-    delete_remote_db(&url).await;
 }

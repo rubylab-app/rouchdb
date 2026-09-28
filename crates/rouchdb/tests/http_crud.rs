@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{AllDocsOptions, ChangesOptions, Database};
 
 #[tokio::test]
@@ -19,8 +19,6 @@ async fn http_put_and_get() {
 
     let doc = db.get("doc1").await.unwrap();
     assert_eq!(doc.data["name"], "Alice");
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -40,8 +38,6 @@ async fn http_update_document() {
 
     let doc = db.get("doc1").await.unwrap();
     assert_eq!(doc.data["v"], 2);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -58,8 +54,6 @@ async fn http_delete_document() {
 
     let err = db.get("doc1").await;
     assert!(err.is_err());
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -80,8 +74,6 @@ async fn http_all_docs() {
 
     let result = db.all_docs(AllDocsOptions::new()).await.unwrap();
     assert_eq!(result.total_rows, 3);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -95,6 +87,4 @@ async fn http_changes_feed() {
 
     let changes = db.changes(ChangesOptions::default()).await.unwrap();
     assert_eq!(changes.results.len(), 2);
-
-    delete_remote_db(&url).await;
 }

@@ -28,5 +28,8 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = "3.1.0"
 rouchdb = { path = "../rouchdb" }
+# For the CouchDB helpers shared with crates/rouchdb/tests/common.
+reqwest = { version = "0.12.16", default-features = false }
+uuid = { version = "1", features = ["v4"] }
 serde_json = "1.0.106"
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }

@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::Database;
 
 // -----------------------------------------------------------------------
@@ -28,8 +28,6 @@ async fn post_to_couchdb() {
 
     let info = db.info().await.unwrap();
     assert_eq!(info.doc_count, 2);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -54,8 +52,6 @@ async fn post_and_replicate_to_couchdb() {
 
     remote.get(&r1.id).await.unwrap();
     remote.get(&r2.id).await.unwrap();
-
-    delete_remote_db(&url).await;
 }
 
 // -----------------------------------------------------------------------
@@ -114,6 +110,4 @@ async fn remove_attachment_from_couchdb() {
         )
         .await;
     assert!(err.is_err());
-
-    delete_remote_db(&url).await;
 }

@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{Database, GetAttachmentOptions};
 
 #[tokio::test]
@@ -34,8 +34,6 @@ async fn attachment_put_and_get_http() {
 
     let doc = db.get("doc1").await.unwrap();
     assert_eq!(doc.data["name"], "test");
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -67,6 +65,4 @@ async fn attachment_binary_data() {
         .await
         .unwrap();
     assert_eq!(retrieved, binary_data);
-
-    delete_remote_db(&url).await;
 }

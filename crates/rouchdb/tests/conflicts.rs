@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{Database, GetOptions};
 
 #[tokio::test]
@@ -85,8 +85,6 @@ async fn conflict_both_sides_modify_same_doc() {
         remote_doc.data.get("_conflicts").is_some(),
         "Remote should have _conflicts"
     );
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -123,8 +121,6 @@ async fn conflict_local_delete_remote_update() {
         local_doc.data["v"], 2,
         "Local should agree with remote winner"
     );
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -157,8 +153,6 @@ async fn conflict_remote_delete_local_update() {
 
     let remote_doc = remote.get("doc1").await.unwrap();
     assert_eq!(remote_doc.data["v"], 2);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -216,8 +210,6 @@ async fn conflict_three_way() {
 
     assert_eq!(d1.data["v"], d2.data["v"]);
     assert_eq!(d2.data["v"], dr.data["v"]);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -283,6 +275,4 @@ async fn conflict_resolve_by_update() {
     let remote_doc = remote.get("doc1").await.unwrap();
     assert_eq!(local_doc.data["v"], "resolved");
     assert_eq!(remote_doc.data["v"], "resolved");
-
-    delete_remote_db(&url).await;
 }

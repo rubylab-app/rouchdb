@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::Database;
 
 #[tokio::test]
@@ -19,8 +19,6 @@ async fn database_info_http() {
 
     let info = db.info().await.unwrap();
     assert_eq!(info.doc_count, 2);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -50,8 +48,6 @@ async fn database_compact_http() {
 
     let info = db.info().await.unwrap();
     assert_eq!(info.doc_count, 1);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
@@ -111,6 +107,4 @@ async fn cross_adapter_fidelity_memory_couchdb_redb() {
     assert_eq!(remote_doc.data["array"], redb_doc.data["array"]);
     assert_eq!(mem_doc.data["nested"], remote_doc.data["nested"]);
     assert_eq!(remote_doc.data["nested"], redb_doc.data["nested"]);
-
-    delete_remote_db(&url).await;
 }
