@@ -121,20 +121,27 @@ impl ViewEngine {
         );
         if !behind
             && index.last_seq != Seq::default()
-            && let Some(last_seq) = apply_changes(adapter, &map_fn, index, state).await?
+            && apply_changes(adapter, &map_fn, index, state)
+                .await?
+                .is_some()
         {
             // The document count can only be compared when no write
-            // happened between reading it and reading the changes.
+            // happened between reading it and reading the changes. A purge
+            // bumps update_seq without leaving a change, so check that
+            // update_seq itself did not move rather than matching it
+            // against the last change.
+            let settled = adapter.info().await?.update_seq == info.update_seq;
             let gap = info.doc_count as i64 - state.live.len() as i64;
-            if last_seq != info.update_seq || gap == state.baseline_gap {
+            if !settled || gap == state.baseline_gap {
                 return Ok(());
             }
         }
 
         // Build the index from scratch.
         reset(index, state);
-        let last_seq = apply_changes(adapter, &map_fn, index, state).await?;
-        state.baseline_gap = if last_seq.as_ref() == Some(&info.update_seq) {
+        apply_changes(adapter, &map_fn, index, state).await?;
+        let settled = adapter.info().await?.update_seq == info.update_seq;
+        state.baseline_gap = if settled {
             info.doc_count as i64 - state.live.len() as i64
         } else {
             0
