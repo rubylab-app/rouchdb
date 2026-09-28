@@ -1102,41 +1102,93 @@ mod tests {
 
     // --- F06: the rev hash covers attachments ---
 
-    #[test]
-    fn rev_hash_depends_on_attachments() {
-        let body = serde_json::json!({"a": 1});
-        let meta = |digest: &str| AttachmentMeta {
-            content_type: "text/plain".into(),
+    fn att_meta(digest: &str, content_type: &str) -> AttachmentMeta {
+        AttachmentMeta {
+            content_type: content_type.into(),
             digest: digest.into(),
             length: 3,
             stub: true,
             data: None,
-        };
+        }
+    }
+
+    #[test]
+    fn rev_hash_depends_on_attachments() {
+        let body = serde_json::json!({"a": 1});
         let none = generate_rev_hash(&body, false, Some("1-x"), &HashMap::new());
-        let a: HashMap<_, _> = [("f".to_string(), meta("md5-AAA"))].into();
-        let b: HashMap<_, _> = [("f".to_string(), meta("md5-BBB"))].into();
+        let a: HashMap<_, _> = [("f".to_string(), att_meta("md5-AAA", "text/plain"))].into();
+        let b: HashMap<_, _> = [("f".to_string(), att_meta("md5-BBB", "text/plain"))].into();
         let ha = generate_rev_hash(&body, false, Some("1-x"), &a);
         let hb = generate_rev_hash(&body, false, Some("1-x"), &b);
         assert_ne!(ha, hb);
         assert_ne!(ha, none);
         // Deterministic.
         assert_eq!(ha, generate_rev_hash(&body, false, Some("1-x"), &a));
+        // The attachment name and the content type are covered too.
+        let renamed: HashMap<_, _> = [("g".to_string(), att_meta("md5-AAA", "text/plain"))].into();
+        assert_ne!(ha, generate_rev_hash(&body, false, Some("1-x"), &renamed));
+        let retyped: HashMap<_, _> = [("f".to_string(), att_meta("md5-AAA", "image/png"))].into();
+        assert_ne!(ha, generate_rev_hash(&body, false, Some("1-x"), &retyped));
     }
 
     #[test]
-    fn rev_hash_without_attachments_is_unchanged() {
-        // Documents without attachments keep the historical hash so replicas
-        // on different versions still agree on revision ids.
-        use md5::{Digest, Md5};
-        let body = serde_json::json!({"name": "Alice"});
-        let mut hasher = Md5::new();
-        hasher.update(b"1-abc");
-        hasher.update(b"0");
-        hasher.update(serde_json::to_string(&body).unwrap().as_bytes());
-        let expected = format!("{:x}", hasher.finalize());
+    fn rev_hash_depends_on_deleted_and_parent() {
+        // A tombstone and an empty-body edit of the same parent must not
+        // share a revision id, and neither may edits of different parents.
+        let empty = serde_json::json!({});
+        let live = generate_rev_hash(&empty, false, Some("1-abc"), &HashMap::new());
+        let tomb = generate_rev_hash(&empty, true, Some("1-abc"), &HashMap::new());
+        assert_ne!(live, tomb);
+        assert_ne!(
+            live,
+            generate_rev_hash(&empty, false, Some("1-abd"), &HashMap::new())
+        );
+        assert_ne!(
+            live,
+            generate_rev_hash(&empty, false, None, &HashMap::new())
+        );
+    }
+
+    #[test]
+    fn rev_hash_golden_values() {
+        // Revision ids are persisted and exchanged with other replicas, so the
+        // algorithm must never change silently: md5 over parent rev, deleted
+        // flag, JSON body and, only when present, the sorted attachment set
+        // (`\0name\0digest\0content_type` per attachment). Documents without
+        // attachments keep the historical hash.
+        let alice = serde_json::json!({"name": "Alice"});
+        let none = HashMap::new();
         assert_eq!(
-            generate_rev_hash(&body, false, Some("1-abc"), &HashMap::new()),
-            expected
+            generate_rev_hash(&alice, false, Some("1-abc"), &none),
+            "f133ae7ee0488fb8b317cdbde22abd5a"
+        );
+        assert_eq!(
+            generate_rev_hash(&alice, false, None, &none),
+            "20225af052e2e499c2693fe0977044fa"
+        );
+        let empty = serde_json::json!({});
+        assert_eq!(
+            generate_rev_hash(&empty, false, Some("1-abc"), &none),
+            "b4ad2a06747d1afbfa67965f67605fd5"
+        );
+        assert_eq!(
+            generate_rev_hash(&empty, true, Some("1-abc"), &none),
+            "6775d54c2efb18e61bb66a15b74da837"
+        );
+        let one: HashMap<_, _> = [("f.txt".to_string(), att_meta("md5-AAA", "text/plain"))].into();
+        assert_eq!(
+            generate_rev_hash(&alice, false, Some("1-abc"), &one),
+            "38b695b617e8cf91c097faa5096f18ec"
+        );
+        // Attachments are hashed in name order, whatever the map order.
+        let two: HashMap<_, _> = [
+            ("b".to_string(), att_meta("md5-B", "image/png")),
+            ("a".to_string(), att_meta("md5-A", "text/plain")),
+        ]
+        .into();
+        assert_eq!(
+            generate_rev_hash(&alice, false, Some("1-abc"), &two),
+            "a6039fa3778c7444a1870165af951a01"
         );
     }
 

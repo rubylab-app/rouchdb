@@ -372,24 +372,182 @@ mod tests {
         (b.tree, winner, loser)
     }
 
+    fn revs(v: &[Revision]) -> Vec<String> {
+        v.iter().map(|r| r.to_string()).collect()
+    }
+
+    fn json<T: serde::Serialize>(v: &T) -> serde_json::Value {
+        serde_json::to_value(v).unwrap()
+    }
+
     #[test]
     fn can_update_and_delete_a_losing_leaf() {
-        let (tree, _winner, loser) = conflicted();
-        // Updating the losing leaf extends it.
+        let (tree, winner, loser) = conflicted();
+        let loser_rev: Revision = loser.parse().unwrap();
+        // Updating the losing leaf extends it (and, one generation ahead, it
+        // becomes the winner).
         let upd = plan_new_edit(
             Some(&tree),
             doc("d", Some(&loser), serde_json::json!({"v": "fixed"})),
             None,
             true,
             1000,
+        )
+        .unwrap();
+        assert_eq!(upd.rev.pos, 3);
+        assert_eq!(
+            upd.rev.hash,
+            generate_rev_hash(
+                &serde_json::json!({"v": "fixed"}),
+                false,
+                Some(&loser),
+                &HashMap::new()
+            )
         );
-        assert!(upd.is_ok());
-        // Deleting it resolves the conflict.
+        assert_eq!(
+            crate::rev_tree::find_rev_ancestry(&upd.tree, 3, &upd.rev.hash).unwrap()[1],
+            loser_rev.hash
+        );
+        assert_eq!(winning_rev(&upd.tree).unwrap(), upd.rev);
+        assert_eq!(revs(&collect_conflicts(&upd.tree)), vec![winner.clone()]);
+        // Deleting it resolves the conflict and leaves the winner in place.
         let mut del = doc("d", Some(&loser), serde_json::json!({}));
         del.deleted = true;
         let del = plan_new_edit(Some(&tree), del, None, true, 1000).unwrap();
+        assert_eq!(del.rev.pos, 3);
+        assert!(del.deleted);
         assert!(collect_conflicts(&del.tree).is_empty());
+        assert_eq!(winning_rev(&del.tree).unwrap().to_string(), winner);
         assert!(!del.doc_deleted);
+    }
+
+    #[test]
+    fn deletion_and_empty_edit_get_distinct_revs() {
+        // A tombstone and an empty-body edit of the same parent are different
+        // revisions (the hash covers `_deleted`), so replicating one into a
+        // database holding the other surfaces two leaves instead of silently
+        // treating them as the same revision.
+        let w1 = write(None, doc("d", None, serde_json::json!({"v": 1})));
+        let r1 = w1.rev.to_string();
+        let edit = write(Some(&w1.tree), doc("d", Some(&r1), serde_json::json!({})));
+        let mut del = doc("d", Some(&r1), serde_json::json!({}));
+        del.deleted = true;
+        let tomb = write(Some(&w1.tree), del);
+        assert_eq!((edit.rev.pos, tomb.rev.pos), (2, 2));
+        assert_ne!(edit.rev, tomb.rev);
+        assert!(!edit.deleted && !edit.doc_deleted);
+        assert!(tomb.deleted && tomb.doc_deleted);
+
+        let replicated = doc(
+            "d",
+            Some(&tomb.rev.to_string()),
+            serde_json::json!({"_revisions": {"start": 2, "ids": [tomb.rev.hash, w1.rev.hash]}}),
+        );
+        let mut replicated = replicated;
+        replicated.deleted = true;
+        let ReplicatedWrite::Write(both) =
+            plan_replicated_edit(Some(&edit.tree), replicated, false, 1000).unwrap()
+        else {
+            panic!("a new tombstone must be written");
+        };
+        let mut leaves: Vec<String> = crate::rev_tree::collect_leaves(&both.tree)
+            .iter()
+            .map(|l| l.rev_string())
+            .collect();
+        leaves.sort();
+        let mut expected = vec![edit.rev.to_string(), tomb.rev.to_string()];
+        expected.sort();
+        assert_eq!(leaves, expected);
+        // The live edit wins over the tombstone.
+        assert_eq!(winning_rev(&both.tree).unwrap(), edit.rev);
+        assert!(!both.doc_deleted);
+    }
+
+    #[test]
+    fn retrying_an_update_with_the_old_rev_conflicts() {
+        // A retried PUT (same parent, same body) produces the revision that
+        // already exists; its parent is no longer a leaf, so CouchDB answers
+        // 409 rather than reporting a second successful write.
+        let w1 = write(None, doc("d", None, serde_json::json!({"v": 1})));
+        let r1 = w1.rev.to_string();
+        let w2 = write(
+            Some(&w1.tree),
+            doc("d", Some(&r1), serde_json::json!({"v": 2})),
+        );
+        let err = plan_new_edit(
+            Some(&w2.tree),
+            doc("d", Some(&r1), serde_json::json!({"v": 2})),
+            None,
+            true,
+            1000,
+        )
+        .unwrap_err();
+        assert_eq!(err.error.as_deref(), Some("conflict"));
+        assert_eq!(err.id, "d");
+    }
+
+    #[test]
+    fn new_document_rev_is_generation_one_hash_of_body() {
+        let data = serde_json::json!({"name": "Alice"});
+        let expected = generate_rev_hash(&data, false, None, &HashMap::new());
+        // No stored tree, or an empty one (nothing left after a purge), both
+        // mean "new document".
+        for existing in [None, Some(Vec::new())] {
+            let w = plan_new_edit(
+                existing.as_ref(),
+                doc("d", None, data.clone()),
+                None,
+                true,
+                1000,
+            )
+            .unwrap();
+            assert_eq!(w.rev, Revision::new(1, expected.clone()));
+            assert_eq!(w.data, data);
+            assert!(!w.deleted && !w.doc_deleted);
+            assert_eq!(winning_rev(&w.tree).unwrap(), w.rev);
+        }
+    }
+
+    #[test]
+    fn writes_apply_the_rev_limit() {
+        // new_edits=true: the planned tree is stemmed to rev_limit.
+        let mut w = write(None, doc("d", None, serde_json::json!({"v": 0})));
+        for i in 1..5 {
+            w = plan_new_edit(
+                Some(&w.tree),
+                doc("d", Some(&w.rev.to_string()), serde_json::json!({ "v": i })),
+                None,
+                true,
+                3,
+            )
+            .unwrap();
+        }
+        assert_eq!(w.rev.pos, 5);
+        assert_eq!(w.tree.len(), 1);
+        assert_eq!(w.tree[0].pos, 3);
+        assert_eq!(
+            crate::rev_tree::find_rev_ancestry(&w.tree, 5, &w.rev.hash)
+                .unwrap()
+                .len(),
+            3
+        );
+
+        // new_edits=false: a long `_revisions` list is stemmed too.
+        let ids: Vec<String> = (1..=6).rev().map(|i| format!("{:032x}", i)).collect();
+        let d = doc(
+            "r",
+            Some(&format!("6-{}", ids[0])),
+            serde_json::json!({"_revisions": {"start": 6, "ids": ids}}),
+        );
+        let ReplicatedWrite::Write(p) = plan_replicated_edit(None, d, false, 2).unwrap() else {
+            panic!("a new revision must be written");
+        };
+        assert_eq!(p.tree.len(), 1);
+        assert_eq!(p.tree[0].pos, 5);
+        assert_eq!(
+            crate::rev_tree::find_rev_ancestry(&p.tree, 6, &ids[0]).unwrap(),
+            [ids[0].clone(), ids[1].clone()]
+        );
     }
 
     #[test]
@@ -452,8 +610,21 @@ mod tests {
         d.attachments.insert("a".into(), inline(b"AAA"));
         d.attachments.insert("b".into(), inline(b"BBB"));
         let w1 = write(None, d);
-        assert_eq!(w1.new_blobs.len(), 2);
+        let mut blobs: Vec<(String, Vec<u8>)> = w1.new_blobs.clone();
+        blobs.sort();
+        let mut expected = vec![
+            (crate::document::attachment_digest(b"AAA"), b"AAA".to_vec()),
+            (crate::document::attachment_digest(b"BBB"), b"BBB".to_vec()),
+        ];
+        expected.sort();
+        assert_eq!(blobs, expected);
         let parent = w1.attachments.clone();
+        assert_eq!(
+            parent["a"].digest,
+            crate::document::attachment_digest(b"AAA")
+        );
+        assert_eq!((parent["a"].length, parent["a"].stub), (3, true));
+        assert!(parent["a"].data.is_none());
 
         // Body-only edit inherits.
         let w2 = plan_new_edit(
@@ -464,7 +635,8 @@ mod tests {
             1000,
         )
         .unwrap();
-        assert_eq!(w2.attachments.len(), 2);
+        assert_eq!(json(&w2.attachments), json(&parent));
+        assert!(w2.new_blobs.is_empty());
 
         // Explicit set with one stub: the omitted attachment is dropped.
         let mut d3 = doc("d", Some(&w2.rev.to_string()), serde_json::json!({}));
@@ -473,6 +645,7 @@ mod tests {
         d3.attachments.insert("a".into(), stub);
         let w3 = plan_new_edit(Some(&w2.tree), d3, Some(&parent), true, 1000).unwrap();
         assert_eq!(w3.attachments.keys().collect::<Vec<_>>(), vec!["a"]);
+        assert_eq!(json(&w3.attachments["a"]), json(&parent["a"]));
 
         // Tombstone.
         let mut del = doc("d", Some(&w2.rev.to_string()), serde_json::json!({}));
@@ -517,7 +690,9 @@ mod tests {
         let w1 = write(None, doc("d", None, serde_json::json!({"v": 1})));
         let again = doc("d", Some(&w1.rev.to_string()), serde_json::json!({"v": 99}));
         match plan_replicated_edit(Some(&w1.tree), again.clone(), true, 1000).unwrap() {
-            ReplicatedWrite::AlreadyStored(r) => assert!(r.ok),
+            ReplicatedWrite::AlreadyStored(r) => {
+                assert_eq!(json(&r), json(&ok_result("d", &w1.rev)));
+            }
             ReplicatedWrite::Write(_) => panic!("existing rev must not be rewritten"),
         }
         // Without a stored body it is written (and the node becomes available).
@@ -541,7 +716,20 @@ mod tests {
             Some("3-c"),
             serde_json::json!({"_revisions": {"start": 2, "ids": ["c", "b"]}}),
         );
-        assert!(plan_replicated_edit(None, d, false, 1000).is_err());
+        let err = plan_replicated_edit(None, d, false, 1000).unwrap_err();
+        assert_eq!(err.error.as_deref(), Some("bad_request"));
+        // A replicated write needs a revision and an id.
+        let err = plan_replicated_edit(None, doc("d", None, serde_json::json!({})), false, 1000)
+            .unwrap_err();
+        assert_eq!(err.error.as_deref(), Some("bad_request"));
+        let err = plan_replicated_edit(
+            None,
+            doc("", Some("1-a"), serde_json::json!({})),
+            false,
+            1000,
+        )
+        .unwrap_err();
+        assert_eq!(err.error.as_deref(), Some("bad_request"));
     }
 
     #[test]

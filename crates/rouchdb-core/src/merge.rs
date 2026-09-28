@@ -378,69 +378,13 @@ pub fn latest_leaf(tree: &RevTree, pos: u64, hash: &str) -> Option<Revision> {
 }
 
 // ---------------------------------------------------------------------------
-// Utility: find the latest available revision on a branch
-// ---------------------------------------------------------------------------
-
-/// Find the latest available (non-missing) revision following the branch
-/// that contains `rev`. If `rev` itself is available, returns it. Otherwise
-/// walks toward the leaf looking for the closest available revision.
-pub fn latest_rev(tree: &RevTree, pos: u64, hash: &str) -> Option<Revision> {
-    for path in tree {
-        if let Some(rev) = find_latest_in_node(&path.tree, path.pos, pos, hash) {
-            return Some(rev);
-        }
-    }
-    None
-}
-
-fn find_latest_in_node(
-    node: &RevNode,
-    current_pos: u64,
-    target_pos: u64,
-    target_hash: &str,
-) -> Option<Revision> {
-    if current_pos == target_pos && node.hash == target_hash {
-        // Found the target. If it's available, return it.
-        // Otherwise, walk to the first available leaf.
-        if node.status == RevStatus::Available {
-            return Some(Revision::new(current_pos, node.hash.clone()));
-        }
-        return find_first_available_leaf(node, current_pos);
-    }
-
-    for child in &node.children {
-        if let Some(rev) = find_latest_in_node(child, current_pos + 1, target_pos, target_hash) {
-            return Some(rev);
-        }
-    }
-
-    None
-}
-
-fn find_first_available_leaf(node: &RevNode, pos: u64) -> Option<Revision> {
-    if node.children.is_empty() {
-        if node.status == RevStatus::Available {
-            return Some(Revision::new(pos, node.hash.clone()));
-        }
-        return None;
-    }
-
-    for child in &node.children {
-        if let Some(rev) = find_first_available_leaf(child, pos + 1) {
-            return Some(rev);
-        }
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rev_tree::{RevNode, RevPath, build_path_from_revs};
+    use crate::rev_tree::{RevNode, RevPath, build_path_from_revs, find_rev_ancestry};
 
     fn leaf(hash: &str) -> RevNode {
         RevNode {
@@ -467,6 +411,42 @@ mod tests {
             opts: NodeOpts::default(),
             children,
         }
+    }
+
+    /// Newest-first path ending in an available leaf (ancestors missing),
+    /// like a replicated `_revisions` list.
+    fn path(pos: u64, revs: &[&str]) -> RevPath {
+        let revs: Vec<String> = revs.iter().map(|r| r.to_string()).collect();
+        build_path_from_revs(pos, &revs, NodeOpts::default(), RevStatus::Available)
+    }
+
+    /// Canonical rendering of the WHOLE tree: every root with its position,
+    /// every node with its hash, `(m)` when its body is missing, `(d)` when
+    /// it is deleted, and the children in stored order. Comparing dumps
+    /// checks the exact structure instead of a few derived facts.
+    fn dump(tree: &RevTree) -> String {
+        fn render(n: &RevNode, pos: u64) -> String {
+            let mut s = format!("{}-{}", pos, n.hash);
+            if n.status == RevStatus::Missing {
+                s.push_str("(m)");
+            }
+            if n.opts.deleted {
+                s.push_str("(d)");
+            }
+            if !n.children.is_empty() {
+                let kids: Vec<String> = n.children.iter().map(|c| render(c, pos + 1)).collect();
+                s.push_str(&format!("[{}]", kids.join(",")));
+            }
+            s
+        }
+        tree.iter()
+            .map(|p| render(&p.tree, p.pos))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    fn revs(v: &[Revision]) -> Vec<String> {
+        v.iter().map(|r| r.to_string()).collect()
     }
 
     fn simple_tree() -> RevTree {
@@ -496,7 +476,7 @@ mod tests {
             tree: node("a", vec![leaf("b"), leaf("c")]),
         }];
         let winner = winning_rev(&tree).unwrap();
-        assert_eq!(winner.hash, "c"); // "c" > "b" lexicographically
+        assert_eq!(winner.to_string(), "2-c"); // "c" > "b" lexicographically
     }
 
     #[test]
@@ -508,8 +488,7 @@ mod tests {
             tree: node("a", vec![node("b", vec![leaf("d")]), leaf("c")]),
         }];
         let winner = winning_rev(&tree).unwrap();
-        assert_eq!(winner.pos, 3);
-        assert_eq!(winner.hash, "d"); // pos 3 beats pos 2
+        assert_eq!(winner.to_string(), "3-d"); // pos 3 beats pos 2
     }
 
     #[test]
@@ -521,7 +500,40 @@ mod tests {
             tree: node("a", vec![leaf("b"), deleted_leaf("z")]),
         }];
         let winner = winning_rev(&tree).unwrap();
-        assert_eq!(winner.hash, "b");
+        assert_eq!(winner.to_string(), "2-b");
+        assert!(!is_deleted(&tree));
+    }
+
+    #[test]
+    fn winning_rev_live_beats_deleted_of_higher_generation() {
+        // 1-a -> 2-b -> 3-x (deleted)
+        //     -> 2-y        (live)
+        // A live leaf wins even against a deleted leaf of a higher
+        // generation (CouchDB compares `deleted` before the position).
+        let tree = vec![RevPath {
+            pos: 1,
+            tree: node("a", vec![node("b", vec![deleted_leaf("x")]), leaf("y")]),
+        }];
+        assert_eq!(winning_rev(&tree).unwrap().to_string(), "2-y");
+        assert!(!is_deleted(&tree));
+        // The deleted leaf is not a conflict.
+        assert!(collect_conflicts(&tree).is_empty());
+    }
+
+    #[test]
+    fn winning_rev_all_deleted_picks_highest_generation() {
+        // 1-a -> 2-z (deleted)
+        //     -> 2-b -> 3-c (deleted)
+        let tree = vec![RevPath {
+            pos: 1,
+            tree: node(
+                "a",
+                vec![node("b", vec![deleted_leaf("c")]), deleted_leaf("z")],
+            ),
+        }];
+        assert_eq!(winning_rev(&tree).unwrap().to_string(), "3-c");
+        assert!(is_deleted(&tree));
+        assert!(collect_conflicts(&tree).is_empty());
     }
 
     // --- collect_conflicts ---
@@ -534,14 +546,14 @@ mod tests {
 
     #[test]
     fn conflicts_on_branches() {
-        // 1-a -> 2-b, 2-c
+        // 1-a -> 2-b, 2-c, 2-d -> 3-e : 3-e wins, the other live leaves are
+        // conflicts in winner order (higher generation, then higher hash).
         let tree = vec![RevPath {
             pos: 1,
-            tree: node("a", vec![leaf("b"), leaf("c")]),
+            tree: node("a", vec![leaf("b"), leaf("c"), node("d", vec![leaf("e")])]),
         }];
-        let conflicts = collect_conflicts(&tree);
-        assert_eq!(conflicts.len(), 1);
-        assert_eq!(conflicts[0].hash, "b"); // loser
+        assert_eq!(winning_rev(&tree).unwrap().to_string(), "3-e");
+        assert_eq!(revs(&collect_conflicts(&tree)), ["2-c", "2-b"]);
     }
 
     // --- is_deleted ---
@@ -571,19 +583,10 @@ mod tests {
         }];
 
         // Add: 3-c extending from 2-b
-        let new_path = build_path_from_revs(
-            3,
-            &["c".into(), "b".into()],
-            NodeOpts::default(),
-            RevStatus::Available,
-        );
-
-        let (merged, result) = merge_tree(&tree, &new_path, 1000);
+        let (merged, result) = merge_tree(&tree, &path(3, &["c", "b"]), 1000);
         assert_eq!(result, MergeResult::NewLeaf);
-
-        let winner = winning_rev(&merged).unwrap();
-        assert_eq!(winner.pos, 3);
-        assert_eq!(winner.hash, "c");
+        assert_eq!(dump(&merged), "1-a[2-b[3-c]]");
+        assert_eq!(winning_rev(&merged).unwrap().to_string(), "3-c");
     }
 
     #[test]
@@ -595,18 +598,36 @@ mod tests {
         }];
 
         // Add: 2-c branching from 1-a (conflict)
-        let new_path = build_path_from_revs(
-            2,
-            &["c".into(), "a".into()],
-            NodeOpts::default(),
-            RevStatus::Available,
-        );
-
-        let (merged, result) = merge_tree(&tree, &new_path, 1000);
+        let (merged, result) = merge_tree(&tree, &path(2, &["c", "a"]), 1000);
         assert_eq!(result, MergeResult::NewBranch);
+        assert_eq!(dump(&merged), "1-a[2-b,2-c]");
+        assert_eq!(winning_rev(&merged).unwrap().to_string(), "2-c");
+        assert_eq!(revs(&collect_conflicts(&merged)), ["2-b"]);
+    }
 
-        let conflicts = collect_conflicts(&merged);
-        assert_eq!(conflicts.len(), 1);
+    #[test]
+    fn merge_keeps_conflict_children_sorted_by_hash() {
+        // New siblings are inserted in hash order wherever they land, so the
+        // stored tree (and every traversal of it) is canonical.
+        let mut tree = vec![RevPath {
+            pos: 1,
+            tree: node("a", vec![leaf("b"), leaf("d")]),
+        }];
+        for h in ["c", "e", "0"] {
+            let (merged, result) = merge_tree(&tree, &path(2, &[h, "a"]), 1000);
+            assert_eq!(result, MergeResult::NewBranch, "adding 2-{}", h);
+            tree = merged;
+        }
+        assert_eq!(dump(&tree), "1-a[2-0,2-b,2-c,2-d,2-e]");
+        // Merging the same siblings in another order gives the same tree.
+        let mut other = vec![RevPath {
+            pos: 1,
+            tree: node("a", vec![leaf("e")]),
+        }];
+        for h in ["0", "d", "b", "c"] {
+            other = merge_tree(&other, &path(2, &[h, "a"]), 1000).0;
+        }
+        assert_eq!(dump(&other), dump(&tree));
     }
 
     #[test]
@@ -618,15 +639,9 @@ mod tests {
         }];
 
         // Add: 2-b (already exists)
-        let new_path = build_path_from_revs(
-            2,
-            &["b".into(), "a".into()],
-            NodeOpts::default(),
-            RevStatus::Available,
-        );
-
-        let (_merged, result) = merge_tree(&tree, &new_path, 1000);
+        let (merged, result) = merge_tree(&tree, &path(2, &["b", "a"]), 1000);
         assert_eq!(result, MergeResult::InternalNode);
+        assert_eq!(dump(&merged), dump(&tree));
     }
 
     #[test]
@@ -638,16 +653,45 @@ mod tests {
         }];
 
         // Add: 1-x -> 2-y (completely disjoint)
-        let new_path = build_path_from_revs(
-            2,
-            &["y".into(), "x".into()],
-            NodeOpts::default(),
-            RevStatus::Available,
+        let (merged, result) = merge_tree(&tree, &path(2, &["y", "x"]), 1000);
+        assert_eq!(result, MergeResult::NewBranch);
+        // Two separate roots.
+        assert_eq!(dump(&merged), "1-a[2-b] | 1-x(m)[2-y]");
+        assert_eq!(winning_rev(&merged).unwrap().to_string(), "2-y");
+        assert_eq!(revs(&collect_conflicts(&merged)), ["2-b"]);
+    }
+
+    #[test]
+    fn merge_tree_applies_rev_limit() {
+        // 1-a -> 2-b -> 3-c -> 4-d
+        let (tree, _) = merge_tree(&Vec::new(), &path(4, &["d", "c", "b", "a"]), 1000);
+        assert_eq!(dump(&tree), "1-a(m)[2-b(m)[3-c(m)[4-d]]]");
+
+        // 5-e arrives with rev_limit 3: only the newest 3 revisions stay.
+        let next = path(5, &["e", "d"]);
+        let (stemmed, result) = merge_tree(&tree, &next, 3);
+        assert_eq!(result, MergeResult::NewLeaf);
+        assert_eq!(dump(&stemmed), "3-c(m)[4-d[5-e]]");
+        assert_eq!(stemmed[0].pos, 3);
+        assert_eq!(
+            find_rev_ancestry(&stemmed, 5, "e").unwrap(),
+            ["e", "d", "c"]
         );
 
-        let (merged, result) = merge_tree(&tree, &new_path, 1000);
-        assert_eq!(result, MergeResult::NewBranch);
-        assert_eq!(merged.len(), 2); // Two separate roots
+        // The limit counts revisions, inclusive: 5 keeps all, 4 drops 1-a.
+        assert_eq!(
+            dump(&merge_tree(&tree, &next, 5).0),
+            "1-a(m)[2-b(m)[3-c(m)[4-d[5-e]]]]"
+        );
+        assert_eq!(
+            dump(&merge_tree(&tree, &next, 4).0),
+            "2-b(m)[3-c(m)[4-d[5-e]]]"
+        );
+        // rev_limit 0 means "no limit".
+        assert_eq!(
+            dump(&merge_tree(&tree, &next, 0).0),
+            "1-a(m)[2-b(m)[3-c(m)[4-d[5-e]]]]"
+        );
     }
 
     // --- stem ---
@@ -664,14 +708,9 @@ mod tests {
         }];
 
         let stemmed = stem(&mut tree, 3);
-        assert!(!stemmed.is_empty());
-
-        // Tree should now start at a higher position
-        assert!(tree[0].pos > 1);
-
-        // Leaf should still be present
-        let leaves = collect_leaves(&tree);
-        assert_eq!(leaves[0].hash, "e");
+        assert_eq!(stemmed, ["a", "b"]);
+        // The tree now starts at 3-c and keeps the leaf.
+        assert_eq!(dump(&tree), "3-c[4-d[5-e]]");
     }
 
     #[test]
@@ -685,17 +724,41 @@ mod tests {
 
         // depth=1 means each leaf keeps a single revision. The shared
         // ancestors 1-a and 2-b are pruned and each leaf becomes its own root.
-        let stemmed = stem(&mut tree, 1);
-        assert_eq!(stemmed.len(), 2); // a and b removed
-        assert!(stemmed.contains(&"a".to_string()));
-        assert!(stemmed.contains(&"b".to_string()));
+        let mut stemmed = stem(&mut tree, 1);
+        stemmed.sort();
+        assert_eq!(stemmed, ["a", "b"]);
+        assert_eq!(dump(&tree), "3-c | 3-d");
+    }
 
-        assert_eq!(tree.len(), 2); // two separate roots, one per leaf
-        let leaves = collect_leaves(&tree);
-        let hashes: Vec<&str> = leaves.iter().map(|l| l.hash.as_str()).collect();
-        assert!(hashes.contains(&"c"));
-        assert!(hashes.contains(&"d"));
-        assert!(leaves.iter().all(|l| l.pos == 3));
+    #[test]
+    fn stem_limits_every_path_when_branches_share_a_cut_ancestor() {
+        // 1-a -> 2-b -> 3-c -> 4-d -> 5-e
+        //                   -> 4-x
+        // Each root-to-leaf path is cut on its own (pouchdb-merge): 5-e keeps
+        // [e, d, c] and 4-x keeps [x, c, b]. Re-merging the cut paths must
+        // not graft them back into a path longer than the limit.
+        let mut tree = vec![RevPath {
+            pos: 1,
+            tree: node(
+                "a",
+                vec![node(
+                    "b",
+                    vec![node("c", vec![node("d", vec![leaf("e")]), leaf("x")])],
+                )],
+            ),
+        }];
+        let stemmed = stem(&mut tree, 3);
+        assert_eq!(stemmed, ["a"]); // 2-b is still needed by 4-x
+        assert_eq!(find_rev_ancestry(&tree, 5, "e").unwrap(), ["e", "d", "c"]);
+        assert_eq!(find_rev_ancestry(&tree, 4, "x").unwrap(), ["x", "c", "b"]);
+        for (pos, ids) in root_to_leaf(&tree) {
+            assert!(ids.len() <= 3, "path from {} too long: {:?}", pos, ids);
+        }
+        let leaves: Vec<String> = collect_leaves(&tree)
+            .iter()
+            .map(|l| l.rev_string())
+            .collect();
+        assert_eq!(leaves, ["5-e", "4-x"]);
     }
 
     #[test]
@@ -724,12 +787,7 @@ mod tests {
         assert_eq!(stemmed_sorted, vec!["c".to_string(), "d".to_string()]);
 
         // Roots become [1-a -> 2-b] and [4-e -> 5-f].
-        assert_eq!(tree.len(), 2);
-        assert_eq!(tree[0].pos, 1);
-        assert_eq!(tree[0].tree.hash, "a");
-        assert_eq!(tree[0].tree.children[0].hash, "b");
-        assert_eq!(tree[1].pos, 4);
-        assert_eq!(tree[1].tree.hash, "e");
+        assert_eq!(dump(&tree), "1-a[2-b] | 4-e[5-f]");
         for path in &tree {
             assert!(max_depth(&path.tree) < 2, "every chain must fit the limit");
         }
@@ -738,10 +796,20 @@ mod tests {
         assert_eq!(winner.pos, 5);
         assert_eq!(winner.hash, "f");
         // The short branch keeps its full ancestry.
-        assert_eq!(
-            crate::rev_tree::find_rev_ancestry(&tree, 2, "b").unwrap(),
-            vec!["b", "a"]
-        );
+        assert_eq!(find_rev_ancestry(&tree, 2, "b").unwrap(), vec!["b", "a"]);
+    }
+
+    #[test]
+    fn stem_short_tree_unchanged() {
+        // 1-a -> 2-b (2 revisions, limit 3 => nothing to prune)
+        let mut tree = vec![RevPath {
+            pos: 1,
+            tree: node("a", vec![leaf("b")]),
+        }];
+
+        let stemmed = stem(&mut tree, 3);
+        assert!(stemmed.is_empty());
+        assert_eq!(dump(&tree), "1-a[2-b]");
     }
 
     // --- remove_leaves (purge) ---
@@ -765,16 +833,11 @@ mod tests {
         // 1-a is not a leaf: ignored.
         let (same, removed) = remove_leaves(&tree, &["1-a".to_string()]);
         assert!(removed.is_empty());
-        assert_eq!(collect_leaves(&same).len(), 2);
+        assert_eq!(dump(&same), "1-a[2-b,2-c]");
         // Purging the loser keeps 1-a for the winner.
         let (after, removed) = remove_leaves(&tree, &["2-b".to_string()]);
         assert_eq!(removed, vec!["2-b"]);
-        let leaves: Vec<String> = collect_leaves(&after)
-            .iter()
-            .map(|l| l.rev_string())
-            .collect();
-        assert_eq!(leaves, vec!["2-c"]);
-        assert!(crate::rev_tree::rev_exists(&after, 1, "a"));
+        assert_eq!(dump(&after), "1-a[2-c]");
     }
 
     #[test]
@@ -792,8 +855,7 @@ mod tests {
         ];
         let (after, removed) = remove_leaves(&tree, &["1-b".to_string()]);
         assert_eq!(removed, vec!["1-b"]);
-        assert_eq!(after.len(), 1);
-        assert_eq!(after[0].tree.hash, "a");
+        assert_eq!(dump(&after), "1-a");
     }
 
     // --- doMerge fidelity (F20, F21, F22) ---
@@ -813,60 +875,36 @@ mod tests {
                 tree: leaf("c"),
             },
         ];
-        let new_path = build_path_from_revs(
-            4,
-            &["d".into(), "c".into(), "b".into(), "a".into()],
-            NodeOpts::default(),
-            RevStatus::Available,
-        );
-        let (merged, result) = merge_tree(&tree, &new_path, 1000);
+        let (merged, result) = merge_tree(&tree, &path(4, &["d", "c", "b", "a"]), 1000);
         assert_eq!(result, MergeResult::NewLeaf);
-        let leaves: Vec<String> = collect_leaves(&merged)
-            .iter()
-            .map(|l| l.rev_string())
-            .collect();
-        assert_eq!(leaves, vec!["4-d"]);
+        assert_eq!(dump(&merged), "1-a[2-b[3-c[4-d]]]");
         assert!(collect_conflicts(&merged).is_empty());
-        assert_eq!(merged.len(), 1);
     }
 
     #[test]
     fn merge_keeps_older_incoming_ancestors() {
         // Local tree only knows [3-c]; 4-d arrives with [d, c, b, a]. The
         // incoming path starts earlier, so it must become the root and keep
-        // 1-a and 2-b instead of dropping them.
+        // 1-a and 2-b instead of dropping them. The existing 3-c keeps its
+        // stored (available) status.
         let tree = vec![RevPath {
             pos: 3,
             tree: leaf("c"),
         }];
-        let new_path = build_path_from_revs(
-            4,
-            &["d".into(), "c".into(), "b".into(), "a".into()],
-            NodeOpts::default(),
-            RevStatus::Available,
-        );
-        let (merged, result) = merge_tree(&tree, &new_path, 1000);
+        let (merged, result) = merge_tree(&tree, &path(4, &["d", "c", "b", "a"]), 1000);
         assert_eq!(result, MergeResult::NewLeaf);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].pos, 1);
+        assert_eq!(dump(&merged), "1-a(m)[2-b(m)[3-c[4-d]]]");
         assert_eq!(
-            crate::rev_tree::find_rev_ancestry(&merged, 4, "d").unwrap(),
+            find_rev_ancestry(&merged, 4, "d").unwrap(),
             vec!["d", "c", "b", "a"]
-        );
-        // The existing 3-c keeps its stored status.
-        assert_eq!(
-            merged[0].tree.children[0].children[0].status,
-            RevStatus::Available
         );
     }
 
     #[test]
     fn merge_into_empty_tree_is_new_leaf() {
-        let new_path =
-            build_path_from_revs(1, &["a".into()], NodeOpts::default(), RevStatus::Available);
-        let (merged, result) = merge_tree(&Vec::new(), &new_path, 1000);
+        let (merged, result) = merge_tree(&Vec::new(), &path(1, &["a"]), 1000);
         assert_eq!(result, MergeResult::NewLeaf);
-        assert_eq!(merged.len(), 1);
+        assert_eq!(dump(&merged), "1-a");
     }
 
     #[test]
@@ -885,110 +923,31 @@ mod tests {
                 }],
             ),
         }];
-        let new_path = build_path_from_revs(
-            2,
-            &["b".into(), "a".into()],
-            NodeOpts::default(),
-            RevStatus::Available,
-        );
-        let (merged, result) = merge_tree(&tree, &new_path, 1000);
+        assert_eq!(dump(&tree), "1-a[2-b(m)[3-c]]");
+        let (merged, result) = merge_tree(&tree, &path(2, &["b", "a"]), 1000);
         assert_eq!(result, MergeResult::InternalNode);
-        assert_eq!(merged[0].tree.children[0].status, RevStatus::Available);
+        assert_eq!(dump(&merged), "1-a[2-b[3-c]]");
     }
 
     #[test]
     fn merge_is_idempotent_and_order_independent() {
         // Two conflicting branches merged in either order give the same tree.
-        let p1 = build_path_from_revs(
-            3,
-            &["c".into(), "b".into(), "a".into()],
-            NodeOpts::default(),
-            RevStatus::Available,
-        );
-        let p2 = build_path_from_revs(
-            2,
-            &["x".into(), "a".into()],
-            NodeOpts::default(),
-            RevStatus::Available,
-        );
+        let p1 = path(3, &["c", "b", "a"]);
+        let p2 = path(2, &["x", "a"]);
         let (t1, _) = merge_tree(&Vec::new(), &p1, 1000);
         let (t1, r1) = merge_tree(&t1, &p2, 1000);
         let (t2, _) = merge_tree(&Vec::new(), &p2, 1000);
         let (t2, r2) = merge_tree(&t2, &p1, 1000);
         assert_eq!(r1, MergeResult::NewBranch);
         assert_eq!(r2, MergeResult::NewBranch);
-        let leaves = |t: &RevTree| {
-            let mut v: Vec<String> = collect_leaves(t).iter().map(|l| l.rev_string()).collect();
-            v.sort();
-            v
-        };
-        assert_eq!(leaves(&t1), leaves(&t2));
-        assert_eq!(t1.len(), 1);
-        assert_eq!(t2.len(), 1);
+        assert_eq!(dump(&t1), "1-a(m)[2-b(m)[3-c],2-x]");
+        assert_eq!(dump(&t2), dump(&t1));
         // Re-merging a path that is already present changes nothing.
-        let (t3, r3) = merge_tree(&t1, &p1, 1000);
-        assert_eq!(r3, MergeResult::InternalNode);
-        assert_eq!(leaves(&t3), leaves(&t1));
-    }
-
-    #[test]
-    fn stem_short_tree_unchanged() {
-        // 1-a -> 2-b (depth 1, limit 3 => nothing to prune)
-        let mut tree = vec![RevPath {
-            pos: 1,
-            tree: node("a", vec![leaf("b")]),
-        }];
-
-        let stemmed = stem(&mut tree, 3);
-        assert!(stemmed.is_empty());
-        assert_eq!(tree[0].pos, 1);
-    }
-
-    // --- latest_rev ---
-
-    #[test]
-    fn latest_rev_finds_available_node() {
-        let tree = simple_tree(); // 1-a -> 2-b -> 3-c
-        let rev = latest_rev(&tree, 3, "c").unwrap();
-        assert_eq!(rev.pos, 3);
-        assert_eq!(rev.hash, "c");
-    }
-
-    #[test]
-    fn latest_rev_walks_to_leaf_from_missing() {
-        // 1-a(missing) -> 2-b(available)
-        let tree = vec![RevPath {
-            pos: 1,
-            tree: RevNode {
-                hash: "a".into(),
-                status: RevStatus::Missing,
-                opts: NodeOpts::default(),
-                children: vec![leaf("b")],
-            },
-        }];
-        let rev = latest_rev(&tree, 1, "a").unwrap();
-        assert_eq!(rev.pos, 2);
-        assert_eq!(rev.hash, "b");
-    }
-
-    #[test]
-    fn latest_rev_none_for_nonexistent() {
-        let tree = simple_tree();
-        assert!(latest_rev(&tree, 5, "zzz").is_none());
-    }
-
-    #[test]
-    fn latest_rev_finds_internal_node() {
-        let tree = simple_tree(); // 1-a -> 2-b -> 3-c
-        let rev = latest_rev(&tree, 2, "b").unwrap();
-        assert_eq!(rev.pos, 2);
-        assert_eq!(rev.hash, "b");
-    }
-
-    #[test]
-    fn latest_rev_on_empty_tree() {
-        let tree: RevTree = vec![];
-        assert!(latest_rev(&tree, 1, "a").is_none());
+        for p in [&p1, &p2] {
+            let (t3, r3) = merge_tree(&t1, p, 1000);
+            assert_eq!(r3, MergeResult::InternalNode);
+            assert_eq!(dump(&t3), dump(&t1));
+        }
     }
 
     #[test]
@@ -1000,6 +959,9 @@ mod tests {
         assert_eq!(rev.hash, "c");
         // A leaf returns itself.
         assert_eq!(latest_leaf(&tree, 3, "c").unwrap().hash, "c");
+        // Unknown revisions have no latest leaf.
+        assert!(latest_leaf(&tree, 2, "zzz").is_none());
+        assert!(latest_leaf(&Vec::new(), 1, "a").is_none());
     }
 
     #[test]
@@ -1025,20 +987,19 @@ mod tests {
 
     #[test]
     fn merge_exact_root_match_no_children() {
-        // Tree: 1-a (single node)
+        // Tree: 1-a (single node); adding the same node is a no-op.
         let tree = vec![RevPath {
             pos: 1,
             tree: leaf("a"),
         }];
-
-        // Add same node: 1-a
         let new_path = RevPath {
             pos: 1,
             tree: leaf("a"),
         };
 
-        let (_, result) = merge_tree(&tree, &new_path, 1000);
+        let (merged, result) = merge_tree(&tree, &new_path, 1000);
         assert_eq!(result, MergeResult::InternalNode);
+        assert_eq!(dump(&merged), "1-a");
     }
 
     #[test]
@@ -1047,18 +1008,9 @@ mod tests {
         let tree = simple_tree();
 
         // Add: 1-a -> 2-b -> 3-c -> 4-d (full ancestry extending leaf)
-        let new_path = build_path_from_revs(
-            4,
-            &["d".into(), "c".into(), "b".into(), "a".into()],
-            NodeOpts::default(),
-            RevStatus::Available,
-        );
-
-        let (merged, result) = merge_tree(&tree, &new_path, 1000);
+        let (merged, result) = merge_tree(&tree, &path(4, &["d", "c", "b", "a"]), 1000);
         assert_eq!(result, MergeResult::NewLeaf);
-        let winner = winning_rev(&merged).unwrap();
-        assert_eq!(winner.pos, 4);
-        assert_eq!(winner.hash, "d");
+        assert_eq!(dump(&merged), "1-a[2-b[3-c[4-d]]]");
     }
 
     #[test]
@@ -1081,7 +1033,7 @@ mod tests {
             pos: 1,
             tree: node("a", vec![leaf("b"), deleted_leaf("c")]),
         }];
-        let conflicts = collect_conflicts(&tree);
-        assert!(conflicts.is_empty());
+        assert_eq!(winning_rev(&tree).unwrap().to_string(), "2-b");
+        assert!(collect_conflicts(&tree).is_empty());
     }
 }
