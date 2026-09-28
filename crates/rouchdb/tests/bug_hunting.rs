@@ -264,9 +264,10 @@ async fn purge_partial_revs() {
         .unwrap();
     let _rev2 = r2.rev.unwrap();
 
-    // Purge only the first revision — doc should still exist with rev2
+    // Purging a non-leaf revision is ignored (CouchDB reports it with an
+    // empty list); the document is untouched.
     let purge_result = db.purge("doc1", vec![rev1]).await.unwrap();
-    assert!(purge_result.purged.contains_key("doc1"));
+    assert_eq!(purge_result.purged["doc1"], Vec::<String>::new());
 
     // Doc should still be accessible via latest rev
     let doc = db.get("doc1").await.unwrap();

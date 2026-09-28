@@ -285,6 +285,45 @@ fn is_empty_node(node: &RevNode) -> bool {
     node.hash.is_empty() && node.children.is_empty()
 }
 
+/// Remove the given leaf revisions from the tree, together with every
+/// ancestor that no remaining leaf still needs (`couch_key_tree:remove_leafs`,
+/// used by purge). Revisions that are not leaves are ignored.
+///
+/// Returns the new tree and the revisions actually removed as leaves.
+pub fn remove_leaves(tree: &RevTree, revs: &[String]) -> (RevTree, Vec<String>) {
+    let leaves: Vec<String> = collect_leaves(tree)
+        .iter()
+        .map(|l| l.rev_string())
+        .collect();
+    let mut removed: Vec<String> = Vec::new();
+    for rev in revs {
+        if leaves.contains(rev) && !removed.contains(rev) {
+            removed.push(rev.clone());
+        }
+    }
+    if removed.is_empty() {
+        return (tree.clone(), removed);
+    }
+
+    let mut result: RevTree = Vec::new();
+    for (pos, ids) in root_to_leaf(tree) {
+        let leaf = format!("{}-{}", pos + ids.len() as u64 - 1, ids[ids.len() - 1].0);
+        if removed.contains(&leaf) {
+            continue;
+        }
+        let path = RevPath {
+            pos,
+            tree: path_to_tree(&ids),
+        };
+        result = if result.is_empty() {
+            vec![path]
+        } else {
+            do_merge(&result, &path, true).0
+        };
+    }
+    (result, removed)
+}
+
 /// Find the winning leaf revision that descends from `(pos, hash)`.
 ///
 /// Used for `latest=true`: walk to the tip of the requested rev's branch.
@@ -703,6 +742,58 @@ mod tests {
             crate::rev_tree::find_rev_ancestry(&tree, 2, "b").unwrap(),
             vec!["b", "a"]
         );
+    }
+
+    // --- remove_leaves (purge) ---
+
+    #[test]
+    fn remove_leaves_drops_unshared_ancestors() {
+        // 1-a -> 2-b -> 3-c : purging the only leaf empties the tree instead
+        // of resurrecting 2-b.
+        let (tree, removed) = remove_leaves(&simple_tree(), &["3-c".to_string()]);
+        assert!(tree.is_empty());
+        assert_eq!(removed, vec!["3-c"]);
+    }
+
+    #[test]
+    fn remove_leaves_keeps_shared_ancestors_and_ignores_internal_nodes() {
+        // 1-a -> 2-b, 2-c
+        let tree = vec![RevPath {
+            pos: 1,
+            tree: node("a", vec![leaf("b"), leaf("c")]),
+        }];
+        // 1-a is not a leaf: ignored.
+        let (same, removed) = remove_leaves(&tree, &["1-a".to_string()]);
+        assert!(removed.is_empty());
+        assert_eq!(collect_leaves(&same).len(), 2);
+        // Purging the loser keeps 1-a for the winner.
+        let (after, removed) = remove_leaves(&tree, &["2-b".to_string()]);
+        assert_eq!(removed, vec!["2-b"]);
+        let leaves: Vec<String> = collect_leaves(&after)
+            .iter()
+            .map(|l| l.rev_string())
+            .collect();
+        assert_eq!(leaves, vec!["2-c"]);
+        assert!(crate::rev_tree::rev_exists(&after, 1, "a"));
+    }
+
+    #[test]
+    fn remove_leaves_drops_whole_root() {
+        // Two roots 1-a and 1-b: purging 1-b removes that root entirely.
+        let tree = vec![
+            RevPath {
+                pos: 1,
+                tree: leaf("a"),
+            },
+            RevPath {
+                pos: 1,
+                tree: leaf("b"),
+            },
+        ];
+        let (after, removed) = remove_leaves(&tree, &["1-b".to_string()]);
+        assert_eq!(removed, vec!["1-b"]);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].tree.hash, "a");
     }
 
     // --- doMerge fidelity (F20, F21, F22) ---

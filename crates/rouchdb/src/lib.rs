@@ -1195,8 +1195,19 @@ mod tests {
         let r1 = db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
         let rev = r1.rev.unwrap();
 
-        // remove_attachment creates a new revision even though attachment
-        // tracking in the memory adapter is simplified
+        // Removing an attachment the document does not have is an error and
+        // writes nothing.
+        assert!(matches!(
+            db.remove_attachment("doc1", "photo.jpg", &rev).await,
+            Err(RouchError::NotFound(_))
+        ));
+
+        let rev = db
+            .put_attachment("doc1", "photo.jpg", &rev, vec![1, 2, 3], "image/jpeg")
+            .await
+            .unwrap()
+            .rev
+            .unwrap();
         let r2 = db
             .remove_attachment("doc1", "photo.jpg", &rev)
             .await
@@ -1204,6 +1215,7 @@ mod tests {
         assert!(r2.ok);
         assert!(r2.rev.is_some());
         assert_ne!(r2.rev.as_deref().unwrap(), rev);
+        assert!(db.get_attachment("doc1", "photo.jpg").await.is_err());
     }
 
     #[tokio::test]

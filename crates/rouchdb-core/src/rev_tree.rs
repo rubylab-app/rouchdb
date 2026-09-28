@@ -270,6 +270,63 @@ pub fn find_rev_ancestry(
     None
 }
 
+/// `revs_info` for a revision: the revision and its ancestors (newest
+/// first) with their CouchDB status (`available`, `missing` or `deleted`).
+///
+/// Only the requested revision's own branch is listed, not the whole tree.
+/// Returns `None` if the revision is not in the tree.
+pub fn revs_info(
+    tree: &RevTree,
+    target_pos: u64,
+    target_hash: &str,
+) -> Option<Vec<crate::document::RevInfo>> {
+    fn walk<'a>(
+        node: &'a RevNode,
+        pos: u64,
+        target_pos: u64,
+        target_hash: &str,
+        chain: &mut Vec<(u64, &'a RevNode)>,
+    ) -> bool {
+        chain.push((pos, node));
+        if pos == target_pos && node.hash == target_hash {
+            return true;
+        }
+        if pos < target_pos {
+            for child in &node.children {
+                if walk(child, pos + 1, target_pos, target_hash, chain) {
+                    return true;
+                }
+            }
+        }
+        chain.pop();
+        false
+    }
+
+    for path in tree {
+        let mut chain = Vec::new();
+        if walk(&path.tree, path.pos, target_pos, target_hash, &mut chain) {
+            return Some(
+                chain
+                    .into_iter()
+                    .rev()
+                    .map(|(pos, node)| crate::document::RevInfo {
+                        rev: format!("{}-{}", pos, node.hash),
+                        status: if node.status == RevStatus::Missing {
+                            "missing"
+                        } else if node.opts.deleted {
+                            "deleted"
+                        } else {
+                            "available"
+                        }
+                        .to_string(),
+                    })
+                    .collect(),
+            );
+        }
+    }
+    None
+}
+
 fn find_chain_in_node(
     node: &RevNode,
     current_pos: u64,
@@ -389,6 +446,39 @@ mod tests {
         assert_eq!(ancestry, vec!["a"]);
 
         assert!(find_rev_ancestry(&tree, 3, "z").is_none());
+    }
+
+    #[test]
+    fn revs_info_lists_only_the_requested_branch() {
+        // 1-a -> 2-b (deleted) ; 1-a -> 2-c ; 1-a missing
+        let tree = vec![RevPath {
+            pos: 1,
+            tree: RevNode {
+                hash: "a".into(),
+                status: RevStatus::Missing,
+                opts: NodeOpts::default(),
+                children: vec![
+                    RevNode {
+                        hash: "b".into(),
+                        status: RevStatus::Available,
+                        opts: NodeOpts { deleted: true },
+                        children: vec![],
+                    },
+                    leaf("c"),
+                ],
+            },
+        }];
+        let info = revs_info(&tree, 2, "c").unwrap();
+        let got: Vec<(String, String)> = info.into_iter().map(|i| (i.rev, i.status)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("2-c".to_string(), "available".to_string()),
+                ("1-a".to_string(), "missing".to_string())
+            ]
+        );
+        assert_eq!(revs_info(&tree, 2, "b").unwrap()[0].status, "deleted");
+        assert!(revs_info(&tree, 3, "z").is_none());
     }
 
     #[test]
