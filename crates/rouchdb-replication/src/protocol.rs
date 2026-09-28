@@ -1348,17 +1348,35 @@ mod tests {
         assert_eq!(target_info.doc_count, 3);
     }
 
-    /// Target that answers `new_edits=false` writes the way CouchDB does:
-    /// only failed docs are reported, so a fully successful batch is `[]`.
-    struct CouchLikeTarget(MemoryAdapter);
+    /// Target that behaves like CouchDB 3.5 where the memory adapter does not:
+    /// - `new_edits=false` writes report only the failed docs, so a fully
+    ///   successful batch is `[]`;
+    /// - `reject` models a `validate_doc_update` that refuses one doc id
+    ///   (per-doc `forbidden`, the rest of the batch is stored);
+    /// - `_local` docs get revs `0-N`: a `_rev` that is not `0-<n>` is a 400,
+    ///   and a write with `_rev: 0-n` stores `0-(n+1)` (CouchDB does not check
+    ///   that `n` is the current rev, and a write without `_rev` stores `0-1`).
+    struct CouchLikeTarget {
+        inner: MemoryAdapter,
+        reject: Option<&'static str>,
+    }
+
+    impl CouchLikeTarget {
+        fn new(inner: MemoryAdapter) -> Self {
+            Self {
+                inner,
+                reject: None,
+            }
+        }
+    }
 
     #[async_trait::async_trait]
     impl Adapter for CouchLikeTarget {
         async fn info(&self) -> Result<DbInfo> {
-            self.0.info().await
+            self.inner.info().await
         }
         async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
-            self.0.get(id, opts).await
+            self.inner.get(id, opts).await
         }
         async fn bulk_docs(
             &self,
@@ -1366,23 +1384,33 @@ mod tests {
             opts: BulkDocsOptions,
         ) -> Result<Vec<DocResult>> {
             let new_edits = opts.new_edits;
-            let results = self.0.bulk_docs(docs, opts).await?;
+            let (rejected, docs): (Vec<_>, Vec<_>) = docs
+                .into_iter()
+                .partition(|d| Some(d.id.as_str()) == self.reject);
+            let mut results = self.inner.bulk_docs(docs, opts).await?;
+            results.extend(rejected.into_iter().map(|d| DocResult {
+                ok: false,
+                id: d.id,
+                rev: d.rev.map(|r| r.to_string()),
+                error: Some("forbidden".into()),
+                reason: Some("rejected by validate_doc_update".into()),
+            }));
             if new_edits {
                 return Ok(results);
             }
             Ok(results.into_iter().filter(|r| !r.ok).collect())
         }
         async fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
-            self.0.all_docs(opts).await
+            self.inner.all_docs(opts).await
         }
         async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
-            self.0.changes(opts).await
+            self.inner.changes(opts).await
         }
         async fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
-            self.0.revs_diff(revs).await
+            self.inner.revs_diff(revs).await
         }
         async fn bulk_get(&self, docs: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
-            self.0.bulk_get(docs).await
+            self.inner.bulk_get(docs).await
         }
         async fn put_attachment(
             &self,
@@ -1392,7 +1420,7 @@ mod tests {
             data: Vec<u8>,
             content_type: &str,
         ) -> Result<DocResult> {
-            self.0
+            self.inner
                 .put_attachment(doc_id, att_id, rev, data, content_type)
                 .await
         }
@@ -1402,7 +1430,7 @@ mod tests {
             att_id: &str,
             opts: GetAttachmentOptions,
         ) -> Result<Vec<u8>> {
-            self.0.get_attachment(doc_id, att_id, opts).await
+            self.inner.get_attachment(doc_id, att_id, opts).await
         }
         async fn remove_attachment(
             &self,
@@ -1410,29 +1438,38 @@ mod tests {
             att_id: &str,
             rev: &str,
         ) -> Result<DocResult> {
-            self.0.remove_attachment(doc_id, att_id, rev).await
+            self.inner.remove_attachment(doc_id, att_id, rev).await
         }
         async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
-            self.0.get_local(id).await
+            self.inner.get_local(id).await
         }
-        async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
-            self.0.put_local(id, doc).await
+        async fn put_local(&self, id: &str, mut doc: serde_json::Value) -> Result<()> {
+            let n = match doc.get("_rev") {
+                None => 0,
+                Some(rev) => rev
+                    .as_str()
+                    .and_then(|r| r.strip_prefix("0-"))
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .ok_or_else(|| RouchError::BadRequest("Invalid rev format".into()))?,
+            };
+            doc["_rev"] = serde_json::json!(format!("0-{}", n + 1));
+            self.inner.put_local(id, doc).await
         }
         async fn remove_local(&self, id: &str) -> Result<()> {
-            self.0.remove_local(id).await
+            self.inner.remove_local(id).await
         }
         async fn compact(&self) -> Result<()> {
-            self.0.compact().await
+            self.inner.compact().await
         }
         async fn destroy(&self) -> Result<()> {
-            self.0.destroy().await
+            self.inner.destroy().await
         }
     }
 
     #[tokio::test]
     async fn docs_written_counts_couchdb_style_empty_replies() {
         let source = MemoryAdapter::new("source");
-        let target = CouchLikeTarget(MemoryAdapter::new("target"));
+        let target = CouchLikeTarget::new(MemoryAdapter::new("target"));
 
         put_doc(&source, "doc1", serde_json::json!({"v": 1})).await;
         put_doc(&source, "doc2", serde_json::json!({"v": 2})).await;
@@ -1447,26 +1484,105 @@ mod tests {
         assert_eq!(target.info().await.unwrap().doc_count, 3);
     }
 
+    #[tokio::test]
+    async fn docs_written_excludes_docs_couchdb_rejected_in_a_batch() {
+        let source = MemoryAdapter::new("source");
+        let target = CouchLikeTarget {
+            inner: MemoryAdapter::new("target"),
+            reject: Some("x"),
+        };
+        for id in ["a", "x", "b"] {
+            put_doc(&source, id, serde_json::json!({})).await;
+        }
+
+        // One batch of three; CouchDB answers with the one failure only.
+        let result = replicate(&source, &target, ReplicationOptions::default())
+            .await
+            .unwrap();
+
+        assert!(!result.ok);
+        assert_eq!((result.docs_read, result.docs_written), (3, 2));
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(
+            result.errors[0].starts_with("write error for x: forbidden"),
+            "{:?}",
+            result.errors
+        );
+        let ids: Vec<String> = target
+            .all_docs(AllDocsOptions::new())
+            .await
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_round_trips_the_couchdb_local_rev() {
+        let source = MemoryAdapter::new("source");
+        let target = CouchLikeTarget::new(MemoryAdapter::new("target"));
+        for i in 0..3 {
+            put_doc(&source, &format!("d{i}"), serde_json::json!({})).await;
+        }
+
+        // One checkpoint write per batch, each carrying the rev just read.
+        let result = replicate(
+            &source,
+            &target,
+            ReplicationOptions {
+                batch_size: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(result.ok, "{:?}", result.errors);
+
+        let rep_id = new_checkpointer(&source, &target, &None)
+            .await
+            .unwrap()
+            .replication_id()
+            .to_string();
+        let cp = target.get_local(&rep_id).await.unwrap();
+        assert_eq!(cp["_rev"], "0-3");
+        assert_eq!(cp["last_seq"], 3);
+    }
+
     /// Faults a [`Faulty`] adapter injects around a memory adapter.
     #[derive(Default)]
     struct Faults {
         /// `bulk_get` answers this doc id with an error item of this kind.
         bulk_get_error: Option<(String, String)>,
+        /// `bulk_get` answers `not_found` for this (doc id, rev) only, though
+        /// the rev is still a leaf.
+        bulk_get_missing_rev: Option<(String, String)>,
         /// Before answering `bulk_get`, edit this doc and compact, so the
         /// requested rev no longer exists (one-shot).
         supersede_on_bulk_get: Option<String>,
         /// `bulk_docs` rejects this doc id with this error kind.
         write_error: Option<(String, String)>,
+        /// The n-th `bulk_docs` call (1-based) fails as a whole, like a
+        /// connection reset.
+        bulk_docs_fails_on_call: Option<usize>,
+        /// `get_local` fails with this error.
+        get_local_error: Option<fn() -> RouchError>,
         /// `put_local` fails with this error.
         put_local_error: Option<fn() -> RouchError>,
-        /// Unreachable: every call fails, except `id()`, which falls back to
-        /// this value (as an HTTP adapter may without a server answer).
+        /// The next this many `put_local` calls fail with `Conflict`.
+        put_local_conflicts: usize,
+        /// Unreachable: the calls a replication makes (`info`, `changes`,
+        /// `revs_diff`, `bulk_get`, `bulk_docs`, `get_local`, `put_local`)
+        /// fail, while `id()` falls back to this value (as an HTTP adapter may
+        /// without a server answer).
         offline_id: Option<String>,
     }
 
     struct Faulty {
         inner: MemoryAdapter,
         faults: std::sync::Mutex<Faults>,
+        bulk_docs_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl Faulty {
@@ -1474,6 +1590,7 @@ mod tests {
             Self {
                 inner,
                 faults: std::sync::Mutex::new(faults),
+                bulk_docs_calls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -1512,6 +1629,12 @@ mod tests {
             opts: BulkDocsOptions,
         ) -> Result<Vec<DocResult>> {
             self.check_online()?;
+            let call = 1 + self
+                .bulk_docs_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.faults.lock().unwrap().bulk_docs_fails_on_call == Some(call) {
+                return Err(RouchError::DatabaseError("connection reset".into()));
+            }
             let write_error = self.faults.lock().unwrap().write_error.clone();
             let Some((bad_id, error)) = write_error else {
                 return self.inner.bulk_docs(docs, opts).await;
@@ -1551,6 +1674,23 @@ mod tests {
                 self.inner.compact().await?;
             }
             let mut resp = self.inner.bulk_get(docs).await?;
+            if let Some((id, rev)) = self.faults.lock().unwrap().bulk_get_missing_rev.clone() {
+                for doc in resp
+                    .results
+                    .iter_mut()
+                    .filter(|r| r.id == id)
+                    .flat_map(|r| r.docs.iter_mut())
+                    .filter(|d| d.ok.as_ref().is_some_and(|ok| ok["_rev"] == rev.as_str()))
+                {
+                    doc.ok = None;
+                    doc.error = Some(BulkGetError {
+                        id: id.clone(),
+                        rev: rev.clone(),
+                        error: "not_found".into(),
+                        reason: "missing".into(),
+                    });
+                }
+            }
             if let Some((id, error)) = self.faults.lock().unwrap().bulk_get_error.clone() {
                 for result in resp.results.iter_mut().filter(|r| r.id == id) {
                     for doc in &mut result.docs {
@@ -1597,12 +1737,22 @@ mod tests {
         }
         async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
             self.check_online()?;
+            if let Some(error) = self.faults.lock().unwrap().get_local_error {
+                return Err(error());
+            }
             self.inner.get_local(id).await
         }
         async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
             self.check_online()?;
-            if let Some(error) = self.faults.lock().unwrap().put_local_error {
-                return Err(error());
+            {
+                let mut faults = self.faults.lock().unwrap();
+                if let Some(error) = faults.put_local_error {
+                    return Err(error());
+                }
+                if faults.put_local_conflicts > 0 {
+                    faults.put_local_conflicts -= 1;
+                    return Err(RouchError::Conflict);
+                }
             }
             self.inner.put_local(id, doc).await
         }
@@ -2000,5 +2150,450 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(since, Seq::Num(3));
+    }
+
+    #[test]
+    fn seq_after_orders_numeric_and_opaque_sequences() {
+        let num = Seq::Num;
+        assert!(seq_after(&num(5), &num(3)));
+        assert!(!seq_after(&num(3), &num(3)));
+        assert!(!seq_after(&num(2), &num(3)));
+
+        // Opaque CouchDB sequences compare by their numeric prefix only.
+        let s = |v: &str| Seq::Str(v.into());
+        assert!(seq_after(&s("5-g1AAAAB"), &s("3-g1AAAAA")));
+        assert!(!seq_after(&s("3-g1AAAAA"), &s("3-g1AAAAA")));
+        assert!(!seq_after(&s("3-g1AAAAA"), &s("5-g1AAAAB")));
+        // 12 > 9 as numbers, though "12" < "9" as text.
+        assert!(seq_after(&s("12-g1AAAAB"), &s("9-g1AAAAA")));
+        assert!(!seq_after(&s("9-g1AAAAA"), &s("12-g1AAAAB")));
+    }
+
+    async fn target_ids(target: &dyn Adapter) -> Vec<String> {
+        target
+            .all_docs(AllDocsOptions::new())
+            .await
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| r.id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn transport_error_mid_run_resumes_from_the_last_checkpointed_batch() {
+        let source = MemoryAdapter::new("source");
+        for i in 0..10 {
+            put_doc(&source, &format!("d{i}"), serde_json::json!({})).await;
+        }
+        let target = Faulty::new(
+            MemoryAdapter::new("target"),
+            Faults {
+                bulk_docs_fails_on_call: Some(3),
+                ..Default::default()
+            },
+        );
+        let opts = || ReplicationOptions {
+            batch_size: 2,
+            ..Default::default()
+        };
+
+        let first = replicate(&source, &target, opts()).await;
+        assert!(
+            matches!(first, Err(RouchError::DatabaseError(ref m)) if m == "connection reset"),
+            "{first:?}"
+        );
+        assert_eq!(target_ids(&target).await, vec!["d0", "d1", "d2", "d3"]);
+
+        // Batches 1 and 2 were checkpointed before the failure: the next run
+        // starts at the third batch, neither from zero nor past it.
+        target.heal();
+        let second = replicate(&source, &target, opts()).await.unwrap();
+        assert!(second.ok, "{:?}", second.errors);
+        assert_eq!((second.docs_read, second.docs_written), (6, 6));
+        assert_eq!(second.last_seq, Seq::Num(10));
+        assert_eq!(target.info().await.unwrap().doc_count, 10);
+    }
+
+    #[tokio::test]
+    async fn bulk_get_not_found_for_a_live_leaf_fails_the_batch() {
+        let inner = MemoryAdapter::new("source");
+        put_doc(&inner, "a", serde_json::json!({"v": 1})).await;
+        put_doc(&inner, "b", serde_json::json!({"v": 2})).await;
+        let source = Faulty::new(
+            inner,
+            Faults {
+                bulk_get_error: Some(("b".into(), "not_found".into())),
+                ..Default::default()
+            },
+        );
+        let target = MemoryAdapter::new("target");
+
+        // `b` is still a leaf on the source: not_found there is a failure to
+        // retry, not a superseded rev to skip.
+        let r1 = replicate(&source, &target, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert!(!r1.ok);
+        assert_eq!(r1.errors.len(), 1, "{:?}", r1.errors);
+        assert!(
+            r1.errors[0].starts_with("fetch error for b 1-"),
+            "{:?}",
+            r1.errors
+        );
+
+        source.heal();
+        let r2 = replicate(&source, &target, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert!(r2.ok, "{:?}", r2.errors);
+        assert_eq!(target_ids(&target).await, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn bulk_get_not_found_for_a_conflicting_leaf_fails_the_batch() {
+        let inner = MemoryAdapter::new("source");
+        put_rev(&inner, "d", &["bbb", "aaa"], serde_json::json!({"v": "b"})).await;
+        put_rev(&inner, "d", &["ccc", "aaa"], serde_json::json!({"v": "c"})).await;
+        let source = Faulty::new(
+            inner,
+            Faults {
+                bulk_get_missing_rev: Some(("d".into(), "2-bbb".into())),
+                ..Default::default()
+            },
+        );
+        let target = MemoryAdapter::new("target");
+
+        // The losing branch is a leaf too: it must not be skipped as if it
+        // had been superseded.
+        let r1 = replicate(&source, &target, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert!(!r1.ok);
+        assert_eq!(
+            r1.errors,
+            vec!["fetch error for d 2-bbb: not_found: missing".to_string()]
+        );
+
+        source.heal();
+        let r2 = replicate(&source, &target, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert!(r2.ok, "{:?}", r2.errors);
+        assert_eq!(conflicts_of(&target, "d").await, vec!["2-bbb"]);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_write_is_denied_like_forbidden() {
+        let source = MemoryAdapter::new("source");
+        put_doc(&source, "a", serde_json::json!({})).await;
+        put_doc(&source, "x", serde_json::json!({})).await;
+        put_doc(&source, "b", serde_json::json!({})).await;
+        let target = Faulty::new(
+            MemoryAdapter::new("target"),
+            Faults {
+                write_error: Some(("x".into(), "unauthorized".into())),
+                ..Default::default()
+            },
+        );
+        let opts = || ReplicationOptions {
+            batch_size: 1,
+            ..Default::default()
+        };
+
+        // CouchDB validators may throw `unauthorized` as well as `forbidden`;
+        // both are final, so the replication moves past the doc.
+        let r1 = replicate(&source, &target, opts()).await.unwrap();
+        assert!(!r1.ok);
+        assert_eq!((r1.docs_read, r1.docs_written), (3, 2));
+        assert_eq!(
+            r1.errors,
+            vec!["write error for x: unauthorized: injected".to_string()]
+        );
+        assert_eq!(target_ids(&target).await, vec!["a", "b"]);
+
+        let r2 = replicate(&source, &target, opts()).await.unwrap();
+        assert!(r2.ok, "{:?}", r2.errors);
+        assert_eq!(r2.docs_read, 0);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_read_errors_are_surfaced() {
+        let source = MemoryAdapter::new("source");
+        put_doc(&source, "a", serde_json::json!({})).await;
+        let target = Faulty::new(
+            MemoryAdapter::new("target"),
+            Faults {
+                get_local_error: Some(|| RouchError::Unauthorized),
+                ..Default::default()
+            },
+        );
+
+        // Only a missing checkpoint means "start over"; a denied read must
+        // not silently rescan (or write) anything.
+        let result = replicate(&source, &target, ReplicationOptions::default()).await;
+        assert!(
+            matches!(result, Err(RouchError::Unauthorized)),
+            "{result:?}"
+        );
+        assert_eq!(target.info().await.unwrap().doc_count, 0);
+    }
+
+    #[tokio::test]
+    async fn source_checkpoint_write_errors_are_reported() {
+        let inner = MemoryAdapter::new("source");
+        put_doc(&inner, "a", serde_json::json!({})).await;
+        let source = Faulty::new(
+            inner,
+            Faults {
+                put_local_error: Some(|| RouchError::DatabaseError("disk full".into())),
+                ..Default::default()
+            },
+        );
+        let target = MemoryAdapter::new("target");
+
+        // Unlike Forbidden/Unauthorized (a read-only source, see
+        // read_only_source_still_checkpoints), a failed write is an error.
+        let result = replicate(&source, &target, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        assert_eq!(
+            result.errors,
+            vec!["checkpoint write failed: database error: disk full".to_string()]
+        );
+        assert_eq!(result.docs_written, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_probe_of_a_replaced_source_rescans_from_the_start() {
+        let target = MemoryAdapter::new("target");
+        let old_source = MemoryAdapter::new("src");
+        for i in 0..5 {
+            put_doc(&old_source, &format!("old{i}"), serde_json::json!({})).await;
+        }
+        replicate(&old_source, &target, ReplicationOptions::default())
+            .await
+            .unwrap();
+
+        // Same name (so same replication id), fresh feed at seq 2, and the
+        // probe write fails for a reason other than permissions: the source
+        // is not known to be read-only, so the target's seq 5 is not trusted.
+        let inner = MemoryAdapter::new("src");
+        put_doc(&inner, "x", serde_json::json!({})).await;
+        put_doc(&inner, "y", serde_json::json!({})).await;
+        let source = Faulty::new(
+            inner,
+            Faults {
+                put_local_error: Some(|| RouchError::DatabaseError("disk full".into())),
+                ..Default::default()
+            },
+        );
+        let result = replicate(&source, &target, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!((result.docs_read, result.docs_written), (2, 2));
+        assert!(target.get("x", GetOptions::default()).await.is_ok());
+        assert!(target.get("y", GetOptions::default()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_write_conflict_is_retried_once() {
+        let source = MemoryAdapter::new("source");
+        put_doc(&source, "a", serde_json::json!({})).await;
+        // CouchDB 3.5 never answers 409 to a `_local` write (it does not check
+        // `_rev`), but another writer or server may: re-read and retry once.
+        let target = Faulty::new(
+            MemoryAdapter::new("target"),
+            Faults {
+                put_local_conflicts: 1,
+                ..Default::default()
+            },
+        );
+
+        let result = replicate(&source, &target, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert!(result.ok, "{:?}", result.errors);
+        let checkpointer = new_checkpointer(&source, &target, &None).await.unwrap();
+        let cp = target
+            .get_local(checkpointer.replication_id())
+            .await
+            .unwrap();
+        assert_eq!(cp["last_seq"], 1);
+    }
+
+    #[tokio::test]
+    async fn custom_filter_keeps_scanning_past_a_fully_rejected_batch() {
+        let source = MemoryAdapter::new("source");
+        for id in ["a1", "a2", "b1", "b2", "b3"] {
+            put_doc(&source, id, serde_json::json!({})).await;
+        }
+        let target = MemoryAdapter::new("target");
+
+        // The first batch of two is entirely filtered out; later batches
+        // still hold matching docs.
+        let result = replicate(
+            &source,
+            &target,
+            ReplicationOptions {
+                batch_size: 2,
+                filter: Some(ReplicationFilter::Custom(Arc::new(|c| {
+                    c.id.starts_with('b')
+                }))),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(result.ok, "{:?}", result.errors);
+        assert_eq!((result.docs_read, result.docs_written), (3, 3));
+        assert_eq!(target_ids(&target).await, vec!["b1", "b2", "b3"]);
+    }
+
+    #[tokio::test]
+    async fn selector_on_deleted_replicates_only_tombstones() {
+        let source = MemoryAdapter::new("source");
+        put_doc(&source, "kept", serde_json::json!({"v": 1})).await;
+        put_doc(&source, "gone", serde_json::json!({"v": 2})).await;
+        let gone = source.get("gone", GetOptions::default()).await.unwrap();
+        let tombstone = source
+            .bulk_docs(
+                vec![Document {
+                    id: "gone".into(),
+                    rev: gone.rev,
+                    deleted: true,
+                    data: serde_json::json!({}),
+                    attachments: HashMap::new(),
+                }],
+                BulkDocsOptions::new(),
+            )
+            .await
+            .unwrap()[0]
+            .rev
+            .clone()
+            .unwrap();
+        let target = MemoryAdapter::new("target");
+
+        let result = replicate(
+            &source,
+            &target,
+            ReplicationOptions {
+                filter: Some(ReplicationFilter::Selector(
+                    serde_json::json!({"_deleted": true}),
+                )),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(result.ok, "{:?}", result.errors);
+        assert_eq!((result.docs_read, result.docs_written), (2, 1));
+
+        let feed = target.changes(ChangesOptions::default()).await.unwrap();
+        let got: Vec<(&str, &str, bool)> = feed
+            .results
+            .iter()
+            .map(|c| (c.id.as_str(), c.changes[0].rev.as_str(), c.deleted))
+            .collect();
+        assert_eq!(got, vec![("gone", tombstone.as_str(), true)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_retry_backs_off_exponentially_by_default() {
+        let source = Arc::new(MemoryAdapter::new("source"));
+        put_doc(source.as_ref(), "d", serde_json::json!({})).await;
+        let target = Arc::new(Faulty::new(
+            MemoryAdapter::new("target"),
+            Faults {
+                offline_id: Some("http://target/db".into()),
+                ..Default::default()
+            },
+        ));
+
+        let (mut rx, handle) = replicate_live(
+            source,
+            target,
+            ReplicationOptions {
+                live: true,
+                retry: true,
+                ..Default::default()
+            },
+        );
+        // Virtual time: the gaps between failed attempts are the delays.
+        let mut failed_at = Vec::new();
+        while failed_at.len() < 4 {
+            match rx.recv().await {
+                Some(ReplicationEvent::Error(_)) => failed_at.push(tokio::time::Instant::now()),
+                Some(_) => {}
+                None => panic!("live replication ended while retrying"),
+            }
+        }
+        handle.cancel();
+        let gaps: Vec<Duration> = failed_at.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(
+            gaps,
+            [2, 4, 8].map(Duration::from_secs),
+            "default backoff is 2^attempt seconds"
+        );
+    }
+
+    /// Start a live replication of one doc and wait until it is idle.
+    async fn idle_live_replication() -> (mpsc::Receiver<ReplicationEvent>, ReplicationHandle) {
+        let source = Arc::new(MemoryAdapter::new("source"));
+        put_doc(source.as_ref(), "d", serde_json::json!({})).await;
+        let (mut rx, handle) = replicate_live(
+            source,
+            Arc::new(MemoryAdapter::new("target")),
+            ReplicationOptions {
+                live: true,
+                poll_interval: Duration::from_millis(20),
+                ..Default::default()
+            },
+        );
+        assert!(wait_for(&mut rx, |e| matches!(e, ReplicationEvent::Paused)).await);
+        (rx, handle)
+    }
+
+    /// Drain the channel until it closes (bounded).
+    async fn remaining_events(rx: &mut mpsc::Receiver<ReplicationEvent>) -> Vec<ReplicationEvent> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            events
+        })
+        .await
+        .expect("live replication kept running")
+    }
+
+    #[tokio::test]
+    async fn cancel_ends_live_replication_with_one_complete() {
+        let (mut rx, handle) = idle_live_replication().await;
+        handle.cancel();
+        let events = remaining_events(&mut rx).await;
+        let completes: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ReplicationEvent::Complete(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completes.len(), 1, "{events:?}");
+        assert!(completes[0].ok);
+        assert!(matches!(events.last(), Some(ReplicationEvent::Complete(_))));
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_handle_ends_live_replication() {
+        let (mut rx, handle) = idle_live_replication().await;
+        drop(handle);
+        let events = remaining_events(&mut rx).await;
+        assert!(
+            matches!(events.last(), Some(ReplicationEvent::Complete(r)) if r.ok),
+            "{events:?}"
+        );
     }
 }
