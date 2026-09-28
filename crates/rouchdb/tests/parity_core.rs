@@ -228,7 +228,6 @@ const HELLO_DIGEST: &str = "md5-ZajifYh5KDgxtmS9i38K1A==";
 /// What PouchDB and CouchDB clients send when writing an inline attachment:
 /// only `content_type` and base64 `data`; the server computes digest/length.
 #[tokio::test]
-#[ignore = "blocked on F03"]
 async fn inline_base64_attachment_decoding() {
     let json = serde_json::json!({
         "_id": "doc1",
@@ -259,7 +258,6 @@ async fn inline_base64_attachment_decoding() {
 /// `_bulk_get?attachments=true`): inline `data` plus `digest` and `revpos`,
 /// but no `length`.
 #[tokio::test]
-#[ignore = "blocked on F03"]
 async fn inline_attachment_as_returned_by_couchdb() {
     let json = serde_json::json!({
         "_id": "doc1",
