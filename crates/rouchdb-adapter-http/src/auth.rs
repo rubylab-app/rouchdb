@@ -64,15 +64,7 @@ impl AuthClient {
             .send()
             .await
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(RouchError::DatabaseError(format!(
-                "login failed ({}): {}",
-                status, body
-            )));
-        }
+        let resp = crate::check_response(resp).await?;
 
         resp.json::<Session>()
             .await
@@ -123,15 +115,7 @@ impl AuthClient {
             .send()
             .await
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(RouchError::DatabaseError(format!(
-                "signup failed ({}): {}",
-                status, body
-            )));
-        }
+        crate::check_response(resp).await?;
 
         Ok(())
     }

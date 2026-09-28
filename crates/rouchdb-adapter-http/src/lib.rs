@@ -37,7 +37,6 @@ struct CouchDbPutResponse {
 
 #[derive(Debug, Deserialize)]
 struct CouchDbError {
-    #[allow(dead_code)]
     error: String,
     reason: String,
 }
@@ -242,37 +241,41 @@ impl HttpAdapter {
     }
 
     async fn check_error(&self, response: reqwest::Response) -> Result<reqwest::Response> {
-        let status = response.status();
-        if status.is_success() {
-            return Ok(response);
-        }
-
-        match status.as_u16() {
-            401 => Err(RouchError::Unauthorized),
-            403 => {
-                let body: CouchDbError = response.json().await.unwrap_or(CouchDbError {
-                    error: "forbidden".into(),
-                    reason: "access denied".into(),
-                });
-                Err(RouchError::Forbidden(body.reason))
-            }
-            404 => {
-                let body: CouchDbError = response.json().await.unwrap_or(CouchDbError {
-                    error: "not_found".into(),
-                    reason: "missing".into(),
-                });
-                Err(RouchError::NotFound(body.reason))
-            }
-            409 => Err(RouchError::Conflict),
-            _ => {
-                let body = response.text().await.unwrap_or_default();
-                Err(RouchError::DatabaseError(format!(
-                    "HTTP {}: {}",
-                    status, body
-                )))
-            }
-        }
+        check_response(response).await
     }
+}
+
+/// Map an unsuccessful CouchDB response to a `RouchError`, using the
+/// `{"error", "reason"}` body when there is one.
+pub(crate) async fn check_response(response: reqwest::Response) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+
+    let body = response.text().await.unwrap_or_default();
+    let couch = serde_json::from_str::<CouchDbError>(&body).ok();
+    let reason = |default: &str| {
+        couch
+            .as_ref()
+            .map(|e| e.reason.clone())
+            .unwrap_or_else(|| default.to_string())
+    };
+    Err(match status.as_u16() {
+        400 | 413 | 415 => RouchError::BadRequest(reason(&body)),
+        401 => RouchError::Unauthorized,
+        403 => RouchError::Forbidden(reason("access denied")),
+        404 => RouchError::NotFound(reason("missing")),
+        409 => RouchError::Conflict,
+        // 412 is "file_exists" on database creation, but also e.g.
+        // "missing_stub" for a document write.
+        412 => match couch {
+            Some(ref e) if e.error == "file_exists" => RouchError::DatabaseExists(e.reason.clone()),
+            Some(ref e) => RouchError::BadRequest(format!("{}: {}", e.error, e.reason)),
+            None => RouchError::BadRequest(body),
+        },
+        _ => RouchError::DatabaseError(format!("HTTP {}: {}", status, body)),
+    })
 }
 
 /// Parse a CouchDB sequence value (can be integer or string).
@@ -1046,5 +1049,132 @@ mod tests {
         let id_a = a.id().await.unwrap();
         assert_eq!(id_a, "http://127.0.0.1:1/userdb");
         assert_ne!(id_a, b.id().await.unwrap());
+    }
+
+    /// Serve one canned raw HTTP `response` to every connection; returns the
+    /// server's base URL.
+    pub(crate) async fn stub_server(response: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let response = response.clone();
+                tokio::spawn(async move {
+                    // Read the request head and body before answering.
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let Ok(n) = socket.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        req.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&req).to_string();
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let len = text
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if req.len() >= end + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    /// A raw JSON response with the given status line.
+    pub(crate) fn json_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    async fn error_for(status: &str, body: &str) -> rouchdb_core::error::RouchError {
+        let url = stub_server(json_response(status, body)).await;
+        let db = HttpAdapter::with_options(
+            &format!("{url}/db"),
+            super::HttpAdapterOptions { skip_setup: true },
+        );
+        db.info().await.unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn http_errors_map_to_rouch_errors() {
+        use rouchdb_core::error::RouchError;
+        let err = error_for(
+            "400 Bad Request",
+            r#"{"error":"bad_request","reason":"Invalid rev format"}"#,
+        )
+        .await;
+        assert!(
+            matches!(err, RouchError::BadRequest(ref r) if r == "Invalid rev format"),
+            "{err:?}"
+        );
+
+        let err = error_for(
+            "412 Precondition Failed",
+            r#"{"error":"file_exists","reason":"The database could not be created, the file already exists."}"#,
+        )
+        .await;
+        assert!(matches!(err, RouchError::DatabaseExists(_)), "{err:?}");
+
+        let err = error_for(
+            "412 Precondition Failed",
+            r#"{"error":"missing_stub","reason":"Invalid attachment stub in d for a.txt"}"#,
+        )
+        .await;
+        assert!(
+            matches!(err, RouchError::BadRequest(ref r) if r.contains("missing_stub")),
+            "{err:?}"
+        );
+
+        let err = error_for(
+            "413 Request Entity Too Large",
+            r#"{"error":"document_too_large","reason":"d"}"#,
+        )
+        .await;
+        assert!(matches!(err, RouchError::BadRequest(_)), "{err:?}");
+
+        let err = error_for(
+            "415 Unsupported Media Type",
+            r#"{"error":"bad_content_type","reason":"Content-Type must be application/json"}"#,
+        )
+        .await;
+        assert!(matches!(err, RouchError::BadRequest(_)), "{err:?}");
+
+        let err = error_for("403 Forbidden", r#"{"error":"forbidden","reason":"no"}"#).await;
+        assert!(
+            matches!(err, RouchError::Forbidden(ref r) if r == "no"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_with_bad_credentials_is_unauthorized() {
+        let url = stub_server(json_response(
+            "401 Unauthorized",
+            r#"{"error":"unauthorized","reason":"Name or password is incorrect."}"#,
+        ))
+        .await;
+        let auth = super::auth::AuthClient::new(&url);
+        let err = auth.login("bob", "wrong").await.unwrap_err();
+        assert!(
+            matches!(err, rouchdb_core::error::RouchError::Unauthorized),
+            "{err:?}"
+        );
     }
 }

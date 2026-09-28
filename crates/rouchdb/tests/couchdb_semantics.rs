@@ -307,3 +307,34 @@ async fn http_skip_setup_does_not_create_database() {
         Err(rouchdb::RouchError::NotFound(_))
     ));
 }
+
+// =========================================================================
+// HTTP error mapping (F90)
+// =========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn http_errors_keep_couchdb_meaning() {
+    let url = fresh_remote_db("http_errors").await;
+    let remote = Database::http(&url);
+    remote.put("d", serde_json::json!({})).await.unwrap();
+
+    let err = remote
+        .get_with_opts(
+            "d",
+            GetOptions {
+                rev: Some("not-a-rev".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, rouchdb::RouchError::BadRequest(_)), "{err:?}");
+
+    let server = common::couchdb_url().replace("admin:password@", "");
+    let auth = rouchdb::AuthClient::new(&server);
+    let err = auth.login("admin", "wrong-password").await.unwrap_err();
+    assert!(matches!(err, rouchdb::RouchError::Unauthorized), "{err:?}");
+
+    delete_remote_db(&url).await;
+}
