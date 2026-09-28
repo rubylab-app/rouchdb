@@ -133,6 +133,9 @@ enum Commands {
     /// history and process listings, read from the ROUCHDB_USER and
     /// ROUCHDB_PASSWORD environment variables. The variables apply to every
     /// http(s) source or target whose URL has no credentials of its own.
+    ///
+    /// Exits with status 1 if any document could not be replicated; the
+    /// "errors" field of the output says which and why.
     Replicate {
         /// Source: path to an existing .redb file or CouchDB URL
         source: String,
@@ -534,15 +537,31 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
             };
 
             let result = source_db.replicate_to_with_opts(&target_db, opts).await?;
+            let errors: Vec<String> = result
+                .errors
+                .iter()
+                .map(|e| redact_credentials(e))
+                .collect();
 
             print_json(
                 &serde_json::json!({
                     "ok": result.ok,
                     "docs_read": result.docs_read,
                     "docs_written": result.docs_written,
+                    "errors": errors,
+                    "last_seq": result.last_seq,
                 }),
                 cli.pretty,
             );
+
+            // Documents that were not replicated must fail the command, so
+            // `rouchdb replicate a.redb $URL && rm a.redb` cannot lose data.
+            if !result.ok {
+                return Err(rouchdb::RouchError::DatabaseError(format!(
+                    "replication incomplete: {} error(s), see \"errors\" in the output",
+                    errors.len()
+                )));
+            }
         }
 
         Commands::Compact { path, db_name } => {

@@ -1173,6 +1173,86 @@ async fn import_invalid_file_fails() {
     assert!(stderr_str(&output).contains("cannot read file"));
 }
 
+// ─── REPLICATE RESULTS ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn replicate_output_includes_errors_and_last_seq() {
+    let (_src_dir, src_path) = setup_db(&[("a", serde_json::json!({"x": 1}))]).await;
+    let (_tgt_dir, tgt_path) = setup_db(&[]).await;
+
+    let output = run(&["replicate", path_str(&src_path), path_str(&tgt_path)]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let v = stdout_json(&output);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["errors"], serde_json::json!([]));
+    assert_eq!(v["last_seq"], 1);
+}
+
+#[tokio::test]
+async fn replicate_with_rejected_docs_exits_non_zero() {
+    let (_src_dir, src_path) = setup_db(&[
+        ("a", serde_json::json!({"x": 1})),
+        ("b", serde_json::json!({"x": 2})),
+    ])
+    .await;
+    let (base, _log) = spawn_fake_couchdb(fake_target(true));
+
+    let output = run(&["replicate", path_str(&src_path), &format!("{}/db", base)]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let v = stdout_json(&output);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["docs_written"], 0);
+    let errors = v["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 2, "{:?}", errors);
+    assert!(
+        errors
+            .iter()
+            .all(|e| e.as_str().unwrap().contains("rejected by validator"))
+    );
+    assert_eq!(
+        v["last_seq"], 0,
+        "checkpoint must not pass the failed batch"
+    );
+    assert!(stderr_str(&output).contains("replication"));
+}
+
+#[ignore]
+#[tokio::test]
+async fn replicate_rejected_by_couchdb_validator_exits_non_zero() {
+    let db_url = format!("{}/rouchdb_cli_vdu_{}", couchdb_url(), std::process::id());
+    let (status, body) = couch_request("PUT", &db_url, None);
+    assert!(status == 201 || status == 202, "{} {}", status, body);
+    let (status, body) = couch_request(
+        "PUT",
+        &format!("{}/_design/v", db_url),
+        Some(
+            r#"{"validate_doc_update":"function(d){ if(d.bad){ throw({forbidden: 'bad docs are rejected'}); } }"}"#,
+        ),
+    );
+    assert_eq!(status, 201, "{}", body);
+
+    let (_src_dir, src_path) = setup_db(&[
+        ("good", serde_json::json!({"x": 1})),
+        ("evil", serde_json::json!({"bad": true})),
+    ])
+    .await;
+    let output = run(&["replicate", path_str(&src_path), &db_url]);
+    couch_request("DELETE", &db_url, None);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_str(&output));
+    let v = stdout_json(&output);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["docs_written"], 1);
+    let errors = v["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].as_str().unwrap().contains("evil"));
+}
+
 // ─── REPLICATE CREDENTIALS ──────────────────────────────────────────────────
 
 #[tokio::test]
