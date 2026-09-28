@@ -310,8 +310,11 @@ async fn http_errors_keep_couchdb_meaning() {
         .unwrap_err();
     assert!(matches!(err, rouchdb::RouchError::BadRequest(_)), "{err:?}");
 
+    // A random user that does not exist: failed logins as the real admin
+    // make CouchDB 3.4+ lock the account, and every later test gets a 403.
     let auth = rouchdb::AuthClient::new(&common::couchdb().anonymous_url);
-    let err = auth.login("admin", "wrong-password").await.unwrap_err();
+    let nobody = common::unique_db_name("nobody");
+    let err = auth.login(&nobody, "wrong-password").await.unwrap_err();
     assert!(matches!(err, rouchdb::RouchError::Unauthorized), "{err:?}");
 }
 
