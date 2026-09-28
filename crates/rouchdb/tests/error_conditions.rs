@@ -28,10 +28,8 @@ async fn error_update_wrong_rev() {
     let result = db
         .update("doc1", "1-bogusrevisionhash", serde_json::json!({"v": 2}))
         .await;
-    // CouchDB rejects the write per document with a 409 conflict.
-    let result = result.unwrap();
-    assert!(!result.ok, "{result:?}");
-    assert_eq!(result.error.as_deref(), Some("conflict"));
+    // CouchDB rejects the write with a 409, surfaced as a conflict error.
+    assert!(matches!(result, Err(RouchError::Conflict)), "{result:?}");
     // The stored document is left untouched.
     assert_eq!(db.get("doc1").await.unwrap().data["v"], 1);
 
@@ -47,10 +45,8 @@ async fn error_delete_wrong_rev() {
     db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
 
     let result = db.remove("doc1", "1-bogusrevisionhash").await;
-    // CouchDB rejects the write per document with a 409 conflict.
-    let result = result.unwrap();
-    assert!(!result.ok, "{result:?}");
-    assert_eq!(result.error.as_deref(), Some("conflict"));
+    // CouchDB rejects the write with a 409, surfaced as a conflict error.
+    assert!(matches!(result, Err(RouchError::Conflict)), "{result:?}");
     // The stored document is left untouched.
     assert_eq!(db.get("doc1").await.unwrap().data["v"], 1);
 
@@ -66,10 +62,8 @@ async fn error_put_existing_without_rev() {
     db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
 
     let result = db.put("doc1", serde_json::json!({"v": 2})).await;
-    // CouchDB rejects the write per document with a 409 conflict.
-    let result = result.unwrap();
-    assert!(!result.ok, "{result:?}");
-    assert_eq!(result.error.as_deref(), Some("conflict"));
+    // CouchDB rejects the write with a 409, surfaced as a conflict error.
+    assert!(matches!(result, Err(RouchError::Conflict)), "{result:?}");
     // The stored document is left untouched.
     assert_eq!(db.get("doc1").await.unwrap().data["v"], 1);
 

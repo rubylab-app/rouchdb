@@ -83,17 +83,14 @@ async fn concurrent_updates_same_doc_produces_conflicts() {
         db2.update("doc1", &rev2, serde_json::json!({"v": "b"}))
     );
 
-    // Both calls complete (a conflict is reported per document, not as Err),
-    // but exactly one of them may win: the other must be rejected as a
-    // conflict instead of silently overwriting the first (lost update).
-    let r1 = r1.unwrap();
-    let r2 = r2.unwrap();
-    let (winner, loser, winning_value) = match (r1.ok, r2.ok) {
-        (true, false) => (r1, r2, "a"),
-        (false, true) => (r2, r1, "b"),
-        _ => panic!("exactly one update should succeed: {r1:?} / {r2:?}"),
+    // Exactly one of them may win: the other must be rejected as a conflict
+    // instead of silently overwriting the first (lost update).
+    let (winner, winning_value) = match (r1, r2) {
+        (Ok(w), Err(RouchError::Conflict)) => (w, "a"),
+        (Err(RouchError::Conflict), Ok(w)) => (w, "b"),
+        other => panic!("exactly one update should succeed: {other:?}"),
     };
-    assert_eq!(loser.error.as_deref(), Some("conflict"), "{loser:?}");
+    assert!(winner.ok, "{winner:?}");
 
     let doc = db.get("doc1").await.unwrap();
     assert_eq!(doc.data["v"], winning_value);
