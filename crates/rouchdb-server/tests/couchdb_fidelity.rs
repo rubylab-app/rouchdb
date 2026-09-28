@@ -103,6 +103,8 @@ async fn write_responses_carry_location_and_etag() {
 
     let resp = request(&app, Method::PUT, "/db/_design/d", &host, Some("{}")).await;
     assert_eq!(resp.status, StatusCode::CREATED);
+    let conflict = request(&app, Method::PUT, "/db/_design/d", &host, Some("{}")).await;
+    assert_eq!(conflict.status, StatusCode::CONFLICT);
     assert_eq!(
         resp.header("location"),
         Some("http://example.com:5984/db/_design%2Fd")
@@ -218,6 +220,13 @@ async fn missing_and_deleted_documents_have_couchdb_reasons() {
     );
     assert_error(
         &get(&app, "/db/nope").await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "missing",
+    );
+    // An unknown revision is `missing`, even for a deleted document.
+    assert_error(
+        &get(&app, "/db/gone?rev=1-abc").await,
         StatusCode::NOT_FOUND,
         "not_found",
         "missing",
@@ -432,9 +441,24 @@ async fn all_docs_query_parse_errors() {
         let resp = get(&app, &format!("/db/_all_docs?{query}")).await;
         assert_error(&resp, StatusCode::BAD_REQUEST, "query_parse_error", reason);
     }
-    // Valid values still work.
+    // Valid values still work, 0 included.
     put(&app, "/db/a", json!({})).await;
     put(&app, "/db/b", json!({})).await;
+    let resp = get(&app, "/db/_all_docs?limit=0&skip=0").await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(resp.json()["rows"], json!([]));
+    // A range that sorts before every id is empty; descending, the offset
+    // is then the number of rows (CouchDB: `offset` == `total_rows`).
+    let resp = get(&app, "/db/_all_docs?descending=true&startkey=1").await;
+    assert_eq!(
+        resp.json(),
+        json!({"total_rows": 2, "offset": 2, "rows": []})
+    );
+    let resp = get(&app, "/db/_all_docs?startkey=1&endkey=1").await;
+    assert_eq!(
+        resp.json(),
+        json!({"total_rows": 2, "offset": 0, "rows": []})
+    );
     let resp = get(
         &app,
         "/db/_all_docs?limit=1&skip=1&descending=true&include_docs=true",
@@ -623,6 +647,18 @@ async fn changes_report_pending_and_omit_deleted_false() {
         pending("/db/_changes?descending=true&limit=1").await,
         (1, json!(2))
     );
+
+    // Filtered feeds: nothing is pending when `limit` was not reached; when
+    // it was, the unfiltered changes after the last one returned are.
+    let selector = json!({"selector": {"_id": "a"}});
+    for (uri, expected) in [
+        ("/db/_changes?filter=_selector&limit=5", 0),
+        ("/db/_changes?filter=_selector&limit=1", 2),
+    ] {
+        let body = post(&app, uri, selector.clone()).await.json();
+        assert_eq!(body["results"].as_array().unwrap().len(), 1, "{uri}");
+        assert_eq!(body["pending"], expected, "{uri}");
+    }
 
     let body = get(&app, "/db/_changes").await.json();
     let results = body["results"].as_array().unwrap();

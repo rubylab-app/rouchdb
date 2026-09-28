@@ -80,16 +80,32 @@ async fn deleted_database_is_gone_until_recreated() {
 
 #[tokio::test]
 async fn deleted_database_ends_waiting_changes_feeds() {
-    let app = app();
-    let feed = {
-        let app = app.clone();
-        tokio::spawn(async move { get(&app, "/db/_changes?feed=longpoll&since=now").await })
-    };
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(delete(&app, "/db").await.status, StatusCode::OK);
-    let resp = tokio::time::timeout(Duration::from_secs(5), feed)
-        .await
-        .expect("the longpoll feed must end when the database is deleted")
-        .unwrap();
-    assert_eq!(resp.status, StatusCode::OK);
+    for (feed, check) in [
+        ("longpoll", "longpoll answers with no results"),
+        ("continuous", "continuous ends with its last_seq line"),
+    ] {
+        let app = app();
+        let waiting = {
+            let app = app.clone();
+            let uri = format!("/db/_changes?feed={feed}&since=now");
+            tokio::spawn(async move { get(&app, &uri).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(delete(&app, "/db").await.status, StatusCode::OK);
+        let resp = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap_or_else(|_| panic!("the {feed} feed must end when the database is deleted"))
+            .unwrap();
+        assert_eq!(resp.status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&resp.body).to_string();
+        let last: serde_json::Value =
+            serde_json::from_str(text.trim().lines().last().unwrap_or_default())
+                .unwrap_or_else(|e| panic!("{check}: {e}: {text:?}"));
+        if feed == "longpoll" {
+            assert_eq!(last["results"], json!([]), "{check}: {text}");
+        } else {
+            assert!(last.get("last_seq").is_some(), "{check}: {text}");
+            assert!(last.get("results").is_none(), "{check}: {text}");
+        }
+    }
 }
