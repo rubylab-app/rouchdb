@@ -219,3 +219,91 @@ async fn http_id_is_server_uuid_plus_db_name() {
 
     delete_remote_db(&url).await;
 }
+
+// =========================================================================
+// HTTP parity: conflicts in _changes, update_seq, remote db creation (F88)
+// =========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn http_changes_report_conflicts() {
+    let url = fresh_remote_db("changes_conflicts").await;
+    let remote = Database::http(&url);
+    put_rev(&remote, "d", &["bbb", "aaa"], serde_json::json!({})).await;
+    put_rev(&remote, "d", &["ccc", "aaa"], serde_json::json!({})).await;
+
+    for include_docs in [false, true] {
+        let changes = remote
+            .changes(rouchdb::ChangesOptions {
+                conflicts: true,
+                include_docs,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            changes.results[0].conflicts,
+            Some(vec!["2-bbb".to_string()]),
+            "include_docs={include_docs}"
+        );
+        assert_eq!(changes.results[0].doc.is_some(), include_docs);
+    }
+
+    delete_remote_db(&url).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn http_all_docs_reports_update_seq() {
+    let url = fresh_remote_db("all_docs_seq").await;
+    let remote = Database::http(&url);
+    remote.put("a", serde_json::json!({})).await.unwrap();
+
+    let resp = remote
+        .all_docs(rouchdb::AllDocsOptions {
+            update_seq: true,
+            ..rouchdb::AllDocsOptions::new()
+        })
+        .await
+        .unwrap();
+    let seq = resp.update_seq.expect("update_seq requested");
+    assert_eq!(seq.as_num(), 1);
+
+    delete_remote_db(&url).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn http_creates_missing_database_on_first_use() {
+    let url = format!(
+        "{}/created_on_use_{}",
+        common::couchdb_url(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let remote = Database::http(&url);
+
+    let local = Database::memory("local");
+    local.put("a", serde_json::json!({"v": 1})).await.unwrap();
+    let result = local.replicate_to(&remote).await.unwrap();
+    assert!(result.ok, "{:?}", result.errors);
+    assert_eq!(remote.get("a").await.unwrap().data["v"], 1);
+
+    delete_remote_db(&url).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn http_skip_setup_does_not_create_database() {
+    let url = format!(
+        "{}/not_created_{}",
+        common::couchdb_url(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let remote =
+        rouchdb::HttpAdapter::with_options(&url, rouchdb::HttpAdapterOptions { skip_setup: true });
+    use rouchdb::Adapter;
+    assert!(matches!(
+        remote.info().await,
+        Err(rouchdb::RouchError::NotFound(_))
+    ));
+}

@@ -43,8 +43,8 @@ pub use rouchdb_core::error::{Result, RouchError};
 pub use rouchdb_core::merge::{is_deleted, winning_rev};
 
 // Re-export adapters
-pub use rouchdb_adapter_http::HttpAdapter;
 pub use rouchdb_adapter_http::auth::{AuthClient, Session, UserContext};
+pub use rouchdb_adapter_http::{HttpAdapter, HttpAdapterOptions};
 pub use rouchdb_adapter_memory::MemoryAdapter;
 pub use rouchdb_adapter_redb::RedbAdapter;
 

@@ -122,6 +122,9 @@ struct CouchDbAllDocsResponse {
     // CouchDB sends `"offset": null` when `keys` are posted.
     offset: Option<u64>,
     rows: Vec<CouchDbAllDocsRow>,
+    /// Present when `update_seq=true` was requested.
+    #[serde(default)]
+    update_seq: Option<serde_json::Value>,
 }
 
 /// A row of `_all_docs`. When `keys` are posted, keys that do not exist come
@@ -145,10 +148,24 @@ struct CouchDbAllDocsRowValue {
 // HttpAdapter
 // ---------------------------------------------------------------------------
 
+/// Options for [`HttpAdapter::with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct HttpAdapterOptions {
+    /// Do not create the remote database on first use (PouchDB's
+    /// `skip_setup`): operations on a missing database fail with NotFound.
+    pub skip_setup: bool,
+}
+
 /// HTTP adapter that talks to a remote CouchDB instance.
+///
+/// Like PouchDB, the remote database is created on first use if it does not
+/// exist yet, unless [`HttpAdapterOptions::skip_setup`] is set.
 pub struct HttpAdapter {
     client: Client,
     base_url: String,
+    skip_setup: bool,
+    /// Set once the remote database is known to exist.
+    setup: tokio::sync::OnceCell<()>,
 }
 
 impl HttpAdapter {
@@ -157,17 +174,25 @@ impl HttpAdapter {
     /// The URL should include the database name, e.g.
     /// `http://localhost:5984/mydb` or `http://admin:password@localhost:5984/mydb`
     pub fn new(url: &str) -> Self {
-        let base_url = url.trim_end_matches('/').to_string();
-        Self {
-            client: Client::new(),
-            base_url,
-        }
+        Self::with_options(url, HttpAdapterOptions::default())
+    }
+
+    /// Create a new HTTP adapter with explicit options.
+    pub fn with_options(url: &str, opts: HttpAdapterOptions) -> Self {
+        let mut adapter = Self::with_client(url, Client::new());
+        adapter.skip_setup = opts.skip_setup;
+        adapter
     }
 
     /// Create a new HTTP adapter with a custom reqwest client.
     pub fn with_client(url: &str, client: Client) -> Self {
         let base_url = url.trim_end_matches('/').to_string();
-        Self { client, base_url }
+        Self {
+            client,
+            base_url,
+            skip_setup: false,
+            setup: tokio::sync::OnceCell::new(),
+        }
     }
 
     /// Create a new HTTP adapter using an authenticated client.
@@ -176,6 +201,40 @@ impl HttpAdapter {
     /// reqwest client (with cookie store) will be shared with this adapter.
     pub fn with_auth_client(url: &str, auth: &auth::AuthClient) -> Self {
         Self::with_client(url, auth.client().clone())
+    }
+
+    /// Make sure the remote database exists, creating it when missing, as
+    /// PouchDB does. Runs once per adapter; a failure is retried next call.
+    async fn ensure_setup(&self) -> Result<()> {
+        if self.skip_setup {
+            return Ok(());
+        }
+        self.setup
+            .get_or_try_init(|| async {
+                let resp = self
+                    .client
+                    .get(&self.base_url)
+                    .send()
+                    .await
+                    .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+                if resp.status() != reqwest::StatusCode::NOT_FOUND {
+                    self.check_error(resp).await?;
+                    return Ok(());
+                }
+                let resp = self
+                    .client
+                    .put(&self.base_url)
+                    .send()
+                    .await
+                    .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+                // 412: created concurrently by someone else.
+                if resp.status() != reqwest::StatusCode::PRECONDITION_FAILED {
+                    self.check_error(resp).await?;
+                }
+                Ok(())
+            })
+            .await
+            .map(|_| ())
     }
 
     fn url(&self, path: &str) -> String {
@@ -234,6 +293,7 @@ fn parse_seq(value: &serde_json::Value) -> Seq {
 #[async_trait]
 impl Adapter for HttpAdapter {
     async fn info(&self) -> Result<DbInfo> {
+        self.ensure_setup().await?;
         let resp = self
             .client
             .get(&self.base_url)
@@ -276,6 +336,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
+        self.ensure_setup().await?;
         let mut url = self.url(&encode_doc_id(id));
         let mut params = Vec::new();
 
@@ -331,6 +392,7 @@ impl Adapter for HttpAdapter {
         docs: Vec<Document>,
         opts: BulkDocsOptions,
     ) -> Result<Vec<DocResult>> {
+        self.ensure_setup().await?;
         let json_docs: Vec<serde_json::Value> = docs.iter().map(|d| d.to_json()).collect();
 
         let request = CouchDbBulkDocsRequest {
@@ -365,6 +427,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
+        self.ensure_setup().await?;
         let mut params = Vec::new();
         if opts.include_docs {
             params.push("include_docs=true".into());
@@ -440,13 +503,16 @@ impl Adapter for HttpAdapter {
                     })
                 })
                 .collect(),
-            update_seq: None, // TODO: parse from CouchDB response when update_seq=true
+            update_seq: result.update_seq.as_ref().map(parse_seq),
         })
     }
 
     async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
+        self.ensure_setup().await?;
         let mut params = vec![format!("since={}", opts.since.to_query_string())];
-        if opts.include_docs {
+        // CouchDB only reports conflicts inside included docs (`_conflicts`),
+        // so fetch the docs for them and drop them afterwards if unwanted.
+        if opts.include_docs || opts.conflicts {
             params.push("include_docs=true".into());
         }
         if opts.descending {
@@ -506,23 +572,35 @@ impl Adapter for HttpAdapter {
             results: result
                 .results
                 .into_iter()
-                .map(|r| ChangeEvent {
-                    seq: parse_seq(&r.seq),
-                    id: r.id,
-                    changes: r
-                        .changes
-                        .into_iter()
-                        .map(|c| ChangeRev { rev: c.rev })
-                        .collect(),
-                    deleted: r.deleted,
-                    doc: r.doc,
-                    conflicts: None, // CouchDB includes these inline in the doc
+                .map(|r| {
+                    let conflicts = if opts.conflicts {
+                        r.doc
+                            .as_ref()
+                            .and_then(|d| d.get("_conflicts"))
+                            .and_then(|c| serde_json::from_value::<Vec<String>>(c.clone()).ok())
+                            .filter(|c| !c.is_empty())
+                    } else {
+                        None
+                    };
+                    ChangeEvent {
+                        seq: parse_seq(&r.seq),
+                        id: r.id,
+                        changes: r
+                            .changes
+                            .into_iter()
+                            .map(|c| ChangeRev { rev: c.rev })
+                            .collect(),
+                        deleted: r.deleted,
+                        doc: if opts.include_docs { r.doc } else { None },
+                        conflicts,
+                    }
                 })
                 .collect(),
         })
     }
 
     async fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
+        self.ensure_setup().await?;
         let resp = self
             .client
             .post(self.url("_revs_diff"))
@@ -541,6 +619,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn bulk_get(&self, docs: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
+        self.ensure_setup().await?;
         let request = CouchDbBulkGetRequest {
             docs: docs
                 .into_iter()
@@ -603,6 +682,7 @@ impl Adapter for HttpAdapter {
         data: Vec<u8>,
         content_type: &str,
     ) -> Result<DocResult> {
+        self.ensure_setup().await?;
         let url = format!(
             "{}/{}?rev={}",
             self.url(&encode_doc_id(doc_id)),
@@ -639,6 +719,7 @@ impl Adapter for HttpAdapter {
         att_id: &str,
         opts: GetAttachmentOptions,
     ) -> Result<Vec<u8>> {
+        self.ensure_setup().await?;
         let mut url = format!(
             "{}/{}",
             self.url(&encode_doc_id(doc_id)),
@@ -664,6 +745,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn remove_attachment(&self, doc_id: &str, att_id: &str, rev: &str) -> Result<DocResult> {
+        self.ensure_setup().await?;
         let url = format!(
             "{}/{}?rev={}",
             self.url(&encode_doc_id(doc_id)),
@@ -693,6 +775,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
+        self.ensure_setup().await?;
         let url = self.url(&format!("_local/{}", urlencoded(id)));
         let resp = self
             .client
@@ -709,6 +792,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
+        self.ensure_setup().await?;
         let url = self.url(&format!("_local/{}", urlencoded(id)));
         let resp = self
             .client
@@ -722,6 +806,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn remove_local(&self, id: &str) -> Result<()> {
+        self.ensure_setup().await?;
         // Need to get the current rev first
         let doc = self.get_local(id).await?;
         let rev = doc["_rev"].as_str().unwrap_or("");
@@ -741,6 +826,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn compact(&self) -> Result<()> {
+        self.ensure_setup().await?;
         let resp = self
             .client
             .post(self.url("_compact"))
@@ -764,6 +850,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn purge(&self, req: HashMap<String, Vec<String>>) -> Result<PurgeResponse> {
+        self.ensure_setup().await?;
         let resp = self
             .client
             .post(self.url("_purge"))
@@ -780,6 +867,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn get_security(&self) -> Result<SecurityDocument> {
+        self.ensure_setup().await?;
         let resp = self
             .client
             .get(self.url("_security"))
@@ -795,6 +883,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn put_security(&self, doc: SecurityDocument) -> Result<()> {
+        self.ensure_setup().await?;
         let resp = self
             .client
             .put(self.url("_security"))
