@@ -111,6 +111,23 @@ fn filter_fingerprint(filter: &Option<ReplicationFilter>) -> String {
     }
 }
 
+/// The JSON a replication selector is evaluated against: the body plus
+/// `_id`, `_rev` and `_deleted` (attachments are left out).
+fn selector_view(doc: &Document) -> serde_json::Value {
+    let mut obj = match &doc.data {
+        serde_json::Value::Object(m) => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+    obj.insert("_id".into(), serde_json::Value::String(doc.id.clone()));
+    if let Some(rev) = &doc.rev {
+        obj.insert("_rev".into(), serde_json::Value::String(rev.to_string()));
+    }
+    if doc.deleted {
+        obj.insert("_deleted".into(), serde_json::Value::Bool(true));
+    }
+    serde_json::Value::Object(obj)
+}
+
 /// Run a one-shot replication from source to target.
 ///
 /// Implements the CouchDB replication protocol:
@@ -308,9 +325,11 @@ async fn run_replication(
             }
         }
 
-        // Step 4.5: Apply Selector filter to fetched documents
+        // Step 4.5: Apply Selector filter to fetched documents, including
+        // the reserved fields a selector may test (`_id`, `_rev`, `_deleted`).
         if let Some(ReplicationFilter::Selector(ref selector)) = opts.filter {
-            docs_to_write.retain(|doc| rouchdb_query::matches_selector(&doc.data, selector));
+            docs_to_write
+                .retain(|doc| rouchdb_query::matches_selector(&selector_view(doc), selector));
         }
 
         if !docs_to_write.is_empty() {
@@ -870,6 +889,43 @@ mod tests {
         assert_eq!(doc.data["amount"], 100);
 
         assert!(target.get("user1", GetOptions::default()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn replicate_selector_sees_reserved_fields() {
+        let source = MemoryAdapter::new("source");
+        put_doc(&source, "user:1", serde_json::json!({"n": 1})).await;
+        put_doc(&source, "user:2", serde_json::json!({"n": 2})).await;
+        put_doc(&source, "x", serde_json::json!({"n": 3})).await;
+
+        let run = |selector: serde_json::Value| {
+            let source = &source;
+            async move {
+                let target = MemoryAdapter::new("target");
+                let result = replicate(
+                    source,
+                    &target,
+                    ReplicationOptions {
+                        filter: Some(ReplicationFilter::Selector(selector)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(result.ok);
+                let rows = target.all_docs(AllDocsOptions::new()).await.unwrap().rows;
+                rows.into_iter().map(|r| r.id).collect::<Vec<_>>()
+            }
+        };
+
+        assert_eq!(
+            run(serde_json::json!({"_id": {"$regex": "^user:"}})).await,
+            vec!["user:1", "user:2"]
+        );
+        assert_eq!(
+            run(serde_json::json!({"_id": {"$ne": "x"}})).await,
+            vec!["user:1", "user:2"]
+        );
     }
 
     #[tokio::test]
