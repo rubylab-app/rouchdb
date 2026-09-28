@@ -30,3 +30,4 @@ tempfile = "3"
 rouchdb = { path = "../rouchdb" }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+uuid = { version = "1", features = ["v4"] }
