@@ -30,6 +30,12 @@
 //! # }
 //! ```
 
+// The README's Rust examples are compiled (and run) as doctests of this
+// crate, so they cannot drift from the API.
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+struct ReadmeDoctests;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
