@@ -1311,6 +1311,7 @@ dependencies = [
 name = "rouchdb-replication"
 version = "0.4.0"
 dependencies = [
+ "async-trait",
  "md-5",
  "rouchdb-adapter-memory",
  "rouchdb-core",

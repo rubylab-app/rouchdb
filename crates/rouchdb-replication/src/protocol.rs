@@ -242,6 +242,7 @@ pub async fn replicate(
         }
 
         if !docs_to_write.is_empty() {
+            let attempted = docs_to_write.len() as u64;
             let write_results = target
                 .bulk_docs(docs_to_write, BulkDocsOptions::replication())
                 .await?;
@@ -257,8 +258,11 @@ pub async fn replicate(
                 }
             }
 
-            // Count only docs that were actually persisted.
-            total_docs_written += write_results.iter().filter(|wr| wr.ok).count() as u64;
+            // With new_edits=false CouchDB replies only with the docs that
+            // failed (an empty array means every doc was stored), so count
+            // what was sent minus the reported failures.
+            let failed = write_results.iter().filter(|wr| !wr.ok).count() as u64;
+            total_docs_written += attempted - failed;
         }
 
         // Do not advance the checkpoint past a batch that had any parse or
@@ -426,6 +430,7 @@ async fn replicate_with_events_inner(
         }
 
         if !docs_to_write.is_empty() {
+            let attempted = docs_to_write.len() as u64;
             let write_results = target
                 .bulk_docs(docs_to_write, BulkDocsOptions::replication())
                 .await?;
@@ -441,7 +446,11 @@ async fn replicate_with_events_inner(
                 }
             }
 
-            total_docs_written += write_results.iter().filter(|wr| wr.ok).count() as u64;
+            // With new_edits=false CouchDB replies only with the docs that
+            // failed (an empty array means every doc was stored), so count
+            // what was sent minus the reported failures.
+            let failed = write_results.iter().filter(|wr| !wr.ok).count() as u64;
+            total_docs_written += attempted - failed;
         }
 
         // Emit change event
@@ -1082,5 +1091,104 @@ mod tests {
 
         let target_info = target.info().await.unwrap();
         assert_eq!(target_info.doc_count, 3);
+    }
+
+    /// Target that answers `new_edits=false` writes the way CouchDB does:
+    /// only failed docs are reported, so a fully successful batch is `[]`.
+    struct CouchLikeTarget(MemoryAdapter);
+
+    #[async_trait::async_trait]
+    impl Adapter for CouchLikeTarget {
+        async fn info(&self) -> Result<DbInfo> {
+            self.0.info().await
+        }
+        async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
+            self.0.get(id, opts).await
+        }
+        async fn bulk_docs(
+            &self,
+            docs: Vec<Document>,
+            opts: BulkDocsOptions,
+        ) -> Result<Vec<DocResult>> {
+            let new_edits = opts.new_edits;
+            let results = self.0.bulk_docs(docs, opts).await?;
+            if new_edits {
+                return Ok(results);
+            }
+            Ok(results.into_iter().filter(|r| !r.ok).collect())
+        }
+        async fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
+            self.0.all_docs(opts).await
+        }
+        async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
+            self.0.changes(opts).await
+        }
+        async fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
+            self.0.revs_diff(revs).await
+        }
+        async fn bulk_get(&self, docs: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
+            self.0.bulk_get(docs).await
+        }
+        async fn put_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            rev: &str,
+            data: Vec<u8>,
+            content_type: &str,
+        ) -> Result<DocResult> {
+            self.0
+                .put_attachment(doc_id, att_id, rev, data, content_type)
+                .await
+        }
+        async fn get_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            opts: GetAttachmentOptions,
+        ) -> Result<Vec<u8>> {
+            self.0.get_attachment(doc_id, att_id, opts).await
+        }
+        async fn remove_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            rev: &str,
+        ) -> Result<DocResult> {
+            self.0.remove_attachment(doc_id, att_id, rev).await
+        }
+        async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
+            self.0.get_local(id).await
+        }
+        async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
+            self.0.put_local(id, doc).await
+        }
+        async fn remove_local(&self, id: &str) -> Result<()> {
+            self.0.remove_local(id).await
+        }
+        async fn compact(&self) -> Result<()> {
+            self.0.compact().await
+        }
+        async fn destroy(&self) -> Result<()> {
+            self.0.destroy().await
+        }
+    }
+
+    #[tokio::test]
+    async fn docs_written_counts_couchdb_style_empty_replies() {
+        let source = MemoryAdapter::new("source");
+        let target = CouchLikeTarget(MemoryAdapter::new("target"));
+
+        put_doc(&source, "doc1", serde_json::json!({"v": 1})).await;
+        put_doc(&source, "doc2", serde_json::json!({"v": 2})).await;
+        put_doc(&source, "doc3", serde_json::json!({"v": 3})).await;
+
+        let result = replicate(&source, &target, ReplicationOptions::default())
+            .await
+            .unwrap();
+
+        assert!(result.ok);
+        assert_eq!(result.docs_written, 3);
+        assert_eq!(target.info().await.unwrap().doc_count, 3);
     }
 }
