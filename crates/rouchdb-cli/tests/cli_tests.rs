@@ -1544,7 +1544,11 @@ async fn replicate_source_and_target_names_select_the_checkpoint() {
 async fn replicate_to_couchdb() {
     let couchdb_url = std::env::var("COUCHDB_URL")
         .unwrap_or_else(|_| "http://admin:password@localhost:15984".to_string());
-    let target_url = format!("{}/rouchdb_cli_test_{}", couchdb_url, std::process::id());
+    let target_url = format!(
+        "{}/rouchdb_cli_test_{}",
+        couchdb_url,
+        uuid::Uuid::new_v4().simple()
+    );
 
     let (_src_dir, src_path) = setup_db(&[
         ("a", serde_json::json!({"x": 1})),
@@ -1556,6 +1560,8 @@ async fn replicate_to_couchdb() {
         .args(["replicate", src_path.to_str().unwrap(), &target_url])
         .output()
         .unwrap();
+    // The replication created the database: remove it before asserting.
+    couch_request("DELETE", &target_url, None);
 
     assert!(output.status.success());
     let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
