@@ -293,54 +293,13 @@ impl Database {
     /// Returns a receiver for `ChangeEvent` and a `ChangesHandle` that can be
     /// used to cancel the stream. Dropping the handle also cancels it.
     ///
-    /// If `opts.selector` is set, events are post-filtered using the Mango
-    /// selector — only matching changes are forwarded through the channel.
+    /// If `opts.selector` is set, only changes whose document matches the
+    /// Mango selector are forwarded through the channel.
     pub fn live_changes(
         &self,
         opts: ChangesStreamOptions,
     ) -> (tokio::sync::mpsc::Receiver<ChangeEvent>, ChangesHandle) {
-        if let Some(selector) = opts.selector.clone() {
-            let user_wants_docs = opts.include_docs;
-            // Push the selector into the stream's filter so `limit` counts only
-            // matching changes (composing with any pre-existing filter).
-            let existing = opts.filter.clone();
-            let filter: ChangesFilter = Arc::new(move |e: &ChangeEvent| {
-                if let Some(ref ex) = existing
-                    && !ex(e)
-                {
-                    return false;
-                }
-                e.doc
-                    .as_ref()
-                    .is_some_and(|d| matches_selector(d, &selector))
-            });
-            let inner_opts = ChangesStreamOptions {
-                include_docs: true, // Need docs for selector evaluation
-                selector: None,
-                filter: Some(filter),
-                ..opts
-            };
-            let (inner_rx, handle) = live_changes(self.adapter.clone(), inner_opts);
-            if user_wants_docs {
-                return (inner_rx, handle);
-            }
-
-            // Strip docs the user did not request.
-            let (tx, rx) = tokio::sync::mpsc::channel(64);
-            tokio::spawn(async move {
-                let mut inner_rx = inner_rx;
-                while let Some(mut event) = inner_rx.recv().await {
-                    event.doc = None;
-                    if tx.send(event).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            (rx, handle)
-        } else {
-            live_changes(self.adapter.clone(), opts)
-        }
+        live_changes(self.adapter.clone(), opts)
     }
 
     /// Start a live changes feed with lifecycle events.
@@ -351,54 +310,7 @@ impl Database {
         &self,
         opts: ChangesStreamOptions,
     ) -> (tokio::sync::mpsc::Receiver<ChangesEvent>, ChangesHandle) {
-        if let Some(selector) = opts.selector.clone() {
-            let user_wants_docs = opts.include_docs;
-            // Push the selector into the stream's filter so `limit` counts only
-            // matching changes (composing with any pre-existing filter).
-            let existing = opts.filter.clone();
-            let filter: ChangesFilter = Arc::new(move |e: &ChangeEvent| {
-                if let Some(ref ex) = existing
-                    && !ex(e)
-                {
-                    return false;
-                }
-                e.doc
-                    .as_ref()
-                    .is_some_and(|d| matches_selector(d, &selector))
-            });
-            let inner_opts = ChangesStreamOptions {
-                include_docs: true,
-                selector: None,
-                filter: Some(filter),
-                ..opts
-            };
-            let (inner_rx, handle) = live_changes_events(self.adapter.clone(), inner_opts);
-            if user_wants_docs {
-                return (inner_rx, handle);
-            }
-
-            // Strip docs the user did not request from Change events.
-            let (tx, rx) = tokio::sync::mpsc::channel(64);
-            tokio::spawn(async move {
-                let mut inner_rx = inner_rx;
-                while let Some(event) = inner_rx.recv().await {
-                    let forward = match event {
-                        ChangesEvent::Change(mut ce) => {
-                            ce.doc = None;
-                            ChangesEvent::Change(ce)
-                        }
-                        other => other,
-                    };
-                    if tx.send(forward).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            (rx, handle)
-        } else {
-            live_changes_events(self.adapter.clone(), opts)
-        }
+        live_changes_events(self.adapter.clone(), opts)
     }
 
     // -----------------------------------------------------------------
