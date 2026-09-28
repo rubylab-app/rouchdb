@@ -1551,9 +1551,9 @@ mod tests {
 
         let r2 = db.remove("doc1", &rev).await.unwrap();
         assert!(r2.ok);
+        assert!(r2.rev.as_deref().unwrap().starts_with("2-"), "{r2:?}");
 
-        let err = db.get("doc1").await;
-        assert!(err.is_err());
+        assert!(matches!(db.get("doc1").await, Err(RouchError::NotFound(_))));
     }
 
     #[tokio::test]
@@ -1626,17 +1626,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn database_from_adapter_and_accessor() {
-        let adapter = Arc::new(MemoryAdapter::new("custom"));
-        let db = Database::from_adapter(adapter);
-
-        let _adapter_ref = db.adapter();
-        db.put("doc1", serde_json::json!({})).await.unwrap();
-        let info = db.info().await.unwrap();
-        assert_eq!(info.doc_count, 1);
-    }
-
-    #[tokio::test]
     async fn database_get_with_opts() {
         let db = Database::memory("test");
         let r1 = db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
@@ -1682,26 +1671,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn database_all_docs() {
-        let db = Database::memory("test");
-        db.put("a", serde_json::json!({})).await.unwrap();
-        db.put("b", serde_json::json!({})).await.unwrap();
-
-        let result = db.all_docs(AllDocsOptions::new()).await.unwrap();
-        assert_eq!(result.rows.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn database_changes() {
-        let db = Database::memory("test");
-        db.put("a", serde_json::json!({})).await.unwrap();
-        db.put("b", serde_json::json!({})).await.unwrap();
-
-        let changes = db.changes(ChangesOptions::default()).await.unwrap();
-        assert_eq!(changes.results.len(), 2);
-    }
-
-    #[tokio::test]
     async fn database_replicate_to_with_opts() {
         let local = Database::memory("local");
         let remote = Database::memory("remote");
@@ -1734,7 +1703,8 @@ mod tests {
 
         let r1 = db.post(serde_json::json!({"name": "Alice"})).await.unwrap();
         assert!(r1.ok);
-        assert!(!r1.id.is_empty());
+        let uuid = uuid::Uuid::parse_str(&r1.id).expect("post generates a UUID id");
+        assert_eq!(uuid.get_version_num(), 4, "{}", r1.id);
 
         let r2 = db.post(serde_json::json!({"name": "Bob"})).await.unwrap();
         assert!(r2.ok);
@@ -1774,7 +1744,11 @@ mod tests {
         assert!(r2.ok);
         assert!(r2.rev.is_some());
         assert_ne!(r2.rev.as_deref().unwrap(), rev);
-        assert!(db.get_attachment("doc1", "photo.jpg").await.is_err());
+        assert!(matches!(
+            db.get_attachment("doc1", "photo.jpg").await,
+            Err(RouchError::NotFound(_))
+        ));
+        assert!(db.get("doc1").await.unwrap().attachments.is_empty());
     }
 
     #[tokio::test]
@@ -1818,11 +1792,17 @@ mod tests {
         let found = db
             .find(FindOptions {
                 selector: serde_json::json!({"age": {"$gte": 30}}),
+                sort: Some(vec![SortField::Simple("age".into())]),
                 ..Default::default()
             })
             .await
             .unwrap();
-        assert_eq!(found.docs.len(), 2);
+        let ids: Vec<&str> = found
+            .docs
+            .iter()
+            .map(|d| d["_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["alice", "charlie"]);
 
         // Verify get_indexes
         let indexes = db.get_indexes().await;
@@ -1831,7 +1811,14 @@ mod tests {
 
         // Delete index
         db.delete_index("idx-age").await.unwrap();
-        assert!(db.delete_index("nonexistent").await.is_err());
+        assert!(matches!(
+            db.delete_index("idx-age").await,
+            Err(RouchError::NotFound(_))
+        ));
+        assert!(matches!(
+            db.delete_index("nonexistent").await,
+            Err(RouchError::NotFound(_))
+        ));
 
         let indexes = db.get_indexes().await;
         assert!(indexes.is_empty());
@@ -1966,61 +1953,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn database_changes_with_selector() {
-        let db = Database::memory("test");
-        db.put("alice", serde_json::json!({"type": "user", "age": 30}))
-            .await
-            .unwrap();
-        db.put(
-            "inv1",
-            serde_json::json!({"type": "invoice", "amount": 100}),
-        )
-        .await
-        .unwrap();
-        db.put("bob", serde_json::json!({"type": "user", "age": 25}))
-            .await
-            .unwrap();
-
-        let changes = db
-            .changes(ChangesOptions {
-                selector: Some(serde_json::json!({"type": "user"})),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(changes.results.len(), 2);
-        assert!(
-            changes
-                .results
-                .iter()
-                .all(|c| c.id == "alice" || c.id == "bob")
-        );
-        // Docs should NOT be included (user didn't ask for them)
-        assert!(changes.results[0].doc.is_none());
-    }
-
-    #[tokio::test]
-    async fn database_changes_with_selector_and_include_docs() {
-        let db = Database::memory("test");
-        db.put("a", serde_json::json!({"score": 10})).await.unwrap();
-        db.put("b", serde_json::json!({"score": 50})).await.unwrap();
-        db.put("c", serde_json::json!({"score": 90})).await.unwrap();
-
-        let changes = db
-            .changes(ChangesOptions {
-                selector: Some(serde_json::json!({"score": {"$gte": 50}})),
-                include_docs: true,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(changes.results.len(), 2);
-        assert!(changes.results[0].doc.is_some());
-    }
-
-    #[tokio::test]
     async fn database_live_changes_basic() {
         let db = Database::memory("test");
         db.put("a", serde_json::json!({"v": 1})).await.unwrap();
@@ -2092,12 +2024,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn database_compact() {
-        let db = Database::memory("test");
-        db.compact().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn database_destroy() {
         let db = Database::memory("test");
         db.put("doc1", serde_json::json!({})).await.unwrap();
@@ -2125,7 +2051,12 @@ mod tests {
         let db = Database::memory("test").with_plugin(Arc::new(DropAllPlugin));
         // Must return an error rather than panicking on an empty results vec.
         let result = db.put("doc1", serde_json::json!({"v": 1})).await;
-        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(RouchError::DatabaseError(_))),
+            "{result:?}"
+        );
+        assert!(matches!(db.get("doc1").await, Err(RouchError::NotFound(_))));
+        assert_eq!(db.info().await.unwrap().update_seq, Seq::Num(0));
     }
 
     #[tokio::test]
@@ -2461,17 +2392,20 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(rest.results.len(), 5);
+        let ids: Vec<_> = rest.results.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["a5", "a6", "a7", "a8", "a9"]);
         assert_eq!(rest.last_seq, Seq::Num(20));
 
         // Invalid selectors are rejected.
-        assert!(
-            db.changes(ChangesOptions {
+        let invalid = db
+            .changes(ChangesOptions {
                 selector: Some(serde_json::json!({"type": {"$regex": "["}})),
                 ..Default::default()
             })
-            .await
-            .is_err()
+            .await;
+        assert!(
+            matches!(invalid, Err(RouchError::BadRequest(_))),
+            "{invalid:?}"
         );
     }
 
@@ -2521,6 +2455,15 @@ mod tests {
             .unwrap());
         assert!(foreign.is_empty());
 
+        let own = ids(users
+            .all_docs(AllDocsOptions {
+                key: Some("users:2".into()),
+                ..AllDocsOptions::new()
+            })
+            .await
+            .unwrap());
+        assert_eq!(own, ["users:2"]);
+
         // A range reaching outside the partition is clamped to it.
         let clamped = ids(users
             .all_docs(AllDocsOptions {
@@ -2531,5 +2474,683 @@ mod tests {
             .await
             .unwrap());
         assert_eq!(clamped, ["users:1"]);
+    }
+
+    // -----------------------------------------------------------------
+    // Delegation to the adapter (with and without plugins)
+    // -----------------------------------------------------------------
+
+    /// Adapter that records the calls it receives (and the `changes`
+    /// options), delegating to a `MemoryAdapter`.
+    ///
+    /// Like CouchDB with a `validate_doc_update`, it answers documents listed
+    /// in `reject` with that per-document error, and with `failures_only` it
+    /// answers writes with only the failed documents (what CouchDB returns
+    /// for `new_edits=false`).
+    struct SpyAdapter {
+        inner: MemoryAdapter,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+        changes_opts: std::sync::Mutex<Vec<ChangesOptions>>,
+        reject: HashMap<String, (Option<&'static str>, Option<&'static str>)>,
+        failures_only: bool,
+    }
+
+    impl SpyAdapter {
+        fn new() -> Self {
+            Self {
+                inner: MemoryAdapter::new("spy"),
+                calls: Default::default(),
+                changes_opts: Default::default(),
+                reject: HashMap::new(),
+                failures_only: false,
+            }
+        }
+
+        fn rejecting(
+            mut self,
+            id: &str,
+            error: Option<&'static str>,
+            reason: Option<&'static str>,
+        ) -> Self {
+            self.reject.insert(id.to_string(), (error, reason));
+            self
+        }
+
+        fn record(&self, call: &'static str) {
+            self.calls.lock().unwrap().push(call);
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Adapter for SpyAdapter {
+        async fn info(&self) -> Result<DbInfo> {
+            self.record("info");
+            self.inner.info().await
+        }
+        async fn id(&self) -> Result<String> {
+            self.record("id");
+            self.inner.id().await
+        }
+        async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
+            self.record("get");
+            self.inner.get(id, opts).await
+        }
+        async fn bulk_docs(
+            &self,
+            docs: Vec<Document>,
+            opts: BulkDocsOptions,
+        ) -> Result<Vec<DocResult>> {
+            self.record("bulk_docs");
+            let mut results = Vec::new();
+            for doc in docs {
+                match self.reject.get(&doc.id) {
+                    Some((error, reason)) => results.push(DocResult {
+                        ok: false,
+                        id: doc.id,
+                        rev: None,
+                        error: error.map(str::to_string),
+                        reason: reason.map(str::to_string),
+                    }),
+                    None => results.extend(self.inner.bulk_docs(vec![doc], opts.clone()).await?),
+                }
+            }
+            if self.failures_only {
+                results.retain(|r| !r.ok);
+            }
+            Ok(results)
+        }
+        async fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
+            self.record("all_docs");
+            self.inner.all_docs(opts).await
+        }
+        async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
+            self.record("changes");
+            self.changes_opts.lock().unwrap().push(opts.clone());
+            self.inner.changes(opts).await
+        }
+        async fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
+            self.record("revs_diff");
+            self.inner.revs_diff(revs).await
+        }
+        async fn bulk_get(&self, docs: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
+            self.record("bulk_get");
+            self.inner.bulk_get(docs).await
+        }
+        async fn put_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            rev: &str,
+            data: Vec<u8>,
+            content_type: &str,
+        ) -> Result<DocResult> {
+            self.record("put_attachment");
+            self.inner
+                .put_attachment(doc_id, att_id, rev, data, content_type)
+                .await
+        }
+        async fn get_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            opts: GetAttachmentOptions,
+        ) -> Result<Vec<u8>> {
+            self.record("get_attachment");
+            self.inner.get_attachment(doc_id, att_id, opts).await
+        }
+        async fn remove_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            rev: &str,
+        ) -> Result<DocResult> {
+            self.record("remove_attachment");
+            self.inner.remove_attachment(doc_id, att_id, rev).await
+        }
+        async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
+            self.record("get_local");
+            self.inner.get_local(id).await
+        }
+        async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
+            self.record("put_local");
+            self.inner.put_local(id, doc).await
+        }
+        async fn remove_local(&self, id: &str) -> Result<()> {
+            self.record("remove_local");
+            self.inner.remove_local(id).await
+        }
+        async fn compact(&self) -> Result<()> {
+            self.record("compact");
+            self.inner.compact().await
+        }
+        async fn destroy(&self) -> Result<()> {
+            self.record("destroy");
+            self.inner.destroy().await
+        }
+        async fn close(&self) -> Result<()> {
+            self.record("close");
+            self.inner.close().await
+        }
+        async fn purge(&self, req: HashMap<String, Vec<String>>) -> Result<PurgeResponse> {
+            self.record("purge");
+            self.inner.purge(req).await
+        }
+        async fn get_security(&self) -> Result<SecurityDocument> {
+            self.record("get_security");
+            self.inner.get_security().await
+        }
+        async fn put_security(&self, doc: SecurityDocument) -> Result<()> {
+            self.record("put_security");
+            self.inner.put_security(doc).await
+        }
+    }
+
+    fn new_doc(id: &str, rev: Option<&str>, data: serde_json::Value) -> Document {
+        Document {
+            id: id.into(),
+            rev: rev.map(|r| r.parse().unwrap()),
+            deleted: false,
+            data,
+            attachments: HashMap::new(),
+        }
+    }
+
+    fn security(admin: &str) -> SecurityDocument {
+        SecurityDocument {
+            admins: SecurityGroup {
+                names: vec![admin.into()],
+                roles: vec![],
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn database_delegates_to_the_given_adapter() {
+        let spy = Arc::new(SpyAdapter::new());
+        let db = Database::from_adapter(spy.clone());
+
+        // Writes through the database land in the given adapter, and
+        // `adapter()` is that adapter.
+        db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
+        assert_eq!(
+            spy.inner
+                .get("doc1", GetOptions::default())
+                .await
+                .unwrap()
+                .data["v"],
+            1
+        );
+        assert_eq!(db.adapter().info().await.unwrap().db_name, "spy");
+        assert_eq!(db.info().await.unwrap().doc_count, 1);
+
+        db.put_security(security("bob")).await.unwrap();
+        assert_eq!(
+            spy.inner.get_security().await.unwrap().admins.names,
+            ["bob"]
+        );
+        assert_eq!(db.get_security().await.unwrap().admins.names, ["bob"]);
+
+        spy.calls.lock().unwrap().clear();
+        db.compact().await.unwrap();
+        db.close().await.unwrap();
+        db.destroy().await.unwrap();
+        assert_eq!(spy.calls(), ["compact", "close", "destroy"]);
+        assert_eq!(spy.inner.info().await.unwrap().doc_count, 0);
+    }
+
+    struct NoopPlugin;
+
+    #[async_trait::async_trait]
+    impl Plugin for NoopPlugin {
+        fn name(&self) -> &str {
+            "noop"
+        }
+    }
+
+    fn plugin_adapter(spy: &Arc<SpyAdapter>, plugins: Vec<Arc<dyn Plugin>>) -> PluginAdapter {
+        PluginAdapter {
+            inner: spy.clone(),
+            plugins,
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_adapter_delegates_every_non_write_method() {
+        // Replication writes into a PluginAdapter: everything but the writes
+        // must reach the wrapped adapter unchanged.
+        let spy = Arc::new(SpyAdapter::new());
+        let pa = plugin_adapter(&spy, vec![Arc::new(NoopPlugin)]);
+        let inner = &spy.inner;
+
+        let r1 = inner
+            .bulk_docs(
+                vec![new_doc("d", None, serde_json::json!({"v": 1}))],
+                BulkDocsOptions::new(),
+            )
+            .await
+            .unwrap()[0]
+            .rev
+            .clone()
+            .unwrap();
+        let r2 = inner
+            .put_attachment("d", "a.txt", &r1, b"hello".to_vec(), "text/plain")
+            .await
+            .unwrap()
+            .rev
+            .unwrap();
+        inner
+            .put_local("cp", serde_json::json!({"seq": 1}))
+            .await
+            .unwrap();
+        inner.put_security(security("alice")).await.unwrap();
+        spy.calls.lock().unwrap().clear();
+
+        assert_eq!(pa.id().await.unwrap(), "spy");
+        assert_eq!(pa.info().await.unwrap().update_seq, Seq::Num(2));
+        assert_eq!(
+            pa.get("d", GetOptions::default())
+                .await
+                .unwrap()
+                .rev
+                .unwrap()
+                .to_string(),
+            r2
+        );
+        assert_eq!(
+            pa.get_attachment("d", "a.txt", GetAttachmentOptions::default())
+                .await
+                .unwrap(),
+            b"hello"
+        );
+        assert_eq!(pa.get_local("cp").await.unwrap()["seq"], 1);
+        assert_eq!(pa.get_security().await.unwrap().admins.names, ["alice"]);
+        assert_eq!(
+            pa.all_docs(AllDocsOptions::new()).await.unwrap().rows.len(),
+            1
+        );
+        assert_eq!(
+            pa.changes(ChangesOptions::default())
+                .await
+                .unwrap()
+                .last_seq,
+            Seq::Num(2)
+        );
+
+        pa.put_local("cp", serde_json::json!({"seq": 2}))
+            .await
+            .unwrap();
+        assert_eq!(inner.get_local("cp").await.unwrap()["seq"], 2);
+        pa.remove_local("cp").await.unwrap();
+        assert!(matches!(
+            inner.get_local("cp").await,
+            Err(RouchError::NotFound(_))
+        ));
+
+        pa.put_security(security("carol")).await.unwrap();
+        assert_eq!(inner.get_security().await.unwrap().admins.names, ["carol"]);
+
+        pa.compact().await.unwrap();
+        let old = inner
+            .get(
+                "d",
+                GetOptions {
+                    rev: Some(r1.clone()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(old, Err(RouchError::NotFound(_))), "{old:?}");
+
+        pa.close().await.unwrap();
+        pa.destroy().await.unwrap();
+        assert_eq!(inner.info().await.unwrap().doc_count, 0);
+        assert_eq!(
+            spy.calls(),
+            [
+                "id",
+                "info",
+                "get",
+                "get_attachment",
+                "get_local",
+                "get_security",
+                "all_docs",
+                "changes",
+                "put_local",
+                "remove_local",
+                "put_security",
+                "compact",
+                "close",
+                "destroy",
+            ]
+        );
+    }
+
+    /// Records every `after_write` batch.
+    #[derive(Default)]
+    struct AfterWriteLog(std::sync::Mutex<Vec<Vec<DocResult>>>);
+
+    #[async_trait::async_trait]
+    impl Plugin for AfterWriteLog {
+        fn name(&self) -> &str {
+            "after-write-log"
+        }
+        async fn after_write(&self, results: &[DocResult]) -> Result<()> {
+            self.0.lock().unwrap().push(results.to_vec());
+            Ok(())
+        }
+    }
+
+    fn summary(results: &[DocResult]) -> Vec<(String, bool, Option<String>, Option<String>)> {
+        let mut summary: Vec<_> = results
+            .iter()
+            .map(|r| (r.id.clone(), r.ok, r.rev.clone(), r.error.clone()))
+            .collect();
+        summary.sort();
+        summary
+    }
+
+    #[tokio::test]
+    async fn plugin_adapter_reports_every_replicated_doc_to_after_write() {
+        // CouchDB answers new_edits=false writes with only the failures: the
+        // documents it does not list were written under their own revision,
+        // and after_write must see them as such.
+        let mut spy = SpyAdapter::new().rejecting("bad", Some("forbidden"), Some("no"));
+        spy.failures_only = true;
+        let spy = Arc::new(spy);
+        let log = Arc::new(AfterWriteLog::default());
+        let pa = plugin_adapter(&spy, vec![log.clone()]);
+
+        let results = pa
+            .bulk_docs(
+                vec![
+                    new_doc("a", Some("1-aaa"), serde_json::json!({})),
+                    new_doc("bad", Some("1-bbb"), serde_json::json!({})),
+                    new_doc("c", Some("1-ccc"), serde_json::json!({})),
+                ],
+                BulkDocsOptions::replication(),
+            )
+            .await
+            .unwrap();
+        let expected = vec![
+            ("a".to_string(), true, Some("1-aaa".to_string()), None),
+            (
+                "bad".to_string(),
+                false,
+                None,
+                Some("forbidden".to_string()),
+            ),
+            ("c".to_string(), true, Some("1-ccc".to_string()), None),
+        ];
+        assert_eq!(summary(&results), expected);
+        assert_eq!(log.0.lock().unwrap().len(), 1);
+        assert_eq!(summary(&log.0.lock().unwrap()[0]), expected);
+
+        // A new_edits=true write has no revision to report for an omitted
+        // document, so nothing is made up.
+        let results = pa
+            .bulk_docs(
+                vec![
+                    new_doc("d", None, serde_json::json!({})),
+                    new_doc("bad", None, serde_json::json!({})),
+                ],
+                BulkDocsOptions::new(),
+            )
+            .await
+            .unwrap();
+        let expected = vec![(
+            "bad".to_string(),
+            false,
+            None,
+            Some("forbidden".to_string()),
+        )];
+        assert_eq!(summary(&results), expected);
+        assert_eq!(summary(&log.0.lock().unwrap()[1]), expected);
+    }
+
+    /// Rejects documents by id: `u*` as unauthorized, `f*` as forbidden,
+    /// `b*` as a bad request, `e*` with an unrelated error, and drops `x*`.
+    struct GatePlugin;
+
+    #[async_trait::async_trait]
+    impl Plugin for GatePlugin {
+        fn name(&self) -> &str {
+            "gate"
+        }
+        async fn before_write(&self, docs: &mut Vec<Document>) -> Result<()> {
+            for doc in docs.iter_mut() {
+                match doc.id.chars().next() {
+                    Some('u') => return Err(RouchError::Unauthorized),
+                    Some('f') => return Err(RouchError::Forbidden("no f".into())),
+                    Some('b') => return Err(RouchError::BadRequest("no b".into())),
+                    Some('e') => return Err(RouchError::DatabaseError("broken".into())),
+                    _ => doc.data["changed_by_plugin"] = serde_json::json!(true),
+                }
+            }
+            docs.retain(|d| !d.id.starts_with('x'));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_adapter_denies_rejected_replicated_docs_one_by_one() {
+        let spy = Arc::new(SpyAdapter::new());
+        let pa = plugin_adapter(&spy, vec![Arc::new(GatePlugin)]);
+
+        let results = pa
+            .bulk_docs(
+                vec![
+                    new_doc("ok", Some("1-aaa"), serde_json::json!({"v": 1})),
+                    new_doc("u1", Some("1-aaa"), serde_json::json!({})),
+                    new_doc("f1", Some("1-aaa"), serde_json::json!({})),
+                    new_doc("b1", Some("1-aaa"), serde_json::json!({})),
+                    new_doc("x1", Some("1-aaa"), serde_json::json!({})),
+                ],
+                BulkDocsOptions::replication(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            summary(&results),
+            vec![
+                ("b1".to_string(), false, None, Some("forbidden".to_string())),
+                ("f1".to_string(), false, None, Some("forbidden".to_string())),
+                ("ok".to_string(), true, Some("1-aaa".to_string()), None),
+                (
+                    "u1".to_string(),
+                    false,
+                    None,
+                    Some("unauthorized".to_string())
+                ),
+                ("x1".to_string(), false, None, Some("forbidden".to_string())),
+            ]
+        );
+        let dropped = results.iter().find(|r| r.id == "x1").unwrap();
+        assert!(
+            dropped
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("dropped by plugin gate"),
+            "{dropped:?}"
+        );
+
+        // Only the accepted doc is stored, with the source's body.
+        let ids: Vec<String> = spy
+            .inner
+            .all_docs(AllDocsOptions::new())
+            .await
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, ["ok"]);
+        let stored = spy.inner.get("ok", GetOptions::default()).await.unwrap();
+        assert_eq!(stored.data, serde_json::json!({"v": 1}));
+
+        // Any other plugin error fails the whole write.
+        let failed = pa
+            .bulk_docs(
+                vec![
+                    new_doc("ok2", Some("1-aaa"), serde_json::json!({})),
+                    new_doc("e1", Some("1-aaa"), serde_json::json!({})),
+                ],
+                BulkDocsOptions::replication(),
+            )
+            .await;
+        assert!(
+            matches!(failed, Err(RouchError::DatabaseError(_))),
+            "{failed:?}"
+        );
+        assert!(matches!(
+            spy.inner.get("ok2", GetOptions::default()).await,
+            Err(RouchError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn single_doc_write_errors_keep_their_kind() {
+        // A per-document failure reported by the adapter becomes the
+        // matching error (what CouchDB's validate_doc_update produces).
+        let spy = SpyAdapter::new()
+            .rejecting("f", Some("forbidden"), Some("no f"))
+            .rejecting("u", Some("unauthorized"), Some("no u"))
+            .rejecting("n", Some("not_found"), Some("missing"))
+            .rejecting("c", Some("conflict"), Some("Document update conflict."))
+            .rejecting("o", Some("some_other_error"), Some("odd"))
+            .rejecting("r", Some("some_other_error"), None)
+            .rejecting("none", None, None);
+        let db = Database::from_adapter(Arc::new(spy));
+        let put = |id: &'static str| {
+            let db = &db;
+            async move { db.put(id, serde_json::json!({})).await }
+        };
+        let forbidden = put("f").await;
+        assert!(
+            matches!(&forbidden, Err(RouchError::Forbidden(reason)) if reason == "no f"),
+            "{forbidden:?}"
+        );
+        let unauthorized = put("u").await;
+        assert!(
+            matches!(unauthorized, Err(RouchError::Unauthorized)),
+            "{unauthorized:?}"
+        );
+        let not_found = put("n").await;
+        assert!(
+            matches!(&not_found, Err(RouchError::NotFound(id)) if id == "n"),
+            "{not_found:?}"
+        );
+        let conflict = put("c").await;
+        assert!(
+            matches!(conflict, Err(RouchError::Conflict)),
+            "{conflict:?}"
+        );
+        let other = put("o").await;
+        assert!(
+            matches!(&other, Err(RouchError::BadRequest(reason)) if reason == "odd"),
+            "{other:?}"
+        );
+        let no_reason = put("r").await;
+        assert!(
+            matches!(&no_reason, Err(RouchError::BadRequest(reason)) if reason == "some_other_error"),
+            "{no_reason:?}"
+        );
+        let nothing = put("none").await;
+        assert!(
+            matches!(&nothing, Err(RouchError::BadRequest(reason)) if reason == "document write failed"),
+            "{nothing:?}"
+        );
+        assert_eq!(db.info().await.unwrap().update_seq, Seq::Num(0));
+    }
+
+    // -----------------------------------------------------------------
+    // Changes filtered by a selector
+    // -----------------------------------------------------------------
+
+    /// A spied database with `n` documents `d0000`, `d0001`, ... (`{"n": i}`).
+    async fn numbered_docs(n: usize) -> (Arc<SpyAdapter>, Database) {
+        let spy = Arc::new(SpyAdapter::new());
+        let docs = (0..n)
+            .map(|i| new_doc(&format!("d{i:04}"), None, serde_json::json!({"n": i})))
+            .collect();
+        spy.inner
+            .bulk_docs(docs, BulkDocsOptions::new())
+            .await
+            .unwrap();
+        (spy.clone(), Database::from_adapter(spy))
+    }
+
+    #[tokio::test]
+    async fn selector_changes_read_the_feed_in_batches() {
+        // The matching changes are past the first batches: the feed must be
+        // read on until `limit` matches are found.
+        let total = 2 * SELECTOR_CHANGES_BATCH as usize + 200;
+        let (spy, db) = numbered_docs(total).await;
+        let first = total - 150;
+        let changes = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            db.changes(ChangesOptions {
+                selector: Some(serde_json::json!({"n": {"$gte": first}})),
+                limit: Some(3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("selector changes did not finish")
+        .unwrap();
+        let ids: Vec<&str> = changes.results.iter().map(|c| c.id.as_str()).collect();
+        let expected: Vec<String> = (first..first + 3).map(|i| format!("d{i:04}")).collect();
+        assert_eq!(ids, expected);
+        assert_eq!(changes.last_seq, Seq::Num(first as u64 + 3));
+        assert!(changes.results.iter().all(|c| c.doc.is_none()));
+
+        // The adapter is asked for unfiltered batches with the documents;
+        // the selector is applied here.
+        let opts = spy.changes_opts.lock().unwrap().clone();
+        assert_eq!(opts.len(), 3, "{opts:?}");
+        let sinces: Vec<Seq> = opts.iter().map(|o| o.since.clone()).collect();
+        let batch = SELECTOR_CHANGES_BATCH;
+        assert_eq!(sinces, [Seq::Num(0), Seq::Num(batch), Seq::Num(2 * batch)]);
+        for o in &opts {
+            assert!(o.selector.is_none(), "{o:?}");
+            assert!(o.include_docs, "{o:?}");
+            assert_eq!(o.limit, Some(batch), "{o:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn descending_selector_changes_read_the_feed_whole() {
+        // A descending feed cannot be resumed from a sequence, so it is read
+        // in one go and filtered from the newest change down.
+        let total = SELECTOR_CHANGES_BATCH as usize + 100;
+        let (spy, db) = numbered_docs(total).await;
+        let changes = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            db.changes(ChangesOptions {
+                selector: Some(serde_json::json!({"n": {"$lt": 3}})),
+                descending: true,
+                limit: Some(2),
+                include_docs: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("descending selector changes did not finish")
+        .unwrap();
+        let ids: Vec<&str> = changes.results.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["d0002", "d0001"]);
+        assert_eq!(changes.last_seq, Seq::Num(2));
+        assert_eq!(changes.results[0].doc.as_ref().unwrap()["n"], 2);
+
+        let opts = spy.changes_opts.lock().unwrap().clone();
+        assert_eq!(opts.len(), 1, "{opts:?}");
+        assert!(opts[0].descending);
+        assert_eq!(opts[0].limit, None);
+        assert!(opts[0].selector.is_none());
     }
 }
