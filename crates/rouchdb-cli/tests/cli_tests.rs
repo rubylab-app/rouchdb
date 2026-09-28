@@ -772,16 +772,6 @@ async fn info_db_name_defaults_to_file_stem_and_can_be_overridden() {
     assert_eq!(v["doc_count"], 1);
 }
 
-#[tokio::test]
-async fn info_nonexistent_path_fails() {
-    // Use a path under a nonexistent directory so redb can't create the file
-    rouchdb_cmd()
-        .args(["info", "/tmp/no_such_dir_rouchdb/no_such.redb"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("Error"));
-}
-
 // ─── GET ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1359,40 +1349,86 @@ async fn dump_empty_database() {
 // ─── REPLICATE ──────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn replicate_redb_to_redb() {
-    // Set up source with 3 docs
-    let (_src_dir, src_path) = setup_db(&[
-        ("a", serde_json::json!({"x": 1})),
-        ("b", serde_json::json!({"x": 2})),
-        ("c", serde_json::json!({"x": 3})),
-    ])
-    .await;
+async fn replicate_redb_to_redb_copies_docs_revisions_and_conflicts() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.redb");
+    let s = path_str(&src);
+    rev_of(&run(&["put", s, "a", r#"{"x":1}"#]));
+    let b1 = rev_of(&run(&["put", s, "b", r#"{"x":2}"#]));
+    rev_of(&run(&["put", s, "b", r#"{"x":20}"#, "--rev", &b1]));
+    let c1 = rev_of(&run(&["put", s, "c", r#"{"x":3}"#]));
+    rev_of(&run(&["delete", s, "c", "--rev", &c1]));
+    rev_of(&run(&["put", s, "d", r#"{"v":"main"}"#]));
+    {
+        let db = rouchdb::Database::open(&src, "src").unwrap();
+        let branch = rouchdb::Document {
+            id: "d".into(),
+            rev: Some(rouchdb::Revision::new(1, "f".repeat(32))),
+            deleted: false,
+            data: serde_json::json!({"v": "branch"}),
+            attachments: HashMap::new(),
+        };
+        let results = db
+            .bulk_docs(vec![branch], rouchdb::BulkDocsOptions::replication())
+            .await
+            .unwrap();
+        assert!(results.iter().all(|r| r.ok), "{:?}", results);
+    }
+    let tgt = dir.path().join("tgt.redb");
+    let t = path_str(&tgt);
 
-    // Create empty target
-    let (_tgt_dir, tgt_path) = setup_db(&[]).await;
+    let output = run(&["replicate", s, t]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    // Four changes, five leaves (both sides of the conflict on d).
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({
+            "ok": true, "docs_read": 4, "docs_written": 5, "errors": [], "last_seq": 7
+        })
+    );
 
-    let output = rouchdb_cmd()
-        .args([
-            "replicate",
-            src_path.to_str().unwrap(),
-            tgt_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
+    // The same live documents, at the same revisions, with the same bodies.
+    let source_docs = all_docs_with_bodies(&src);
+    let ids: Vec<&serde_json::Value> = source_docs.iter().map(|d| &d["_id"]).collect();
+    assert_eq!(ids, ["a", "b", "d"]);
+    assert_eq!(all_docs_with_bodies(&tgt), source_docs);
+    // The same conflict...
+    let conflicted = stdout_json(&run(&["get", s, "d", "--conflicts"]));
+    assert_eq!(conflicted["_conflicts"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        stdout_json(&run(&["get", t, "d", "--conflicts"])),
+        conflicted
+    );
+    // ...and the same deletion: the feeds match except for the seqs, which
+    // depend on the order the target stored the documents in.
+    let feed = |path: &str| {
+        let mut rows: Vec<serde_json::Value> = stdout_json(&run(&["changes", path]))["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(|mut row| {
+                row.as_object_mut().unwrap().remove("seq");
+                row
+            })
+            .collect();
+        rows.sort_by(|x, y| x["id"].as_str().cmp(&y["id"].as_str()));
+        rows
+    };
+    let source_feed = feed(s);
+    assert_eq!(source_feed[2]["id"], "c");
+    assert_eq!(source_feed[2]["deleted"], true);
+    assert_eq!(feed(t), source_feed);
 
-    assert!(output.status.success());
-    let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(v["ok"], true);
-    assert_eq!(v["docs_written"], 3);
-
-    // Verify target has docs
-    let output2 = rouchdb_cmd()
-        .args(["info", tgt_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-
-    let info: serde_json::Value = serde_json::from_slice(&output2.stdout).unwrap();
-    assert_eq!(info["doc_count"], 3);
+    // A second run resumes from the checkpoint.
+    let output = run(&["replicate", s, t]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({
+            "ok": true, "docs_read": 0, "docs_written": 0, "errors": [], "last_seq": 7
+        })
+    );
 }
 
 /// Every live document (`_id`, `_rev` and body), via `all-docs --include-docs`.
@@ -1541,16 +1577,6 @@ async fn compact_returns_ok() {
     assert!(output.status.success());
     let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(v["ok"], true);
-}
-
-#[tokio::test]
-async fn compact_nonexistent_fails() {
-    // Use a path under a nonexistent directory so redb can't create the file
-    rouchdb_cmd()
-        .args(["compact", "/tmp/no_such_dir_rouchdb/no_such.redb"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("Error"));
 }
 
 // ─── MISSING DATABASE FILES ─────────────────────────────────────────────────
@@ -2289,19 +2315,6 @@ async fn dump_warns_about_conflicting_revisions() {
 }
 
 // ─── REPLICATE RESULTS ──────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn replicate_output_includes_errors_and_last_seq() {
-    let (_src_dir, src_path) = setup_db(&[("a", serde_json::json!({"x": 1}))]).await;
-    let (_tgt_dir, tgt_path) = setup_db(&[]).await;
-
-    let output = run(&["replicate", path_str(&src_path), path_str(&tgt_path)]);
-    assert!(output.status.success(), "{}", stderr_str(&output));
-    let v = stdout_json(&output);
-    assert_eq!(v["ok"], true);
-    assert_eq!(v["errors"], serde_json::json!([]));
-    assert_eq!(v["last_seq"], 1);
-}
 
 #[tokio::test]
 async fn replicate_with_rejected_docs_exits_non_zero() {
