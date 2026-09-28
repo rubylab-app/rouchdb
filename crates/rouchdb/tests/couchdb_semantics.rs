@@ -381,3 +381,30 @@ async fn http_get_with_open_revs() {
 
     delete_remote_db(&url).await;
 }
+
+// =========================================================================
+// Cookie login against CouchDB (extra: AuthClient login response shape)
+// =========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn cookie_login_against_couchdb() {
+    let url = fresh_remote_db("cookie_login").await;
+    let server = common::couchdb_url().replace("admin:password@", "");
+    let auth = rouchdb::AuthClient::new(&server);
+
+    let session = auth.login("admin", "password").await.unwrap();
+    assert!(session.ok);
+    assert_eq!(session.user_ctx.name.as_deref(), Some("admin"));
+    assert!(session.user_ctx.roles.contains(&"_admin".to_string()));
+
+    // The cookie authenticates later requests.
+    let current = auth.get_session().await.unwrap();
+    assert_eq!(current.user_ctx.name.as_deref(), Some("admin"));
+    let db_url = url.replace("admin:password@", "");
+    let db = Database::http_with_auth(&db_url, &auth);
+    db.put("d", serde_json::json!({"v": 1})).await.unwrap();
+    assert_eq!(db.get("d").await.unwrap().data["v"], 1);
+
+    delete_remote_db(&url).await;
+}

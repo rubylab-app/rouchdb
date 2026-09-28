@@ -22,6 +22,19 @@ pub struct UserContext {
     pub roles: Vec<String>,
 }
 
+/// `POST /_session` reply: CouchDB puts `name` and `roles` at the top level
+/// here (only `GET /_session` nests them in `userCtx`); accept both.
+#[derive(Deserialize)]
+struct LoginResponse {
+    ok: bool,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    roles: Vec<String>,
+    #[serde(rename = "userCtx", default)]
+    user_ctx: Option<UserContext>,
+}
+
 /// A client that handles CouchDB authentication.
 ///
 /// Uses cookie-based auth (`_session` endpoint). The internal `reqwest::Client`
@@ -67,9 +80,17 @@ impl AuthClient {
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
         let resp = crate::check_response(resp).await?;
 
-        resp.json::<Session>()
+        let login = resp
+            .json::<LoginResponse>()
             .await
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))
+            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+        Ok(Session {
+            ok: login.ok,
+            user_ctx: login.user_ctx.unwrap_or(UserContext {
+                name: login.name,
+                roles: login.roles,
+            }),
+        })
     }
 
     /// Log out (delete session cookie).
@@ -130,6 +151,23 @@ fn user_doc_url(server_url: &str, user_id: &str) -> String {
 mod tests {
     use super::AuthClient;
     use crate::tests::{json_response, recording_stub_server};
+
+    #[tokio::test]
+    async fn login_reads_couchdb_session_reply() {
+        // Verbatim CouchDB 3 reply to POST /_session: no `userCtx`.
+        let (url, _) = recording_stub_server(json_response(
+            "200 OK",
+            r#"{"ok":true,"name":"admin","roles":["_admin"]}"#,
+        ))
+        .await;
+        let session = AuthClient::new(&url)
+            .login("admin", "password")
+            .await
+            .unwrap();
+        assert!(session.ok);
+        assert_eq!(session.user_ctx.name.as_deref(), Some("admin"));
+        assert_eq!(session.user_ctx.roles, vec!["_admin"]);
+    }
 
     #[tokio::test]
     async fn sign_up_escapes_the_user_id() {
