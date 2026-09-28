@@ -6,7 +6,7 @@
 mod common;
 
 use common::{delete_remote_db, fresh_remote_db};
-use rouchdb::{Database, FindOptions};
+use rouchdb::{Database, FindOptions, ReduceFn, ViewQueryOptions, query_view};
 use serde_json::{Value, json};
 
 /// Documents shared by the Mango parity table. String values stay ASCII
@@ -163,6 +163,330 @@ async fn mango_selectors_match_couchdb() {
             mismatches.push(format!("{selector}: accepted by rouchdb"));
         }
     }
+
+    delete_remote_db(&url).await;
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// Query a CouchDB view and return the response body.
+async fn couch_view(url: &str, view: &str, query: &str) -> Value {
+    reqwest::Client::new()
+        .get(format!("{url}/_design/parity/_view/{view}?{query}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// Revision hashes differ between CouchDB and RouchDB, so compare bodies.
+fn without_rev(doc: &Value) -> Value {
+    let mut doc = doc.clone();
+    if let Some(obj) = doc.as_object_mut() {
+        obj.remove("_rev");
+    }
+    doc
+}
+
+fn rows_json(result: &rouchdb::ViewResult) -> Value {
+    Value::Array(
+        result
+            .rows
+            .iter()
+            .map(|r| {
+                let mut row = json!({"key": r.key, "value": r.value});
+                if let Some(ref id) = r.id {
+                    row["id"] = json!(id);
+                }
+                if let Some(ref doc) = r.doc {
+                    row["doc"] = without_rev(doc);
+                }
+                row
+            })
+            .collect(),
+    )
+}
+
+#[tokio::test]
+#[ignore]
+async fn views_match_couchdb() {
+    let url = fresh_remote_db("parity_views").await;
+    let local = Database::memory("local");
+    let docs = vec![
+        json!({"_id": "a", "dept": "eng", "n": 30, "arr": [1, 2], "obj": {"x": 1, "y": 2}, "ref": "b"}),
+        json!({"_id": "b", "dept": "sales", "n": 25, "arr": [3, 4], "obj": {"x": 2}}),
+        json!({"_id": "c", "dept": "eng", "n": 35, "arr": [1, 0], "obj": {"z": 1}, "ref": "a"}),
+        json!({"_id": "d", "dept": "hr", "n": 5, "arr": [0, 1], "obj": {"x": 0}, "ref": "zzz"}),
+    ];
+    let mut ddoc = json!({"_id": "_design/parity", "views": {
+        "by_dept": {"map": "function(doc){ if (doc.dept) emit(doc.dept, doc.n); }", "reduce": "_sum"},
+        "count": {"map": "function(doc){ emit(doc._id, 1); }", "reduce": "_count"},
+        "stats": {"map": "function(doc){ if (doc.dept) emit(doc.dept, doc.n); }", "reduce": "_stats"},
+        "arrs": {"map": "function(doc){ if (doc.arr) emit(doc.dept, doc.arr); }", "reduce": "_sum"},
+        "objs": {"map": "function(doc){ if (doc.obj) emit(doc.dept, doc.obj); }", "reduce": "_sum"},
+        "linked": {"map": "function(doc){ if (doc.ref) emit(doc._id, {_id: doc.ref}); }"},
+        "custom": {"map": "function(doc){ if (doc.dept) emit([doc.dept, doc.n], 1); }",
+                   "reduce": "function(keys, values, rereduce){ if (rereduce) return sum(values); return keys.length; }"}
+    }});
+    let client = reqwest::Client::new();
+    let mut all = docs.clone();
+    all.push(ddoc.take());
+    let resp = client
+        .post(format!("{url}/_bulk_docs"))
+        .json(&json!({"docs": all}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    for doc in all {
+        let doc = rouchdb::Document::from_json(doc).unwrap();
+        local
+            .bulk_docs(vec![doc], rouchdb::BulkDocsOptions::new())
+            .await
+            .unwrap();
+    }
+
+    let by_dept = |doc: &Value| -> Vec<(Value, Value)> {
+        match doc.get("dept") {
+            Some(d) => vec![(d.clone(), doc["n"].clone())],
+            None => vec![],
+        }
+    };
+    let by_id = |doc: &Value| -> Vec<(Value, Value)> { vec![(doc["_id"].clone(), json!(1))] };
+    let arrs = |doc: &Value| -> Vec<(Value, Value)> {
+        match doc.get("arr") {
+            Some(a) => vec![(doc["dept"].clone(), a.clone())],
+            None => vec![],
+        }
+    };
+    let objs = |doc: &Value| -> Vec<(Value, Value)> {
+        match doc.get("obj") {
+            Some(o) => vec![(doc["dept"].clone(), o.clone())],
+            None => vec![],
+        }
+    };
+    let linked = |doc: &Value| -> Vec<(Value, Value)> {
+        match doc.get("ref") {
+            Some(r) => vec![(doc["_id"].clone(), json!({"_id": r}))],
+            None => vec![],
+        }
+    };
+    let custom_map = |doc: &Value| -> Vec<(Value, Value)> {
+        match doc.get("dept") {
+            Some(d) => vec![(json!([d, doc["n"]]), json!(1))],
+            None => vec![],
+        }
+    };
+    // CouchDB passes [key, docid] pairs to a custom reduce.
+    let custom_reduce = ReduceFn::Custom(Box::new(|keys, values, rereduce| {
+        if rereduce {
+            json!(values.iter().filter_map(Value::as_u64).sum::<u64>())
+        } else {
+            assert!(
+                keys.iter()
+                    .all(|k| k.as_array().is_some_and(|p| p.len() == 2))
+            );
+            json!(keys.len())
+        }
+    }));
+
+    type MapFn<'a> = &'a dyn Fn(&Value) -> Vec<(Value, Value)>;
+    let cases: Vec<(&str, MapFn, Option<&ReduceFn>, &str, ViewQueryOptions)> = vec![
+        // F53: total_rows / offset
+        (
+            "by_dept",
+            &by_dept,
+            Some(&ReduceFn::Sum),
+            "reduce=false&key=%22eng%22",
+            ViewQueryOptions {
+                reduce: false,
+                key: Some(json!("eng")),
+                ..ViewQueryOptions::new()
+            },
+        ),
+        (
+            "by_dept",
+            &by_dept,
+            Some(&ReduceFn::Sum),
+            "reduce=false&startkey=%22hr%22",
+            ViewQueryOptions {
+                reduce: false,
+                start_key: Some(json!("hr")),
+                ..ViewQueryOptions::new()
+            },
+        ),
+        (
+            "by_dept",
+            &by_dept,
+            Some(&ReduceFn::Sum),
+            "reduce=false&startkey=%22hr%22&descending=true",
+            ViewQueryOptions {
+                reduce: false,
+                start_key: Some(json!("hr")),
+                descending: true,
+                ..ViewQueryOptions::new()
+            },
+        ),
+        (
+            "by_dept",
+            &by_dept,
+            Some(&ReduceFn::Sum),
+            "reduce=false&skip=1&limit=2",
+            ViewQueryOptions {
+                reduce: false,
+                skip: 1,
+                limit: Some(2),
+                ..ViewQueryOptions::new()
+            },
+        ),
+        // F104: reduce is on by default when a reduce function is given
+        (
+            "by_dept",
+            &by_dept,
+            Some(&ReduceFn::Sum),
+            "",
+            ViewQueryOptions::new(),
+        ),
+        (
+            "by_dept",
+            &by_dept,
+            Some(&ReduceFn::Sum),
+            "group=true",
+            ViewQueryOptions {
+                group: true,
+                ..ViewQueryOptions::new()
+            },
+        ),
+        // F50: design documents are not mapped
+        (
+            "count",
+            &by_id,
+            Some(&ReduceFn::Count),
+            "",
+            ViewQueryOptions::new(),
+        ),
+        (
+            "count",
+            &by_id,
+            Some(&ReduceFn::Count),
+            "reduce=false",
+            ViewQueryOptions {
+                reduce: false,
+                ..ViewQueryOptions::new()
+            },
+        ),
+        // F54: _sum / _stats keep integers and handle arrays and objects
+        (
+            "stats",
+            &by_dept,
+            Some(&ReduceFn::Stats),
+            "",
+            ViewQueryOptions::new(),
+        ),
+        (
+            "stats",
+            &by_dept,
+            Some(&ReduceFn::Stats),
+            "group=true",
+            ViewQueryOptions {
+                group: true,
+                ..ViewQueryOptions::new()
+            },
+        ),
+        (
+            "arrs",
+            &arrs,
+            Some(&ReduceFn::Sum),
+            "",
+            ViewQueryOptions::new(),
+        ),
+        (
+            "objs",
+            &objs,
+            Some(&ReduceFn::Sum),
+            "",
+            ViewQueryOptions::new(),
+        ),
+        // F16: include_docs, including linked documents
+        (
+            "by_dept",
+            &by_dept,
+            Some(&ReduceFn::Sum),
+            "reduce=false&include_docs=true&limit=2",
+            ViewQueryOptions {
+                reduce: false,
+                include_docs: true,
+                limit: Some(2),
+                ..ViewQueryOptions::new()
+            },
+        ),
+        (
+            "linked",
+            &linked,
+            None,
+            "include_docs=true",
+            ViewQueryOptions {
+                include_docs: true,
+                ..ViewQueryOptions::new()
+            },
+        ),
+        // F105: custom reduce receives [key, id] pairs
+        (
+            "custom",
+            &custom_map,
+            Some(&custom_reduce),
+            "group_level=1",
+            ViewQueryOptions {
+                group_level: Some(1),
+                ..ViewQueryOptions::new()
+            },
+        ),
+    ];
+
+    let mut mismatches = Vec::new();
+    for (view, map_fn, reduce, query, opts) in cases {
+        let couch = couch_view(&url, view, query).await;
+        let ours = query_view(local.adapter(), map_fn, reduce, opts)
+            .await
+            .unwrap();
+        let mut expected_rows = couch["rows"].clone();
+        // Linked docs to a missing id come back as null from CouchDB.
+        for row in expected_rows.as_array_mut().unwrap() {
+            match row.get("doc") {
+                Some(Value::Null) => {
+                    row.as_object_mut().unwrap().remove("doc");
+                }
+                Some(doc) => row["doc"] = without_rev(doc),
+                None => {}
+            }
+        }
+        let same_rows = rows_json(&ours) == expected_rows;
+        let same_counts = couch.get("total_rows").is_none()
+            || (couch["total_rows"] == json!(ours.total_rows)
+                && couch["offset"] == json!(ours.offset));
+        if !same_rows || !same_counts {
+            mismatches.push(format!(
+                "{view}?{query}:\n  couchdb={couch}\n  rouchdb=total_rows {} offset {} rows {}",
+                ours.total_rows,
+                ours.offset,
+                rows_json(&ours)
+            ));
+        }
+    }
+
+    // CouchDB rejects include_docs on a reduced query.
+    let err = query_view(
+        local.adapter(),
+        &by_dept,
+        Some(&ReduceFn::Sum),
+        ViewQueryOptions {
+            include_docs: true,
+            ..ViewQueryOptions::new()
+        },
+    )
+    .await;
+    assert!(err.is_err());
 
     delete_remote_db(&url).await;
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));

@@ -16,5 +16,6 @@ pub use mango::{
     find, find_in_docs, get_nested_field, matches_selector,
 };
 pub use mapreduce::{
-    EmittedRow, ReduceFn, StaleOption, ViewQueryOptions, ViewResult, ViewRow, query_view,
+    EmittedRow, ReduceFn, StaleOption, ViewQueryOptions, ViewResult, ViewRow, attach_docs,
+    query_emitted, query_view,
 };

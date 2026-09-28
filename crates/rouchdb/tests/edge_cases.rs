@@ -622,12 +622,11 @@ async fn view_reduce_sum_on_non_numeric_values() {
             ..ViewQueryOptions::new()
         },
     )
-    .await
-    .unwrap();
+    .await;
 
-    // Sum of non-numeric values should be 0 (filter_map skips them)
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0].value, serde_json::json!(0.0));
+    // Like CouchDB, _sum over non-numeric values is a builtin_reduce_error
+    // rather than a silent 0.
+    assert!(matches!(result, Err(RouchError::BadRequest(_))));
 }
 
 #[tokio::test]
