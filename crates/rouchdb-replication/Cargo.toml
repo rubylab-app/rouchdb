@@ -21,5 +21,6 @@ tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+async-trait = "0.1"
 rouchdb-adapter-memory = { path = "../rouchdb-adapter-memory" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

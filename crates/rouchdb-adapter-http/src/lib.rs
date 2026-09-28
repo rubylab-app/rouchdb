@@ -119,15 +119,18 @@ struct CouchDbChangeRev {
 #[derive(Debug, Deserialize)]
 struct CouchDbAllDocsResponse {
     total_rows: u64,
-    offset: u64,
+    // CouchDB sends `"offset": null` when `keys` are posted.
+    offset: Option<u64>,
     rows: Vec<CouchDbAllDocsRow>,
 }
 
+/// A row of `_all_docs`. When `keys` are posted, keys that do not exist come
+/// back as `{"key": "x", "error": "not_found"}` with no `id` or `value`.
 #[derive(Debug, Deserialize)]
 struct CouchDbAllDocsRow {
-    id: String,
+    id: Option<String>,
     key: String,
-    value: CouchDbAllDocsRowValue,
+    value: Option<CouchDbAllDocsRowValue>,
     doc: Option<serde_json::Value>,
 }
 
@@ -398,18 +401,22 @@ impl Adapter for HttpAdapter {
 
         Ok(AllDocsResponse {
             total_rows: result.total_rows,
-            offset: result.offset,
+            offset: result.offset.unwrap_or(0),
+            // Skip `not_found` rows for missing keys, like the local adapters.
             rows: result
                 .rows
                 .into_iter()
-                .map(|r| AllDocsRow {
-                    id: r.id,
-                    key: r.key,
-                    value: AllDocsRowValue {
-                        rev: r.value.rev,
-                        deleted: r.value.deleted,
-                    },
-                    doc: r.doc,
+                .filter_map(|r| {
+                    let (id, value) = (r.id?, r.value?);
+                    Some(AllDocsRow {
+                        id,
+                        key: r.key,
+                        value: AllDocsRowValue {
+                            rev: value.rev,
+                            deleted: value.deleted,
+                        },
+                        doc: r.doc,
+                    })
                 })
                 .collect(),
             update_seq: None, // TODO: parse from CouchDB response when update_seq=true
@@ -813,7 +820,7 @@ fn encode_query_key(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_doc_id, encode_query_key, urlencoded};
+    use super::{CouchDbAllDocsResponse, encode_doc_id, encode_query_key, urlencoded};
 
     #[test]
     fn design_and_local_ids_keep_prefix_slash() {
@@ -840,5 +847,21 @@ mod tests {
         let uni = encode_query_key("\u{ffff}");
         assert!(uni.starts_with("%22") && uni.ends_with("%22"));
         assert!(uni.contains('%'));
+    }
+
+    #[test]
+    fn all_docs_keys_response_decodes() {
+        // Verbatim CouchDB 3 reply to `POST _all_docs?include_docs=true` with
+        // `{"keys": ["a", "missing"]}`: `offset` is null and the missing key
+        // comes back as an error row with no `id` or `value`.
+        let body = r#"{"total_rows":1,"offset":null,"rows":[
+            {"id":"a","key":"a","value":{"rev":"1-bd51d4cccb23dccbc65c71d8d863ba1c"},"doc":{"_id":"a","_rev":"1-bd51d4cccb23dccbc65c71d8d863ba1c","age":30}},
+            {"key":"missing","error":"not_found"}
+        ]}"#;
+        let resp: CouchDbAllDocsResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(resp.offset, None);
+        assert_eq!(resp.rows.len(), 2);
+        assert_eq!(resp.rows[0].id.as_deref(), Some("a"));
+        assert!(resp.rows[1].id.is_none() && resp.rows[1].value.is_none());
     }
 }
