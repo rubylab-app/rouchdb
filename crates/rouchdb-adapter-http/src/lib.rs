@@ -1042,6 +1042,7 @@ mod tests {
         fill_inline_attachment_lengths, urlencoded, winning_open_rev,
     };
     use rouchdb_core::adapter::Adapter;
+    use rouchdb_core::error::RouchError;
 
     #[test]
     fn design_and_local_ids_keep_prefix_slash() {
@@ -1195,6 +1196,608 @@ mod tests {
         )
     }
 
+    /// One request received by a [`scripted_server`].
+    #[derive(Debug, Clone)]
+    pub(crate) struct Captured {
+        pub method: String,
+        /// Path without the query string.
+        pub path: String,
+        /// Decoded query parameters, sorted by name.
+        pub query: std::collections::BTreeMap<String, String>,
+        /// Header names are lowercase.
+        pub headers: Vec<(String, String)>,
+        pub body: Vec<u8>,
+    }
+
+    impl Captured {
+        pub fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        }
+
+        pub fn json(&self) -> serde_json::Value {
+            serde_json::from_slice(&self.body)
+                .unwrap_or_else(|e| panic!("{} {} body is not JSON: {e}", self.method, self.path))
+        }
+
+        /// `"METHOD /path"`, for comparing request sequences.
+        pub fn line(&self) -> String {
+            format!("{} {}", self.method, self.path)
+        }
+    }
+
+    pub(crate) type Requests = std::sync::Arc<std::sync::Mutex<Vec<Captured>>>;
+
+    /// Serve `script` in order, one `(status line, JSON body)` per request,
+    /// capturing each request in full. A request beyond the script gets a
+    /// 500 whose reason names it, so the test fails with a clear message.
+    pub(crate) async fn scripted_server(script: Vec<(&'static str, String)>) -> (String, Requests) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests: Requests = Default::default();
+        let recorded = requests.clone();
+        let script = std::sync::Arc::new(std::sync::Mutex::new(
+            script
+                .into_iter()
+                .collect::<std::collections::VecDeque<_>>(),
+        ));
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let recorded = recorded.clone();
+                let script = script.clone();
+                tokio::spawn(async move {
+                    let mut raw = Vec::new();
+                    let mut buf = [0u8; 8192];
+                    let (head_len, body_len) = loop {
+                        let Ok(n) = socket.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        raw.extend_from_slice(&buf[..n]);
+                        if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&raw[..end]).to_string();
+                            let len = head
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            break (end + 4, len);
+                        }
+                    };
+                    while raw.len() < head_len + body_len {
+                        let Ok(n) = socket.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        raw.extend_from_slice(&buf[..n]);
+                    }
+                    let head = String::from_utf8_lossy(&raw[..head_len - 4]).to_string();
+                    let mut lines = head.lines();
+                    let mut request_line = lines.next().unwrap_or_default().split(' ');
+                    let method = request_line.next().unwrap_or_default().to_string();
+                    let target = request_line.next().unwrap_or_default().to_string();
+                    let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+                    let decode = |v: &str| {
+                        percent_encoding::percent_decode_str(v)
+                            .decode_utf8_lossy()
+                            .to_string()
+                    };
+                    let captured = Captured {
+                        method,
+                        path: path.to_string(),
+                        query: query
+                            .split('&')
+                            .filter(|p| !p.is_empty())
+                            .map(|p| {
+                                let (k, v) = p.split_once('=').unwrap_or((p, ""));
+                                (decode(k), decode(v))
+                            })
+                            .collect(),
+                        headers: lines
+                            .filter_map(|l| l.split_once(':'))
+                            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                            .collect(),
+                        body: raw[head_len..head_len + body_len].to_vec(),
+                    };
+                    let line = captured.line();
+                    recorded.lock().unwrap().push(captured);
+                    let response = match script.lock().unwrap().pop_front() {
+                        Some((status, body)) => json_response(status, &body),
+                        None => json_response(
+                            "500 Internal Server Error",
+                            &serde_json::json!({"error": "unscripted", "reason": line}).to_string(),
+                        ),
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{}", addr), requests)
+    }
+
+    /// An adapter for `{url}/db` that does not probe or create the database.
+    fn adapter_at(url: &str) -> HttpAdapter {
+        HttpAdapter::with_options(
+            &format!("{url}/db"),
+            super::HttpAdapterOptions {
+                skip_setup: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn query(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn only_request(requests: &Requests) -> Captured {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        requests[0].clone()
+    }
+
+    #[tokio::test]
+    async fn changes_asks_for_every_leaf_and_posts_doc_ids() {
+        use rouchdb_core::document::{ChangesOptions, ChangesStyle, Seq};
+        let (url, requests) = scripted_server(vec![(
+            "200 OK",
+            r#"{"results":[{"seq":"3-g1AAAA","id":"b","changes":[{"rev":"2-x"},{"rev":"2-y"}],"deleted":true}],"last_seq":7,"pending":0}"#.into(),
+        )])
+        .await;
+
+        let feed = adapter_at(&url)
+            .changes(ChangesOptions {
+                since: Seq::Str("1-g1AAAA".into()),
+                limit: Some(10),
+                style: ChangesStyle::AllDocs,
+                doc_ids: Some(vec!["b".into(), "c".into()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let req = only_request(&requests);
+        assert_eq!(req.line(), "POST /db/_changes");
+        assert_eq!(
+            req.query,
+            query(&[
+                ("since", "1-g1AAAA"),
+                ("limit", "10"),
+                ("style", "all_docs"),
+                ("filter", "_doc_ids"),
+            ])
+        );
+        assert_eq!(req.json(), serde_json::json!({"doc_ids": ["b", "c"]}));
+
+        assert_eq!(feed.last_seq, Seq::Num(7));
+        assert_eq!(feed.results.len(), 1);
+        let change = &feed.results[0];
+        assert_eq!(change.seq, Seq::Str("3-g1AAAA".into()));
+        assert_eq!(change.id, "b");
+        let revs: Vec<&str> = change.changes.iter().map(|c| c.rev.as_str()).collect();
+        assert_eq!(revs, vec!["2-x", "2-y"]);
+        assert!(change.deleted);
+        assert!(change.doc.is_none() && change.conflicts.is_none());
+    }
+
+    #[tokio::test]
+    async fn changes_conflicts_fetch_docs_but_do_not_return_them() {
+        use rouchdb_core::document::ChangesOptions;
+        let (url, requests) = scripted_server(vec![(
+            "200 OK",
+            r#"{"results":[{"seq":2,"id":"d","changes":[{"rev":"2-b"}],"doc":{"_id":"d","_rev":"2-b","_conflicts":["2-a"]}}],"last_seq":2}"#.into(),
+        )])
+        .await;
+
+        let feed = adapter_at(&url)
+            .changes(ChangesOptions {
+                conflicts: true,
+                selector: Some(serde_json::json!({"type": "t"})),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // CouchDB only reports conflicts inside the docs.
+        let req = only_request(&requests);
+        assert_eq!(req.line(), "POST /db/_changes");
+        assert_eq!(
+            req.query,
+            query(&[
+                ("since", "0"),
+                ("include_docs", "true"),
+                ("conflicts", "true"),
+                ("filter", "_selector"),
+            ])
+        );
+        assert_eq!(req.json(), serde_json::json!({"selector": {"type": "t"}}));
+        assert_eq!(feed.results[0].conflicts, Some(vec!["2-a".to_string()]));
+        assert!(feed.results[0].doc.is_none());
+    }
+
+    #[tokio::test]
+    async fn plain_changes_is_a_get_with_only_since() {
+        use rouchdb_core::document::{ChangesOptions, Seq};
+        let (url, requests) = scripted_server(vec![(
+            "200 OK",
+            r#"{"results":[],"last_seq":"0-g1AAAA"}"#.into(),
+        )])
+        .await;
+        let feed = adapter_at(&url)
+            .changes(ChangesOptions::default())
+            .await
+            .unwrap();
+        let req = only_request(&requests);
+        assert_eq!(req.line(), "GET /db/_changes");
+        assert_eq!(req.query, query(&[("since", "0")]));
+        assert_eq!(feed.last_seq, Seq::Str("0-g1AAAA".into()));
+    }
+
+    fn replicated_doc() -> rouchdb_core::document::Document {
+        rouchdb_core::document::Document::from_json(serde_json::json!({
+            "_id": "d",
+            "_rev": "2-b",
+            "_revisions": {"start": 2, "ids": ["b", "a"]},
+            "v": 1,
+            "_attachments": {"a.bin": {"content_type": "application/octet-stream", "data": "AAH/"}}
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bulk_docs_in_replication_mode_sends_new_edits_false() {
+        use rouchdb_core::document::BulkDocsOptions;
+        let (url, requests) = scripted_server(vec![
+            // CouchDB lists only failures when new_edits is false.
+            ("201 Created", "[]".into()),
+            (
+                "201 Created",
+                r#"[{"id":"d","error":"forbidden","reason":"no"}]"#.into(),
+            ),
+        ])
+        .await;
+        let db = adapter_at(&url);
+
+        let stored = db
+            .bulk_docs(vec![replicated_doc()], BulkDocsOptions::replication())
+            .await
+            .unwrap();
+        assert!(stored.is_empty(), "{stored:?}");
+        let denied = db
+            .bulk_docs(vec![replicated_doc()], BulkDocsOptions::replication())
+            .await
+            .unwrap();
+        assert_eq!(denied.len(), 1);
+        assert!(!denied[0].ok);
+        assert_eq!(denied[0].id, "d");
+        assert_eq!(denied[0].error.as_deref(), Some("forbidden"));
+        assert_eq!(denied[0].reason.as_deref(), Some("no"));
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].line(), "POST /db/_bulk_docs");
+        let body = requests[0].json();
+        assert_eq!(body["new_edits"], false);
+        let doc = &body["docs"][0];
+        assert_eq!(doc["_rev"], "2-b");
+        assert_eq!(
+            doc["_revisions"],
+            serde_json::json!({"start": 2, "ids": ["b", "a"]})
+        );
+        assert_eq!(doc["_attachments"]["a.bin"]["data"], "AAH/");
+        assert_eq!(doc["v"], 1);
+    }
+
+    #[tokio::test]
+    async fn bulk_docs_with_new_edits_reports_each_doc() {
+        use rouchdb_core::document::{BulkDocsOptions, Document};
+        let (url, requests) = scripted_server(vec![(
+            "201 Created",
+            r#"[{"ok":true,"id":"n","rev":"1-a"},{"id":"x","rev":"1-b","error":"conflict","reason":"Document update conflict."}]"#.into(),
+        )])
+        .await;
+        let docs = ["n", "x"]
+            .map(|id| Document::from_json(serde_json::json!({"_id": id})).unwrap())
+            .to_vec();
+
+        let results = adapter_at(&url)
+            .bulk_docs(docs, BulkDocsOptions::new())
+            .await
+            .unwrap();
+
+        let body = only_request(&requests).json();
+        assert!(body.get("new_edits").is_none(), "{body}");
+        assert_eq!(body["docs"].as_array().unwrap().len(), 2);
+        let summary: Vec<_> = results
+            .iter()
+            .map(|r| (r.ok, r.id.as_str(), r.rev.as_deref(), r.error.as_deref()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (true, "n", Some("1-a"), None),
+                (false, "x", Some("1-b"), Some("conflict")),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_get_asks_for_history_attachments_and_latest() {
+        use rouchdb_core::document::BulkGetItem;
+        let (url, requests) = scripted_server(vec![(
+            "200 OK",
+            r#"{"results":[
+                {"id":"d","docs":[{"ok":{"_id":"d","_rev":"2-b","_revisions":{"start":2,"ids":["b","a"]},
+                    "_attachments":{
+                        "three.txt":{"content_type":"text/plain","revpos":2,"digest":"md5-x","data":"aGkh"},
+                        "one.bin":{"content_type":"application/octet-stream","revpos":2,"digest":"md5-y","data":"AQ=="},
+                        "two.bin":{"content_type":"application/octet-stream","revpos":2,"digest":"md5-z","data":"AQI="},
+                        "sized.bin":{"content_type":"application/octet-stream","revpos":2,"digest":"md5-w","data":"AQI=","length":2}}}}]},
+                {"id":"e","docs":[{"error":{"id":"e","rev":"1-x","error":"not_found","reason":"missing"}}]}
+            ]}"#.into(),
+        )])
+        .await;
+
+        let resp = adapter_at(&url)
+            .bulk_get(vec![
+                BulkGetItem {
+                    id: "d".into(),
+                    rev: Some("2-b".into()),
+                },
+                BulkGetItem {
+                    id: "e".into(),
+                    rev: None,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let req = only_request(&requests);
+        assert_eq!(req.line(), "POST /db/_bulk_get");
+        assert_eq!(
+            req.query,
+            query(&[
+                ("revs", "true"),
+                ("attachments", "true"),
+                ("latest", "true")
+            ])
+        );
+        // JSON, not the multipart reply CouchDB sends by default here.
+        assert_eq!(req.header("accept"), Some("application/json"));
+        assert_eq!(
+            req.json(),
+            serde_json::json!({"docs": [{"id": "d", "rev": "2-b"}, {"id": "e"}]})
+        );
+
+        // CouchDB omits `length` for inline data: it is filled in.
+        let doc = resp.results[0].docs[0].ok.as_ref().unwrap();
+        let lengths: Vec<_> = ["three.txt", "one.bin", "two.bin", "sized.bin"]
+            .iter()
+            .map(|a| doc["_attachments"][a]["length"].clone())
+            .collect();
+        assert_eq!(lengths, [3, 1, 2, 2].map(|n| serde_json::json!(n)));
+        let err = resp.results[1].docs[0].error.as_ref().unwrap();
+        assert_eq!(
+            (
+                err.id.as_str(),
+                err.rev.as_str(),
+                err.error.as_str(),
+                err.reason.as_str()
+            ),
+            ("e", "1-x", "not_found", "missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn all_docs_sends_only_the_requested_options() {
+        use rouchdb_core::document::AllDocsOptions;
+        let reply = r#"{"total_rows":0,"offset":0,"rows":[]}"#;
+        let (url, requests) = scripted_server(vec![
+            ("200 OK", reply.into()),
+            ("200 OK", reply.into()),
+            ("200 OK", reply.into()),
+        ])
+        .await;
+        let db = adapter_at(&url);
+
+        db.all_docs(AllDocsOptions::new()).await.unwrap();
+        db.all_docs(AllDocsOptions {
+            include_docs: true,
+            limit: Some(2),
+            skip: 1,
+            ..AllDocsOptions::new()
+        })
+        .await
+        .unwrap();
+        db.all_docs(AllDocsOptions {
+            keys: Some(vec!["a".into(), "b".into()]),
+            ..AllDocsOptions::new()
+        })
+        .await
+        .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].line(), "GET /db/_all_docs");
+        assert_eq!(requests[0].query, query(&[]));
+        assert_eq!(
+            requests[1].query,
+            query(&[("include_docs", "true"), ("limit", "2"), ("skip", "1")])
+        );
+        assert_eq!(requests[2].line(), "POST /db/_all_docs");
+        assert_eq!(requests[2].json(), serde_json::json!({"keys": ["a", "b"]}));
+    }
+
+    #[tokio::test]
+    async fn remove_local_deletes_the_current_rev() {
+        let (url, requests) = scripted_server(vec![
+            (
+                "200 OK",
+                r#"{"_id":"_local/cp","_rev":"0-3","last_seq":5}"#.into(),
+            ),
+            (
+                "200 OK",
+                r#"{"ok":true,"id":"_local/cp","rev":"0-0"}"#.into(),
+            ),
+            (
+                "404 Object Not Found",
+                r#"{"error":"not_found","reason":"missing"}"#.into(),
+            ),
+        ])
+        .await;
+        let db = adapter_at(&url);
+
+        db.remove_local("cp").await.unwrap();
+        let missing = db.remove_local("cp").await;
+        assert!(
+            matches!(missing, Err(RouchError::NotFound(ref r)) if r == "missing"),
+            "{missing:?}"
+        );
+
+        let requests = requests.lock().unwrap();
+        let lines: Vec<_> = requests.iter().map(Captured::line).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "GET /db/_local/cp",
+                "DELETE /db/_local/cp",
+                "GET /db/_local/cp"
+            ]
+        );
+        assert_eq!(requests[1].query, query(&[("rev", "0-3")]));
+    }
+
+    #[tokio::test]
+    async fn compact_posts_json_and_reports_errors() {
+        let (url, requests) = scripted_server(vec![
+            ("202 Accepted", r#"{"ok":true}"#.into()),
+            (
+                "401 Unauthorized",
+                r#"{"error":"unauthorized","reason":"You are not a server admin."}"#.into(),
+            ),
+        ])
+        .await;
+        let db = adapter_at(&url);
+
+        db.compact().await.unwrap();
+        assert!(matches!(db.compact().await, Err(RouchError::Unauthorized)));
+
+        let req = requests.lock().unwrap()[0].clone();
+        assert_eq!(req.line(), "POST /db/_compact");
+        assert_eq!(req.header("content-type"), Some("application/json"));
+    }
+
+    #[tokio::test]
+    async fn security_document_round_trips_over_http() {
+        use rouchdb_core::document::SecurityDocument;
+        let security = serde_json::json!({
+            "admins": {"names": ["ann"], "roles": ["ops"]},
+            "members": {"names": [], "roles": ["staff"]},
+        });
+        let (url, requests) = scripted_server(vec![
+            ("200 OK", security.to_string()),
+            ("200 OK", r#"{"ok":true}"#.into()),
+            (
+                "403 Forbidden",
+                r#"{"error":"forbidden","reason":"You are not a db or server admin."}"#.into(),
+            ),
+        ])
+        .await;
+        let db = adapter_at(&url);
+
+        let doc = db.get_security().await.unwrap();
+        assert_eq!(serde_json::to_value(&doc).unwrap(), security);
+        db.put_security(doc).await.unwrap();
+        let denied = db.put_security(SecurityDocument::default()).await;
+        assert!(
+            matches!(denied, Err(RouchError::Forbidden(ref r)) if r == "You are not a db or server admin."),
+            "{denied:?}"
+        );
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].line(), "GET /db/_security");
+        assert_eq!(requests[1].line(), "PUT /db/_security");
+        assert_eq!(requests[1].json(), security);
+    }
+
+    #[tokio::test]
+    async fn missing_database_is_created_on_first_use() {
+        let info = r#"{"db_name":"db","doc_count":0,"doc_del_count":0,"update_seq":"0-g1AAAA"}"#;
+        let (url, requests) = scripted_server(vec![
+            (
+                "404 Object Not Found",
+                r#"{"error":"not_found","reason":"Database does not exist."}"#.into(),
+            ),
+            ("201 Created", r#"{"ok":true}"#.into()),
+            ("200 OK", info.into()),
+            ("200 OK", info.into()),
+        ])
+        .await;
+        let db = HttpAdapter::new(&format!("{url}/db"));
+
+        db.info().await.unwrap();
+        db.info().await.unwrap();
+
+        let lines: Vec<_> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(Captured::line)
+            .collect();
+        assert_eq!(lines, vec!["GET /db", "PUT /db", "GET /db", "GET /db"]);
+    }
+
+    #[tokio::test]
+    async fn existing_database_is_not_created_again() {
+        let info = r#"{"db_name":"db","doc_count":1,"doc_del_count":0,"update_seq":7}"#;
+        let (url, requests) =
+            scripted_server(vec![("200 OK", info.into()), ("200 OK", info.into())]).await;
+        let db = HttpAdapter::new(&format!("{url}/db"));
+
+        let got = db.info().await.unwrap();
+        assert_eq!(got.update_seq, rouchdb_core::document::Seq::Num(7));
+        let lines: Vec<_> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(Captured::line)
+            .collect();
+        assert_eq!(lines, vec!["GET /db", "GET /db"]);
+    }
+
+    #[tokio::test]
+    async fn database_created_concurrently_is_not_an_error() {
+        let (url, requests) = scripted_server(vec![
+            (
+                "404 Object Not Found",
+                r#"{"error":"not_found","reason":"Database does not exist."}"#.into(),
+            ),
+            (
+                "412 Precondition Failed",
+                r#"{"error":"file_exists","reason":"The database could not be created, the file already exists."}"#.into(),
+            ),
+            (
+                "200 OK",
+                r#"{"db_name":"db","doc_count":0,"doc_del_count":0,"update_seq":"0-g1AAAA"}"#.into(),
+            ),
+        ])
+        .await;
+        HttpAdapter::new(&format!("{url}/db")).info().await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 3);
+    }
+
     async fn error_for(status: &str, body: &str) -> rouchdb_core::error::RouchError {
         let url = stub_server(json_response(status, body)).await;
         let db = HttpAdapter::with_options(
@@ -1209,7 +1812,6 @@ mod tests {
 
     #[tokio::test]
     async fn http_errors_map_to_rouch_errors() {
-        use rouchdb_core::error::RouchError;
         let err = error_for(
             "400 Bad Request",
             r#"{"error":"bad_request","reason":"Invalid rev format"}"#,
@@ -1254,6 +1856,53 @@ mod tests {
         let err = error_for("403 Forbidden", r#"{"error":"forbidden","reason":"no"}"#).await;
         assert!(
             matches!(err, RouchError::Forbidden(ref r) if r == "no"),
+            "{err:?}"
+        );
+
+        let err = error_for(
+            "404 Object Not Found",
+            r#"{"error":"not_found","reason":"Database does not exist."}"#,
+        )
+        .await;
+        assert!(
+            matches!(err, RouchError::NotFound(ref r) if r == "Database does not exist."),
+            "{err:?}"
+        );
+        // Without a CouchDB error body the reason falls back to "missing".
+        let err = error_for("404 Not Found", "nope").await;
+        assert!(
+            matches!(err, RouchError::NotFound(ref r) if r == "missing"),
+            "{err:?}"
+        );
+
+        let err = error_for(
+            "401 Unauthorized",
+            r#"{"error":"unauthorized","reason":"Name or password is incorrect."}"#,
+        )
+        .await;
+        assert!(matches!(err, RouchError::Unauthorized), "{err:?}");
+
+        let err = error_for(
+            "409 Conflict",
+            r#"{"error":"conflict","reason":"Document update conflict."}"#,
+        )
+        .await;
+        assert!(matches!(err, RouchError::Conflict), "{err:?}");
+
+        let err = error_for(
+            "412 Precondition Failed",
+            r#"{"error":"missing_stub","reason":"Invalid attachment stub in d for a.txt"}"#,
+        )
+        .await;
+        assert!(
+            matches!(err, RouchError::BadRequest(ref r) if r == "missing_stub: Invalid attachment stub in d for a.txt"),
+            "{err:?}"
+        );
+
+        let body = r#"{"error":"unknown_error","reason":"function_clause"}"#;
+        let err = error_for("500 Internal Server Error", body).await;
+        assert!(
+            matches!(err, RouchError::DatabaseError(ref r) if *r == format!("HTTP 500 Internal Server Error: {body}")),
             "{err:?}"
         );
     }
