@@ -3086,6 +3086,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn indexed_find_reads_only_the_changes_since_the_index() {
+        // The index is brought up to date from where it left off, not by
+        // re-reading the whole changes feed on every query.
+        let (spy, db) = numbered_docs(3).await;
+        db.create_index(IndexDefinition {
+            name: String::new(),
+            fields: vec![SortField::Simple("n".into())],
+            ddoc: None,
+        })
+        .await
+        .unwrap();
+        let find = || {
+            let db = &db;
+            async move {
+                let docs = db
+                    .find(FindOptions {
+                        selector: serde_json::json!({"n": {"$gte": 1}}),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap()
+                    .docs;
+                docs.iter()
+                    .map(|d| d["_id"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            }
+        };
+        let sinces = || {
+            std::mem::take(&mut *spy.changes_opts.lock().unwrap())
+                .into_iter()
+                .map(|o| o.since)
+                .collect::<Vec<_>>()
+        };
+        sinces();
+
+        assert_eq!(find().await, ["d0001", "d0002"]);
+        assert_eq!(sinces(), [Seq::Num(3)]);
+        db.put("d0003", serde_json::json!({"n": 3})).await.unwrap();
+        assert_eq!(find().await, ["d0001", "d0002", "d0003"]);
+        assert_eq!(sinces(), [Seq::Num(3)]);
+        assert_eq!(find().await, ["d0001", "d0002", "d0003"]);
+        assert_eq!(sinces(), [Seq::Num(4)]);
+    }
+
+    #[tokio::test]
     async fn selector_changes_read_the_feed_in_batches() {
         // The matching changes are past the first batches: the feed must be
         // read on until `limit` matches are found.
