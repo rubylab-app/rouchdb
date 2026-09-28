@@ -53,7 +53,7 @@ rouchdb                     <- umbrella: Database struct + re-exports + Plugin t
 ├── rouchdb-adapter-memory  -> core         (in-memory storage)
 ├── rouchdb-adapter-redb    -> core         (persistent storage via redb)
 ├── rouchdb-adapter-http    -> core         (CouchDB REST client via reqwest + cookie auth)
-├── rouchdb-changes         -> core         (changes feed + live streaming + events)
+├── rouchdb-changes         -> core, query  (changes feed + live streaming + events)
 ├── rouchdb-replication     -> core, query  (CouchDB replication protocol)
 ├── rouchdb-query           -> core         (Mango selectors + map/reduce)
 ├── rouchdb-views           -> core         (design documents + view engine)
@@ -130,7 +130,7 @@ Clap-based CLI. Read commands: `info`, `get`, `all-docs`, `find`, `changes`, `du
 
 ## Publishing
 
-All 9 library crates must be published to crates.io in dependency order: core → adapter-memory, changes, adapter-redb, adapter-http → query, views, replication → rouchdb (umbrella). Server, CLI and bench are `publish = false`.
+All 9 library crates must be published to crates.io in dependency order: core → adapter-memory, adapter-redb, adapter-http, query → changes, views, replication → rouchdb (umbrella). Server, CLI and bench are `publish = false`.
 
 ## CI
 
