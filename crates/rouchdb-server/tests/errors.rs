@@ -117,6 +117,7 @@ async fn unsupported_method_is_json_405() {
     let app = app();
     let resp = raw(&app, Method::PATCH, "/db", None, "").await;
     assert_json_error(&resp, StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
+    assert_eq!(resp.header("allow"), Some("GET,HEAD,PUT,POST,DELETE"));
 }
 
 #[tokio::test]
