@@ -767,8 +767,8 @@ impl Database {
 
     /// Replicate with event streaming.
     ///
-    /// Same as `replicate_to()` but emits `ReplicationEvent` through the
-    /// returned receiver as replication progresses.
+    /// Same as `replicate_to()` but also returns every `ReplicationEvent`
+    /// emitted while replicating, buffered in the returned receiver.
     pub async fn replicate_to_with_events(
         &self,
         target: &Database,
@@ -777,9 +777,27 @@ impl Database {
         ReplicationResult,
         tokio::sync::mpsc::Receiver<ReplicationEvent>,
     )> {
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let result =
-            replicate_with_events(self.adapter.as_ref(), target.adapter.as_ref(), opts, tx).await?;
+        // Drain the events while replicating: nobody can read the returned
+        // receiver until this call finishes, so a bounded channel that fills
+        // up would stall the replication forever.
+        let (tx, mut inner_rx) = tokio::sync::mpsc::channel(64);
+        let replication =
+            replicate_with_events(self.adapter.as_ref(), target.adapter.as_ref(), opts, tx);
+        let collect = async {
+            let mut events = Vec::new();
+            while let Some(event) = inner_rx.recv().await {
+                events.push(event);
+            }
+            events
+        };
+        let (result, events) = tokio::join!(replication, collect);
+        let result = result?;
+
+        // Hand the events back through a channel large enough to hold them.
+        let (tx, rx) = tokio::sync::mpsc::channel(events.len().max(1));
+        for event in events {
+            let _ = tx.try_send(event);
+        }
         Ok((result, rx))
     }
 
@@ -1301,6 +1319,46 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ReplicationEvent::Complete(_)))
         );
+    }
+
+    #[tokio::test]
+    async fn replicate_to_with_events_does_not_stall_on_many_events() {
+        let local = Database::memory("local");
+        let remote = Database::memory("remote");
+        for i in 0..100 {
+            local
+                .put(&format!("doc{i:03}"), serde_json::json!({"i": i}))
+                .await
+                .unwrap();
+        }
+
+        // batch_size=1 produces more events than any fixed channel capacity.
+        let replication = local.replicate_to_with_events(
+            &remote,
+            ReplicationOptions {
+                batch_size: 1,
+                ..Default::default()
+            },
+        );
+        let (result, mut rx) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), replication)
+                .await
+                .expect("replicate_to_with_events stalled")
+                .unwrap();
+        assert!(result.ok);
+        assert_eq!(result.docs_written, 100);
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let changes = events
+            .iter()
+            .filter(|e| matches!(e, ReplicationEvent::Change { .. }))
+            .count();
+        assert_eq!(changes, 100);
+        assert!(matches!(events.first(), Some(ReplicationEvent::Active)));
+        assert!(matches!(events.last(), Some(ReplicationEvent::Complete(_))));
     }
 
     #[tokio::test]
