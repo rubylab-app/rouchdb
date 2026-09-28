@@ -235,6 +235,13 @@ rouchdb delete mydb.redb user:alice --rev 2-def                        # Delete
 rouchdb import mydb.redb docs.json                                     # Bulk import
 ```
 
+`dump` exports each document's winning revision with its attachments inlined as
+base64, and `import` restores them. Revision history and conflicting revisions
+are not exported (`dump` warns about documents with conflicts); use `replicate`
+to copy a database with its full history. Read-only commands fail instead of
+creating a missing `.redb` file, and every command exits with status 1 on
+failure (including a `replicate` or `import` that only partly succeeded).
+
 ### Operations
 
 ```bash

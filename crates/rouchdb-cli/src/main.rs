@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::io::{self, BufWriter, Write};
 use std::process;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Parser, Subcommand};
 use rouchdb::{
     AllDocsOptions, BulkDocsOptions, ChangesOptions, Database, Document, FindOptions, GetOptions,
@@ -120,6 +122,12 @@ enum Commands {
     },
 
     /// Export all documents as a JSON array
+    ///
+    /// Each document is exported at its winning revision, with its attachments
+    /// inlined as base64 ("_attachments": {name: {content_type, data}}), which
+    /// `import` restores. Revision history and conflicting revisions are not
+    /// exported (a warning names the documents that have conflicts); use
+    /// `replicate` to copy a database with its full history.
     Dump {
         /// Path to the .redb file
         path: String,
@@ -208,6 +216,11 @@ enum Commands {
     },
 
     /// Import documents from a JSON file (array of objects)
+    ///
+    /// Documents get fresh revisions (any "_rev" is ignored). Inline
+    /// attachments ("_attachments": {name: {content_type, data: <base64>}}),
+    /// as written by `dump`, are restored; attachment stubs without data are
+    /// rejected. Exits with status 1 if any document fails to import.
     Import {
         /// Path to the .redb file
         path: String,
@@ -336,9 +349,19 @@ fn redact_credentials(text: &str) -> String {
 /// Documents written per `bulk_docs` call by `import`.
 const IMPORT_BATCH_SIZE: usize = 500;
 
-/// Turn one element of an import file into a new document, or the error to
-/// report for it. Any `_rev` is dropped: imported docs get fresh revisions.
-fn import_doc(mut value: serde_json::Value) -> Result<Document, serde_json::Value> {
+/// An attachment carried inline (base64) by an imported document.
+struct InlineAttachment {
+    name: String,
+    content_type: String,
+    data: Vec<u8>,
+}
+
+/// Turn one element of an import file into a new document plus its inline
+/// attachments, or the error to report for it. Any `_rev` is dropped:
+/// imported docs get fresh revisions.
+fn import_doc(
+    mut value: serde_json::Value,
+) -> Result<(Document, Vec<InlineAttachment>), serde_json::Value> {
     let id = match value.get("_id").and_then(|v| v.as_str()).map(String::from) {
         Some(id) if id.is_empty() => {
             return Err(serde_json::json!({
@@ -354,17 +377,82 @@ fn import_doc(mut value: serde_json::Value) -> Result<Document, serde_json::Valu
             }));
         }
     };
+    let mut raw_attachments = None;
     if let Some(obj) = value.as_object_mut() {
         obj.remove("_id");
         obj.remove("_rev");
+        raw_attachments = obj.remove("_attachments");
     }
-    Ok(Document {
+
+    // Attachments are stored with put_attachment once the doc is written.
+    let attachment_error = |message: String| serde_json::json!({"id": id, "error": message});
+    let mut attachments = Vec::new();
+    match raw_attachments {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Object(map)) => {
+            for (name, meta) in map {
+                let Some(data) = meta.get("data").and_then(|v| v.as_str()) else {
+                    return Err(attachment_error(format!(
+                        "attachment '{}' has no inline data",
+                        name
+                    )));
+                };
+                let data = BASE64.decode(data).map_err(|e| {
+                    attachment_error(format!("attachment '{}': invalid base64: {}", name, e))
+                })?;
+                let content_type = meta
+                    .get("content_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                attachments.push(InlineAttachment {
+                    name,
+                    content_type,
+                    data,
+                });
+            }
+        }
+        Some(_) => {
+            return Err(attachment_error("_attachments must be an object".into()));
+        }
+    }
+
+    let doc = Document {
         id,
         rev: None,
         deleted: false,
         data: value,
         attachments: HashMap::new(),
-    })
+    };
+    Ok((doc, attachments))
+}
+
+/// Store the inline attachments of an imported document, chaining from the
+/// revision its `bulk_docs` write returned.
+async fn put_inline_attachments(
+    db: &Database,
+    id: &str,
+    rev: Option<String>,
+    attachments: Vec<InlineAttachment>,
+) -> Result<(), String> {
+    if attachments.is_empty() {
+        return Ok(());
+    }
+    let mut rev = rev.ok_or_else(|| "no revision returned for the document".to_string())?;
+    for att in attachments {
+        let result = db
+            .put_attachment(id, &att.name, &rev, att.data, &att.content_type)
+            .await
+            .map_err(|e| format!("attachment '{}': {}", att.name, e))?;
+        match result.rev {
+            Some(new_rev) if result.ok => rev = new_rev,
+            _ => {
+                let reason = result.reason.or(result.error).unwrap_or_default();
+                return Err(format!("attachment '{}': {}", att.name, reason));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check_doc_result(result: &rouchdb::DocResult) -> rouchdb::Result<()> {
@@ -536,17 +624,60 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
 
         Commands::Dump { path, db_name } => {
             let db = open_existing_db(&path, db_name.as_deref());
-            let all = db
-                .all_docs(AllDocsOptions {
-                    include_docs: true,
-                    inclusive_end: true,
-                    ..Default::default()
-                })
-                .await?;
+            let all = db.all_docs(AllDocsOptions::new()).await?;
 
-            let docs: Vec<&serde_json::Value> =
-                all.rows.iter().filter_map(|row| row.doc.as_ref()).collect();
-            print_json(&serde_json::to_value(&docs).unwrap(), cli.pretty);
+            let mut docs = Vec::with_capacity(all.rows.len());
+            let mut conflicted = Vec::new();
+            for row in all.rows {
+                // all_docs bodies carry no attachments, so read each doc
+                // (with its conflicts, to warn about them) and inline the
+                // attachment data in the format `import` reads back.
+                let doc = db
+                    .get_with_opts(
+                        &row.id,
+                        GetOptions {
+                            conflicts: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                let mut json = doc.to_json();
+                if let Some(obj) = json.as_object_mut() {
+                    if obj.remove("_conflicts").is_some() {
+                        conflicted.push(row.id);
+                    }
+                    if !doc.attachments.is_empty() {
+                        let mut names: Vec<&String> = doc.attachments.keys().collect();
+                        names.sort();
+                        let mut attachments = serde_json::Map::new();
+                        for name in names {
+                            let data = db.get_attachment(&doc.id, name).await?;
+                            attachments.insert(
+                                name.clone(),
+                                serde_json::json!({
+                                    "content_type": doc.attachments[name].content_type,
+                                    "data": BASE64.encode(data),
+                                }),
+                            );
+                        }
+                        obj.insert(
+                            "_attachments".into(),
+                            serde_json::Value::Object(attachments),
+                        );
+                    }
+                }
+                docs.push(json);
+            }
+
+            if !conflicted.is_empty() {
+                eprintln!(
+                    "warning: {} document(s) have conflicting revisions; only the winning \
+                     revision was exported: {}",
+                    conflicted.len(),
+                    conflicted.join(", ")
+                );
+            }
+            print_json(&serde_json::Value::Array(docs), cli.pretty);
         }
 
         Commands::Replicate {
@@ -721,8 +852,8 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
                 let mut positions = Vec::with_capacity(IMPORT_BATCH_SIZE);
                 for (index, value) in docs.by_ref().take(IMPORT_BATCH_SIZE) {
                     match import_doc(value) {
-                        Ok(doc) => {
-                            positions.push((index, doc.id.clone()));
+                        Ok((doc, attachments)) => {
+                            positions.push((index, doc.id.clone(), attachments));
                             batch.push(doc);
                         }
                         Err(e) => errors.push((index, e)),
@@ -736,9 +867,18 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
                 match db.bulk_docs(batch, BulkDocsOptions::new()).await {
                     Ok(results) => {
                         let mut results = results.into_iter();
-                        for (index, id) in positions {
+                        for (index, id, attachments) in positions {
                             match results.next() {
-                                Some(r) if r.ok => imported += 1,
+                                Some(r) if r.ok => {
+                                    match put_inline_attachments(&db, &id, r.rev, attachments).await
+                                    {
+                                        Ok(()) => imported += 1,
+                                        Err(e) => errors.push((
+                                            index,
+                                            serde_json::json!({"id": id, "error": e}),
+                                        )),
+                                    }
+                                }
                                 Some(r) => {
                                     let reason = r
                                         .reason
@@ -758,7 +898,7 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
                         }
                     }
                     Err(e) => {
-                        for (index, id) in positions {
+                        for (index, id, _) in positions {
                             errors.push((
                                 index,
                                 serde_json::json!({"id": id, "error": e.to_string()}),

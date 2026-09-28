@@ -1193,6 +1193,191 @@ async fn import_invalid_file_fails() {
     assert!(stderr_str(&output).contains("cannot read file"));
 }
 
+// ─── DUMP / IMPORT ROUND TRIP ───────────────────────────────────────────────
+
+async fn setup_db_with_attachment() -> (TempDir, PathBuf) {
+    let (dir, db_path) =
+        setup_db(&[("plain", serde_json::json!({"name": "no attachments"}))]).await;
+    {
+        let db = rouchdb::Database::open(&db_path, "test").unwrap();
+        let r = db
+            .put("doc1", serde_json::json!({"name": "Alice"}))
+            .await
+            .unwrap();
+        let r = db
+            .put_attachment(
+                "doc1",
+                "hello.txt",
+                &r.rev.unwrap(),
+                b"hello world".to_vec(),
+                "text/plain",
+            )
+            .await
+            .unwrap();
+        db.put_attachment(
+            "doc1",
+            "blob.bin",
+            &r.rev.unwrap(),
+            vec![0, 159, 255, 1, 2],
+            "application/octet-stream",
+        )
+        .await
+        .unwrap();
+    }
+    (dir, db_path)
+}
+
+#[tokio::test]
+async fn dump_includes_attachments_inline() {
+    let (_dir, db_path) = setup_db_with_attachment().await;
+
+    let output = run(&["dump", path_str(&db_path)]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let docs = stdout_json(&output);
+    let doc1 = docs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["_id"] == "doc1")
+        .unwrap();
+    let atts = &doc1["_attachments"];
+    assert_eq!(atts["hello.txt"]["content_type"], "text/plain");
+    assert_eq!(atts["hello.txt"]["data"], b64(b"hello world"));
+    assert_eq!(atts["blob.bin"]["data"], b64(&[0, 159, 255, 1, 2]));
+
+    let plain = docs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["_id"] == "plain")
+        .unwrap();
+    assert!(plain.get("_attachments").is_none());
+}
+
+#[tokio::test]
+async fn dump_then_import_round_trip_preserves_data_and_attachments() {
+    let (dir, db_path) = setup_db_with_attachment().await;
+
+    let dump = run(&["dump", path_str(&db_path)]);
+    assert!(dump.status.success(), "{}", stderr_str(&dump));
+    let dump_file = dir.path().join("backup.json");
+    std::fs::write(&dump_file, &dump.stdout).unwrap();
+
+    let restored = dir.path().join("restored.redb");
+    let output = run(&["import", path_str(&restored), path_str(&dump_file)]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let v = stdout_json(&output);
+    assert_eq!(v["imported"], 2);
+
+    let doc1 = stdout_json(&run(&["get", path_str(&restored), "doc1"]));
+    assert_eq!(doc1["name"], "Alice");
+    assert_eq!(
+        doc1["_attachments"]["hello.txt"]["content_type"],
+        "text/plain"
+    );
+    assert_eq!(doc1["_attachments"]["hello.txt"]["length"], 11);
+
+    let plain = stdout_json(&run(&["get", path_str(&restored), "plain"]));
+    assert_eq!(plain["name"], "no attachments");
+    assert!(plain.get("_attachments").is_none());
+
+    {
+        let db = rouchdb::Database::open(&restored, "restored").unwrap();
+        assert_eq!(
+            db.get_attachment("doc1", "hello.txt").await.unwrap(),
+            b"hello world"
+        );
+        assert_eq!(
+            db.get_attachment("doc1", "blob.bin").await.unwrap(),
+            vec![0, 159, 255, 1, 2]
+        );
+    }
+
+    // Dumping the restored database yields the same bodies and attachments.
+    let redump = stdout_json(&run(&["dump", path_str(&restored)]));
+    let strip_revs = |v: serde_json::Value| -> Vec<serde_json::Value> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(|mut d| {
+                d.as_object_mut().unwrap().remove("_rev");
+                d
+            })
+            .collect()
+    };
+    assert_eq!(strip_revs(redump), strip_revs(stdout_json(&dump)));
+}
+
+#[tokio::test]
+async fn import_rejects_attachment_stubs_without_data() {
+    let (dir, db_path) = setup_db(&[]).await;
+    let p = path_str(&db_path);
+    let file = write_json_file(
+        dir.path(),
+        "docs.json",
+        &serde_json::json!([
+            {"_id": "ok", "x": 1},
+            {"_id": "stub", "_attachments": {"a.txt": {
+                "content_type": "text/plain", "digest": "md5-x", "length": 3, "stub": true
+            }}},
+            {"_id": "badb64", "_attachments": {"a.txt": {
+                "content_type": "text/plain", "data": "!!!not base64!!!"
+            }}}
+        ]),
+    );
+
+    let output = run(&["import", p, path_str(&file)]);
+    assert_eq!(output.status.code(), Some(1));
+    let v = stdout_json(&output);
+    assert_eq!(v["imported"], 1);
+    let ids: Vec<&str> = v["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["stub", "badb64"]);
+    assert!(!run(&["get", p, "stub"]).status.success());
+}
+
+#[tokio::test]
+async fn dump_warns_about_conflicting_revisions() {
+    let (_dir, db_path) = setup_db(&[
+        ("clean", serde_json::json!({"v": 1})),
+        ("conflicted", serde_json::json!({"v": 1})),
+    ])
+    .await;
+    {
+        let db = rouchdb::Database::open(&db_path, "test").unwrap();
+        let branch = rouchdb::Document {
+            id: "conflicted".into(),
+            rev: Some(rouchdb::Revision::new(1, "f".repeat(32))),
+            deleted: false,
+            data: serde_json::json!({"v": 99}),
+            attachments: HashMap::new(),
+        };
+        let results = db
+            .bulk_docs(vec![branch], rouchdb::BulkDocsOptions::replication())
+            .await
+            .unwrap();
+        assert!(results.iter().all(|r| r.ok));
+    }
+
+    let output = run(&["dump", path_str(&db_path)]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let stderr = stderr_str(&output);
+    assert!(stderr.contains("warning"), "stderr: {}", stderr);
+    assert!(stderr.contains("conflicted"), "stderr: {}", stderr);
+    assert!(!stderr.contains("clean"), "stderr: {}", stderr);
+
+    let docs = stdout_json(&output);
+    assert_eq!(docs.as_array().unwrap().len(), 2);
+    for d in docs.as_array().unwrap() {
+        assert!(d.get("_conflicts").is_none(), "{:?}", d);
+    }
+}
+
 // ─── REPLICATE RESULTS ──────────────────────────────────────────────────────
 
 #[tokio::test]
