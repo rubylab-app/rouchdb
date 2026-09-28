@@ -1778,6 +1778,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_sends_only_the_requested_options() {
+        use rouchdb_core::document::GetOptions;
+        let doc = r#"{"_id":"a/b","_rev":"2-x","v":1,"_conflicts":["2-w"]}"#;
+        let (url, requests) =
+            scripted_server(vec![("200 OK", doc.into()), ("200 OK", doc.into())]).await;
+        let db = adapter_at(&url);
+
+        db.get("a/b", GetOptions::default()).await.unwrap();
+        let got = db
+            .get(
+                "a/b",
+                GetOptions {
+                    conflicts: true,
+                    revs: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(got.data["_conflicts"], serde_json::json!(["2-w"]));
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].line(), "GET /db/a%2Fb");
+        assert_eq!(requests[0].query, query(&[]));
+        assert_eq!(
+            requests[1].query,
+            query(&[("conflicts", "true"), ("revs", "true")])
+        );
+    }
+
+    #[tokio::test]
+    async fn get_attachment_returns_the_raw_bytes() {
+        use rouchdb_core::document::GetAttachmentOptions;
+        // Returned as is, not parsed as JSON.
+        let body = "\u{0}raw\u{7f} bytes";
+        let (url, requests) = scripted_server(vec![
+            ("200 OK", body.into()),
+            (
+                "404 Object Not Found",
+                r#"{"error":"not_found","reason":"Document is missing attachment"}"#.into(),
+            ),
+        ])
+        .await;
+        let db = adapter_at(&url);
+
+        let got = db
+            .get_attachment(
+                "d",
+                "a b.txt",
+                GetAttachmentOptions {
+                    rev: Some("1-x".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(got, body.as_bytes());
+        let missing = db
+            .get_attachment("d", "gone", GetAttachmentOptions::default())
+            .await;
+        assert!(
+            matches!(missing, Err(RouchError::NotFound(ref r)) if r == "Document is missing attachment"),
+            "{missing:?}"
+        );
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].line(), "GET /db/d/a%20b.txt");
+        assert_eq!(requests[0].query, query(&[("rev", "1-x")]));
+        assert_eq!(requests[1].line(), "GET /db/d/gone");
+    }
+
+    #[tokio::test]
+    async fn put_local_sends_the_doc_and_reports_errors() {
+        let (url, requests) = scripted_server(vec![
+            (
+                "201 Created",
+                r#"{"ok":true,"id":"_local/cp","rev":"0-1"}"#.into(),
+            ),
+            (
+                "400 Bad Request",
+                r#"{"error":"bad_request","reason":"Invalid rev format"}"#.into(),
+            ),
+        ])
+        .await;
+        let db = adapter_at(&url);
+
+        db.put_local("cp", serde_json::json!({"last_seq": 5}))
+            .await
+            .unwrap();
+        let bad = db
+            .put_local("cp", serde_json::json!({"_rev": "x", "last_seq": 6}))
+            .await;
+        assert!(
+            matches!(bad, Err(RouchError::BadRequest(ref r)) if r == "Invalid rev format"),
+            "{bad:?}"
+        );
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].line(), "PUT /db/_local/cp");
+        assert_eq!(requests[0].json(), serde_json::json!({"last_seq": 5}));
+    }
+
+    #[tokio::test]
+    async fn destroy_deletes_the_database_and_reports_errors() {
+        let (url, requests) = scripted_server(vec![
+            ("200 OK", r#"{"ok":true}"#.into()),
+            (
+                "404 Object Not Found",
+                r#"{"error":"not_found","reason":"Database does not exist."}"#.into(),
+            ),
+        ])
+        .await;
+        let db = adapter_at(&url);
+
+        db.destroy().await.unwrap();
+        assert!(matches!(db.destroy().await, Err(RouchError::NotFound(_))));
+        let lines: Vec<_> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(Captured::line)
+            .collect();
+        assert_eq!(lines, vec!["DELETE /db", "DELETE /db"]);
+    }
+
+    #[tokio::test]
+    async fn adapter_from_an_auth_client_sends_its_session_cookie() {
+        let info = r#"{"db_name":"db","doc_count":0,"doc_del_count":0,"update_seq":0}"#;
+        let (url, requests) = scripted_server(vec![
+            // A status line can carry extra headers after it.
+            (
+                "200 OK\r\nSet-Cookie: AuthSession=c2Vzc2lvbg; Version=1; Path=/; HttpOnly",
+                r#"{"ok":true,"name":"bob","roles":[]}"#.into(),
+            ),
+            ("200 OK", info.into()),
+            ("200 OK", info.into()),
+        ])
+        .await;
+        let auth = super::auth::AuthClient::new(&url);
+        auth.login("bob", "secret").await.unwrap();
+
+        let db = HttpAdapter::with_auth_client(&format!("{url}/db"), &auth);
+        db.info().await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        let lines: Vec<_> = requests.iter().map(Captured::line).collect();
+        assert_eq!(lines, vec!["POST /_session", "GET /db", "GET /db"]);
+        for req in &requests[1..] {
+            assert_eq!(req.header("cookie"), Some("AuthSession=c2Vzc2lvbg"));
+        }
+    }
+
+    #[tokio::test]
     async fn database_created_concurrently_is_not_an_error() {
         let (url, requests) = scripted_server(vec![
             (
