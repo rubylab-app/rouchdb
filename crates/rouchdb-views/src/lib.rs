@@ -69,6 +69,7 @@ mod tests {
         let json = doc.to_json();
         let ddoc = DesignDocument::from_json(json).unwrap();
         assert_eq!(ddoc.id, "_design/myapp");
+        assert_eq!(ddoc.name(), "myapp");
         assert!(ddoc.views.contains_key("by_type"));
         assert!(ddoc.filters.contains_key("users_only"));
 
@@ -76,6 +77,14 @@ mod tests {
         let back = ddoc.to_json();
         assert_eq!(back["_id"], "_design/myapp");
         assert!(back["views"]["by_type"]["map"].is_string());
+    }
+
+    #[test]
+    fn design_document_name_strips_the_prefix() {
+        let ddoc = |id: &str| DesignDocument::from_json(serde_json::json!({"_id": id})).unwrap();
+        assert_eq!(ddoc("_design/app").name(), "app");
+        assert_eq!(ddoc("_design/a/b").name(), "a/b");
+        assert_eq!(ddoc("app").name(), "app");
     }
 
     #[tokio::test]
@@ -93,11 +102,54 @@ mod tests {
             }
         });
 
-        // Build index
-        engine.update_index(&db, "myapp", "by_type").await.unwrap();
-
-        // Query
-        let index = engine.get_index("myapp", "by_type").unwrap();
-        assert_eq!(index.entries.len(), 3); // alice, bob, order1 (not the design doc)
+        // The design document (which has no type anyway) is not mapped.
+        let result = engine
+            .query(
+                &db,
+                "myapp",
+                "by_type",
+                None,
+                rouchdb_query::ViewQueryOptions::new(),
+            )
+            .await
+            .unwrap();
+        let rows: Vec<_> = result
+            .rows
+            .iter()
+            .map(|r| (r.id.clone().unwrap(), r.key.clone()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("order1".to_string(), serde_json::json!("order")),
+                ("alice".to_string(), serde_json::json!("user")),
+                ("bob".to_string(), serde_json::json!("user")),
+            ]
+        );
+        let counts = engine
+            .query(
+                &db,
+                "myapp",
+                "by_type",
+                Some(&rouchdb_query::ReduceFn::Count),
+                rouchdb_query::ViewQueryOptions {
+                    group: true,
+                    ..rouchdb_query::ViewQueryOptions::new()
+                },
+            )
+            .await
+            .unwrap();
+        let counts: Vec<_> = counts
+            .rows
+            .iter()
+            .map(|r| (r.key.clone(), r.value.clone()))
+            .collect();
+        assert_eq!(
+            counts,
+            [
+                (serde_json::json!("order"), serde_json::json!(1)),
+                (serde_json::json!("user"), serde_json::json!(2)),
+            ]
+        );
     }
 }
