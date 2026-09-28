@@ -628,6 +628,74 @@ async fn design_doc_update_requires_rev() {
 
 /// `put_design` carries over what `DesignDocument` does not model from the
 /// revision it replaces, which is not always the winning one.
+/// What `put_design` removes through the struct stays removed: only fields
+/// the struct cannot represent are carried over from the replaced revision.
+#[tokio::test]
+async fn put_design_update_drops_what_the_struct_removes() {
+    let js = "function(doc) { emit(doc._id, 1); }";
+    for b in backends("test") {
+        let db = &b.db;
+        let r1 = db
+            .put(
+                "_design/app",
+                serde_json::json!({
+                    "views": {
+                        "counted": {"map": js, "reduce": "_count", "options": {"collation": "raw"}},
+                        "by_type": {"map": {"fields": {"type": "asc"}}, "options": {"def": {"fields": ["type"]}}},
+                        "lib": {"util": "exports.x = 1"}
+                    },
+                    "validate_doc_update": "function(newDoc) {}",
+                    "custom": "kept"
+                }),
+            )
+            .await
+            .unwrap()
+            .rev
+            .unwrap();
+        let mut ddoc = db.get_design("app").await.unwrap();
+        assert_eq!(ddoc.rev.as_deref(), Some(r1.as_str()), "{}", b.name);
+        // Drop the reduce and the validation function, and redefine the
+        // Mango index view as a JavaScript view.
+        ddoc.views.get_mut("counted").unwrap().reduce = None;
+        ddoc.validate_doc_update = None;
+        ddoc.views.insert(
+            "by_type".into(),
+            rouchdb::ViewDef {
+                map: js.into(),
+                reduce: None,
+            },
+        );
+        let r2 = db.put_design(ddoc).await.unwrap().rev.unwrap();
+        let stored = db
+            .get_with_opts(
+                "_design/app",
+                GetOptions {
+                    rev: Some(r2.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .data;
+        assert_eq!(
+            stored["views"],
+            serde_json::json!({
+                "counted": {"map": js, "options": {"collation": "raw"}},
+                "by_type": {"map": js},
+                "lib": {"util": "exports.x = 1"}
+            }),
+            "{}",
+            b.name
+        );
+        assert!(
+            stored.get("validate_doc_update").is_none(),
+            "{}: {stored}",
+            b.name
+        );
+        assert_eq!(stored["custom"], "kept", "{}", b.name);
+    }
+}
+
 #[tokio::test]
 async fn put_design_keeps_fields_of_the_revision_it_replaces() {
     for b in backends("test") {
