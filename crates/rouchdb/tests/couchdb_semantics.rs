@@ -142,3 +142,54 @@ async fn pull_from_couchdb_carries_attachment_bytes() {
 
     delete_remote_db(&url).await;
 }
+
+// =========================================================================
+// Docs rejected by validate_doc_update (F36)
+// =========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn push_skips_docs_denied_by_validate_doc_update() {
+    let url = fresh_remote_db("vdu_denied").await;
+    reqwest::Client::new()
+        .put(format!("{}/_design/guard", url))
+        .json(&serde_json::json!({
+            "validate_doc_update":
+                "function(doc) { if (doc.bad) { throw({forbidden: 'no bad docs'}); } }"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let remote = Database::http(&url);
+    let local = Database::memory("local");
+    local.put("a", serde_json::json!({"v": 1})).await.unwrap();
+    local
+        .put("x", serde_json::json!({"bad": true}))
+        .await
+        .unwrap();
+    local.put("b", serde_json::json!({"v": 3})).await.unwrap();
+    let opts = || rouchdb::ReplicationOptions {
+        batch_size: 1,
+        ..Default::default()
+    };
+
+    let r1 = local.replicate_to_with_opts(&remote, opts()).await.unwrap();
+    assert!(!r1.ok);
+    assert_eq!(r1.docs_written, 2);
+    assert!(
+        r1.errors.iter().any(|e| e.contains("forbidden")),
+        "{:?}",
+        r1.errors
+    );
+    assert!(remote.get("b").await.is_ok());
+    assert!(remote.get("x").await.is_err());
+
+    // The denied doc is not retried on every run.
+    let r2 = local.replicate_to_with_opts(&remote, opts()).await.unwrap();
+    assert!(r2.ok, "{:?}", r2.errors);
+    assert_eq!(r2.docs_read, 0);
+
+    delete_remote_db(&url).await;
+}

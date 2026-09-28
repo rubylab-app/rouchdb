@@ -199,6 +199,14 @@ pub async fn replicate_with_events(
 /// Result of one pass of the replication loop.
 struct RunOutcome {
     result: ReplicationResult,
+    /// Set when the pass stopped at a batch it could not fully replicate
+    /// (the checkpoint was not advanced past it), so it must be retried.
+    failure: Option<String>,
+}
+
+/// Per-doc write errors that will never succeed on retry.
+fn is_denied(error: &str) -> bool {
+    error.eq_ignore_ascii_case("forbidden") || error.eq_ignore_ascii_case("unauthorized")
 }
 
 /// Send an event if there is a listener.
@@ -252,6 +260,7 @@ async fn run_replication(
     let mut total_docs_written = 0u64;
     let mut errors = Vec::new();
     let mut current_seq = since;
+    let mut failed = false;
 
     emit(events, ReplicationEvent::Active).await;
 
@@ -366,15 +375,23 @@ async fn run_replication(
                 .bulk_docs(docs_to_write, BulkDocsOptions::replication())
                 .await?;
 
-            for wr in &write_results {
-                if !wr.ok {
-                    errors.push(format!(
-                        "write error for {}: {}",
-                        wr.id,
-                        wr.reason.as_deref().unwrap_or("unknown")
-                    ));
+            for wr in write_results.iter().filter(|wr| !wr.ok) {
+                let error = wr.error.as_deref().unwrap_or("unknown");
+                let message = format!(
+                    "write error for {}: {}: {}",
+                    wr.id,
+                    error,
+                    wr.reason.as_deref().unwrap_or("unknown")
+                );
+                if is_denied(error) {
+                    // Rejected for good (validation or permissions). Like
+                    // PouchDB's `denied`, report it and move on so a single
+                    // doc cannot stall the replication forever.
+                    emit(events, ReplicationEvent::Error(message.clone())).await;
+                } else {
                     batch_failed = true;
                 }
+                errors.push(message);
             }
 
             // With new_edits=false CouchDB replies only with the docs that
@@ -392,10 +409,11 @@ async fn run_replication(
         )
         .await;
 
-        // Do not advance the checkpoint past a batch that had any parse or
-        // write failure; stop so the next run retries from the un-advanced
-        // sequence rather than silently losing those docs.
+        // Do not advance the checkpoint past a batch that had any fetch,
+        // parse or (non-denied) write failure; stop so the next run retries
+        // from the un-advanced sequence rather than silently losing docs.
         if batch_failed {
+            failed = true;
             break;
         }
 
@@ -413,6 +431,7 @@ async fn run_replication(
         }
     }
 
+    let failure = failed.then(|| errors.join("; "));
     Ok(RunOutcome {
         result: ReplicationResult {
             ok: errors.is_empty(),
@@ -421,6 +440,7 @@ async fn run_replication(
             errors,
             last_seq: current_seq,
         },
+        failure,
     })
 }
 
@@ -465,36 +485,40 @@ pub fn replicate_live(
                 )
                 .await
             }
-            .await
-            .map(|outcome| outcome.result);
+            .await;
 
-            match result {
-                Ok(r) => {
-                    attempt = 0; // Reset retry counter on success
-                    if r.docs_read == 0 {
-                        // No changes — emit Paused and wait
-                        let _ = tx.send(ReplicationEvent::Paused).await;
-                    }
-                    last_result = Some(r);
-                }
-                Err(e) => {
-                    let _ = tx.send(ReplicationEvent::Error(e.to_string())).await;
-                    if retry {
-                        attempt += 1;
-                        let delay = if let Some(ref f) = back_off {
-                            f(attempt)
-                        } else {
-                            // Default exponential backoff: min(1s * 2^attempt, 60s)
-                            let secs = (1u64 << attempt.min(6)).min(60);
-                            Duration::from_secs(secs)
-                        };
-                        tokio::select! {
-                            _ = tokio::time::sleep(delay) => continue 'live,
-                            _ = cancel_clone.cancelled() => break 'live,
+            let failure = match result {
+                Ok(outcome) => {
+                    if outcome.failure.is_none() {
+                        attempt = 0; // Reset retry counter on success
+                        if outcome.result.docs_read == 0 {
+                            // No changes — emit Paused and wait
+                            let _ = tx.send(ReplicationEvent::Paused).await;
                         }
-                    } else {
-                        break 'live;
                     }
+                    last_result = Some(outcome.result);
+                    outcome.failure
+                }
+                Err(e) => Some(e.to_string()),
+            };
+
+            if let Some(message) = failure {
+                let _ = tx.send(ReplicationEvent::Error(message)).await;
+                if retry {
+                    attempt += 1;
+                    let delay = if let Some(ref f) = back_off {
+                        f(attempt)
+                    } else {
+                        // Default exponential backoff: min(1s * 2^attempt, 60s)
+                        let secs = (1u64 << attempt.min(6)).min(60);
+                        Duration::from_secs(secs)
+                    };
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => continue 'live,
+                        _ = cancel_clone.cancelled() => break 'live,
+                    }
+                } else {
+                    break 'live;
                 }
             }
 
@@ -1231,6 +1255,8 @@ mod tests {
         /// Before answering `bulk_get`, edit this doc and compact, so the
         /// requested rev no longer exists (one-shot).
         supersede_on_bulk_get: Option<String>,
+        /// `bulk_docs` rejects this doc id with this error kind.
+        write_error: Option<(String, String)>,
     }
 
     struct Faulty {
@@ -1264,7 +1290,20 @@ mod tests {
             docs: Vec<Document>,
             opts: BulkDocsOptions,
         ) -> Result<Vec<DocResult>> {
-            self.inner.bulk_docs(docs, opts).await
+            let write_error = self.faults.lock().unwrap().write_error.clone();
+            let Some((bad_id, error)) = write_error else {
+                return self.inner.bulk_docs(docs, opts).await;
+            };
+            let (rejected, docs): (Vec<_>, Vec<_>) = docs.into_iter().partition(|d| d.id == bad_id);
+            let mut results = self.inner.bulk_docs(docs, opts).await?;
+            results.extend(rejected.into_iter().map(|d| DocResult {
+                ok: false,
+                id: d.id,
+                rev: None,
+                error: Some(error.clone()),
+                reason: Some("injected".into()),
+            }));
+            Ok(results)
         }
         async fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
             self.inner.all_docs(opts).await
@@ -1409,5 +1448,114 @@ mod tests {
             target.get("d", GetOptions::default()).await.unwrap().data["v"],
             "next"
         );
+    }
+
+    #[tokio::test]
+    async fn denied_doc_does_not_stall_replication() {
+        let source = MemoryAdapter::new("source");
+        put_doc(&source, "a", serde_json::json!({"v": 1})).await;
+        put_doc(&source, "x", serde_json::json!({"v": 2})).await;
+        put_doc(&source, "b", serde_json::json!({"v": 3})).await;
+        let target = Faulty::new(
+            MemoryAdapter::new("target"),
+            Faults {
+                write_error: Some(("x".into(), "forbidden".into())),
+                ..Default::default()
+            },
+        );
+        let opts = || ReplicationOptions {
+            batch_size: 1,
+            ..Default::default()
+        };
+
+        // `x` is rejected for good (e.g. by validate_doc_update): it is
+        // reported, and the docs after it still replicate.
+        let (tx, mut rx) = mpsc::channel(64);
+        let r1 = replicate_with_events(&source, &target, opts(), tx)
+            .await
+            .unwrap();
+        assert!(!r1.ok);
+        assert_eq!(r1.docs_written, 2);
+        assert!(r1.errors.iter().any(|e| e.contains("x")), "{:?}", r1.errors);
+        assert!(target.get("b", GetOptions::default()).await.is_ok());
+        let mut denied_reported = false;
+        while let Ok(event) = rx.try_recv() {
+            denied_reported |= matches!(event, ReplicationEvent::Error(ref m) if m.contains("x"));
+        }
+        assert!(denied_reported);
+
+        // The checkpoint moved past `x`, so it is not retried forever.
+        let r2 = replicate(&source, &target, opts()).await.unwrap();
+        assert!(r2.ok, "{:?}", r2.errors);
+        assert_eq!(r2.docs_read, 0);
+    }
+
+    #[tokio::test]
+    async fn transient_write_error_stops_without_advancing() {
+        let source = MemoryAdapter::new("source");
+        put_doc(&source, "a", serde_json::json!({"v": 1})).await;
+        put_doc(&source, "x", serde_json::json!({"v": 2})).await;
+        put_doc(&source, "b", serde_json::json!({"v": 3})).await;
+        let target = Faulty::new(
+            MemoryAdapter::new("target"),
+            Faults {
+                write_error: Some(("x".into(), "unknown_error".into())),
+                ..Default::default()
+            },
+        );
+        let opts = || ReplicationOptions {
+            batch_size: 1,
+            ..Default::default()
+        };
+
+        let r1 = replicate(&source, &target, opts()).await.unwrap();
+        assert!(!r1.ok);
+        assert!(target.get("b", GetOptions::default()).await.is_err());
+
+        target.heal();
+        let r2 = replicate(&source, &target, opts()).await.unwrap();
+        assert!(r2.ok, "{:?}", r2.errors);
+        assert!(target.get("x", GetOptions::default()).await.is_ok());
+        assert!(target.get("b", GetOptions::default()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn live_replication_reports_write_failures() {
+        let source = Arc::new(MemoryAdapter::new("source"));
+        put_doc(source.as_ref(), "x", serde_json::json!({"v": 1})).await;
+        let target = Arc::new(Faulty::new(
+            MemoryAdapter::new("target"),
+            Faults {
+                write_error: Some(("x".into(), "unknown_error".into())),
+                ..Default::default()
+            },
+        ));
+
+        let (mut rx, _handle) = replicate_live(
+            source,
+            target,
+            ReplicationOptions {
+                live: true,
+                poll_interval: Duration::from_millis(20),
+                ..Default::default()
+            },
+        );
+
+        // Without retry the failure is reported and ends the replication.
+        let events = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            events
+        })
+        .await
+        .expect("live replication kept running after a write failure");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ReplicationEvent::Error(m) if m.contains("x")))
+        );
+        assert!(matches!(events.last(), Some(ReplicationEvent::Complete(r)) if !r.ok));
     }
 }
