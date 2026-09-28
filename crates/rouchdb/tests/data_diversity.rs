@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::Database;
 
 // =========================================================================
@@ -10,7 +10,7 @@ use rouchdb::Database;
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_nested_objects_roundtrip() {
     let url = fresh_remote_db("data_nested").await;
     let local = Database::memory("local");
@@ -40,12 +40,10 @@ async fn data_nested_objects_roundtrip() {
     local2.replicate_from(&remote).await.unwrap();
     let doc2 = local2.get("doc1").await.unwrap();
     assert_eq!(doc2.data["address"]["geo"]["lng"], -74.006);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_arrays_roundtrip() {
     let url = fresh_remote_db("data_arrays").await;
     let local = Database::memory("local");
@@ -65,12 +63,10 @@ async fn data_arrays_roundtrip() {
     assert_eq!(doc.data["tags"][2], "sync");
     assert_eq!(doc.data["matrix"][1][2], 6);
     assert_eq!(doc.data["nested"][0]["name"], "a");
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_null_and_bool_roundtrip() {
     let url = fresh_remote_db("data_nullbool").await;
     let local = Database::memory("local");
@@ -93,12 +89,10 @@ async fn data_null_and_bool_roundtrip() {
     assert_eq!(doc.data["active"], true);
     assert_eq!(doc.data["deleted"], false);
     assert!(doc.data["flags"][2].is_null());
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_numeric_types_roundtrip() {
     let url = fresh_remote_db("data_nums").await;
     let local = Database::memory("local");
@@ -125,12 +119,10 @@ async fn data_numeric_types_roundtrip() {
     assert_eq!(doc.data["small_float"], 0.001);
     assert_eq!(doc.data["negative_float"], -273.15);
     assert_eq!(doc.data["big"], 9999999999_i64);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_empty_structures_roundtrip() {
     let url = fresh_remote_db("data_empty").await;
     let local = Database::memory("local");
@@ -151,12 +143,10 @@ async fn data_empty_structures_roundtrip() {
     assert_eq!(doc.data["empty_obj"].as_object().unwrap().len(), 0);
     assert_eq!(doc.data["empty_str"], "");
     assert_eq!(doc.data["nested_empty"]["a"].as_array().unwrap().len(), 0);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_mixed_type_array_roundtrip() {
     let url = fresh_remote_db("data_mixed").await;
     let local = Database::memory("local");
@@ -177,12 +167,10 @@ async fn data_mixed_type_array_roundtrip() {
     assert!(mix[3].is_null());
     assert_eq!(mix[4]["nested"], 5);
     assert_eq!(mix[5][1], 7);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_unicode_roundtrip() {
     let url = fresh_remote_db("data_unicode").await;
     let local = Database::memory("local");
@@ -209,12 +197,10 @@ async fn data_unicode_roundtrip() {
         "caf\u{00E9} na\u{00EF}ve r\u{00E9}sum\u{00E9}"
     );
     assert_eq!(doc.data["special_chars"], "line1\nline2\ttab\\backslash");
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_large_document() {
     let url = fresh_remote_db("data_large").await;
     let local = Database::memory("local");
@@ -240,8 +226,6 @@ async fn data_large_document() {
     assert_eq!(doc.data["field_0"]["index"], 0);
     assert_eq!(doc.data["field_99"]["value"], "value_99");
     assert_eq!(doc.data["field_50"]["nested"]["data"][2], 150);
-
-    delete_remote_db(&url).await;
 }
 
 // =========================================================================
@@ -249,7 +233,7 @@ async fn data_large_document() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn special_id_with_spaces() {
     let url = fresh_remote_db("id_spaces").await;
     let db = Database::http(&url);
@@ -260,12 +244,10 @@ async fn special_id_with_spaces() {
     let doc = db.get("my document").await.unwrap();
     assert_eq!(doc.data["v"], 1);
     assert_eq!(doc.id, "my document");
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn special_id_with_unicode() {
     let url = fresh_remote_db("id_unicode").await;
     let db = Database::http(&url);
@@ -275,12 +257,10 @@ async fn special_id_with_unicode() {
         .unwrap();
     let doc = db.get("doc_\u{00E9}\u{00E8}\u{00EA}").await.unwrap();
     assert_eq!(doc.data["v"], 1);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn special_id_replicate_roundtrip() {
     let url = fresh_remote_db("id_repl").await;
     let local = Database::memory("local");
@@ -310,6 +290,4 @@ async fn special_id_replicate_roundtrip() {
 
     let doc = remote.get("has+plus").await.unwrap();
     assert_eq!(doc.data["t"], "plus");
-
-    delete_remote_db(&url).await;
 }

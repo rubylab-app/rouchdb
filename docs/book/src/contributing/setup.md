@@ -72,23 +72,7 @@ cargo test -p rouchdb-adapter-memory
 
 ## Docker Compose Setup for CouchDB
 
-The project includes a `docker-compose.yml` at the repository root that starts a CouchDB 3 instance:
-
-```yaml
-services:
-  couchdb:
-    image: couchdb:3
-    ports:
-      - "15984:5984"
-    environment:
-      COUCHDB_USER: admin
-      COUCHDB_PASSWORD: password
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5984/_up"]
-      interval: 3s
-      timeout: 5s
-      retries: 10
-```
+The project includes a `docker-compose.yml` at the repository root that starts a CouchDB 3.5.1 instance (the version CI tests against) on port 15984, with the admin `admin:password`. A one-shot `couchdb-setup` service then turns off CouchDB's account lockout, which would otherwise lock the admin out after a few failed logins and fail the rest of the suite with 403.
 
 Start CouchDB:
 
@@ -112,7 +96,7 @@ docker compose down
 
 ## Running Integration Tests
 
-Integration tests verify RouchDB against a real CouchDB server. They are marked `#[ignore]` so they do not run during normal `cargo test`. Run them explicitly:
+Integration tests verify RouchDB against a real CouchDB server. They are marked `#[ignore = "requires CouchDB"]` so they do not run during normal `cargo test`. Run them explicitly (see [Testing](testing.md)):
 
 ```bash
 docker compose up -d

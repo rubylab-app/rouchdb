@@ -13,14 +13,14 @@ readme.workspace = true
 
 [dependencies]
 rouchdb-core = { path = "../rouchdb-core", version = "0.4.0" }
-async-trait = "0.1"
-base64 = "0.22"
+async-trait = "0.1.68"
+base64 = "0.22.1"
 redb = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["unbounded_depth"] }
-tokio = { version = "1", features = ["rt", "sync"] }
+serde = { version = "1.0.184", features = ["derive"] }
+serde_json = { version = "1.0.106", features = ["unbounded_depth"] }
+tokio = { version = "1.37", features = ["rt", "sync"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tempfile = "3.1.0"
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "sync"] }

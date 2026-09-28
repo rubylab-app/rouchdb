@@ -15,9 +15,9 @@ bench = false
 
 [dependencies]
 rouchdb = { path = "../rouchdb" }
-serde_json = "1"
-tempfile = "3"
-tokio = { version = "1", features = ["rt"] }
+serde_json = "1.0.106"
+tempfile = "3.1.0"
+tokio = { version = "1.37", features = ["rt"] }
 
 [dev-dependencies]
 criterion = "0.8"

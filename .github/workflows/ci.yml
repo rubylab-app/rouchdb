@@ -23,6 +23,7 @@ jobs:
   check:
     name: Check & Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -45,6 +46,18 @@ jobs:
             exit 1
           fi
 
+      # The CouchDB scripts select tests by these two reasons (and by the
+      # blocked_on_ name of blocked tests), so no other kind of #[ignore].
+      - name: Every ignored test says why
+        run: |
+          bad=$(git grep -nE '#\[ignore' -- '*.rs' \
+            | grep -vE '#\[ignore = "(requires CouchDB|blocked on [^"]+)"\]' || true)
+          if [ -n "$bad" ]; then
+            echo '::error::Use #[ignore = "requires CouchDB"] or #[ignore = "blocked on Fxx"] (docs/book/src/contributing/testing.md):'
+            echo "$bad"
+            exit 1
+          fi
+
       # --all-targets also type-checks tests, examples and benches.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -58,6 +71,7 @@ jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -66,15 +80,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # --no-fail-fast: report every failing test binary, not just the first.
       - name: Run unit tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
 
   couchdb:
     name: CouchDB integration tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       couchdb:
-        image: couchdb:3
+        # Pinned, like docker-compose.yml.
+        image: couchdb:3.5.1
         ports:
           - 15984:5984
         env:
@@ -96,19 +113,46 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build tests
-        run: cargo test --workspace --locked --no-run
+        run: cargo test --workspace --tests --locked --no-run
 
       - name: Wait for CouchDB
         run: curl -fsS --retry 30 --retry-delay 2 --retry-all-errors "$COUCHDB_URL/_up"
 
-      # The #[ignore]d tests are the ones that need a real CouchDB. The script
-      # skips tests marked #[ignore = "blocked on Fxx"] (known library bugs).
-      - name: Run ignored (CouchDB) tests
+      # CouchDB 3.4+ locks an account after 5 failed logins, and a locked-out
+      # admin fails every remaining test with 403. The tests never log in as
+      # the admin with a wrong password; this is the safety net (the same
+      # setting docker-compose.yml applies).
+      - name: Disable CouchDB account lockout
+        run: |
+          curl -fsS -X PUT "$COUCHDB_URL/_node/_local/_config/chttpd_auth_lockout/mode" -d '"off"'
+
+      # Every #[ignore = "requires CouchDB"] test, in parallel. The script
+      # skips the tests blocked on a known bug (`blocked_on_` in the name) and
+      # fails if a test leaves one of its rouchdb_test_* databases behind.
+      - name: Run CouchDB tests
         run: bash scripts/test-couchdb.sh --locked
 
+      # xfail check, non-blocking: flags blocked tests that pass now, i.e.
+      # bugs that seem fixed while the test is still marked as blocked.
+      - name: Blocked tests still fail
+        continue-on-error: true
+        run: bash scripts/test-blocked.sh --locked
+
+      # Also catches databases created outside the common helpers.
+      - name: No databases left behind
+        if: success() || failure()
+        run: |
+          leftovers=$(curl -fsS "$COUCHDB_URL/_all_dbs" | jq -r '.[] | select(startswith("_") | not)')
+          if [ -n "$leftovers" ]; then
+            echo "::error::The CouchDB tests left these databases behind:"
+            echo "$leftovers"
+            exit 1
+          fi
+
   bench:
-    name: Benchmarks (build only)
+    name: Benchmarks (build + smoke run)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -117,13 +161,22 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Running them is manual: see the Benchmarks workflow (bench.yml).
       - name: Build benchmarks
         run: cargo bench --workspace --locked --no-run
+
+      # Criterion's --test mode runs every benchmark once, on a small
+      # dataset: it executes the benches' own assertions (results, query
+      # plans) but measures nothing. Measuring is manual: see bench.yml.
+      # --workspace plus the bench names reuses the build above.
+      - name: Smoke-run benchmarks
+        env:
+          ROUCHDB_BENCH_N: "1000"
+        run: cargo bench --workspace --locked --bench core_ops --bench revtree -- --test
 
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       # Overrides rust-toolchain.toml. Keep in sync with `rust-version` in
       # the root Cargo.toml.
@@ -143,6 +196,7 @@ jobs:
   latest:
     name: Clippy on ${{ matrix.toolchain }} (early warning)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Non-blocking: reports lints from the next toolchains before the pin in
     # rust-toolchain.toml is bumped.
     continue-on-error: true
