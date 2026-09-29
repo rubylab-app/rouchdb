@@ -386,11 +386,10 @@ async fn before_write_rejection_leaves_a_batch_unwritten() {
 }
 
 /// `put_attachment` and `remove_attachment` write a new revision of the
-/// document without running `before_write`: a validating plugin cannot
-/// reject them (CouchDB runs `validate_doc_update` on attachment updates).
+/// document, so `before_write` sees it and can reject it, as CouchDB runs
+/// `validate_doc_update` on attachment updates.
 #[tokio::test]
-#[ignore = "blocked on Q-API-2: put_attachment/remove_attachment skip before_write"]
-async fn blocked_on_q_api_2_before_write_runs_on_attachment_writes() {
+async fn before_write_runs_on_attachment_writes() {
     for kind in KINDS {
         for op in ATTACHMENT_OPS {
             let log = Log::default();
@@ -409,6 +408,146 @@ async fn blocked_on_q_api_2_before_write_runs_on_attachment_writes() {
             );
             assert_eq!(state(&b.db, op).await, before, "{kind} {op:?}");
             assert_eq!(take(&log), ["gate.before d null"], "{kind} {op:?}");
+        }
+    }
+}
+
+/// A plugin that records the documents `before_write` gets, then either
+/// changes them (which must not be stored) or drops them.
+struct Capture {
+    seen: Mutex<Vec<Document>>,
+    drop_docs: bool,
+}
+
+#[async_trait::async_trait]
+impl Plugin for Capture {
+    fn name(&self) -> &str {
+        "capture"
+    }
+
+    async fn before_write(&self, docs: &mut Vec<Document>) -> Result<()> {
+        self.seen.lock().unwrap().extend(docs.iter().cloned());
+        if self.drop_docs {
+            docs.clear();
+        }
+        for doc in docs.iter_mut() {
+            doc.data["stamp"] = true.into();
+            doc.attachments.clear();
+        }
+        Ok(())
+    }
+}
+
+impl Capture {
+    fn take(&self) -> Vec<Document> {
+        std::mem::take(&mut *self.seen.lock().unwrap())
+    }
+}
+
+fn attachment_names(doc: &Document) -> Vec<&str> {
+    let mut names: Vec<&str> = doc.attachments.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    names
+}
+
+/// `before_write` gets the revision an attachment write creates (the
+/// parent's body and attachments with the change applied); its changes are
+/// not stored.
+#[tokio::test]
+async fn before_write_sees_attachment_edits_without_changing_them() {
+    for kind in KINDS {
+        let capture = Arc::new(Capture {
+            seen: Mutex::new(Vec::new()),
+            drop_docs: false,
+        });
+        let b = Backend::open(kind, "plugins").configure(|db| db.with_plugin(capture.clone()));
+        let adapter = b.db.adapter();
+        let doc = Document::from_json(serde_json::json!({"_id": "d", "v": 0})).unwrap();
+        let r1 = adapter
+            .bulk_docs(vec![doc], BulkDocsOptions::new())
+            .await
+            .unwrap()[0]
+            .rev
+            .clone()
+            .unwrap();
+        let r2 = adapter
+            .put_attachment("d", "a.txt", &r1, b"hi".to_vec(), "text/plain")
+            .await
+            .unwrap()
+            .rev
+            .unwrap();
+
+        let bytes = vec![0u8, 1, 255];
+        let r3 =
+            b.db.put_attachment("d", "b.bin", &r2, bytes.clone(), "application/x-raw")
+                .await
+                .unwrap()
+                .rev
+                .unwrap();
+        let seen = capture.take();
+        assert_eq!(seen.len(), 1, "{kind}");
+        let probe = &seen[0];
+        assert_eq!(probe.id, "d", "{kind}");
+        assert_eq!(probe.rev.as_ref().unwrap().to_string(), r2, "{kind}");
+        assert!(!probe.deleted, "{kind}");
+        assert_eq!(probe.data, serde_json::json!({"v": 0}), "{kind}");
+        assert_eq!(attachment_names(probe), ["a.txt", "b.bin"], "{kind}");
+        assert!(probe.attachments["a.txt"].stub, "{kind}");
+        let new = &probe.attachments["b.bin"];
+        assert_eq!(new.data.as_deref(), Some(&bytes[..]), "{kind}");
+        assert_eq!(
+            (new.content_type.as_str(), new.length, new.stub),
+            ("application/x-raw", 3, false),
+            "{kind}"
+        );
+
+        // The plugin's changes (a stamp, no attachments) are not stored.
+        let stored = b.db.get("d").await.unwrap();
+        assert_eq!(stored.rev.as_ref().unwrap().to_string(), r3, "{kind}");
+        assert_eq!(stored.data, serde_json::json!({"v": 0}), "{kind}");
+        assert_eq!(attachment_names(&stored), ["a.txt", "b.bin"], "{kind}");
+        assert_eq!(stored.attachments["b.bin"].digest, new.digest, "{kind}");
+
+        b.db.remove_attachment("d", "a.txt", &r3).await.unwrap();
+        let seen = capture.take();
+        assert_eq!(seen.len(), 1, "{kind}");
+        assert_eq!(seen[0].rev.as_ref().unwrap().to_string(), r3, "{kind}");
+        assert_eq!(seen[0].data, serde_json::json!({"v": 0}), "{kind}");
+        assert_eq!(attachment_names(&seen[0]), ["b.bin"], "{kind}");
+
+        // A write on a document that cannot be read still goes through
+        // before_write (with an empty body), then fails as without plugins.
+        let err =
+            b.db.put_attachment("nope", "x", &r1, b"x".to_vec(), "text/plain")
+                .await
+                .unwrap_err();
+        assert!(matches!(err, RouchError::NotFound(_)), "{kind}: {err:?}");
+        let seen = capture.take();
+        assert_eq!(seen.len(), 1, "{kind}");
+        assert_eq!(seen[0].id, "nope", "{kind}");
+        assert_eq!(seen[0].data, serde_json::json!({}), "{kind}");
+        assert_eq!(attachment_names(&seen[0]), ["x"], "{kind}");
+    }
+}
+
+#[tokio::test]
+async fn dropping_an_attachment_edit_rejects_it() {
+    for kind in KINDS {
+        for op in ATTACHMENT_OPS {
+            let b = Backend::open(kind, "plugins").configure(|db| {
+                db.with_plugin(Arc::new(Capture {
+                    seen: Mutex::new(Vec::new()),
+                    drop_docs: true,
+                }))
+            });
+            let rev = op.setup(&b.db).await;
+            let before = state(&b.db, op).await;
+            let result = op.run(&b.db, rev.as_deref()).await;
+            assert!(
+                matches!(&result, Err(RouchError::Forbidden(r)) if r == "dropped by plugin capture"),
+                "{kind} {op:?}: {result:?}"
+            );
+            assert_eq!(state(&b.db, op).await, before, "{kind} {op:?}");
         }
     }
 }

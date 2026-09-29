@@ -88,6 +88,13 @@ pub trait Plugin: Send + Sync {
     /// source's body is kept under the source's revision id), and a document
     /// it drops or rejects with `Forbidden`, `Unauthorized` or `BadRequest`
     /// is reported as denied while the rest of the batch is still written.
+    ///
+    /// `put_attachment` and `remove_attachment` call it with the revision
+    /// they create: the parent's body and its attachments with the change
+    /// applied (a new attachment carries its data). It can reject the write
+    /// (the error is returned unchanged, and dropping the document is
+    /// `Forbidden`), but its changes are ignored: the stored body already
+    /// went through the plugins when it was written.
     async fn before_write(&self, _docs: &mut Vec<Document>) -> Result<()> {
         Ok(())
     }
@@ -117,6 +124,50 @@ fn denial(error: &RouchError) -> Option<&'static str> {
         RouchError::Forbidden(_) | RouchError::BadRequest(_) => Some("forbidden"),
         RouchError::Unauthorized => Some("unauthorized"),
         _ => None,
+    }
+}
+
+impl PluginAdapter {
+    /// Run `before_write` on the revision an attachment write creates: the
+    /// document at `rev` with `edit` applied to its attachments (a document
+    /// with no body when `rev` cannot be read, which the write itself then
+    /// reports). As for replicated documents, plugins only accept or reject
+    /// it: the stored body already went through them, so their changes are
+    /// not applied. A rejection is returned as is; dropping the document is
+    /// `Forbidden`.
+    async fn validate_attachment_edit(
+        &self,
+        doc_id: &str,
+        rev: &str,
+        edit: impl FnOnce(&mut HashMap<String, AttachmentMeta>),
+    ) -> Result<()> {
+        let opts = GetOptions {
+            rev: Some(rev.to_string()),
+            ..Default::default()
+        };
+        let mut doc = match self.inner.get(doc_id, opts).await {
+            Ok(doc) => doc,
+            Err(_) => Document {
+                id: doc_id.to_string(),
+                rev: rev.parse().ok(),
+                deleted: false,
+                data: serde_json::json!({}),
+                attachments: HashMap::new(),
+            },
+        };
+        doc.deleted = false;
+        edit(&mut doc.attachments);
+        let mut docs = vec![doc];
+        for plugin in &self.plugins {
+            plugin.before_write(&mut docs).await?;
+            if docs.is_empty() {
+                return Err(RouchError::Forbidden(format!(
+                    "dropped by plugin {}",
+                    plugin.name()
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -234,6 +285,17 @@ impl Adapter for PluginAdapter {
         data: Vec<u8>,
         content_type: &str,
     ) -> Result<DocResult> {
+        let attachment = AttachmentMeta {
+            content_type: content_type.to_string(),
+            digest: rouchdb_core::document::attachment_digest(&data),
+            length: data.len() as u64,
+            stub: false,
+            data: Some(data.clone()),
+        };
+        self.validate_attachment_edit(doc_id, rev, |atts| {
+            atts.insert(att_id.to_string(), attachment);
+        })
+        .await?;
         let result = self
             .inner
             .put_attachment(doc_id, att_id, rev, data, content_type)
@@ -254,6 +316,10 @@ impl Adapter for PluginAdapter {
     }
 
     async fn remove_attachment(&self, doc_id: &str, att_id: &str, rev: &str) -> Result<DocResult> {
+        self.validate_attachment_edit(doc_id, rev, |atts| {
+            atts.remove(att_id);
+        })
+        .await?;
         let result = self.inner.remove_attachment(doc_id, att_id, rev).await?;
         for plugin in &self.plugins {
             plugin.after_write(std::slice::from_ref(&result)).await?;
