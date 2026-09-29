@@ -107,4 +107,9 @@ impl Plugin for RequireTypeField {
 | `after_write` | After successful writes | No (read-only `&[DocResult]`) | Yes (return `Err`) |
 | `on_destroy` | When `db.destroy()` is called | N/A | Yes (return `Err`) |
 
-Plugins are called for all write paths: `put()`, `update()`, `remove()`, `post()`, and `bulk_docs()`.
+Plugins are called for all write paths: `put()`, `update()`, `remove()`, `post()`, `bulk_docs()`,
+`put_attachment()`, `remove_attachment()` and documents replicated into the database.
+For attachment writes and replicated documents `before_write` acts like CouchDB's
+`validate_doc_update`: it sees the revision being written (for an attachment write, the
+parent's body with the attachment added or removed) and can reject it, but its changes are
+not stored.

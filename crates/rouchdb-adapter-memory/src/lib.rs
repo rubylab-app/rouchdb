@@ -993,10 +993,16 @@ fn process_doc_new_edits(
     rev_limit: u64,
 ) -> DocResult {
     if let Err(e) = doc.prepare_for_write() {
-        return error_result(&doc.id, "bad_request", &e.to_string());
+        // The bare reason, as CouchDB and replicated writes report it.
+        let reason = match e {
+            RouchError::BadRequest(reason) => reason,
+            other => other.to_string(),
+        };
+        return error_result(&doc.id, "bad_request", &reason);
     }
     if doc.id.is_empty() {
-        doc.id = Uuid::new_v4().to_string();
+        // 32 hex digits, like the ids CouchDB generates.
+        doc.id = Uuid::new_v4().simple().to_string();
     }
     if local_doc_id(&doc.id).is_some() {
         return match plan_local_write(doc) {

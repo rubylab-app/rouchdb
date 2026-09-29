@@ -208,16 +208,16 @@ let result = query_view(
 ```
 
 `ViewQueryOptions` fields:
-- `key` -- return only rows with this exact key.
-- `start_key` / `end_key` -- define a key range (inclusive by default).
+- `key` -- return only rows with this exact key. With `start_key` or `end_key` it is the other bound of the range (as when `startkey` follows `key` in a CouchDB query string).
+- `start_key` / `end_key` -- define a key range (inclusive by default). A range no row can be in (a start after the end, or before it when descending) is a `BadRequest`, as in CouchDB.
 - `inclusive_end` -- whether to include the end key.
 - `descending` -- reverse the sort order.
 - `skip` / `limit` -- pagination.
 - `include_docs` -- embed full documents (a value `{"_id": ...}` embeds that document instead).
 - `reduce` -- whether to run the reduce function (on by default with `new()`, as in CouchDB).
-- `group` -- group reduced results by key.
+- `group` -- group reduced results by key. Grouping (`group`, or a `group_level` above 0) without a reduce is a `BadRequest`.
 - `group_level` -- for array keys, group by the first N elements.
-- `keys` -- return the rows of these keys, in this order. With a reduce, more than one key requires `group: true` without `group_level` (CouchDB's rule); a single key behaves like `key`.
+- `keys` -- return the rows of these keys, in this order (reversed when `descending`, except for grouped reduce rows, which keep it). With a reduce, more than one key requires `group: true` without `group_level` (CouchDB's rule); a single key behaves like `key`. Several keys cannot be combined with `key`, `start_key` or `end_key`.
 
 ### Built-In Reduce Functions
 
@@ -242,7 +242,7 @@ let sum_result = query_view(
 // sum_result.rows[0].value == 90 (30 + 25 + 35; integers stay integers)
 ```
 
-- `ReduceFn::Sum` -- sums numbers (arrays element-wise, objects field by field); other values are an error.
+- `ReduceFn::Sum` -- sums numbers (arrays element-wise, objects field by field). Like CouchDB, values it cannot add make the reduced value an error object (`{"error": "builtin_reduce_error", "reason": ..., "caused_by": <value>}`) instead of failing the query.
 - `ReduceFn::Count` -- counts the number of rows.
 - `ReduceFn::Stats` -- computes `{"sum", "count", "min", "max", "sumsqr"}`.
 

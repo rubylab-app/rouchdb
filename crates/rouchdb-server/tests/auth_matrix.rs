@@ -457,8 +457,19 @@ async fn every_route_rejects_missing_or_wrong_credentials_without_side_effects()
 
         for variant in variants(&fx.token) {
             if row.uri == "/" && variant.reason.is_none() {
-                // CouchDB answers anonymous non-GET requests on `/` with 405,
-                // not 401; only wrong credentials are checked there.
+                // CouchDB checks the method of `/` first: anonymous non-GET
+                // requests there are 405, not 401.
+                let resp = request(
+                    &fx.app,
+                    row.method.clone(),
+                    &row.uri,
+                    &variant.headers,
+                    row.body.clone(),
+                )
+                .await;
+                let ctx = format!("{what} with {}", variant.label);
+                assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "{ctx}");
+                assert_eq!(resp.header("allow"), Some("GET,HEAD"), "{ctx}");
                 continue;
             }
             let resp = request(

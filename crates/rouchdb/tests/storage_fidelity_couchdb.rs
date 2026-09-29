@@ -116,6 +116,52 @@ fn nested(depth: usize) -> serde_json::Value {
     serde_json::json!({ "v": v })
 }
 
+/// Writes over http enforce rouchdb's depth limit like the local adapters:
+/// CouchDB would store a deeper document, which rouchdb could not read back.
+#[tokio::test]
+#[ignore = "requires CouchDB"]
+async fn writes_over_http_apply_the_depth_limit() {
+    let url = fresh_remote_db("sfid_deep_write").await;
+    let remote = Database::http(&url);
+    let edge = nested(MAX_NESTING_DEPTH);
+    remote.put("edge", edge.clone()).await.unwrap();
+    assert_eq!(remote.get("edge").await.unwrap().data, edge);
+
+    let doc = |id: &str, depth: usize| {
+        let mut body = nested(depth);
+        body["_id"] = id.into();
+        Document::from_json(body).unwrap()
+    };
+    let results = remote
+        .bulk_docs(
+            vec![doc("over", MAX_NESTING_DEPTH + 1), doc("ok", 2)],
+            BulkDocsOptions::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        (results[0].id.as_str(), results[0].error.as_deref()),
+        ("over", Some("bad_request"))
+    );
+    assert!(results[1].ok, "{:?}", results[1]);
+    assert!(matches!(
+        remote.get("over").await,
+        Err(RouchError::NotFound(_))
+    ));
+    assert!(matches!(
+        remote.put("over", nested(MAX_NESTING_DEPTH + 1)).await,
+        Err(RouchError::BadRequest(_))
+    ));
+    let err = remote
+        .adapter()
+        .put_local("deep", nested(MAX_NESTING_DEPTH + 1))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RouchError::BadRequest(_)), "{err:?}");
+    delete_remote_db(&url).await;
+}
+
 /// Q-CORE-8: over http, a malformed revision is `InvalidRev` and `remove`
 /// of a missing or deleted document is `NotFound` (without writing a
 /// tombstone), like the local adapters.

@@ -7,6 +7,7 @@ use rouchdb::{BulkDocsOptions, Document, Revision};
 use rouchdb_core::error::RouchError;
 
 use crate::error::AppError;
+use crate::extract::JsonBody;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -52,7 +53,7 @@ fn revision_from_history(json: &serde_json::Value) -> Option<Revision> {
 pub async fn bulk_docs(
     State(state): State<AppState>,
     Path(db): Path<String>,
-    Json(body): Json<BulkDocsBody>,
+    JsonBody(body): JsonBody<BulkDocsBody>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     state.check_db(&db)?;
 

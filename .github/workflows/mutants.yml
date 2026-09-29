@@ -1,13 +1,20 @@
 name: Mutation testing
 
 # cargo-mutants on the code a pull request changes: every mutant the tests
-# do not catch is a line whose behavior no test checks. Informational
-# (continue-on-error), never blocks a merge; the list is in the job summary
-# and the mutants.out artifact.
+# do not catch is a line whose behavior no test checks. Each mutant runs the
+# whole workspace suite, CouchDB tests included, so code only the CouchDB
+# suite covers (much of the HTTP adapter) is not reported as untested.
+#
+# Informational: surviving (missed or timed-out) mutants are listed in the
+# job summary and the mutants.out artifact, and the job still passes. It
+# fails only when cargo-mutants itself fails, e.g. when the unmutated code
+# does not pass its tests. Never blocks a merge.
 on:
   pull_request:
     paths:
       - "crates/*/src/**.rs"
+      # A change to this file runs it too (usually with no mutants).
+      - ".github/workflows/mutants.yml"
 
 permissions:
   contents: read
@@ -23,8 +30,26 @@ jobs:
   mutants:
     name: Mutants in the diff
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Above the cargo-mutants time budget below, so a long run ends with
+    # partial results instead of a cancelled job.
+    timeout-minutes: 90
     continue-on-error: true
+    # The same service as the couchdb job in ci.yml.
+    services:
+      couchdb:
+        image: couchdb:3.5.1
+        ports:
+          - 15984:5984
+        env:
+          COUCHDB_USER: admin
+          COUCHDB_PASSWORD: password
+        options: >-
+          --health-cmd "curl -fs http://localhost:5984/_up"
+          --health-interval 3s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      COUCHDB_URL: http://admin:password@localhost:15984
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,28 +64,106 @@ jobs:
         with:
           tool: cargo-mutants
 
+      - name: Wait for CouchDB
+        run: curl -fsS --retry 30 --retry-delay 2 --retry-all-errors "$COUCHDB_URL/_up"
+
+      # As in ci.yml: a locked-out admin fails every remaining CouchDB test
+      # with 403, and a mutant may well send a wrong password.
+      - name: Disable CouchDB account lockout
+        run: |
+          curl -fsS -X PUT "$COUCHDB_URL/_node/_local/_config/chttpd_auth_lockout/mode" -d '"off"'
+
       - name: Diff against the base branch
         env:
           BASE_REF: ${{ github.base_ref }}
         run: git diff "origin/$BASE_REF...HEAD" > pr.diff
 
-      # --timeout: seconds per test run, so a mutant that hangs a test
-      # (an infinite loop) cannot eat the job.
+      # --test-workspace=true: the tests of every crate, not only those of
+      #   the mutated one (the HTTP adapter's CouchDB tests live in
+      #   crates/rouchdb/tests).
+      # After `--`, the cargo test arguments of scripts/test-couchdb.sh:
+      #   --tests leaves out the doctests (with --include-ignored libtest
+      #   would also run the ```ignore ones); after the second `--`, the
+      #   test binaries also run the #[ignore = "requires CouchDB"] tests,
+      #   except those blocked on a known bug (blocked_on_ in the name).
+      # --timeout: seconds per test run, so a mutant that hangs a test (an
+      #   infinite loop) cannot eat the job. Explicit because the automatic
+      #   one comes from the baseline run, which only tests the mutated
+      #   crates, while the whole suite takes a minute or two.
+      # `timeout` bounds the whole run; cut short, cargo-mutants still
+      # reports the mutants tested so far.
+      # cargo-mutants exit codes: 0 every mutant caught, 2 some missed,
+      # 3 some timed out (2 and 3 are reported, not failures), 1 usage
+      # error, 4 the unmutated baseline fails.
       - name: Run cargo-mutants on the diff
-        run: cargo mutants --in-diff pr.diff --timeout 120 --no-shuffle
+        id: mutants
+        run: |
+          status=0
+          timeout --signal=INT --kill-after=2m 75m \
+            cargo mutants --in-diff pr.diff --test-workspace=true \
+              --timeout 300 --no-shuffle \
+              -- --tests -- --include-ignored --skip blocked_on_ \
+            || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          case $status in
+            0) ;;
+            2 | 3) echo "::notice title=Surviving mutants::Some mutants were not caught; they are listed in the job summary." ;;
+            124 | 137) echo "::warning title=Partial mutants run::The time budget ran out; the job summary lists the mutants tested so far." ;;
+            *)
+              echo "::error title=cargo-mutants failed::Exit code $status (4: the unmutated code fails its tests, 1: usage error); see the log above."
+              exit "$status"
+              ;;
+          esac
 
       - name: Summary
         if: always()
+        env:
+          STATUS: ${{ steps.mutants.outputs.status }}
         run: |
+          out=mutants.out
+          # Number of mutants with outcome $1.
+          count() {
+            if [ -f "$out/$1.txt" ]; then wc -l < "$out/$1.txt" | tr -d ' '; else echo 0; fi
+          }
+          # A section titled $2 listing the mutants with outcome $1, if any.
+          list() {
+            if [ -s "$out/$1.txt" ]; then
+              echo "### $2"
+              echo
+              echo '```'
+              cat "$out/$1.txt"
+              echo '```'
+              echo
+            fi
+          }
+          # shellcheck disable=SC2016 # Markdown backticks, not substitutions
           {
-            echo '## Mutants the tests did not catch'
+            echo '## Mutants in the diff'
             echo
-            if [ -s mutants.out/missed.txt ]; then
-              echo '```'
-              cat mutants.out/missed.txt
-              echo '```'
-            else
-              echo 'None.'
+            case $STATUS in
+              0) echo 'The tests catch every mutant in the changed code (if it has any).' ;;
+              2 | 3) echo 'Some mutants survived: no test checks the behavior they change. A report, not a failure.' ;;
+              124 | 137) echo 'Partial run: the time budget ran out. The counts cover the mutants tested so far.' ;;
+              '') echo 'cargo-mutants did not run; see the log.' ;;
+              *) echo "cargo-mutants failed with exit code $STATUS (4: the unmutated code fails its tests); see the log." ;;
+            esac
+            echo
+            if [ -d "$out" ]; then
+              echo '| Caught | Missed | Timeout | Unviable |'
+              echo '|-------:|-------:|--------:|---------:|'
+              echo "| $(count caught) | $(count missed) | $(count timeout) | $(count unviable) |"
+              echo
+              list missed 'Missed: no test fails with this change'
+              list timeout 'Timed out: the tests hang with this change'
+              if [ -s "$out/missed.txt" ] || [ -s "$out/timeout.txt" ]; then
+                echo 'Each line is `file:line:column: mutation`. To kill a mutant, add or'
+                echo 'tighten a test that fails with that change. The logs are in the'
+                echo '`mutants-out` artifact. To reproduce one file locally, with CouchDB running:'
+                echo
+                echo '```sh'
+                echo 'cargo mutants -f <file> --test-workspace=true --timeout 300 -- --tests -- --include-ignored --skip blocked_on_'
+                echo '```'
+              fi
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 

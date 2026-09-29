@@ -121,8 +121,20 @@ impl Auth {
     }
 
     /// Start a new cookie session and return its token.
+    ///
+    /// Tokens have the shape of CouchDB's (unpadded base64url of
+    /// `name:hex time:hash`, here a random hash), so the malformed-cookie
+    /// check treats both alike.
     pub fn create_session(&self) -> String {
-        let token = uuid::Uuid::new_v4().simple().to_string();
+        let unix_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(
+            "{}:{:X}:{}",
+            self.admin.username,
+            unix_time,
+            uuid::Uuid::new_v4().simple()
+        ));
         let mut sessions = self.sessions.lock().unwrap();
         let now = Instant::now();
         sessions.retain(|_, last_seen| now.duration_since(*last_seen) < self.timeout);
@@ -176,25 +188,56 @@ fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
     Some((user.to_string(), pass.to_string()))
 }
 
-/// Extract the `AuthSession` cookie value.
-fn session_token(headers: &HeaderMap) -> Option<String> {
+/// The value of the first `AuthSession` cookie, if there is one: like
+/// CouchDB, a later one is ignored, even when the first is empty.
+fn session_cookie(headers: &HeaderMap) -> Option<&str> {
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .filter_map(|pair| pair.trim().split_once('='))
-        .find(|(name, value)| *name == SESSION_COOKIE && !value.is_empty())
-        .map(|(_, value)| value.to_string())
+        .find(|(name, _)| *name == SESSION_COOKIE)
+        .map(|(_, value)| value)
 }
 
-/// Endpoints that stay reachable without credentials, as in CouchDB: the
-/// welcome message, session login/logout, UUIDs and the static Fauxton files.
+/// The session token the request carries: its first `AuthSession` cookie,
+/// unless empty.
+fn session_token(headers: &HeaderMap) -> Option<String> {
+    session_cookie(headers)
+        .filter(|value| !value.is_empty())
+        .map(String::from)
+}
+
+/// Whether a session cookie value cannot be a CouchDB one: unpadded
+/// base64url (CouchDB adds the padding itself) of at least three
+/// `:`-separated parts (`name:time:hash`). CouchDB answers such a cookie
+/// with a 400 on every request.
+fn is_malformed_session(value: &str) -> bool {
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    const BASE64URL: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::URL_SAFE,
+        GeneralPurposeConfig::new()
+            .with_decode_padding_mode(DecodePaddingMode::RequireNone)
+            .with_decode_allow_trailing_bits(true),
+    );
+    BASE64URL.decode(value).map_or(true, |decoded| {
+        decoded.iter().filter(|&&b| b == b':').count() < 2
+    })
+}
+
+/// Requests that need no credentials, as in CouchDB: the welcome message,
+/// session login/logout, UUIDs and the static Fauxton files, and the
+/// methods `/` and `/_active_tasks` do not allow (CouchDB checks the method
+/// of these before the credentials, so they are a 405, not a 401).
 fn is_public(method: &Method, path: &str) -> bool {
+    let reads = method == Method::GET || method == Method::HEAD;
     match path {
-        "/" => method == Method::GET || method == Method::HEAD,
-        "/_session" | "/_uuids" | "/_utils" => true,
-        _ => path.starts_with("/_utils/"),
+        "/" => true,
+        "/_active_tasks" => !reads,
+        "/_session" | "/_uuids" => true,
+        "/_utils" => reads,
+        _ => reads && path.starts_with("/_utils/"),
     }
 }
 
@@ -209,6 +252,13 @@ pub async fn require_auth(State(state): State<AppState>, req: Request, next: Nex
     let Some(auth) = state.auth.as_deref() else {
         return next.run(req).await;
     };
+    if session_cookie(req.headers()).is_some_and(|v| !v.is_empty() && is_malformed_session(v)) {
+        return crate::error::couch_error(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "Malformed AuthSession cookie. Please clear your cookies.",
+        );
+    }
     let outcome = auth.authenticate(req.headers());
     let path = req.uri().path();
     match outcome {

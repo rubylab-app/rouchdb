@@ -1679,6 +1679,7 @@ dependencies = [
  "predicates",
  "reqwest",
  "rouchdb",
+ "rouchdb-core",
  "serde_json",
  "tempfile",
  "tokio",

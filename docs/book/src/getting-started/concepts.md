@@ -16,7 +16,7 @@ A document is a JSON object identified by a unique `_id`. This is the fundamenta
 }
 ```
 
-- `_id` — unique identifier you choose (or RouchDB generates a UUID)
+- `_id` — unique identifier you choose (or RouchDB generates a UUID v4, written like CouchDB's ids as 32 hex digits)
 - `_rev` — revision string managed by RouchDB (never set this manually)
 - Everything else is your data, stored as `serde_json::Value`
 
