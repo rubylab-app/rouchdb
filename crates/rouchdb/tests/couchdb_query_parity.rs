@@ -10,7 +10,7 @@ mod common;
 
 use std::future::Future;
 
-use common::fresh_remote_db;
+use common::unique_remote_db;
 use rouchdb::{
     BulkDocsOptions, Database, Document, FindOptions, IndexDefinition, ReduceFn, SortField,
     ViewQueryOptions, query_view,
@@ -33,15 +33,21 @@ where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let db = fresh_remote_db(label).await;
-    let client = reqwest::Client::new();
-    client.delete(db.url()).send().await.unwrap();
-    let created = client
+    // Create the database once, with a single shard. Creating it with the
+    // default sharding, deleting it and re-creating it with `?q=1` raced
+    // CouchDB's asynchronous delete (412 `file_exists`).
+    let db = unique_remote_db(label);
+    let created = reqwest::Client::new()
         .put(format!("{}?q=1", db.url()))
         .send()
         .await
         .unwrap();
-    assert!(created.status().is_success(), "{}", created.status());
+    assert!(
+        created.status().is_success(),
+        "Failed to create DB {}: {}",
+        db.name(),
+        created.status()
+    );
     body(db.url().to_string()).await;
 }
 
