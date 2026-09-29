@@ -171,7 +171,7 @@ document, once one is set).
 ```rust
 struct MetaRecord {
     update_seq: u64,    // highest sequence number
-    db_uuid: String,    // random, reset by destroy()
+    db_uuid: String,    // random, reset by destroy(); part of Adapter::id()
     schema: u32,        // on-disk layout version (currently 2)
     purge_seq: u64,     // number of purge requests applied
     doc_count: u64,     // live documents, maintained on every write
@@ -180,7 +180,13 @@ struct MetaRecord {
 ```
 
 `info()` and `all_docs().total_rows` read the counts from this record
-instead of scanning documents. A file whose `schema` is higher than this
+instead of scanning documents.
+
+`Adapter::id()` is `db_uuid` followed by the MD5 of the file's canonical
+path (resolved when the file is opened). A copy of a file holds the same
+`db_uuid` but lives at another path, so it is a different database for
+replication; reopening a file at the same path, or through a symlink, keeps
+its id and so its checkpoints, while moving it costs one rescan per peer. A file whose `schema` is higher than this
 version knows is refused unchanged.
 
 ### The format guard (`"metadata"`)
@@ -378,7 +384,8 @@ Used during replication:
 - `destroy()` deletes and recreates every table except the guard, and resets
   the metadata (new UUID, `update_seq` 0, no security document). The file
   stays on disk, still a 0.5 file, and the handle keeps working as a new,
-  empty database.
+  empty database. Once committed, it sends `ChangeNotice::reset()` to the
+  subscribers, so live replications to or from the file start over.
 
 ## Key Format Summary
 

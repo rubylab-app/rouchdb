@@ -55,7 +55,7 @@ Types the library returns are `#[non_exhaustive]`. Their fields stay public, so 
 | `BulkGetResponse`, `BulkGetResult` | `BulkGetResponse::new(results)`, `BulkGetResult::new(id, docs)` |
 | `BulkGetDoc`, `BulkGetError` | `BulkGetDoc::ok(json)`, `BulkGetDoc::error(err)`, `BulkGetError::new(id, rev, error, reason)` |
 | `PurgeResponse` | `PurgeResponse::new(purge_seq, purged)` |
-| `ChangeNotice` | `ChangeNotice::new(seq, doc_id)` |
+| `ChangeNotice` | `ChangeNotice::new(seq, doc_id)`, `ChangeNotice::reset()` |
 | `DocMetadata` | `DocMetadata::new(id, rev_tree, seq)` |
 | `FindResponse` | `FindResponse::new(docs)` |
 | `IndexInfo`, `IndexFields` | `IndexInfo::new(name, ddoc, fields)`, `IndexFields::new(fields)` |

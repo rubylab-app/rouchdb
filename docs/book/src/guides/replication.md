@@ -127,7 +127,7 @@ let opts = ReplicationOptions {
 | `checkpoint` | `true` | Set to `false` to disable checkpoint saving. Each replication will start from the beginning (or `since`). |
 | `live` | `false` | Enable continuous replication that keeps running and picks up new changes. |
 | `retry` | `false` | Automatically retry on network or transient errors (live mode). |
-| `poll_interval` | 500ms | How frequently to poll for new changes in live mode, for a source that cannot announce them (a remote CouchDB). A local source (memory, redb) wakes the replication up on each change instead. |
+| `poll_interval` | 500ms | How frequently to poll for new changes in live mode, for a source that cannot announce them (a remote CouchDB), and to check the identity of such a target. A local source (memory, redb) wakes the replication up on each change instead. |
 | `back_off_function` | `None` | Custom backoff function for retries. Receives retry count, returns delay. |
 
 ## Filtered Replication
@@ -231,6 +231,7 @@ println!("Last sequence:     {}", result.last_seq);
 | `docs_written` | `u64` | Number of documents written to the target. |
 | `errors` | `Vec<String>` | Descriptions of any errors during replication. |
 | `last_seq` | `Seq` | The source sequence up to which replication completed. |
+| `warnings` | `Vec<String>` | Conditions that did not stop the replication (such as both databases reporting the same identity, which disables checkpoints). They do not affect `ok`. |
 
 Note that `docs_read` may be greater than `docs_written` when the target already has some of the documents (incremental replication).
 
@@ -250,6 +251,8 @@ local.put("new_doc", json!({"data": "hello"})).await?;
 let r2 = local.replicate_to(&remote).await?;
 println!("Incremental: {} docs written", r2.docs_written); // 1
 ```
+
+Checkpoints are keyed on both databases' identities (`Adapter::id()`), not their names. A redb file's identity includes its path: a copy of the file is a different database (syncing a file with its copy works both ways), and a file that is moved or copied is rescanned once with each peer. Two databases that report the same identity (a custom adapter that keeps the default `id()`, the database name) are replicated without checkpoints, and `ReplicationResult::warnings` says so.
 
 ## Replication Events
 
@@ -290,12 +293,13 @@ while let Ok(event) = rx.try_recv() {
 | `Paused` | Waiting for more changes (live mode). |
 | `Complete(ReplicationResult)` | Replication finished (one-shot or one cycle in live mode). |
 | `Error(String)` | An error occurred during replication. |
+| `Warning(String)` | A condition that did not stop the replication, also listed in `ReplicationResult::warnings` (sent once per live session). |
 
 `ReplicationEvent` is `#[non_exhaustive]` (a `match` needs a `_` arm) and so is its `Change` variant (match it as `Change { docs_read, .. }`), so that events and fields can be added without a breaking release. See [API Stability](../reference/api-stability.md).
 
 ## Live (Continuous) Replication
 
-Live replication keeps running in the background, replicating new changes as they happen: a local source (memory, redb) announces each committed change, a remote one is polled every `poll_interval`. This is the equivalent of PouchDB's `{ live: true }` option.
+Live replication keeps running in the background, replicating new changes as they happen: a local source (memory, redb) announces each committed change, a remote one is polled every `poll_interval`. If either database is destroyed (and maybe reused) while the replication runs, it starts over and copies every document of the source again, even when the source is idle. This is the equivalent of PouchDB's `{ live: true }` option.
 
 ```rust
 use rouchdb::{ReplicationOptions, ReplicationEvent};

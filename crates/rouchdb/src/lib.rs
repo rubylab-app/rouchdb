@@ -334,6 +334,10 @@ impl Adapter for PluginAdapter {
         self.inner.destroy().await
     }
 
+    fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<ChangeNotice>> {
+        self.inner.subscribe()
+    }
+
     async fn close(&self) -> Result<()> {
         self.inner.close().await
     }

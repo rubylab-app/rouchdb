@@ -389,11 +389,25 @@ pub struct RedbAdapter {
 struct Inner {
     db: Database,
     name: String,
+    /// Hex MD5 of the file's canonical path when it was opened: part of
+    /// [`Adapter::id`], so a copy of the file (same persisted uuid) is a
+    /// different database for replication.
+    location: String,
     /// Serializes writers before they reach redb (which would otherwise park
     /// one blocking thread per waiting writer).
     write_lock: Mutex<()>,
     /// Change notifications, sent once a write is committed.
     notices: broadcast::Sender<ChangeNotice>,
+}
+
+/// Hex MD5 of the canonical form of `path` (symlinks and `..` resolved), or
+/// of its absolute form if it cannot be canonicalized.
+fn location_hash(path: &Path) -> String {
+    use md5::{Digest, Md5};
+    let resolved = std::fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf());
+    format!("{:x}", Md5::digest(resolved.as_os_str().as_encoded_bytes()))
 }
 
 /// Change notices buffered per subscriber before it lags (and re-reads the
@@ -453,6 +467,7 @@ impl RedbAdapter {
             inner: Arc::new(Inner {
                 db,
                 name: name.to_string(),
+                location: location_hash(path.as_ref()),
                 write_lock: Mutex::new(()),
                 notices: broadcast::channel(NOTICE_CAPACITY).0,
             }),
@@ -829,9 +844,14 @@ impl Adapter for RedbAdapter {
     }
 
     /// The uuid stored in the file when the database was created (or last
-    /// destroyed), not its name: two files opened under the same name, or
-    /// one file before and after `destroy()`, never share replication
-    /// checkpoints, while reopening a file keeps its checkpoints.
+    /// destroyed), not its name, combined with a hash of the file's
+    /// canonical path: two files opened under the same name, one file
+    /// before and after `destroy()`, or a file and a copy of it (which
+    /// holds the same uuid) never share replication checkpoints, while
+    /// reopening a file at the same path (directly or through a symlink)
+    /// keeps its checkpoints. Copying or moving a file therefore makes its
+    /// next replication with each peer rescan the changes feed once; no
+    /// document is transferred again.
     async fn id(&self) -> Result<String> {
         self.run(|db| db.id()).await
     }
@@ -981,10 +1001,12 @@ impl Inner {
         ))
     }
 
-    /// The database's persisted uuid, renewed by `destroy()`.
+    /// The database's persisted uuid (renewed by `destroy()`) and the hash
+    /// of its location.
     fn id(&self) -> Result<String> {
         let read_txn = db_err!(self.db.begin_read())?;
-        Ok(read_meta(&db_err!(read_txn.open_table(META_TABLE))?)?.db_uuid)
+        let uuid = read_meta(&db_err!(read_txn.open_table(META_TABLE))?)?.db_uuid;
+        Ok(format!("{uuid}-{}", self.location))
     }
 
     fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
@@ -1689,6 +1711,7 @@ impl Inner {
         )?;
 
         db_err!(write_txn.commit())?;
+        let _ = self.notices.send(ChangeNotice::reset());
         Ok(())
     }
 
@@ -2063,6 +2086,18 @@ mod tests {
             db.get_local("ck1").await,
             Err(RouchError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn destroy_announces_a_reset() {
+        use rouchdb_core::adapter::ChangeNotice;
+        let (_dir, db) = temp_db();
+        let before = db.id().await.unwrap();
+        let mut rx = db.subscribe().unwrap();
+        db.destroy().await.unwrap();
+        assert_eq!(rx.try_recv().unwrap(), ChangeNotice::reset());
+        assert!(rx.try_recv().is_err());
+        assert_ne!(db.id().await.unwrap(), before);
     }
 
     #[tokio::test]

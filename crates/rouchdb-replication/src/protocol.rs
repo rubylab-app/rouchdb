@@ -83,7 +83,9 @@ pub struct ReplicationOptions {
     /// Override the starting sequence (skip checkpoint lookup).
     pub since: Option<Seq>,
     /// Whether to save/read checkpoints (default: true).
-    /// Set to false to always replicate from scratch.
+    /// Set to false to always replicate from scratch. Checkpoints are
+    /// never used between two peers that report the same
+    /// [`Adapter::id`] (see [`ReplicationResult::warnings`]).
     pub checkpoint: bool,
 }
 
@@ -114,6 +116,16 @@ pub struct ReplicationResult {
     pub docs_written: u64,
     pub errors: Vec<String>,
     pub last_seq: Seq,
+    /// Conditions that did not stop the replication but that the caller
+    /// should know about. Currently: the source and the target report the
+    /// same [`Adapter::id`] (a custom adapter that keeps the default id,
+    /// the database name, replicating with a same-named database; or one
+    /// database replicating with itself). The replication id could not
+    /// tell the two directions or pairs apart, so checkpoints were neither
+    /// read nor written and the whole changes feed was scanned: the
+    /// replication is complete, but every run rescans. Does not affect
+    /// [`ok`](ReplicationResult::ok).
+    pub warnings: Vec<String>,
 }
 
 /// Events emitted during replication for progress tracking.
@@ -132,6 +144,10 @@ pub enum ReplicationEvent {
     Active,
     Complete(ReplicationResult),
     Error(String),
+    /// A condition that does not stop the replication, also listed in
+    /// [`ReplicationResult::warnings`]. A live replication sends it once
+    /// per session, not on every pass.
+    Warning(String),
 }
 
 /// Build a stable fingerprint of the active filter for the replication ID,
@@ -232,14 +248,14 @@ pub async fn replicate(
     opts: ReplicationOptions,
 ) -> Result<ReplicationResult> {
     let selector = compile_filter(&opts.filter)?;
-    let checkpointer = new_checkpointer(source, target, &opts.filter).await?;
+    let session = new_session(source, target, &opts.filter).await?;
     let since = opts.since.clone();
     let outcome = run_replication(
         source,
         target,
         &opts,
         selector.as_ref(),
-        &checkpointer,
+        &session,
         since,
         None,
     )
@@ -260,14 +276,19 @@ pub async fn replicate_with_events(
     events_tx: mpsc::Sender<ReplicationEvent>,
 ) -> Result<ReplicationResult> {
     let selector = compile_filter(&opts.filter)?;
-    let checkpointer = new_checkpointer(source, target, &opts.filter).await?;
+    let session = new_session(source, target, &opts.filter).await?;
+    for warning in &session.warnings {
+        let _ = events_tx
+            .send(ReplicationEvent::Warning(warning.clone()))
+            .await;
+    }
     let since = opts.since.clone();
     let outcome = run_replication(
         source,
         target,
         &opts,
         selector.as_ref(),
-        &checkpointer,
+        &session,
         since,
         Some(&events_tx),
     )
@@ -298,8 +319,49 @@ async fn emit(events: Option<&mpsc::Sender<ReplicationEvent>>, event: Replicatio
     }
 }
 
+/// How a replication session stores its progress.
+struct Session {
+    /// `None` when the source and the target report the same id: their
+    /// replication id could not tell the two directions (or two such pairs)
+    /// apart, so a checkpoint could be one written by another replication,
+    /// and resuming from it would skip documents.
+    checkpointer: Option<Checkpointer>,
+    /// Reported in the result of every pass.
+    warnings: Vec<String>,
+}
+
+/// The session for a source/target pair and filter.
+async fn new_session(
+    source: &dyn Adapter,
+    target: &dyn Adapter,
+    filter: &Option<ReplicationFilter>,
+) -> Result<Session> {
+    let ids = peer_ids(source, target).await?;
+    Ok(session_for(&ids, filter))
+}
+
+fn session_for(ids: &(String, String), filter: &Option<ReplicationFilter>) -> Session {
+    if ids.0 == ids.1 {
+        return Session {
+            checkpointer: None,
+            warnings: vec![format!(
+                "the source and the target report the same database id ({:?}), so their \
+                 replication checkpoints cannot be told apart: replicating without \
+                 checkpoints (every run scans the whole changes feed); give each \
+                 database a distinct Adapter::id",
+                ids.0
+            )],
+        };
+    }
+    Session {
+        checkpointer: Some(checkpointer_for(ids, filter)),
+        warnings: Vec::new(),
+    }
+}
+
 /// Build the checkpointer (and so the replication id) for a source/target
 /// pair and filter.
+#[cfg(test)]
 async fn new_checkpointer(
     source: &dyn Adapter,
     target: &dyn Adapter,
@@ -327,15 +389,19 @@ async fn run_replication(
     target: &dyn Adapter,
     opts: &ReplicationOptions,
     selector: Option<&CompiledSelector>,
-    checkpointer: &Checkpointer,
+    session: &Session,
     since: Option<Seq>,
     events: Option<&mpsc::Sender<ReplicationEvent>>,
 ) -> Result<RunOutcome> {
-    let use_checkpoint =
-        opts.checkpoint && !matches!(opts.filter, Some(ReplicationFilter::Custom(_)));
+    // Checkpoints are used when enabled, meaningful for the filter, and
+    // distinct for this pair of peers.
+    let checkpointer = session
+        .checkpointer
+        .as_ref()
+        .filter(|_| opts.checkpoint && !matches!(opts.filter, Some(ReplicationFilter::Custom(_))));
     let since = if let Some(override_since) = since {
         override_since
-    } else if use_checkpoint {
+    } else if let Some(checkpointer) = checkpointer {
         checkpointer.read_checkpoint(source, target).await?
     } else {
         Seq::default()
@@ -513,7 +579,7 @@ async fn run_replication(
 
         // Step 6: Save checkpoint (if enabled)
         current_seq = batch_last_seq;
-        if use_checkpoint {
+        if let Some(checkpointer) = checkpointer {
             if let Err(e) = checkpointer
                 .write_checkpoint(source, target, current_seq.clone())
                 .await
@@ -536,7 +602,7 @@ async fn run_replication(
     // target) are progress too: save it once so the next run does not
     // rescan them. After a failure `current_seq` still stops before the
     // failed batch, so this never skips anything.
-    if use_checkpoint
+    if let Some(checkpointer) = checkpointer
         && !checkpoint_failed
         && current_seq != checkpointed_seq
         && let Err(e) = checkpointer
@@ -555,6 +621,7 @@ async fn run_replication(
             docs_written: total_docs_written,
             errors,
             last_seq: current_seq,
+            warnings: session.warnings.clone(),
         },
         failure,
     })
@@ -573,7 +640,18 @@ async fn run_replication(
 /// one changed (a memory or redb database that was destroyed, and maybe
 /// reused, gets a new one), the replication starts over from the new pair's
 /// checkpoint (none after a `destroy`, so from the start of the changes
-/// feed) instead of resuming from a sequence of the old database.
+/// feed) instead of resuming from a sequence of the old database. While the
+/// source is idle, a destroyed target is noticed too: the replication
+/// listens for the reset notice ([`ChangeNotice::reset`]) that the memory
+/// and redb adapters announce on `destroy`, and compares the ids of a
+/// target that cannot announce it (such as a remote CouchDB) every
+/// `poll_interval`, then runs a pass that copies everything to the new
+/// target. (The HTTP adapter caches the server's uuid, so a remote database
+/// that is deleted and re-created keeps its id.)
+///
+/// When both peers report the same id, the replication runs without
+/// checkpoints and sends one [`ReplicationEvent::Warning`] (see
+/// [`ReplicationResult::warnings`]).
 ///
 /// An invalid [`ReplicationFilter::Selector`] sends one `Error` event and
 /// ends the replication (even with `retry`) before anything is read or
@@ -603,43 +681,56 @@ pub fn replicate_live(
             }
         };
         // Subscribed before the first pass, so a change made during a pass
-        // wakes the next one up.
+        // wakes the next one up. The target is followed only for resets (it
+        // is destroyed, and maybe reused, while the source is idle); a
+        // target that cannot announce them has its id compared every
+        // `poll_interval` instead.
         let mut notices = source.subscribe();
+        let mut target_notices = target.subscribe();
         let mut attempt: u32 = 0;
         // Track the last successful result so a single terminal Complete can
         // be emitted when the live loop finally exits.
         let mut last_result: Option<ReplicationResult> = None;
         // Starts at the caller's `since` (or the checkpoint when unset), then
         // follows each pass's last_seq so polls never rescan the feed. One
-        // checkpointer (one session) spans the live replication until a pass
-        // fails with an error.
+        // session (one checkpointer) spans the live replication until a pass
+        // fails with an error or a peer is reset.
         let mut since = opts.since.clone();
-        let mut checkpointer: Option<Checkpointer> = None;
-        // The identities the cursor and the checkpointer belong to.
+        let mut session: Option<Session> = None;
+        // The identities the cursor and the session belong to.
         let mut session_ids: Option<(String, String)> = None;
+        // A peer announced a reset (`ChangeNotice::reset`) since the last
+        // pass.
+        let mut reset = false;
 
         'live: loop {
             let result = async {
                 // A peer that was destroyed (and possibly reused) since the
-                // last pass reports a new identity; its sequences start over,
-                // so the cursor would skip its changes. Start again from its
-                // checkpoint under the new identity (none: from the start).
+                // last pass reports a new identity, and announces a reset if
+                // it can; its sequences start over, so the cursor would skip
+                // its changes. Start again from the checkpoint of the new
+                // pair (none after a destroy: from the start).
                 let ids = peer_ids(source.as_ref(), target.as_ref()).await?;
-                if session_ids.as_ref().is_some_and(|old| *old != ids) {
+                if std::mem::take(&mut reset) || session_ids.as_ref().is_some_and(|old| *old != ids)
+                {
                     since = None;
-                    checkpointer = None;
+                    session = None;
                 }
-                if checkpointer.is_none() {
-                    checkpointer = Some(checkpointer_for(&ids, &opts.filter));
+                if session.is_none() {
+                    let new = session_for(&ids, &opts.filter);
+                    for warning in &new.warnings {
+                        let _ = tx.send(ReplicationEvent::Warning(warning.clone())).await;
+                    }
+                    session = Some(new);
                 }
                 session_ids = Some(ids);
-                let checkpointer = checkpointer.as_ref().expect("initialized above");
+                let session = session.as_ref().expect("initialized above");
                 run_replication(
                     source.as_ref(),
                     target.as_ref(),
                     &opts,
                     selector.as_ref(),
-                    checkpointer,
+                    session,
                     since.clone(),
                     Some(&tx),
                 )
@@ -670,7 +761,7 @@ pub fn replicate_live(
                     // The peer may have been unreachable when the id was
                     // derived (an HTTP adapter then falls back to its URL):
                     // derive it again on the next attempt.
-                    checkpointer = None;
+                    session = None;
                     Some(e.to_string())
                 }
             };
@@ -695,32 +786,86 @@ pub fn replicate_live(
                 }
             }
 
+            // Whether a peer may have been reset without announcing it to
+            // us: its id changed since the pass started.
+            let ids_changed = || async {
+                peer_ids(source.as_ref(), target.as_ref())
+                    .await
+                    .is_ok_and(|ids| session_ids.as_ref() != Some(&ids))
+            };
+
+            // Changes (and resets) announced during the pass are handled
+            // right away. The target's other notices are the pass's own
+            // writes, or writes of others that the source does not need.
+            let mut wake = false;
+            if let Some(rx) = notices.as_mut() {
+                let drained = drain_notices(rx);
+                wake |= drained.any;
+                reset |= drained.reset;
+            }
+            if let Some(rx) = target_notices.as_mut() {
+                let drained = drain_notices(rx);
+                reset |= drained.reset;
+                // A lagging receiver may have missed a reset.
+                if drained.lagged && ids_changed().await {
+                    wake = true;
+                }
+            }
+            if wake || reset {
+                continue 'live;
+            }
+
             // Wait for a change on the source (its notifications, or
-            // poll_interval without them) or cancellation.
-            match notices.as_mut() {
-                Some(rx) => {
-                    // Changes made during the pass are replicated right away.
-                    if !drain_notices(rx) {
-                        if caught_up {
-                            let _ = tx.send(ReplicationEvent::Paused).await;
+            // poll_interval without them), a reset of the target (its
+            // notifications, or its id checked every poll_interval without
+            // them) or cancellation.
+            if caught_up && notices.is_some() {
+                let _ = tx.send(ReplicationEvent::Paused).await;
+            }
+            let mut deadline = tokio::time::Instant::now() + poll_interval;
+            loop {
+                tokio::select! {
+                    notice = next_notice(&mut notices), if notices.is_some() => {
+                        match notice {
+                            Err(broadcast::error::RecvError::Closed) => {
+                                notices = None; // poll from now on
+                            }
+                            Ok(notice) => reset |= notice.reset,
+                            Err(broadcast::error::RecvError::Lagged(_)) => {}
                         }
-                        tokio::select! {
-                            notice = rx.recv() => {
-                                if matches!(notice, Err(broadcast::error::RecvError::Closed)) {
-                                    notices = None; // poll from now on
-                                } else {
-                                    drain_notices(rx);
+                        if let Some(rx) = notices.as_mut() {
+                            reset |= drain_notices(rx).reset;
+                        }
+                        break;
+                    }
+                    _ = tokio::time::sleep_until(deadline), if notices.is_none() => break,
+                    notice = next_notice(&mut target_notices), if target_notices.is_some() => {
+                        match notice {
+                            Ok(notice) if notice.reset => {
+                                reset = true;
+                                break;
+                            }
+                            Ok(_) => {}
+                            Err(broadcast::error::RecvError::Closed) => {
+                                target_notices = None; // check its id from now on
+                                deadline = tokio::time::Instant::now() + poll_interval;
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                if ids_changed().await {
+                                    break;
                                 }
                             }
-                            _ = cancel_clone.cancelled() => break 'live,
                         }
                     }
-                }
-                None => {
-                    tokio::select! {
-                        _ = tokio::time::sleep(poll_interval) => {},
-                        _ = cancel_clone.cancelled() => break 'live,
+                    _ = tokio::time::sleep_until(deadline),
+                        if notices.is_some() && target_notices.is_none() =>
+                    {
+                        if ids_changed().await {
+                            break;
+                        }
+                        deadline = tokio::time::Instant::now() + poll_interval;
                     }
+                    _ = cancel_clone.cancelled() => break 'live,
                 }
             }
         }
@@ -734,14 +879,43 @@ pub fn replicate_live(
     (rx, ReplicationHandle { cancel })
 }
 
-/// Consume the change notices already queued; whether there were any (a
-/// lagging receiver had some too).
-fn drain_notices(rx: &mut broadcast::Receiver<ChangeNotice>) -> bool {
-    let mut any = false;
-    while let Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) = rx.try_recv() {
-        any = true;
+/// What [`drain_notices`] consumed.
+#[derive(Default)]
+struct Drained {
+    /// There were notices (a lagging receiver had some too).
+    any: bool,
+    /// One of them was a reset.
+    reset: bool,
+    /// The receiver lagged: notices, maybe a reset, were lost.
+    lagged: bool,
+}
+
+/// Consume the change notices already queued.
+fn drain_notices(rx: &mut broadcast::Receiver<ChangeNotice>) -> Drained {
+    let mut drained = Drained::default();
+    loop {
+        match rx.try_recv() {
+            Ok(notice) => {
+                drained.any = true;
+                drained.reset |= notice.reset;
+            }
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                drained.any = true;
+                drained.lagged = true;
+            }
+            Err(_) => return drained,
+        }
     }
-    any
+}
+
+/// The next notice of an optional subscription (never, without one).
+async fn next_notice(
+    rx: &mut Option<broadcast::Receiver<ChangeNotice>>,
+) -> std::result::Result<ChangeNotice, broadcast::error::RecvError> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Handle for a live replication task. Dropping this cancels the replication.
@@ -950,6 +1124,201 @@ mod tests {
         async fn destroy(&self) -> Result<()> {
             self.0.destroy().await
         }
+    }
+
+    /// A memory adapter that does not announce its changes (nor its
+    /// resets), like a remote CouchDB, but whose id `destroy` renews.
+    struct Quiet(MemoryAdapter);
+
+    #[async_trait::async_trait]
+    impl Adapter for Quiet {
+        async fn info(&self) -> Result<DbInfo> {
+            self.0.info().await
+        }
+        async fn id(&self) -> Result<String> {
+            self.0.id().await
+        }
+        async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
+            self.0.get(id, opts).await
+        }
+        async fn bulk_docs(
+            &self,
+            docs: Vec<Document>,
+            opts: BulkDocsOptions,
+        ) -> Result<Vec<DocResult>> {
+            self.0.bulk_docs(docs, opts).await
+        }
+        async fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
+            self.0.all_docs(opts).await
+        }
+        async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
+            self.0.changes(opts).await
+        }
+        async fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
+            self.0.revs_diff(revs).await
+        }
+        async fn bulk_get(&self, docs: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
+            self.0.bulk_get(docs).await
+        }
+        async fn put_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            rev: &str,
+            data: Vec<u8>,
+            content_type: &str,
+        ) -> Result<DocResult> {
+            self.0
+                .put_attachment(doc_id, att_id, rev, data, content_type)
+                .await
+        }
+        async fn get_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            opts: GetAttachmentOptions,
+        ) -> Result<Vec<u8>> {
+            self.0.get_attachment(doc_id, att_id, opts).await
+        }
+        async fn remove_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            rev: &str,
+        ) -> Result<DocResult> {
+            self.0.remove_attachment(doc_id, att_id, rev).await
+        }
+        async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
+            self.0.get_local(id).await
+        }
+        async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
+            self.0.put_local(id, doc).await
+        }
+        async fn remove_local(&self, id: &str) -> Result<()> {
+            self.0.remove_local(id).await
+        }
+        async fn compact(&self) -> Result<()> {
+            self.0.compact().await
+        }
+        async fn destroy(&self) -> Result<()> {
+            self.0.destroy().await
+        }
+    }
+
+    #[tokio::test]
+    async fn peers_with_the_same_id_replicate_without_checkpoints() {
+        // Like a redb file and its copy before identities included the
+        // path, or two same-named databases of an adapter that keeps the
+        // default id: A->B and B->A would share one checkpoint, and B->A
+        // would resume from A->B's sequence, skipping B's documents.
+        let a = NamedAt(MemoryAdapter::new("db"), "same");
+        let b = NamedAt(MemoryAdapter::new("db"), "same");
+        put_doc(&a, "seed", serde_json::json!({})).await;
+        replicate(&a, &b, ReplicationOptions::default())
+            .await
+            .unwrap();
+        put_doc(&a, "a", serde_json::json!({})).await;
+        put_doc(&b, "b", serde_json::json!({})).await;
+
+        let push = replicate(&a, &b, ReplicationOptions::default())
+            .await
+            .unwrap();
+        let pull = replicate(&b, &a, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert!(push.ok && pull.ok, "{push:?} {pull:?}");
+        assert_eq!(push.docs_written, 1, "{push:?}");
+        assert_eq!(pull.docs_written, 1, "pull skipped b: {pull:?}");
+        for result in [&push, &pull] {
+            assert_eq!(result.warnings.len(), 1, "{result:?}");
+            assert!(result.warnings[0].contains("same database id"));
+        }
+        for db in [&a, &b] {
+            let ids: Vec<String> = db
+                .all_docs(AllDocsOptions::new())
+                .await
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|r| r.key)
+                .collect();
+            assert_eq!(ids, ["a", "b", "seed"]);
+        }
+
+        // No checkpoint was stored on either side.
+        let shared = checkpointer_for(&("same".into(), "same".into()), &None);
+        for db in [&a, &b] {
+            assert!(db.get_local(shared.replication_id()).await.is_err());
+        }
+
+        // Retries rescan, and change nothing.
+        let retry = replicate(&b, &a, ReplicationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!((retry.docs_read, retry.docs_written), (3, 0));
+
+        // The warning is an event too.
+        let (tx, mut rx) = mpsc::channel(16);
+        replicate_with_events(&a, &b, ReplicationOptions::default(), tx)
+            .await
+            .unwrap();
+        let mut warnings = 0;
+        while let Ok(event) = rx.try_recv() {
+            warnings += matches!(event, ReplicationEvent::Warning(_)) as usize;
+        }
+        assert_eq!(warnings, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_replication_checks_the_id_of_a_target_without_notices() {
+        let source = Arc::new(MemoryAdapter::new("source"));
+        let target = Arc::new(Quiet(MemoryAdapter::new("target")));
+        for i in 0..3 {
+            put_doc(source.as_ref(), &format!("keep{i}"), serde_json::json!({})).await;
+        }
+        let (mut rx, handle) = replicate_live(
+            source.clone(),
+            target.clone(),
+            ReplicationOptions {
+                poll_interval: Duration::from_millis(20),
+                live: true,
+                ..Default::default()
+            },
+        );
+        while !matches!(rx.recv().await, Some(ReplicationEvent::Paused)) {}
+
+        // The source stays idle; the target is destroyed and reused.
+        target.destroy().await.unwrap();
+        put_doc(target.as_ref(), "reused", serde_json::json!({})).await;
+        let refilled = async {
+            loop {
+                if target
+                    .all_docs(AllDocsOptions::new())
+                    .await
+                    .unwrap()
+                    .rows
+                    .len()
+                    == 4
+                {
+                    return;
+                }
+                while rx.try_recv().is_ok() {}
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), refilled)
+            .await
+            .expect("the destroyed target was never refilled");
+        for i in 0..3 {
+            assert!(
+                target
+                    .get(&format!("keep{i}"), GetOptions::default())
+                    .await
+                    .is_ok()
+            );
+        }
+        assert_eq!(source.info().await.unwrap().update_seq, Seq::Num(3));
+        handle.cancel();
     }
 
     #[tokio::test]
