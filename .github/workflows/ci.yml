@@ -106,8 +106,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run the redb adapter, CLI and 0.4 compatibility tests
-        run: cargo test -p rouchdb-adapter-redb -p rouchdb-cli -p rouchdb-compat-tests --locked --no-fail-fast
+      # `-p rouchdb-adapter-redb` is ambiguous (the compat tests also link
+      # the 0.4.0 release), so that crate is selected by its manifest.
+      - name: Run the redb adapter tests
+        run: cargo test --manifest-path crates/rouchdb-adapter-redb/Cargo.toml --locked --no-fail-fast
+
+      - name: Run the CLI and 0.4 compatibility tests
+        run: cargo test -p rouchdb-cli -p rouchdb-compat-tests --locked --no-fail-fast
 
   couchdb:
     name: CouchDB integration tests
