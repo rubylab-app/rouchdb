@@ -292,12 +292,14 @@ is not a backup (delete it); a `<backup>` is complete, as it is only renamed
 into place once verified.
 
 **3. Upgrade.** One write transaction with two-phase commit applies the
-plan, so an error or a crash at any point leaves the file as it was: re-key
+plan, so the file is upgraded completely or not at all (an error or a crash
+before the commit leaves it as it was): re-key
 the attachment bytes, move the `_local/` documents, rewrite the revision
 trees and body keys, write the `MetaRecord` (and the security document, if
 any) to `rouchdb_meta`, delete the old `"metadata"` table and create the
-guard. If this step fails, the backup made for the attempt is removed (it
-would block a retry); if the commit itself fails, it is kept.
+guard. If this step fails before the commit, the backup made for the
+attempt is removed (it would block a retry); if the commit itself fails, it
+is kept, since the file may then be either the old one or the upgraded one.
 
 **Disk space.** redb copies every page the transaction changes and keeps
 the old pages until the commit, so the upgrade needs about twice the file
