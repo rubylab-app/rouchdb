@@ -9,6 +9,7 @@ use rouchdb::{AllDocsOptions, Database, FindOptions, IndexDefinition, SortField}
 use rouchdb_core::error::RouchError;
 
 use crate::error::AppError;
+use crate::extract::JsonBody;
 use crate::state::AppState;
 
 /// CouchDB's `_find` limit when the request does not set one.
@@ -32,7 +33,7 @@ fn decode_bookmark(bookmark: &serde_json::Value) -> Option<u64> {
 pub async fn find(
     State(state): State<AppState>,
     Path(db): Path<String>,
-    Json(mut body): Json<serde_json::Value>,
+    JsonBody(mut body): JsonBody<serde_json::Value>,
 ) -> Result<Response, AppError> {
     state.check_db(&db)?;
     if body.get("selector").is_none() {
@@ -273,7 +274,7 @@ async fn persist_index(
 pub async fn create_index(
     State(state): State<AppState>,
     Path(db): Path<String>,
-    Json(body): Json<CreateIndexBody>,
+    JsonBody(body): JsonBody<CreateIndexBody>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     state.check_db(&db)?;
 
@@ -413,7 +414,7 @@ pub struct BulkDeleteIndexBody {
 pub async fn bulk_delete_indexes(
     State(state): State<AppState>,
     Path(db): Path<String>,
-    Json(body): Json<BulkDeleteIndexBody>,
+    JsonBody(body): JsonBody<BulkDeleteIndexBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     state.check_db(&db)?;
 
@@ -461,7 +462,7 @@ pub async fn bulk_delete_indexes(
 pub async fn explain(
     State(state): State<AppState>,
     Path(db): Path<String>,
-    Json(opts): Json<FindOptions>,
+    JsonBody(opts): JsonBody<FindOptions>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     state.check_db(&db)?;
     let response = state.db.explain(opts).await;

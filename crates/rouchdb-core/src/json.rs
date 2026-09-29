@@ -76,12 +76,38 @@ pub fn text_depth(bytes: &[u8]) -> usize {
 /// Reject a document body nested deeper than [`MAX_NESTING_DEPTH`].
 pub fn check_document_depth(body: &serde_json::Value) -> Result<()> {
     if value_depth(body) > MAX_NESTING_DEPTH {
-        return Err(RouchError::BadRequest(format!(
-            "Document nesting exceeds the maximum depth of {}",
-            MAX_NESTING_DEPTH
-        )));
+        return Err(too_deep());
     }
     Ok(())
+}
+
+fn too_deep() -> RouchError {
+    RouchError::BadRequest(format!(
+        "Document nesting exceeds the maximum depth of {}",
+        MAX_NESTING_DEPTH
+    ))
+}
+
+/// Decode JSON input (a request body, a file, a command-line argument)
+/// whose documents sit `envelope` levels deep, such as the 2 levels of
+/// `{"docs": [...]}`: it may be nested up to [`MAX_NESTING_DEPTH`] +
+/// `envelope` levels, so every document a write accepts can be sent.
+///
+/// Deeper input is rejected with the `BadRequest` of
+/// [`check_document_depth`]; malformed input or input of the wrong shape is
+/// `RouchError::Json`.
+pub fn from_input<T>(bytes: &[u8], envelope: usize) -> Result<T>
+where
+    T: DeserializeOwned + Send + 'static,
+{
+    let max_depth = MAX_NESTING_DEPTH.saturating_add(envelope);
+    from_slice(bytes, max_depth).map_err(|e| {
+        if text_depth(bytes) > max_depth {
+            too_deep()
+        } else {
+            RouchError::Json(e)
+        }
+    })
 }
 
 /// Whether serde_json gave up because the input is nested too deeply.
@@ -181,6 +207,49 @@ mod tests {
         assert!(is_recursion_limit(&err), "{err}");
         let err = serde_json::from_str::<serde_json::Value>("[1,]").unwrap_err();
         assert!(!is_recursion_limit(&err), "{err}");
+    }
+
+    #[test]
+    fn input_holds_documents_up_to_the_limit() {
+        // A document at the limit, alone or inside `{"docs": [...]}`.
+        let doc = |depth: usize| format!(r#"{{"v": {}}}"#, nested_text(depth - 1));
+        let body = |depth: usize| format!(r#"{{"docs": [{}]}}"#, doc(depth));
+        let value: serde_json::Value = from_input(body(MAX_NESTING_DEPTH).as_bytes(), 2).unwrap();
+        assert_eq!(value_depth(&value), MAX_NESTING_DEPTH + 2);
+        let value: serde_json::Value = from_input(doc(MAX_NESTING_DEPTH).as_bytes(), 0).unwrap();
+        assert_eq!(value_depth(&value), MAX_NESTING_DEPTH);
+
+        // Deeper input gets the BadRequest of a too-deep document write.
+        let too_deep: serde_json::Value =
+            from_slice(doc(MAX_NESTING_DEPTH + 1).as_bytes(), usize::MAX).unwrap();
+        let expected = check_document_depth(&too_deep).unwrap_err().to_string();
+        for (text, envelope) in [
+            (doc(MAX_NESTING_DEPTH + 1), 0),
+            (body(MAX_NESTING_DEPTH + 1), 2),
+            (body(MAX_NESTING_DEPTH + 50), 2),
+        ] {
+            let err = from_input::<serde_json::Value>(text.as_bytes(), envelope).unwrap_err();
+            assert!(matches!(err, RouchError::BadRequest(_)), "{err:?}");
+            assert_eq!(err.to_string(), expected);
+        }
+
+        // Malformed input and input of the wrong shape are JSON errors.
+        for text in [
+            "{\"a\": }".to_string(),
+            "[1] x".to_string(),
+            format!("{} x", nested_text(300)),
+        ] {
+            let err = from_input::<serde_json::Value>(text.as_bytes(), 0).unwrap_err();
+            assert!(
+                matches!(err, RouchError::Json(ref e) if e.is_syntax()),
+                "{err:?}"
+            );
+        }
+        let err = from_input::<Vec<u8>>(b"{}", 0).unwrap_err();
+        assert!(
+            matches!(err, RouchError::Json(ref e) if e.is_data()),
+            "{err:?}"
+        );
     }
 
     #[test]

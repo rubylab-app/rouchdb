@@ -6,6 +6,7 @@ use rouchdb::AllDocsOptions;
 use rouchdb_core::error::RouchError;
 
 use crate::error::AppError;
+use crate::extract::JsonBody;
 use crate::state::AppState;
 
 /// Query-string parameters of `_all_docs`. Booleans and integers are kept as
@@ -188,7 +189,7 @@ pub async fn post_all_docs(
     State(state): State<AppState>,
     Path(db): Path<String>,
     Query(query): Query<AllDocsQuery>,
-    Json(body): Json<serde_json::Value>,
+    JsonBody(body): JsonBody<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     state.check_db(&db)?;
     let keys = match body.get("keys") {

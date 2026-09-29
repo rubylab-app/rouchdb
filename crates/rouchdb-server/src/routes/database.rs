@@ -7,6 +7,7 @@ use serde_json::json;
 
 use super::set_location;
 use crate::error::AppError;
+use crate::extract::JsonBody;
 use crate::state::{AppState, db_not_found};
 
 /// GET /{db} — database info with CouchDB-compatible fields.
@@ -92,7 +93,7 @@ pub async fn post_doc(
     State(state): State<AppState>,
     Path(db): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    JsonBody(body): JsonBody<serde_json::Value>,
 ) -> Result<Response, AppError> {
     state.check_db(&db)?;
 
