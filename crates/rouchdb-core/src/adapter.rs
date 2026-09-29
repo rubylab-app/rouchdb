@@ -168,6 +168,11 @@ pub trait Adapter: Send + Sync {
     /// database (a remote one is re-created on its next use). A local
     /// database also gets a new [`id`](Adapter::id), so replications with it
     /// start over instead of resuming from the old database's checkpoints.
+    /// A remote (HTTP) database keeps its id when it is re-created, so
+    /// replications with it must be restarted from scratch by the caller
+    /// (`since: Some(Seq::zero())`, `checkpoint: false`). Live changes
+    /// streams do not start over either: create a new one from
+    /// `Seq::zero()` after destroying the database.
     async fn destroy(&self) -> Result<()>;
 
     /// Subscribe to the changes this adapter commits, if it can announce

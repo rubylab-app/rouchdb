@@ -1211,6 +1211,13 @@ impl Database {
     /// http database is re-created on its next use (unless it was opened
     /// with `skip_setup`, in which case operations fail with `NotFound`
     /// until the database is created again).
+    ///
+    /// Replications with a destroyed memory or redb database start over on
+    /// their own (it gets a new identity). A re-created http database keeps
+    /// its identity: cancel live replications with it and copy everything
+    /// again with `since: Some(Seq::zero())` and `checkpoint: false`. Live
+    /// changes streams keep their position: after `destroy()`, cancel them
+    /// and create new ones from `Seq::zero()`.
     pub async fn destroy(&self) -> Result<()> {
         for plugin in &self.plugins {
             plugin.on_destroy().await?;
