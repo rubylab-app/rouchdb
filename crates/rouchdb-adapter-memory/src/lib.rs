@@ -875,6 +875,9 @@ impl Adapter for MemoryAdapter {
         inner.update_seq = 0;
         inner.purge_seq = 0;
         inner.uuid = Uuid::new_v4().to_string();
+        // Under the write lock, like `announce`: a woken reader sees the
+        // empty database and its new id.
+        let _ = self.notices.send(ChangeNotice::reset());
         Ok(())
     }
 
@@ -1307,6 +1310,18 @@ mod tests {
             .unwrap();
         assert_eq!(rx.try_recv().unwrap(), notice(5, "c"));
         assert_eq!(other.try_recv().unwrap(), notice(5, "c"));
+    }
+
+    #[tokio::test]
+    async fn destroy_announces_a_reset() {
+        use rouchdb_core::adapter::ChangeNotice;
+        let db = MemoryAdapter::new("test");
+        let before = db.id().await.unwrap();
+        let mut rx = db.subscribe().unwrap();
+        db.destroy().await.unwrap();
+        assert_eq!(rx.try_recv().unwrap(), ChangeNotice::reset());
+        assert!(rx.try_recv().is_err());
+        assert_ne!(db.id().await.unwrap(), before);
     }
 
     #[tokio::test]

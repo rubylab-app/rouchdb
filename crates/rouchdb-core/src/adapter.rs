@@ -7,16 +7,24 @@ use crate::error::Result;
 
 /// A change an adapter committed, announced to the subscribers of
 /// [`Adapter::subscribe`]: one notice per changed document, sent after the
-/// write is visible to readers.
+/// write is visible to readers, or a [reset](ChangeNotice::reset) notice
+/// after [`destroy`](Adapter::destroy).
 ///
-/// `#[non_exhaustive]`: build it with [`ChangeNotice::new`].
+/// `#[non_exhaustive]`: build it with [`ChangeNotice::new`] or
+/// [`ChangeNotice::reset`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ChangeNotice {
-    /// The sequence of the change.
+    /// The sequence of the change (`0` for a reset notice).
     pub seq: Seq,
-    /// The id of the changed document.
+    /// The id of the changed document (empty for a reset notice).
     pub doc_id: String,
+    /// Whether the database was destroyed (and possibly reused) rather than
+    /// a document changed: its sequences start over and it has a new
+    /// [`id`](Adapter::id), so a reader following its changes feed must
+    /// start over from the beginning instead of resuming from the last
+    /// sequence it processed.
+    pub reset: bool,
 }
 
 impl ChangeNotice {
@@ -25,6 +33,17 @@ impl ChangeNotice {
         Self {
             seq: seq.into(),
             doc_id: doc_id.into(),
+            reset: false,
+        }
+    }
+
+    /// The database was destroyed: its sequences start over (see
+    /// [`reset`](ChangeNotice::reset)).
+    pub fn reset() -> Self {
+        Self {
+            seq: Seq::default(),
+            doc_id: String::new(),
+            reset: true,
         }
     }
 }
@@ -53,9 +72,17 @@ pub trait Adapter: Send + Sync {
     /// live replication compares it on every pass and starts over from the
     /// peer's checkpoint when it changes, since the sequences of a
     /// destroyed database start over too. The local adapters use a uuid of
-    /// their own (persisted in the file for redb, per instance in memory)
-    /// that `destroy` renews; the HTTP adapter uses the server's uuid plus
-    /// the database name.
+    /// their own that `destroy` renews: per instance in memory; for redb,
+    /// the uuid persisted in the file combined with the file's canonical
+    /// path, so a copy of a file (which holds the same uuid) is a different
+    /// database, and a file that is copied or moved is replicated with a
+    /// full rescan once instead of resuming its old checkpoints. The HTTP
+    /// adapter uses the server's uuid plus the database name.
+    ///
+    /// Replication never uses checkpoints between two peers that report the
+    /// same id: it could not tell their checkpoints apart, so it scans the
+    /// whole changes feed every time and reports a warning
+    /// (`ReplicationResult::warnings` in `rouchdb-replication`).
     ///
     /// Defaults to the database name, which meets neither requirement:
     /// override it.
@@ -153,6 +180,14 @@ pub trait Adapter: Send + Sync {
     /// [`RecvError::Lagged`](tokio::sync::broadcast::error::RecvError) and
     /// must re-read from the last sequence it processed. Writes of local
     /// (`_local/`) documents are not announced.
+    ///
+    /// An adapter that announces its changes must also announce
+    /// [`destroy`](Adapter::destroy), with a [`ChangeNotice::reset`] sent
+    /// once the database is empty and has its new id: a live replication
+    /// listens for it on both peers (to notice a target that is destroyed
+    /// and reused while the source is idle) and starts over. Peers that
+    /// return `None` are checked by comparing their `id` every
+    /// `poll_interval` instead.
     fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<ChangeNotice>> {
         None
     }

@@ -1,5 +1,6 @@
 //! Replication checkpoints keyed on the identity of each local database:
-//! same-named databases, destroyed and reused databases, `DocIds`
+//! same-named databases, a redb file and its copy, destroyed and reused
+//! databases (source or target), `DocIds`
 //! selections that only differ in how their ids are joined, and invalid
 //! selectors. Every scenario runs on the in-memory and the redb adapter.
 
@@ -120,6 +121,113 @@ async fn redb_identity_survives_reopen_and_the_checkpoint_is_resumed() {
     assert!(pull.docs_read <= 2, "pull rescanned: {pull:?}");
     assert_eq!(ids(&a).await, ids(&b).await);
     assert_eq!(ids(&a).await.len(), 6);
+}
+
+// =========================================================================
+// A redb file and a copy of it
+// =========================================================================
+
+/// A redb file with one document, closed, and a copy of it: both hold the
+/// same persisted uuid.
+async fn file_and_copy(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let original = dir.join("original.redb");
+    let copy = dir.join("copy.redb");
+    let db = Database::open(&original, "db").unwrap();
+    db.put("seed", serde_json::json!({})).await.unwrap();
+    db.close().await.unwrap();
+    drop(db);
+    std::fs::copy(&original, &copy).unwrap();
+    (original, copy)
+}
+
+#[tokio::test]
+async fn sync_between_a_redb_file_and_its_copy_copies_both_ways() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path_a, path_b) = file_and_copy(dir.path()).await;
+    let a = Database::open(&path_a, "original").unwrap();
+    let b = Database::open(&path_b, "copy").unwrap();
+    assert_ne!(
+        a.adapter().id().await.unwrap(),
+        b.adapter().id().await.unwrap(),
+        "a copy of a file must not share its identity"
+    );
+    a.put("a", serde_json::json!({"from": "A"})).await.unwrap();
+    b.put("b", serde_json::json!({"from": "B"})).await.unwrap();
+
+    let (push, pull) = a.sync(&b).await.unwrap();
+    assert!(push.ok && pull.ok, "{push:?} {pull:?}");
+    assert!(push.warnings.is_empty() && pull.warnings.is_empty());
+    assert_eq!(push.docs_written, 1, "{push:?}");
+    assert_eq!(
+        pull.docs_written, 1,
+        "pull skipped the copy's document: {pull:?}"
+    );
+    assert_eq!(ids(&a).await, ["a", "b", "seed"]);
+    assert_eq!(ids(&b).await, ["a", "b", "seed"]);
+
+    // A retry has nothing left to do.
+    let (push, pull) = a.sync(&b).await.unwrap();
+    assert_eq!((push.docs_written, pull.docs_written), (0, 0));
+
+    // Nor after reopening both files, which keeps both identities; new
+    // divergent writes still go both ways.
+    let (id_a, id_b) = (
+        a.adapter().id().await.unwrap(),
+        b.adapter().id().await.unwrap(),
+    );
+    drop((a, b));
+    let a = Database::open(&path_a, "original").unwrap();
+    let b = Database::open(&path_b, "copy").unwrap();
+    assert_eq!(a.adapter().id().await.unwrap(), id_a);
+    assert_eq!(b.adapter().id().await.unwrap(), id_b);
+    let (push, pull) = a.sync(&b).await.unwrap();
+    assert_eq!((push.docs_written, pull.docs_written), (0, 0));
+    a.put("a2", serde_json::json!({})).await.unwrap();
+    b.put("b2", serde_json::json!({})).await.unwrap();
+    let (push, pull) = a.sync(&b).await.unwrap();
+    assert_eq!((push.docs_written, pull.docs_written), (1, 1));
+    assert_eq!(ids(&a).await, ["a", "a2", "b", "b2", "seed"]);
+    assert_eq!(ids(&b).await, ["a", "a2", "b", "b2", "seed"]);
+    assert_eq!(
+        a.get("b").await.unwrap().data["from"],
+        serde_json::json!("B")
+    );
+    assert_eq!(
+        b.get("a").await.unwrap().data["from"],
+        serde_json::json!("A")
+    );
+}
+
+#[tokio::test]
+async fn redb_identity_is_bound_to_the_file_location() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.redb");
+    let db = Database::open(&path, "db").unwrap();
+    db.put("d", serde_json::json!({})).await.unwrap();
+    let id = db.adapter().id().await.unwrap();
+    drop(db);
+
+    // The same file through another spelling of its path, or a symlink.
+    let spelled = dir.path().join(".").join("db.redb");
+    let db = Database::open(&spelled, "db").unwrap();
+    assert_eq!(db.adapter().id().await.unwrap(), id);
+    drop(db);
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("link.redb");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        let db = Database::open(&link, "db").unwrap();
+        assert_eq!(db.adapter().id().await.unwrap(), id);
+        drop(db);
+    }
+
+    // A moved file is another replica: its documents are intact, and its
+    // next replication with each peer rescans once.
+    let moved = dir.path().join("moved.redb");
+    std::fs::rename(&path, &moved).unwrap();
+    let db = Database::open(&moved, "db").unwrap();
+    assert_ne!(db.adapter().id().await.unwrap(), id);
+    assert_eq!(ids(&db).await, ["d"]);
 }
 
 #[tokio::test]
@@ -285,6 +393,62 @@ async fn live_replication_after_the_reused_source_passes_the_old_cursor() {
                 "{kind}: fresh{i} skipped"
             );
         }
+        handle.cancel();
+    }
+}
+
+// =========================================================================
+// Live replication to a target that is destroyed and reused
+// =========================================================================
+
+#[tokio::test]
+async fn live_replication_refills_a_destroyed_target_while_the_source_is_idle() {
+    for kind in KINDS {
+        let source = Backend::open(kind, "source");
+        let target = Backend::open(kind, "target");
+        for i in 0..3 {
+            source
+                .db
+                .put(&format!("keep{i}"), serde_json::json!({}))
+                .await
+                .unwrap();
+        }
+
+        let (mut rx, handle) = source.db.replicate_to_live(
+            &target.db,
+            ReplicationOptions {
+                // Long enough that only the reset notice can wake the
+                // session within the test's deadline.
+                poll_interval: Duration::from_secs(3600),
+                live: true,
+                ..Default::default()
+            },
+        );
+        until_paused(&mut rx).await;
+        assert_eq!(ids(&target.db).await.len(), 3, "{kind}");
+
+        // The source stays idle: nothing is written to it from here on.
+        let source_seq = source.db.info().await.unwrap().update_seq;
+        target.db.destroy().await.unwrap();
+        target
+            .db
+            .put("target_reused", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(
+            wait_for(&target.db, "keep2", &mut rx).await,
+            "{kind}: the destroyed target was not refilled"
+        );
+        assert_eq!(
+            ids(&target.db).await,
+            ["keep0", "keep1", "keep2", "target_reused"],
+            "{kind}"
+        );
+        assert_eq!(source.db.info().await.unwrap().update_seq, source_seq);
+
+        // The session keeps following the source into the new target.
+        source.db.put("after", serde_json::json!({})).await.unwrap();
+        assert!(wait_for(&target.db, "after", &mut rx).await, "{kind}");
         handle.cancel();
     }
 }
