@@ -1398,6 +1398,132 @@ mod tests {
         assert_eq!(inner.purge_seq, 0);
     }
 
+    /// The security document round-trips, is kept apart from local
+    /// documents (`_local/_security` is an ordinary one, as in CouchDB) and
+    /// is reset by `destroy`.
+    #[tokio::test]
+    async fn security_document_round_trip() {
+        let db = new_db().await;
+        let stored = |sec: SecurityDocument| serde_json::to_value(sec).unwrap();
+        let empty = stored(SecurityDocument::default());
+        assert_eq!(stored(db.get_security().await.unwrap()), empty);
+
+        let sec = SecurityDocument {
+            admins: SecurityGroup {
+                names: vec!["bob".into()],
+                roles: vec![],
+            },
+            members: SecurityGroup {
+                names: vec![],
+                roles: vec!["team".into()],
+            },
+            extra: serde_json::Map::from_iter([("x".into(), serde_json::json!(1))]),
+        };
+        let expected = stored(sec.clone());
+        db.put_security(sec).await.unwrap();
+        assert_eq!(stored(db.get_security().await.unwrap()), expected);
+
+        assert!(matches!(
+            db.get_local("_security").await,
+            Err(RouchError::NotFound(_))
+        ));
+        db.put_local(
+            "_security",
+            serde_json::json!({"admins": {"names": ["eve"]}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored(db.get_security().await.unwrap()), expected);
+
+        db.destroy().await.unwrap();
+        assert_eq!(stored(db.get_security().await.unwrap()), empty);
+    }
+
+    /// Re-sending a revision already stored with its body in replication
+    /// mode is a no-op, as in CouchDB: the stored body stays, and there is
+    /// no new sequence or change.
+    #[tokio::test]
+    async fn replicated_known_revision_is_a_noop() {
+        let db = new_db().await;
+        let rev: Revision = format!("1-{}", "a".repeat(32)).parse().unwrap();
+        for v in [1, 2] {
+            let doc = Document {
+                id: "d".into(),
+                rev: Some(rev.clone()),
+                deleted: false,
+                data: serde_json::json!({"v": v}),
+                attachments: HashMap::new(),
+            };
+            let results = db
+                .bulk_docs(vec![doc], BulkDocsOptions::replication())
+                .await
+                .unwrap();
+            assert!(results[0].ok, "{:?}", results[0]);
+        }
+
+        let doc = db.get("d", GetOptions::default()).await.unwrap();
+        assert_eq!(doc.data["v"], 1);
+        assert_eq!(db.info().await.unwrap().update_seq, Seq::Num(1));
+        let changes = db.changes(ChangesOptions::default()).await.unwrap();
+        assert_eq!(changes.results.len(), 1);
+        assert_eq!(changes.results[0].seq, Seq::Num(1));
+    }
+
+    /// A replicated attachment stub must name bytes already stored: a known
+    /// digest is accepted, an unknown one is CouchDB's `missing_stub`.
+    #[tokio::test]
+    async fn replicated_stubs_need_stored_bytes() {
+        let db = new_db().await;
+        let r1 = db
+            .bulk_docs(
+                vec![Document::from_json(serde_json::json!({"_id": "src"})).unwrap()],
+                BulkDocsOptions::new(),
+            )
+            .await
+            .unwrap()[0]
+            .rev
+            .clone()
+            .unwrap();
+        db.put_attachment("src", "a.txt", &r1, b"hi".to_vec(), "text/plain")
+            .await
+            .unwrap();
+        let src = db.get("src", GetOptions::default()).await.unwrap();
+        let digest = src.attachments["a.txt"].digest.clone();
+
+        let replicated = |id: &str, digest: &str| {
+            Document::from_json(serde_json::json!({
+                "_id": id,
+                "_rev": format!("1-{}", "b".repeat(32)),
+                "_attachments": {"a.txt": {
+                    "stub": true, "content_type": "text/plain",
+                    "digest": digest, "length": 2, "revpos": 1,
+                }},
+            }))
+            .unwrap()
+        };
+        let results = db
+            .bulk_docs(
+                vec![
+                    replicated("known", &digest),
+                    replicated("unknown", "md5-AAAAAAAAAAAAAAAAAAAAAA=="),
+                ],
+                BulkDocsOptions::replication(),
+            )
+            .await
+            .unwrap();
+        assert!(results[0].ok, "{:?}", results[0]);
+        assert_eq!(results[1].error.as_deref(), Some("missing_stub"));
+        let bytes = db
+            .get_attachment("known", "a.txt", GetAttachmentOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"hi");
+        assert!(matches!(
+            db.get("unknown", GetOptions::default()).await,
+            Err(RouchError::NotFound(_))
+        ));
+    }
+
     #[tokio::test]
     async fn attachment_roundtrip() {
         let db = new_db().await;
