@@ -204,10 +204,7 @@ async fn get_open_revs(
 
     let items = revs
         .iter()
-        .map(|rev| BulkGetItem {
-            id: docid.to_string(),
-            rev: Some(rev.clone()),
-        })
+        .map(|rev| BulkGetItem::new(docid).with_rev(rev))
         .collect();
     let response = state.db.adapter().bulk_get(items).await?;
 

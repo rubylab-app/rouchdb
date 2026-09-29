@@ -213,7 +213,7 @@ let another_receiver = sender.subscribe();
 sender.notify(Seq::Num(42), "user:alice".into());
 ```
 
-A custom adapter should rather implement `Adapter::subscribe` (a default method returning `None`): return a `tokio::sync::broadcast::Receiver<ChangeNotice>` and send a `ChangeNotice { seq, doc_id }` for every document change once it is committed. Live changes streams and live replication then use it automatically. `ChangeSender` remains for feeding a stream notifications by hand; `ChangeNotification` is the same type as `ChangeNotice`.
+A custom adapter should rather implement `Adapter::subscribe` (a default method returning `None`): return a `tokio::sync::broadcast::Receiver<ChangeNotice>` and send a `ChangeNotice::new(seq, doc_id)` for every document change once it is committed. Live changes streams and live replication then use it automatically. `ChangeSender` remains for feeding a stream notifications by hand; `ChangeNotification` is the same type as `ChangeNotice`.
 
 ## Custom Filter Closures
 
@@ -291,7 +291,7 @@ while let Some(event) = rx.recv().await {
         ChangesEvent::Change(ce) => {
             println!("Doc changed: {} seq={}", ce.id, ce.seq);
         }
-        ChangesEvent::Complete { last_seq } => {
+        ChangesEvent::Complete { last_seq, .. } => {
             println!("Caught up at seq {}", last_seq);
         }
         ChangesEvent::Error(msg) => {
@@ -303,6 +303,9 @@ while let Some(event) = rx.recv().await {
         ChangesEvent::Active => {
             println!("Processing changes...");
         }
+        // `ChangesEvent` is `#[non_exhaustive]` (this also covers
+        // `Heartbeat` and events added later).
+        _ => {}
     }
 }
 

@@ -128,7 +128,10 @@ pub struct MyAdapter {
 
 #[async_trait]
 impl Adapter for MyAdapter {
-    async fn info(&self) -> Result<DbInfo> { todo!() }
+    async fn info(&self) -> Result<DbInfo> {
+        // db_name, doc_count, doc_del_count, update_seq
+        Ok(DbInfo::new("mydb", 0, 0, 0))
+    }
 
     async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> { todo!() }
 
@@ -186,6 +189,39 @@ impl Adapter for MyAdapter {
     // Override them if your adapter needs custom behavior.
 }
 ```
+
+### Building Results
+
+The result types an adapter returns (`DbInfo`, `DocResult`, `AllDocsResponse`, `ChangesResponse`, `ChangeEvent`, `RevsDiffResponse`, `BulkGetResponse`, `PurgeResponse`, `ChangeNotice`, ...) are `#[non_exhaustive]`, so that fields can be added without a breaking release: build them with their constructors, not struct literals.
+
+```rust
+use rouchdb_core::adapter::ChangeNotice;
+use rouchdb_core::document::*;
+use serde_json::json;
+
+// bulk_docs, put_attachment, remove_attachment
+let written = DocResult::ok("doc1", "2-abc");
+let failed = DocResult::error("doc2", "conflict", "Document update conflict.");
+
+// all_docs
+let row = AllDocsRow::document("doc1", AllDocsRowValue::new("2-abc", false))
+    .with_doc(json!({"_id": "doc1", "_rev": "2-abc"}));
+let all = AllDocsResponse::new(1, 0, vec![row]).with_update_seq(Seq::Num(7));
+
+// changes
+let event = ChangeEvent::new(7, "doc1", ["2-abc"]).with_deleted(false);
+let changes = ChangesResponse::new(vec![event], 7);
+
+// bulk_get
+let found = BulkGetDoc::ok(json!({"_id": "doc1", "_rev": "2-abc"}));
+let missing = BulkGetDoc::error(BulkGetError::new("doc3", "1-x", "not_found", "missing"));
+let bulk = BulkGetResponse::new(vec![BulkGetResult::new("doc1", vec![found, missing])]);
+
+// subscribe
+let notice = ChangeNotice::new(7, "doc1");
+```
+
+Fields stay public, so tests and callers read them as before. See [API Stability](../reference/api-stability.md).
 
 ### Key Implementation Notes
 

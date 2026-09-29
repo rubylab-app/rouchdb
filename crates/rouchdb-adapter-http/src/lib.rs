@@ -168,6 +168,23 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Options for [`HttpAdapter::with_options`].
+///
+/// Set the options you need and fill the rest with `..Default::default()`:
+/// fields may be added in minor releases, and a literal that lists every
+/// field would then stop compiling.
+///
+/// ```
+/// use rouchdb_adapter_http::{HttpAdapter, HttpAdapterOptions};
+///
+/// let adapter = HttpAdapter::with_options(
+///     "http://localhost:5984/mydb",
+///     HttpAdapterOptions {
+///         skip_setup: true,
+///         ..Default::default()
+///     },
+/// );
+/// # let _ = adapter;
+/// ```
 #[derive(Debug, Clone)]
 pub struct HttpAdapterOptions {
     /// Do not create the remote database on first use (PouchDB's
@@ -340,6 +357,22 @@ pub(crate) async fn check_response(response: reqwest::Response) -> Result<reqwes
 }
 
 /// Parse a CouchDB sequence value (can be integer or string).
+/// A `DocResult` exactly as CouchDB reported it (any member may be missing).
+fn wire_doc_result(
+    ok: bool,
+    id: String,
+    rev: Option<String>,
+    error: Option<String>,
+    reason: Option<String>,
+) -> DocResult {
+    let mut result = DocResult::ok(id, "");
+    result.ok = ok;
+    result.rev = rev;
+    result.error = error;
+    result.reason = reason;
+    result
+}
+
 fn parse_seq(value: &serde_json::Value) -> Seq {
     match value {
         serde_json::Value::Number(n) => Seq::Num(n.as_u64().unwrap_or(0)),
@@ -367,12 +400,12 @@ impl Adapter for HttpAdapter {
         let resp = self.check_error(resp).await?;
         let info: CouchDbInfo = read_json(resp).await?;
 
-        Ok(DbInfo {
-            db_name: info.db_name,
-            doc_count: info.doc_count,
-            doc_del_count: info.doc_del_count,
-            update_seq: parse_seq(&info.update_seq),
-        })
+        Ok(DbInfo::new(
+            info.db_name,
+            info.doc_count,
+            info.doc_del_count,
+            parse_seq(&info.update_seq),
+        ))
     }
 
     async fn id(&self) -> Result<String> {
@@ -510,12 +543,14 @@ impl Adapter for HttpAdapter {
             let resp = self.check_error(resp).await?;
             read_json(resp).await?
         };
-        let mut results = results.into_iter().map(|r| DocResult {
-            ok: r.ok.unwrap_or(r.error.is_none()),
-            id: r.id.unwrap_or_default(),
-            rev: r.rev,
-            error: r.error,
-            reason: r.reason,
+        let mut results = results.into_iter().map(|r| {
+            wire_doc_result(
+                r.ok.unwrap_or(r.error.is_none()),
+                r.id.unwrap_or_default(),
+                r.rev,
+                r.error,
+                r.reason,
+            )
         });
 
         if !opts.new_edits {
@@ -585,12 +620,10 @@ impl Adapter for HttpAdapter {
         let resp = self.check_error(resp).await?;
         let result: CouchDbAllDocsResponse = read_json(resp).await?;
 
-        Ok(AllDocsResponse {
-            total_rows: result.total_rows,
-            offset: result.offset.unwrap_or(0),
-            rows: result.rows,
-            update_seq: result.update_seq.as_ref().map(parse_seq),
-        })
+        Ok(
+            AllDocsResponse::new(result.total_rows, result.offset.unwrap_or(0), result.rows)
+                .with_update_seq(result.update_seq.as_ref().map(parse_seq)),
+        )
     }
 
     async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
@@ -650,9 +683,8 @@ impl Adapter for HttpAdapter {
         let resp = self.check_error(resp).await?;
         let result: CouchDbChangesResponse = read_json(resp).await?;
 
-        Ok(ChangesResponse {
-            last_seq: parse_seq(&result.last_seq),
-            results: result
+        Ok(ChangesResponse::new(
+            result
                 .results
                 .into_iter()
                 .map(|r| {
@@ -665,21 +697,18 @@ impl Adapter for HttpAdapter {
                     } else {
                         None
                     };
-                    ChangeEvent {
-                        seq: parse_seq(&r.seq),
-                        id: r.id,
-                        changes: r
-                            .changes
-                            .into_iter()
-                            .map(|c| ChangeRev { rev: c.rev })
-                            .collect(),
-                        deleted: r.deleted,
-                        doc: if opts.include_docs { r.doc } else { None },
-                        conflicts,
-                    }
+                    ChangeEvent::new(
+                        parse_seq(&r.seq),
+                        r.id,
+                        r.changes.into_iter().map(|c| c.rev),
+                    )
+                    .with_deleted(r.deleted)
+                    .with_doc(if opts.include_docs { r.doc } else { None })
+                    .with_conflicts(conflicts)
                 })
                 .collect(),
-        })
+            parse_seq(&result.last_seq),
+        ))
     }
 
     async fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
@@ -695,7 +724,7 @@ impl Adapter for HttpAdapter {
 
         let results: HashMap<String, RevsDiffResult> = read_json(resp).await?;
 
-        Ok(RevsDiffResponse { results })
+        Ok(RevsDiffResponse::new(results))
     }
 
     async fn bulk_get(&self, docs: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
@@ -727,28 +756,28 @@ impl Adapter for HttpAdapter {
 
         let result: CouchDbBulkGetResponse = read_json(resp).await?;
 
-        Ok(BulkGetResponse {
-            results: result
+        Ok(BulkGetResponse::new(
+            result
                 .results
                 .into_iter()
-                .map(|r| BulkGetResult {
-                    id: r.id,
-                    docs: r
+                .map(|r| {
+                    let docs = r
                         .docs
                         .into_iter()
-                        .map(|d| BulkGetDoc {
-                            ok: d.ok.map(fill_inline_attachment_lengths),
-                            error: d.error.map(|e| BulkGetError {
-                                id: e.id,
-                                rev: e.rev,
-                                error: e.error,
-                                reason: e.reason,
-                            }),
+                        .map(|d| {
+                            // As CouchDB sent it (either member may be missing).
+                            let mut doc = BulkGetDoc::ok(serde_json::Value::Null);
+                            doc.ok = d.ok.map(fill_inline_attachment_lengths);
+                            doc.error = d
+                                .error
+                                .map(|e| BulkGetError::new(e.id, e.rev, e.error, e.reason));
+                            doc
                         })
-                        .collect(),
+                        .collect();
+                    BulkGetResult::new(r.id, docs)
                 })
                 .collect(),
-        })
+        ))
     }
 
     async fn put_attachment(
@@ -778,13 +807,13 @@ impl Adapter for HttpAdapter {
         let resp = self.check_error(resp).await?;
         let result: CouchDbPutResponse = read_json(resp).await?;
 
-        Ok(DocResult {
-            ok: result.ok.unwrap_or(true),
-            id: result.id,
-            rev: Some(result.rev),
-            error: None,
-            reason: None,
-        })
+        Ok(wire_doc_result(
+            result.ok.unwrap_or(true),
+            result.id,
+            Some(result.rev),
+            None,
+            None,
+        ))
     }
 
     async fn get_attachment(
@@ -836,13 +865,13 @@ impl Adapter for HttpAdapter {
         let resp = self.check_error(resp).await?;
         let result: CouchDbPutResponse = read_json(resp).await?;
 
-        Ok(DocResult {
-            ok: result.ok.unwrap_or(true),
-            id: result.id,
-            rev: Some(result.rev),
-            error: None,
-            reason: None,
-        })
+        Ok(wire_doc_result(
+            result.ok.unwrap_or(true),
+            result.id,
+            Some(result.rev),
+            None,
+            None,
+        ))
     }
 
     async fn get_local(&self, id: &str) -> Result<serde_json::Value> {

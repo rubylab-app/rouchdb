@@ -26,6 +26,11 @@ use rouchdb_core::error::{Result, RouchError};
 /// An empty `views`, `filters`, `shows`, `lists` or `updates` object is not
 /// written (CouchDB treats it like an absent one).
 ///
+/// Build one with [`DesignDocument::new`] and the `with_*` methods, or with
+/// a struct literal ending in `..Default::default()`: fields may be added in
+/// minor releases, and a literal that lists every field would then stop
+/// compiling. The same goes for [`ViewDef`].
+///
 /// ```
 /// use rouchdb_views::{DesignDocument, ViewDef};
 ///

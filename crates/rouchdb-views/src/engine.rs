@@ -14,6 +14,9 @@ pub type MapFn =
     Arc<dyn Fn(&serde_json::Value) -> Vec<(serde_json::Value, serde_json::Value)> + Send + Sync>;
 
 /// A persistent view index that is incrementally updated.
+///
+/// `#[non_exhaustive]`: built by [`ViewEngine`], read by callers.
+#[non_exhaustive]
 pub struct PersistentViewIndex {
     pub ddoc: String,
     pub view_name: String,
@@ -175,11 +178,9 @@ impl ViewEngine {
                 .entries
                 .iter()
                 .flat_map(|(id, pairs)| {
-                    pairs.iter().map(|(k, v)| EmittedRow {
-                        id: id.clone(),
-                        key: k.clone(),
-                        value: v.clone(),
-                    })
+                    pairs
+                        .iter()
+                        .map(|(k, v)| EmittedRow::new(id.clone(), k.clone(), v.clone()))
                 })
                 .collect();
             sort_emitted(&mut rows);

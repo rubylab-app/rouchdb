@@ -26,11 +26,17 @@ pub type ChangesFilter = Arc<dyn Fn(&ChangeEvent) -> bool + Send + Sync>;
 ///
 /// Mirrors PouchDB's changes event model: `change`, `complete`, `error`,
 /// `paused`, and `active`.
+///
+/// `#[non_exhaustive]`: new events may be added in minor releases, so a
+/// `match` on it needs a catch-all arm, and `Complete` may gain fields
+/// (match it as `Complete { last_seq, .. }`).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ChangesEvent {
     /// A document changed.
     Change(ChangeEvent),
     /// The stream completed (limit reached or non-live mode ended).
+    #[non_exhaustive]
     Complete { last_seq: Seq },
     /// An error occurred while fetching changes.
     Error(String),
@@ -62,7 +68,7 @@ impl ChangeSender {
 
     pub fn notify(&self, seq: Seq, doc_id: String) {
         // Ignore send errors (no receivers)
-        let _ = self.tx.send(ChangeNotification { seq, doc_id });
+        let _ = self.tx.send(ChangeNotification::new(seq, doc_id));
     }
 
     pub fn subscribe(&self) -> ChangeReceiver {
@@ -107,6 +113,21 @@ impl ChangeReceiver {
 }
 
 /// Configuration for a changes stream.
+///
+/// Set the options you need and fill the rest with `..Default::default()`:
+/// fields may be added in minor releases, and a literal that lists every
+/// field would then stop compiling.
+///
+/// ```
+/// use rouchdb_changes::ChangesStreamOptions;
+///
+/// let opts = ChangesStreamOptions {
+///     live: true,
+///     include_docs: true,
+///     ..Default::default()
+/// };
+/// # let _ = opts;
+/// ```
 #[derive(Clone)]
 pub struct ChangesStreamOptions {
     pub since: Seq,

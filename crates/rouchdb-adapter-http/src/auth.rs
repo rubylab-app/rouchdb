@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 use rouchdb_core::error::{Result, RouchError};
 
 /// A CouchDB session response.
+///
+/// `#[non_exhaustive]`: fields may be added in minor releases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Session {
     pub ok: bool,
     #[serde(rename = "userCtx")]
@@ -16,7 +19,10 @@ pub struct Session {
 }
 
 /// User context from a session response.
+///
+/// `#[non_exhaustive]`: fields may be added in minor releases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct UserContext {
     pub name: Option<String>,
     pub roles: Vec<String>,

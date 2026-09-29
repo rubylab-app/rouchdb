@@ -885,11 +885,12 @@ fn summary(events: &[ReplicationEvent]) -> Vec<String> {
         .map(|e| match e {
             ReplicationEvent::Active => "active".to_string(),
             ReplicationEvent::Paused => "paused".to_string(),
-            ReplicationEvent::Change { docs_read } => format!("change {docs_read}"),
+            ReplicationEvent::Change { docs_read, .. } => format!("change {docs_read}"),
             ReplicationEvent::Complete(r) => {
                 format!("complete ok={} written={}", r.ok, r.docs_written)
             }
             ReplicationEvent::Error(m) => format!("error {m}"),
+            other => format!("{other:?}"),
         })
         .collect()
 }
@@ -1059,7 +1060,7 @@ async fn live_replicate_picks_up_new_docs() {
     assert!(
         wait_for(&mut rx, |e| matches!(
             e,
-            ReplicationEvent::Change { docs_read: 1 }
+            ReplicationEvent::Change { docs_read: 1, .. }
         ))
         .await,
         "late_doc was not replicated by live replication"
@@ -1431,7 +1432,7 @@ async fn live_pull_from_couchdb_delivers_later_writes() {
     assert!(
         wait_for(&mut rx, |e| matches!(
             e,
-            ReplicationEvent::Change { docs_read: 1 }
+            ReplicationEvent::Change { docs_read: 1, .. }
         ))
         .await
     );

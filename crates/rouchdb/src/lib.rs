@@ -64,8 +64,9 @@ pub use rouchdb_changes::{
 };
 pub use rouchdb_query::{
     BuiltIndex, CompiledSelector, CreateIndexResponse, ExplainIndex, ExplainResponse, FindOptions,
-    FindResponse, IndexDefinition, IndexFields, IndexInfo, ReduceFn, SortField, StaleOption,
-    ViewQueryOptions, ViewResult, build_index, find, find_in_docs, matches_selector, query_view,
+    FindResponse, IndexDefinition, IndexFields, IndexInfo, ReduceFn, SortDirection, SortField,
+    StaleOption, ViewQueryOptions, ViewResult, build_index, find, find_in_docs, matches_selector,
+    query_view,
 };
 pub use rouchdb_views::{DesignDocument, PersistentViewIndex, ViewDef, ViewEngine};
 
@@ -218,13 +219,7 @@ impl Adapter for PluginAdapter {
             match outcome {
                 Ok(()) => accepted.push(doc),
                 Err(e) => match denial(&e) {
-                    Some(kind) => denied.push(DocResult {
-                        ok: false,
-                        id: doc.id,
-                        rev: None,
-                        error: Some(kind.to_string()),
-                        reason: Some(e.to_string()),
-                    }),
+                    Some(kind) => denied.push(DocResult::error(doc.id, kind, e.to_string())),
                     None => return Err(e),
                 },
             }
@@ -246,13 +241,9 @@ impl Adapter for PluginAdapter {
                 results.iter().map(|r| r.id.clone()).collect();
             for (id, rev) in written {
                 if !failed.contains(&id) {
-                    results.push(DocResult {
-                        ok: true,
-                        id,
-                        rev,
-                        error: None,
-                        reason: None,
-                    });
+                    let mut written = DocResult::ok(id, "");
+                    written.rev = rev;
+                    results.push(written);
                 }
             }
         }
@@ -722,7 +713,7 @@ impl Database {
                 event.doc = None;
             }
         }
-        Ok(ChangesResponse { results, last_seq })
+        Ok(ChangesResponse::new(results, last_seq))
     }
 
     /// Start a live (continuous) changes feed.
@@ -927,10 +918,7 @@ impl Database {
             return remote_create_index(remote, name, def).await;
         }
 
-        let exists = || CreateIndexResponse {
-            result: "exists".to_string(),
-            name: name.clone(),
-        };
+        let exists = || CreateIndexResponse::new("exists", name.clone());
         if self.indexes.read().await.contains_key(&name) {
             return Ok(exists());
         }
@@ -950,10 +938,7 @@ impl Database {
                 ..Default::default()
             })
             .await?;
-        let mut built = BuiltIndex {
-            def: index_def,
-            entries: Vec::new(),
-        };
+        let mut built = BuiltIndex::new(index_def);
         built.apply_changes(&changes.results);
 
         let mut indexes = self.indexes.write().await;
@@ -968,10 +953,7 @@ impl Database {
             },
         );
 
-        Ok(CreateIndexResponse {
-            result: "created".to_string(),
-            name,
-        })
+        Ok(CreateIndexResponse::new("created", name))
     }
 
     /// Get all indexes defined on this database.
@@ -992,12 +974,9 @@ impl Database {
         let indexes = self.indexes.read().await;
         let mut result: Vec<IndexInfo> = indexes
             .values()
-            .map(|idx| IndexInfo {
-                name: idx.built.def.name.clone(),
-                ddoc: idx.built.def.ddoc.clone(),
-                def: IndexFields {
-                    fields: idx.built.def.fields.clone(),
-                },
+            .map(|idx| {
+                let def = &idx.built.def;
+                IndexInfo::new(def.name.clone(), def.ddoc.clone(), def.fields.clone())
             })
             .collect();
         result.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1023,29 +1002,19 @@ impl Database {
         let dbname = self.info().await.map(|i| i.db_name).unwrap_or_default();
 
         if let Some(def) = usable {
-            ExplainResponse {
+            ExplainResponse::new(
                 dbname,
-                index: ExplainIndex {
-                    ddoc: def.ddoc,
-                    name: def.name,
-                    index_type: "json".into(),
-                    def: IndexFields { fields: def.fields },
-                },
-                selector: opts.selector,
-                fields: opts.fields,
-            }
+                ExplainIndex::new(def.ddoc, def.name, "json", def.fields),
+                opts.selector,
+                opts.fields,
+            )
         } else {
-            ExplainResponse {
+            ExplainResponse::new(
                 dbname,
-                index: ExplainIndex {
-                    ddoc: None,
-                    name: "_all_docs".into(),
-                    index_type: "special".into(),
-                    def: IndexFields { fields: vec![] },
-                },
-                selector: opts.selector,
-                fields: opts.fields,
-            }
+                ExplainIndex::new(None, "_all_docs", "special", vec![]),
+                opts.selector,
+                opts.fields,
+            )
         }
     }
 
@@ -1509,7 +1478,7 @@ async fn remote_find(remote: &HttpAdapter, opts: &FindOptions) -> Result<Option<
                 Some(serde_json::Value::Array(docs)) => docs.clone(),
                 _ => Vec::new(),
             };
-            Ok(Some(FindResponse { docs }))
+            Ok(Some(FindResponse::new(docs)))
         }
         Err((400, body)) if body["error"] == "no_usable_index" => Ok(None),
         Err((status, body)) => Err(remote_error(status, &body)),
@@ -1530,10 +1499,10 @@ async fn remote_create_index(
         body["ddoc"] = serde_json::json!(ddoc);
     }
     match remote_request(remote, "POST", "_index", Some(&body)).await? {
-        Ok(response) => Ok(CreateIndexResponse {
-            result: response["result"].as_str().unwrap_or("created").to_string(),
-            name: response["name"].as_str().unwrap_or(&name).to_string(),
-        }),
+        Ok(response) => Ok(CreateIndexResponse::new(
+            response["result"].as_str().unwrap_or("created"),
+            response["name"].as_str().unwrap_or(&name),
+        )),
         Err((status, body)) => Err(remote_error(status, &body)),
     }
 }
@@ -1552,11 +1521,11 @@ async fn remote_indexes(remote: &HttpAdapter) -> Result<Vec<(String, IndexInfo)>
         let fields = serde_json::from_value(index["def"]["fields"].clone()).unwrap_or_default();
         result.push((
             ddoc.clone(),
-            IndexInfo {
-                name: index["name"].as_str().unwrap_or_default().to_string(),
-                ddoc: Some(ddoc),
-                def: IndexFields { fields },
-            },
+            IndexInfo::new(
+                index["name"].as_str().unwrap_or_default(),
+                Some(ddoc),
+                fields,
+            ),
         ));
     }
     Ok(result)
@@ -1589,19 +1558,17 @@ async fn remote_explain(remote: &HttpAdapter, opts: &FindOptions) -> Option<Expl
         .ok()?
         .ok()?;
     let index = &response["index"];
-    Some(ExplainResponse {
-        dbname: response["dbname"].as_str().unwrap_or_default().to_string(),
-        index: ExplainIndex {
-            ddoc: index["ddoc"].as_str().map(str::to_string),
-            name: index["name"].as_str().unwrap_or_default().to_string(),
-            index_type: index["type"].as_str().unwrap_or_default().to_string(),
-            def: IndexFields {
-                fields: serde_json::from_value(index["def"]["fields"].clone()).unwrap_or_default(),
-            },
-        },
-        selector: opts.selector.clone(),
-        fields: opts.fields.clone(),
-    })
+    Some(ExplainResponse::new(
+        response["dbname"].as_str().unwrap_or_default(),
+        ExplainIndex::new(
+            index["ddoc"].as_str().map(str::to_string),
+            index["name"].as_str().unwrap_or_default(),
+            index["type"].as_str().unwrap_or_default(),
+            serde_json::from_value(index["def"]["fields"].clone()).unwrap_or_default(),
+        ),
+        opts.selector.clone(),
+        opts.fields.clone(),
+    ))
 }
 
 /// Percent-encode a URL path segment (everything but RFC 3986 unreserved
@@ -2674,13 +2641,12 @@ mod tests {
             let mut results = Vec::new();
             for doc in docs {
                 match self.reject.get(&doc.id) {
-                    Some((error, reason)) => results.push(DocResult {
-                        ok: false,
-                        id: doc.id,
-                        rev: None,
-                        error: error.map(str::to_string),
-                        reason: reason.map(str::to_string),
-                    }),
+                    Some((error, reason)) => {
+                        let mut result = DocResult::error(doc.id, "", "");
+                        result.error = error.map(str::to_string);
+                        result.reason = reason.map(str::to_string);
+                        results.push(result);
+                    }
                     None => results.extend(self.inner.bulk_docs(vec![doc], opts.clone()).await?),
                 }
             }

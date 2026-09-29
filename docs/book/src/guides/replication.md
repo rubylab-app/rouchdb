@@ -267,7 +267,7 @@ let (result, mut rx) = local.replicate_to_with_events(
 while let Ok(event) = rx.try_recv() {
     match event {
         ReplicationEvent::Active => println!("Replication started"),
-        ReplicationEvent::Change { docs_read } => {
+        ReplicationEvent::Change { docs_read, .. } => {
             println!("Progress: {} docs read", docs_read);
         }
         ReplicationEvent::Complete(result) => {
@@ -275,6 +275,8 @@ while let Ok(event) = rx.try_recv() {
         }
         ReplicationEvent::Error(msg) => println!("Error: {}", msg),
         ReplicationEvent::Paused => println!("Waiting for changes..."),
+        // `ReplicationEvent` is `#[non_exhaustive]`: new events may be added.
+        _ => {}
     }
 }
 ```
@@ -288,6 +290,8 @@ while let Ok(event) = rx.try_recv() {
 | `Paused` | Waiting for more changes (live mode). |
 | `Complete(ReplicationResult)` | Replication finished (one-shot or one cycle in live mode). |
 | `Error(String)` | An error occurred during replication. |
+
+`ReplicationEvent` is `#[non_exhaustive]` (a `match` needs a `_` arm) and so is its `Change` variant (match it as `Change { docs_read, .. }`), so that events and fields can be added without a breaking release. See [API Stability](../reference/api-stability.md).
 
 ## Live (Continuous) Replication
 

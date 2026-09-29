@@ -80,23 +80,10 @@ assert!(err.is_err());
 
 ```rust
 use rouchdb::{Document, BulkDocsOptions};
-use std::collections::HashMap;
 
 let docs = vec![
-    Document {
-        id: "user:1".into(),
-        rev: None,
-        deleted: false,
-        data: serde_json::json!({"name": "Alice"}),
-        attachments: HashMap::new(),
-    },
-    Document {
-        id: "user:2".into(),
-        rev: None,
-        deleted: false,
-        data: serde_json::json!({"name": "Bob"}),
-        attachments: HashMap::new(),
-    },
+    Document::new("user:1", serde_json::json!({"name": "Alice"})),
+    Document::new("user:2", serde_json::json!({"name": "Bob"})),
 ];
 
 let results = db.bulk_docs(docs, BulkDocsOptions::new()).await?;
