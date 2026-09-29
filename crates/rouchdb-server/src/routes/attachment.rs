@@ -125,6 +125,9 @@ pub async fn put_attachment(
 
     let result = match resolve_rev(query.rev, None, &headers)? {
         Some(rev) => {
+            // Checked first, as in CouchDB: a malformed revision is a 400
+            // even when the document does not exist.
+            check_rev_format(Some(&rev))?;
             let result = state
                 .db
                 .put_attachment(&docid, &attname, &rev, body.to_vec(), content_type)
@@ -187,6 +190,7 @@ pub async fn delete_attachment(
 
     // Without any revision CouchDB reports a conflict.
     let rev = resolve_rev(query.rev, None, &headers)?.ok_or(AppError(RouchError::Conflict))?;
+    check_rev_format(Some(&rev))?;
 
     let result = match state.db.remove_attachment(&docid, &attname, &rev).await {
         Err(RouchError::NotFound(_) | RouchError::Conflict)
