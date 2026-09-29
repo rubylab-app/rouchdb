@@ -978,6 +978,9 @@ fn view_design_docs() -> Vec<Value> {
         json!({"_id": "_design/ragged", "views": {
             "ragged": {"map": "function(doc){ if (doc.rag !== undefined) emit(doc._id, doc.rag); }", "reduce": "_sum"}
         }}),
+        json!({"_id": "_design/strings", "views": {
+            "strs": {"map": "function(doc){ if (doc.dept) emit(doc._id, doc.dept); }", "reduce": "_sum"}
+        }}),
     ]
 }
 
@@ -1115,6 +1118,11 @@ fn local_view(view: &str) -> (&'static str, MapFn, Option<ReduceFn>) {
         "mixed_stats" => ("parity", map_if("v", "k", "v"), Some(ReduceFn::Stats)),
         "mixed_count" => ("parity", map_if("v", "k", "v"), Some(ReduceFn::Count)),
         "ragged" => ("ragged", map_if("rag", "_id", "rag"), Some(ReduceFn::Sum)),
+        "strs" => (
+            "strings",
+            map_if("dept", "_id", "dept"),
+            Some(ReduceFn::Sum),
+        ),
         other => panic!("unknown view {other}"),
     }
 }
@@ -1242,7 +1250,83 @@ fn view_queries() -> Vec<(&'static str, Value)> {
         ("linked_rev", json!({"include_docs": true})),
         // F105: custom reduce receives [key, id] pairs
         ("custom", json!({"group_level": 1})),
+        // group + keys keeps the order of the keys, even descending
+        (
+            "by_dept",
+            json!({"group": true, "keys": ["hr", "eng", "sales"], "descending": true}),
+        ),
+        (
+            "by_dept",
+            json!({"group": true, "keys": ["sales", "zzz", "eng"], "descending": true}),
+        ),
+        // key is both bounds; a startkey (after it in the query string)
+        // replaces the start
+        (
+            "by_dept",
+            json!({"reduce": false, "key": "hr", "startkey": "eng"}),
+        ),
+        (
+            "by_dept",
+            json!({"reduce": false, "key": "eng", "inclusive_end": false}),
+        ),
+        (
+            "by_dept",
+            json!({"reduce": false, "keys": ["hr"], "startkey": "eng"}),
+        ),
+        (
+            "by_dept",
+            json!({"reduce": false, "startkey": "hr", "endkey": "hr", "inclusive_end": false}),
+        ),
+        (
+            "by_dept",
+            json!({"reduce": false, "startkey": "eng", "endkey": "eng", "descending": true}),
+        ),
+        // _sum of values it cannot add: the reduced value is the error
+        ("strs", json!({})),
+        ("strs", json!({"startkey": "b", "endkey": "c"})),
+        ("strs", json!({"group": true})),
+        ("strs", json!({"group_level": 1})),
+        // Grouping a map view with group_level 0 (or group=false) is fine
+        ("linked", json!({"group_level": 0})),
+        ("linked", json!({"group": false})),
         // Rejected by CouchDB with a 400
+        ("by_dept", json!({"startkey": "z", "endkey": "a"})),
+        (
+            "by_dept",
+            json!({"reduce": false, "startkey": "z", "endkey": "a"}),
+        ),
+        (
+            "by_dept",
+            json!({"reduce": false, "startkey": "a", "endkey": "z", "descending": true}),
+        ),
+        (
+            "by_dept",
+            json!({"group": true, "startkey": "z", "endkey": "a"}),
+        ),
+        (
+            "by_dept",
+            json!({"reduce": false, "key": "eng", "startkey": "hr"}),
+        ),
+        (
+            "by_dept",
+            json!({"reduce": false, "keys": ["hr"], "startkey": "z"}),
+        ),
+        (
+            "by_dept",
+            json!({"reduce": false, "keys": ["hr", "eng"], "key": "z"}),
+        ),
+        (
+            "by_dept",
+            json!({"reduce": false, "keys": ["hr", "eng"], "startkey": "a"}),
+        ),
+        (
+            "by_dept",
+            json!({"group": true, "keys": ["hr", "eng"], "endkey": "z"}),
+        ),
+        ("linked", json!({"group": true})),
+        ("linked", json!({"group_level": 1})),
+        ("by_dept", json!({"reduce": false, "group": true})),
+        ("by_dept", json!({"reduce": false, "group_level": 2})),
         ("by_dept", json!({"include_docs": true})),
         ("by_dept", json!({"keys": ["hr", "eng"]})),
         ("by_dept", json!({"keys": ["hr", "eng"], "group_level": 0})),

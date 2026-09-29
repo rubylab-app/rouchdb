@@ -145,22 +145,309 @@ async fn view_reduce_sum_on_non_numeric_values() {
     .await;
     let map_fn = |doc: &Value| -> Emitted { vec![(json!(null), doc["name"].clone())] };
 
-    // Not a silent 0: CouchDB reports a builtin_reduce_error (as the value
-    // of the reduced row for _sum, as a 500 for _stats); RouchDB returns
-    // an error.
-    for reduce in [ReduceFn::Sum, ReduceFn::Stats] {
-        let result = query_view(
-            db.adapter(),
-            &map_fn,
-            Some(&reduce),
-            ViewQueryOptions::new(),
-        )
-        .await;
-        assert!(
-            matches!(&result, Err(RouchError::BadRequest(msg)) if msg.contains("builtin_reduce_error")),
-            "{:?}",
-            result.map(|r| reduced(&r))
+    // Not a silent 0: CouchDB reports a builtin_reduce_error, as the value
+    // of the reduced row for _sum (see sum_errors_are_the_reduced_value)
+    // and as a 500 for _stats, which RouchDB returns as an error.
+    let result = query_view(
+        db.adapter(),
+        &map_fn,
+        Some(&ReduceFn::Sum),
+        ViewQueryOptions::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reduced(&result), [(json!(null), sum_error(json!("Bob")))]);
+    let result = query_view(
+        db.adapter(),
+        &map_fn,
+        Some(&ReduceFn::Stats),
+        ViewQueryOptions::new(),
+    )
+    .await;
+    assert!(
+        matches!(&result, Err(RouchError::BadRequest(msg)) if msg.contains("builtin_reduce_error")),
+        "{:?}",
+        result.map(|r| reduced(&r))
+    );
+}
+
+/// The value CouchDB 3.5.1 reduces `_sum` to when it cannot add `cause`.
+fn sum_error(cause: Value) -> Value {
+    json!({
+        "error": "builtin_reduce_error",
+        "reason": "The _sum function requires that map values be numbers, arrays of numbers, \
+                   or objects. Objects cannot be mixed with other data structures. Objects can \
+                   be arbitrarily nested, provided that the values for all fields are \
+                   themselves numbers, arrays of numbers, or objects.",
+        "caused_by": cause,
+    })
+}
+
+#[tokio::test]
+async fn sum_errors_are_the_reduced_value() {
+    // CouchDB 3.5.1 answers 200 with the error as the value of the row;
+    // it adds an index node's rows last to first, so `caused_by` is the
+    // last value (in view order) that cannot be added.
+    let db = db_with(vec![
+        json!({"_id": "k1", "k": 1, "v": 1}),
+        json!({"_id": "k2", "k": 2, "v": "a"}),
+        json!({"_id": "k3", "k": 3, "v": 2}),
+        json!({"_id": "k4", "k": 4, "v": "b"}),
+        json!({"_id": "k5", "k": 5, "v": {"x": 1}}),
+        json!({"_id": "k6", "k": 6, "v": 7}),
+    ])
+    .await;
+    let map_fn = |doc: &Value| -> Emitted { vec![(doc["k"].clone(), doc["v"].clone())] };
+    let query = |start: i64, end: i64, group: bool| {
+        let opts = ViewQueryOptions {
+            start_key: Some(json!(start)),
+            end_key: Some(json!(end)),
+            group,
+            ..ViewQueryOptions::new()
+        };
+        let db = &db;
+        async move {
+            let result = query_view(db.adapter(), &map_fn, Some(&ReduceFn::Sum), opts)
+                .await
+                .unwrap();
+            reduced(&result)
+        }
+    };
+    assert_eq!(
+        query(1, 4, false).await,
+        [(json!(null), sum_error(json!("b")))]
+    );
+    assert_eq!(
+        query(1, 3, false).await,
+        [(json!(null), sum_error(json!("a")))]
+    );
+    assert_eq!(query(1, 1, false).await, [(json!(null), json!(1))]);
+    assert_eq!(
+        query(1, 4, true).await,
+        [
+            (json!(1), json!(1)),
+            (json!(2), sum_error(json!("a"))),
+            (json!(3), json!(2)),
+            (json!(4), sum_error(json!("b"))),
+        ]
+    );
+    // An object cannot be added to a number: going backwards from 7, the
+    // object is the value that fails.
+    assert_eq!(
+        query(5, 6, false).await,
+        [(json!(null), sum_error(json!({"x": 1})))]
+    );
+    assert_eq!(
+        query(3, 6, false).await,
+        [(json!(null), sum_error(json!({"x": 1})))]
+    );
+}
+
+/// The reason CouchDB 3.5.1 gives for a key range no row can be in.
+fn no_rows(descending: bool) -> String {
+    format!(
+        "No rows can match your key range, reverse your start_key and end_key or set \
+         descending={}",
+        !descending
+    )
+}
+
+async fn view_error(db: &Database, reduce: Option<&ReduceFn>, opts: ViewQueryOptions) -> String {
+    match query_view(db.adapter(), &by_dept, reduce, opts.clone()).await {
+        Err(RouchError::BadRequest(reason)) => reason,
+        other => panic!("{opts:?}: {:?}", other.map(|r| format!("{:?}", rows(&r)))),
+    }
+}
+
+#[tokio::test]
+async fn inverted_key_ranges_are_rejected() {
+    let db = by_dept_db().await;
+    for reduce in [None, Some(&ReduceFn::Sum)] {
+        for group in [false, true] {
+            if reduce.is_none() && group {
+                continue;
+            }
+            for (start, end, descending) in [("z", "a", false), ("a", "z", true)] {
+                let opts = ViewQueryOptions {
+                    start_key: Some(json!(start)),
+                    end_key: Some(json!(end)),
+                    descending,
+                    group,
+                    ..ViewQueryOptions::new()
+                };
+                assert_eq!(view_error(&db, reduce, opts).await, no_rows(descending));
+            }
+        }
+    }
+    // Keys of different types compare by collation: an array sorts after
+    // any string.
+    let opts = ViewQueryOptions {
+        start_key: Some(json!(["a"])),
+        end_key: Some(json!("z")),
+        ..ViewQueryOptions::new()
+    };
+    assert_eq!(view_error(&db, None, opts).await, no_rows(false));
+    // Equal bounds are a range, even when the end is excluded.
+    for (descending, inclusive_end, expected) in [
+        (false, true, vec!["a", "c"]),
+        (true, true, vec!["c", "a"]),
+        (false, false, vec![]),
+        (true, false, vec![]),
+    ] {
+        let opts = ViewQueryOptions {
+            start_key: Some(json!("eng")),
+            end_key: Some(json!("eng")),
+            descending,
+            inclusive_end,
+            ..ViewQueryOptions::new()
+        };
+        let result = query_view(db.adapter(), &by_dept, None, opts)
+            .await
+            .unwrap();
+        assert_eq!(ids(&result), expected, "{descending} {inclusive_end}");
+    }
+}
+
+#[tokio::test]
+async fn key_is_both_bounds_and_start_or_end_key_replace_one() {
+    // In CouchDB `key` sets both bounds and a later `startkey`/`endkey`
+    // replaces one: the options mean `key` followed by them.
+    let db = by_dept_db().await;
+    let query = |key: &str, start: Option<&str>, end: Option<&str>, inclusive_end| {
+        let opts = ViewQueryOptions {
+            key: Some(json!(key)),
+            start_key: start.map(|k| json!(k)),
+            end_key: end.map(|k| json!(k)),
+            inclusive_end,
+            ..ViewQueryOptions::new()
+        };
+        let db = &db;
+        async move {
+            let result = query_view(db.adapter(), &by_dept, None, opts)
+                .await
+                .unwrap();
+            ids(&result)
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(query("hr", Some("eng"), None, true).await, ["a", "c", "d"]);
+    assert_eq!(query("eng", None, Some("hr"), true).await, ["a", "c", "d"]);
+    assert_eq!(query("eng", None, Some("hr"), false).await, ["a", "c"]);
+    assert_eq!(query("eng", None, None, true).await, ["a", "c"]);
+    assert!(query("eng", None, None, false).await.is_empty());
+    let opts = ViewQueryOptions {
+        key: Some(json!("eng")),
+        start_key: Some(json!("hr")),
+        ..ViewQueryOptions::new()
+    };
+    assert_eq!(view_error(&db, None, opts).await, no_rows(false));
+    // A one-element `keys` is `key`.
+    let opts = ViewQueryOptions {
+        keys: keys(&["hr"]),
+        start_key: Some(json!("eng")),
+        ..ViewQueryOptions::new()
+    };
+    let result = query_view(db.adapter(), &by_dept, None, opts)
+        .await
+        .unwrap();
+    assert_eq!(ids(&result), ["a", "c", "d"]);
+    // Several keys exclude key and ranges, and each key is the range from
+    // itself to itself.
+    for opts in [
+        ViewQueryOptions {
+            key: Some(json!("eng")),
+            ..ViewQueryOptions::new()
+        },
+        ViewQueryOptions {
+            start_key: Some(json!("a")),
+            ..ViewQueryOptions::new()
+        },
+        ViewQueryOptions {
+            end_key: Some(json!("z")),
+            group: true,
+            ..ViewQueryOptions::new()
+        },
+    ] {
+        let opts = ViewQueryOptions {
+            keys: keys(&["hr", "eng"]),
+            ..opts
+        };
+        let reduce = opts.group.then_some(&ReduceFn::Sum);
+        assert_eq!(
+            view_error(&db, reduce, opts).await,
+            "`keys` is incompatible with `key`, `start_key` and `end_key`"
         );
+    }
+    let opts = ViewQueryOptions {
+        keys: keys(&["hr", "eng"]),
+        inclusive_end: false,
+        ..ViewQueryOptions::new()
+    };
+    let result = query_view(db.adapter(), &by_dept, None, opts)
+        .await
+        .unwrap();
+    assert!(result.rows.is_empty());
+}
+
+#[tokio::test]
+async fn grouped_keys_keep_their_order_when_descending() {
+    // CouchDB 3.5.1 keeps the order of `keys` for group=true, descending
+    // or not (unlike map rows, which it reverses).
+    let db = by_dept_db().await;
+    for descending in [false, true] {
+        let opts = ViewQueryOptions {
+            keys: keys(&["hr", "zzz", "eng", "sales"]),
+            group: true,
+            descending,
+            ..ViewQueryOptions::new()
+        };
+        let result = query_view(db.adapter(), &by_dept, Some(&ReduceFn::Sum), opts)
+            .await
+            .unwrap();
+        assert_eq!(
+            reduced(&result),
+            [
+                (json!("hr"), json!(5)),
+                (json!("eng"), json!(65)),
+                (json!("sales"), json!(25))
+            ],
+            "descending={descending}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn grouping_a_map_view_is_rejected() {
+    // CouchDB 3.5.1: "Invalid use of grouping on a map view." for a view
+    // without reduce and for reduce=false, unless the group level is 0.
+    let db = by_dept_db().await;
+    for (reduce, reduce_on) in [(None, true), (Some(&ReduceFn::Sum), false)] {
+        for (group, group_level) in [(true, None), (false, Some(1)), (true, Some(2))] {
+            let opts = ViewQueryOptions {
+                group,
+                group_level,
+                reduce: reduce_on,
+                ..ViewQueryOptions::new()
+            };
+            assert_eq!(
+                view_error(&db, reduce, opts).await,
+                "Invalid use of grouping on a map view."
+            );
+        }
+        for (group, group_level) in [(false, None), (false, Some(0)), (true, Some(0))] {
+            let opts = ViewQueryOptions {
+                group,
+                group_level,
+                reduce: reduce_on,
+                ..ViewQueryOptions::new()
+            };
+            let result = query_view(db.adapter(), &by_dept, reduce, opts)
+                .await
+                .unwrap();
+            assert_eq!(ids(&result), ["a", "c", "d", "b"]);
+        }
     }
 }
 

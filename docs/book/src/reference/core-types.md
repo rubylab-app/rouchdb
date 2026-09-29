@@ -447,9 +447,9 @@ pub struct ViewQueryOptions {
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `key` | `Option<serde_json::Value>` | `None` | Return only rows with this exact key. |
-| `keys` | `Option<Vec<serde_json::Value>>` | `None` | Return only rows matching any of these keys, in the given order. |
-| `start_key` | `Option<serde_json::Value>` | `None` | Start of key range (inclusive). |
+| `key` | `Option<serde_json::Value>` | `None` | Return only rows with this exact key (the start and end of the range; `start_key`/`end_key` replace one). |
+| `keys` | `Option<Vec<serde_json::Value>>` | `None` | Return only rows matching any of these keys, in the given order. Several keys exclude `key`, `start_key` and `end_key`. |
+| `start_key` | `Option<serde_json::Value>` | `None` | Start of key range (inclusive). A range no row can be in is a `BadRequest`. |
 | `end_key` | `Option<serde_json::Value>` | `None` | End of key range (inclusive by default). |
 | `inclusive_end` | `bool` | `true` (via `ViewQueryOptions::new()`) | Whether the `end_key` is included in the range. |
 | `descending` | `bool` | `false` | Reverse row order. |
@@ -457,8 +457,8 @@ pub struct ViewQueryOptions {
 | `limit` | `Option<u64>` | `None` | Maximum number of rows to return. |
 | `include_docs` | `bool` | `false` | Include full document body in each row. |
 | `reduce` | `bool` | `false` | Whether to run the reduce function. |
-| `group` | `bool` | `false` | Group results by key (requires `reduce: true`). |
-| `group_level` | `Option<u64>` | `None` | Group to this many array elements of the key (requires `reduce: true`). |
+| `group` | `bool` | `false` | Group results by key (requires a reduce; without one it is a `BadRequest`). |
+| `group_level` | `Option<u64>` | `None` | Group to this many array elements of the key (above 0 it requires a reduce). |
 | `stale` | `StaleOption` | `False` | `False` rebuilds the index before querying (default). `Ok` uses a potentially stale index. `UpdateAfter` returns stale results then rebuilds. |
 
 ---
