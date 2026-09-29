@@ -568,15 +568,12 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
             db_name,
         } => {
             let db = open_existing_db(&path, db_name.as_deref());
-            let selector: serde_json::Value = serde_json::from_str(&selector).map_err(|e| {
-                rouchdb::RouchError::BadRequest(format!("invalid selector JSON: {}", e))
-            })?;
-
+            let selector: serde_json::Value = parse_json(&selector, "invalid selector JSON")?;
             let sort = sort
                 .map(|s| {
-                    serde_json::from_str::<Vec<rouchdb::SortField>>(&s).map_err(|e| {
-                        rouchdb::RouchError::BadRequest(format!("invalid sort JSON: {}", e))
-                    })
+                    let what = "invalid sort JSON";
+                    serde_json::from_value::<Vec<rouchdb::SortField>>(parse_json(&s, what)?)
+                        .map_err(|e| json_error(e.into(), what))
                 })
                 .transpose()?;
 
@@ -690,11 +687,7 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
             let target_db = open_source_or_target(&target, target_name.as_deref(), false);
 
             let selector_value = selector
-                .map(|s| {
-                    serde_json::from_str::<serde_json::Value>(&s).map_err(|e| {
-                        rouchdb::RouchError::BadRequest(format!("invalid selector JSON: {}", e))
-                    })
-                })
+                .map(|s| parse_json(&s, "invalid selector JSON"))
                 .transpose()?;
 
             let opts = ReplicationOptions {
@@ -745,9 +738,7 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
             db_name,
         } => {
             let db = open_db(&path, db_name.as_deref());
-            let data: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-                rouchdb::RouchError::BadRequest(format!("invalid JSON body: {}", e))
-            })?;
+            let data: serde_json::Value = parse_json(&body, "invalid JSON body")?;
 
             let effective_rev = if rev.is_some() {
                 rev
@@ -805,9 +796,7 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
             db_name,
         } => {
             let db = open_db(&path, db_name.as_deref());
-            let data: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-                rouchdb::RouchError::BadRequest(format!("invalid JSON body: {}", e))
-            })?;
+            let data: serde_json::Value = parse_json(&body, "invalid JSON body")?;
 
             let result = db.post(data).await?;
             check_doc_result(&result)?;
@@ -827,18 +816,12 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
             db_name,
         } => {
             let db = open_db(&path, db_name.as_deref());
-            let reader = std::fs::File::open(&file).map_err(|e| {
+            let text = std::fs::read(&file).map_err(|e| {
                 rouchdb::RouchError::BadRequest(format!("cannot read file '{}': {}", file, e))
             })?;
-            let docs: Vec<serde_json::Value> = serde_json::from_reader(io::BufReader::new(reader))
-                .map_err(|e| {
-                    let what = if e.is_io() {
-                        "cannot read file"
-                    } else {
-                        "invalid JSON in"
-                    };
-                    rouchdb::RouchError::BadRequest(format!("{} '{}': {}", what, file, e))
-                })?;
+            // The documents sit one level deep, in the top-level array.
+            let docs: Vec<serde_json::Value> = rouchdb_core::json::from_input(&text, 1)
+                .map_err(|e| json_error(e, &format!("invalid JSON in '{}'", file)))?;
             let total = docs.len();
 
             let mut imported = 0u64;
@@ -932,6 +915,22 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
     }
 
     Ok(())
+}
+
+/// Parse JSON given on the command line. Documents may be nested as deeply
+/// as the database stores them ([`rouchdb::MAX_NESTING_DEPTH`]); deeper
+/// input gets the database's error, malformed input `what` and the reason.
+fn parse_json(text: &str, what: &str) -> rouchdb::Result<serde_json::Value> {
+    rouchdb_core::json::from_input(text.as_bytes(), 0).map_err(|e| json_error(e, what))
+}
+
+/// A JSON decoding error prefixed with `what`; a too-deep input keeps the
+/// database's error.
+fn json_error(error: rouchdb::RouchError, what: &str) -> rouchdb::RouchError {
+    match error {
+        rouchdb::RouchError::Json(e) => rouchdb::RouchError::BadRequest(format!("{}: {}", what, e)),
+        other => other,
+    }
 }
 
 #[cfg(test)]

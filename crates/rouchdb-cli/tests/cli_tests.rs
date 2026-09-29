@@ -2029,6 +2029,75 @@ async fn import_invalid_file_fails() {
     assert!(stderr_str(&output).contains("cannot read file"));
 }
 
+/// `{<members>"v": [[...[1]...]]}`, `depth` containers deep, as text (a
+/// value that deep cannot be parsed back with serde_json alone).
+fn deep_doc_text(depth: usize, members: &str) -> String {
+    format!(
+        r#"{{{members}"v":{}1{}}}"#,
+        "[".repeat(depth - 1),
+        "]".repeat(depth - 1)
+    )
+}
+
+/// Documents as deeply nested as the database stores them can be written
+/// from the command line or a file and found; deeper ones get the
+/// database's error.
+#[tokio::test]
+async fn deep_documents_up_to_the_limit_are_accepted() {
+    let (dir, db_path) = setup_db(&[]).await;
+    let p = path_str(&db_path);
+    let max = rouchdb::MAX_NESTING_DEPTH;
+
+    let output = run(&["put", p, "put", &deep_doc_text(max, "")]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let output = run(&["post", p, &deep_doc_text(max, r#""_id":"posted","#)]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let file = dir.path().join("deep.json");
+    let docs = format!("[{}]", deep_doc_text(max, r#""_id":"imported","#));
+    std::fs::write(&file, docs).unwrap();
+    let output = run(&["import", p, path_str(&file)]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(stdout_json(&output)["imported"], 1);
+
+    // A selector as deep as the documents finds them.
+    let selector = deep_doc_text(max, "");
+    let output = run(&["find", p, "--selector", &selector, "--fields", "_id"]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let mut ids: Vec<String> = stdout_json(&output)["docs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["_id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["imported", "posted", "put"]);
+
+    let too_deep = format!("Document nesting exceeds the maximum depth of {max}");
+    for depth in [max + 1, 5 * max] {
+        let output = run(&["put", p, "deeper", &deep_doc_text(depth, "")]);
+        assert_eq!(output.status.code(), Some(1), "{depth}");
+        assert!(stderr_str(&output).contains(&too_deep), "{depth}");
+        let output = run(&["post", p, &deep_doc_text(depth, "")]);
+        assert_eq!(output.status.code(), Some(1), "{depth}");
+        assert!(stderr_str(&output).contains(&too_deep), "{depth}");
+        let docs = format!("[{}]", deep_doc_text(depth, r#""_id":"deeper","#));
+        std::fs::write(&file, docs).unwrap();
+        let output = run(&["import", p, path_str(&file)]);
+        assert_eq!(output.status.code(), Some(1), "{depth}");
+        assert!(stderr_str(&output).contains(&too_deep), "{depth}");
+    }
+
+    let db = rouchdb::Database::open(&db_path, "test").unwrap();
+    assert_eq!(db.info().await.unwrap().doc_count, 3);
+    let mut expected = serde_json::json!(1);
+    for _ in 1..max {
+        expected = serde_json::Value::Array(vec![expected]);
+    }
+    for id in ["put", "posted", "imported"] {
+        assert_eq!(db.get(id).await.unwrap().data["v"], expected, "{id}");
+    }
+}
+
 // ─── DUMP / IMPORT ROUND TRIP ───────────────────────────────────────────────
 
 async fn setup_db_with_attachment() -> (TempDir, PathBuf) {

@@ -33,9 +33,7 @@ use crate::state::AppState;
 pub(crate) fn json_object_body(
     body: &[u8],
 ) -> Result<serde_json::Map<String, serde_json::Value>, AppError> {
-    let value: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|_| AppError(RouchError::BadRequest("invalid UTF-8 JSON".into())))?;
-    match value {
+    match crate::extract::decode(body)? {
         serde_json::Value::Object(obj) => Ok(obj),
         _ => Err(AppError(RouchError::BadRequest(
             "Document must be a JSON object".into(),
