@@ -192,7 +192,7 @@ All replication methods implement the CouchDB replication protocol: checkpoint r
 | `checkpoint` | `bool` | `true` | Set to `false` to disable checkpoint saving/reading. |
 | `live` | `bool` | `false` | Enable continuous replication (used with `replicate_to_live`). |
 | `retry` | `bool` | `false` | Automatically retry on failure (live mode). |
-| `poll_interval` | `Duration` | `500ms` | How often to poll for new changes in live mode. |
+| `poll_interval` | `Duration` | `500ms` | How often to poll for new changes in live mode when the adapter cannot announce them (`Adapter::subscribe` returns `None`, e.g. HTTP); memory and redb wake the stream up on each change. |
 | `back_off_function` | `Option<Box<dyn Fn(u32) -> Duration>>` | `None` | Custom backoff function for retries. Receives retry count, returns delay. |
 
 ### ReplicationFilter

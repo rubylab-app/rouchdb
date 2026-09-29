@@ -2,10 +2,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 use uuid::Uuid;
 
-use rouchdb_core::adapter::Adapter;
+use rouchdb_core::adapter::{Adapter, ChangeNotice};
 use rouchdb_core::document::*;
 use rouchdb_core::error::{Result, RouchError};
 use rouchdb_core::merge::{
@@ -60,16 +60,25 @@ struct Inner {
     purge_seq: u64,
 }
 
+/// Change notices buffered per subscriber before it lags (and re-reads the
+/// changes feed).
+const NOTICE_CAPACITY: usize = 1024;
+
 /// In-memory adapter for RouchDB. All data is held in RAM.
+///
+/// Clones share the data and the change notifications
+/// ([`Adapter::subscribe`]).
 #[derive(Debug, Clone)]
 pub struct MemoryAdapter {
     inner: Arc<RwLock<Inner>>,
     rev_limit: u64,
+    notices: broadcast::Sender<ChangeNotice>,
 }
 
 impl MemoryAdapter {
     pub fn new(name: &str) -> Self {
         Self {
+            notices: broadcast::channel(NOTICE_CAPACITY).0,
             inner: Arc::new(RwLock::new(Inner {
                 name: name.to_string(),
                 docs: HashMap::new(),
@@ -90,6 +99,21 @@ impl MemoryAdapter {
     pub fn with_rev_limit(mut self, limit: u64) -> Self {
         self.rev_limit = limit;
         self
+    }
+
+    /// Announce the changes recorded after `since` to the subscribers. It
+    /// runs under the write lock, once the write is applied: a woken reader
+    /// waits for the lock and then sees the change.
+    fn announce(&self, inner: &Inner, since: u64) {
+        if self.notices.receiver_count() == 0 {
+            return;
+        }
+        for (seq, (doc_id, _)) in inner.changes.range(since + 1..) {
+            let _ = self.notices.send(ChangeNotice {
+                seq: Seq::Num(*seq),
+                doc_id: doc_id.clone(),
+            });
+        }
     }
 }
 
@@ -285,6 +309,7 @@ impl Adapter for MemoryAdapter {
         opts: BulkDocsOptions,
     ) -> Result<Vec<DocResult>> {
         let mut inner = self.inner.write().await;
+        let since = inner.update_seq;
         let mut results = Vec::with_capacity(docs.len());
 
         for doc in docs {
@@ -296,6 +321,7 @@ impl Adapter for MemoryAdapter {
             results.push(result);
         }
 
+        self.announce(&inner, since);
         Ok(results)
     }
 
@@ -728,7 +754,10 @@ impl Adapter for MemoryAdapter {
         let tree = stored.rev_tree.clone();
         let plan = plan_new_edit(Some(&tree), doc, Some(&parent_atts), false, self.rev_limit)
             .map_err(attachment_edit_error)?;
-        Ok(apply_write(&mut inner, plan))
+        let since = inner.update_seq;
+        let result = apply_write(&mut inner, plan);
+        self.announce(&inner, since);
+        Ok(result)
     }
 
     async fn get_attachment(
@@ -808,7 +837,10 @@ impl Adapter for MemoryAdapter {
         let tree = stored.rev_tree.clone();
         let plan = plan_new_edit(Some(&tree), doc, Some(&parent_atts), false, self.rev_limit)
             .map_err(attachment_edit_error)?;
-        Ok(apply_write(&mut inner, plan))
+        let since = inner.update_seq;
+        let result = apply_write(&mut inner, plan);
+        self.announce(&inner, since);
+        Ok(result)
     }
 
     async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
@@ -871,8 +903,13 @@ impl Adapter for MemoryAdapter {
         Ok(())
     }
 
+    fn subscribe(&self) -> Option<broadcast::Receiver<ChangeNotice>> {
+        Some(self.notices.subscribe())
+    }
+
     async fn purge(&self, req: HashMap<String, Vec<String>>) -> Result<PurgeResponse> {
         let mut inner = self.inner.write().await;
+        let since = inner.update_seq;
         let mut purged = HashMap::new();
         let mut bumped = false;
 
@@ -924,6 +961,7 @@ impl Adapter for MemoryAdapter {
         }
         inner.purge_seq += 1;
         collect_unreferenced_attachments(&mut inner);
+        self.announce(&inner, since);
 
         Ok(PurgeResponse {
             purge_seq: Some(inner.purge_seq),
@@ -1255,6 +1293,49 @@ mod tests {
         let doc2_diff = diff.results.get("doc2").unwrap();
         assert_eq!(doc2_diff.missing, ["1-abc"]);
         assert!(doc2_diff.possible_ancestors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn subscribers_are_notified_after_each_committed_change() {
+        use rouchdb_core::adapter::ChangeNotice;
+        let db = MemoryAdapter::new("test");
+        let mut rx = db
+            .subscribe()
+            .expect("the memory adapter announces changes");
+        let doc = |id: &str| Document::from_json(serde_json::json!({"_id": id})).unwrap();
+        let results = db
+            .bulk_docs(vec![doc("a"), doc("b")], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        let notice = |seq: u64, id: &str| ChangeNotice {
+            seq: Seq::Num(seq),
+            doc_id: id.into(),
+        };
+        assert_eq!(rx.try_recv().unwrap(), notice(1, "a"));
+        assert_eq!(rx.try_recv().unwrap(), notice(2, "b"));
+        // Nothing for a failed write or a local document.
+        db.bulk_docs(vec![doc("a")], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        db.put_local("cp", serde_json::json!({})).await.unwrap();
+        assert!(rx.try_recv().is_err());
+        let rev = results[0].rev.clone().unwrap();
+        let r2 = db
+            .put_attachment("a", "x", &rev, b"x".to_vec(), "text/plain")
+            .await
+            .unwrap()
+            .rev
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap(), notice(3, "a"));
+        db.remove_attachment("a", "x", &r2).await.unwrap();
+        assert_eq!(rx.try_recv().unwrap(), notice(4, "a"));
+        // A clone of the adapter shares the notifications.
+        let mut other = db.clone().subscribe().unwrap();
+        db.bulk_docs(vec![doc("c")], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap(), notice(5, "c"));
+        assert_eq!(other.try_recv().unwrap(), notice(5, "c"));
     }
 
     #[tokio::test]

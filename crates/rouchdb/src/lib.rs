@@ -43,7 +43,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 // Re-export core types
-pub use rouchdb_core::adapter::Adapter;
+pub use rouchdb_core::adapter::{Adapter, ChangeNotice};
 pub use rouchdb_core::document::*;
 pub use rouchdb_core::error::{Result, RouchError};
 pub use rouchdb_core::json::MAX_NESTING_DEPTH;

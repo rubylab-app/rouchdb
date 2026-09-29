@@ -5,10 +5,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
-use rouchdb_core::adapter::Adapter;
+use rouchdb_core::adapter::{Adapter, ChangeNotice};
 use rouchdb_core::document::*;
 use rouchdb_core::error::{Result, RouchError};
 use rouchdb_core::json::MAX_NESTING_DEPTH;
@@ -383,7 +383,13 @@ struct Inner {
     /// Serializes writers before they reach redb (which would otherwise park
     /// one blocking thread per waiting writer).
     write_lock: Mutex<()>,
+    /// Change notifications, sent once a write is committed.
+    notices: broadcast::Sender<ChangeNotice>,
 }
+
+/// Change notices buffered per subscriber before it lags (and re-reads the
+/// changes feed).
+const NOTICE_CAPACITY: usize = 1024;
 
 impl RedbAdapter {
     /// Open or create a database at the given path.
@@ -444,6 +450,7 @@ impl RedbAdapter {
                 db,
                 name: name.to_string(),
                 write_lock: Mutex::new(()),
+                notices: broadcast::channel(NOTICE_CAPACITY).0,
             }),
             rev_limit: DEFAULT_REV_LIMIT,
         })
@@ -873,6 +880,10 @@ impl Adapter for RedbAdapter {
         self.run_write(move |db| db.purge(req)).await
     }
 
+    fn subscribe(&self) -> Option<broadcast::Receiver<ChangeNotice>> {
+        Some(self.inner.notices.subscribe())
+    }
+
     async fn get_security(&self) -> Result<SecurityDocument> {
         self.run(|db| db.get_security()).await
     }
@@ -884,6 +895,28 @@ impl Adapter for RedbAdapter {
 
 /// The storage operations, run synchronously (see `RedbAdapter::run`).
 impl Inner {
+    /// Commit a write transaction, then announce the changes it recorded
+    /// after sequence `since` to the subscribers (read from the transaction
+    /// before it commits, only when someone listens).
+    fn commit_announcing(&self, txn: redb::WriteTransaction, since: u64) -> Result<()> {
+        let mut notices = Vec::new();
+        if self.notices.receiver_count() > 0 {
+            let changes = db_err!(txn.open_table(CHANGES_TABLE))?;
+            for entry in db_err!(changes.range(since + 1..))? {
+                let (seq, record) = db_err!(entry)?;
+                let record: ChangeRecord = serde_json::from_slice(record.value())?;
+                notices.push(ChangeNotice {
+                    seq: Seq::Num(seq.value()),
+                    doc_id: record.doc_id,
+                });
+            }
+        }
+        db_err!(txn.commit())?;
+        for notice in notices {
+            let _ = self.notices.send(notice);
+        }
+        Ok(())
+    }
     fn info(&self) -> Result<DbInfo> {
         // Counts and update_seq live in one metadata record, so they always
         // reflect the same committed state without scanning documents.
@@ -1009,6 +1042,7 @@ impl Inner {
 
         // Read current metadata
         let mut meta = read_meta(&db_err!(write_txn.open_table(META_TABLE))?)?;
+        let since = meta.update_seq;
 
         {
             let mut tables = WriteTables::open(&write_txn)?;
@@ -1025,7 +1059,7 @@ impl Inner {
         // Write updated metadata
         write_meta(&mut db_err!(write_txn.open_table(META_TABLE))?, &meta)?;
 
-        db_err!(write_txn.commit())?;
+        self.commit_announcing(write_txn, since)?;
 
         Ok(results)
     }
@@ -1408,6 +1442,7 @@ impl Inner {
     ) -> Result<DocResult> {
         let write_txn = db_err!(self.db.begin_write())?;
         let mut meta = read_meta(&db_err!(write_txn.open_table(META_TABLE))?)?;
+        let since = meta.update_seq;
 
         let result = {
             let mut tables = WriteTables::open(&write_txn)?;
@@ -1435,7 +1470,7 @@ impl Inner {
         };
 
         write_meta(&mut db_err!(write_txn.open_table(META_TABLE))?, &meta)?;
-        db_err!(write_txn.commit())?;
+        self.commit_announcing(write_txn, since)?;
         Ok(result)
     }
 
@@ -1480,6 +1515,7 @@ impl Inner {
     ) -> Result<DocResult> {
         let write_txn = db_err!(self.db.begin_write())?;
         let mut meta = read_meta(&db_err!(write_txn.open_table(META_TABLE))?)?;
+        let since = meta.update_seq;
 
         let result = {
             let mut tables = WriteTables::open(&write_txn)?;
@@ -1515,7 +1551,7 @@ impl Inner {
         };
 
         write_meta(&mut db_err!(write_txn.open_table(META_TABLE))?, &meta)?;
-        db_err!(write_txn.commit())?;
+        self.commit_announcing(write_txn, since)?;
         Ok(result)
     }
 
@@ -1626,6 +1662,7 @@ impl Inner {
     fn purge(&self, req: HashMap<String, Vec<String>>) -> Result<PurgeResponse> {
         let write_txn = db_err!(self.db.begin_write())?;
         let mut meta = read_meta(&db_err!(write_txn.open_table(META_TABLE))?)?;
+        let since = meta.update_seq;
         let mut purged = HashMap::new();
         let mut bumped = false;
 
@@ -1679,7 +1716,7 @@ impl Inner {
         }
         meta.purge_seq += 1;
         write_meta(&mut db_err!(write_txn.open_table(META_TABLE))?, &meta)?;
-        db_err!(write_txn.commit())?;
+        self.commit_announcing(write_txn, since)?;
 
         Ok(PurgeResponse {
             purge_seq: Some(meta.purge_seq),
@@ -1994,6 +2031,50 @@ mod tests {
             db.get_local("ck1").await,
             Err(RouchError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn subscribers_are_notified_after_each_committed_change() {
+        use rouchdb_core::adapter::ChangeNotice;
+        let dir = tempfile::tempdir().unwrap();
+        let db = RedbAdapter::open(dir.path().join("n.redb"), "test").unwrap();
+        let mut rx = db.subscribe().expect("the redb adapter announces changes");
+        let doc = |id: &str| Document::from_json(serde_json::json!({"_id": id})).unwrap();
+        let results = db
+            .bulk_docs(vec![doc("a"), doc("b")], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        let notice = |seq: u64, id: &str| ChangeNotice {
+            seq: Seq::Num(seq),
+            doc_id: id.into(),
+        };
+        assert_eq!(rx.try_recv().unwrap(), notice(1, "a"));
+        assert_eq!(rx.try_recv().unwrap(), notice(2, "b"));
+        db.bulk_docs(vec![doc("a")], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        db.put_local("cp", serde_json::json!({})).await.unwrap();
+        assert!(rx.try_recv().is_err());
+        let rev = results[0].rev.clone().unwrap();
+        let r2 = db
+            .put_attachment("a", "x", &rev, b"x".to_vec(), "text/plain")
+            .await
+            .unwrap()
+            .rev
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap(), notice(3, "a"));
+        db.remove_attachment("a", "x", &r2).await.unwrap();
+        assert_eq!(rx.try_recv().unwrap(), notice(4, "a"));
+        let purged = db
+            .purge(HashMap::from([(
+                "b".to_string(),
+                vec![results[1].rev.clone().unwrap()],
+            )]))
+            .await
+            .unwrap();
+        assert_eq!(purged.purged["b"].len(), 1);
+        // A fully purged document has no change left to announce.
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

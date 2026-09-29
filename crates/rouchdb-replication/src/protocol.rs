@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rouchdb_core::adapter::Adapter;
+use rouchdb_core::adapter::{Adapter, ChangeNotice};
 use rouchdb_core::document::*;
 use rouchdb_core::error::Result;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::checkpoint::Checkpointer;
@@ -53,7 +53,9 @@ pub struct ReplicationOptions {
     pub live: bool,
     /// Automatically retry on transient errors (live replication only).
     pub retry: bool,
-    /// Polling interval for live replication (default: 500ms).
+    /// Polling interval for live replication (default: 500ms), used when
+    /// the source cannot announce its changes ([`Adapter::subscribe`]
+    /// returns `None`, as for a remote CouchDB).
     pub poll_interval: Duration,
     /// Backoff function for retry: takes attempt number, returns delay.
     pub back_off_function: Option<Box<dyn Fn(u32) -> Duration + Send + Sync>>,
@@ -490,8 +492,9 @@ async fn run_replication(
 
 /// Run continuous (live) replication from source to target.
 ///
-/// Performs an initial one-shot replication, then polls for new changes
-/// at the configured `poll_interval`. Runs until the returned
+/// Performs an initial one-shot replication, then replicates again each
+/// time the source announces a change ([`Adapter::subscribe`]), or, for a
+/// source that cannot, every `poll_interval`. Runs until the returned
 /// `ReplicationHandle` is cancelled/dropped.
 ///
 /// Events are emitted through the returned channel receiver.
@@ -510,6 +513,9 @@ pub fn replicate_live(
     let cancel_clone = cancel.clone();
 
     tokio::spawn(async move {
+        // Subscribed before the first pass, so a change made during a pass
+        // wakes the next one up.
+        let mut notices = source.subscribe();
         let mut attempt: u32 = 0;
         // Track the last successful result so a single terminal Complete can
         // be emitted when the live loop finally exits.
@@ -541,6 +547,9 @@ pub fn replicate_live(
             }
             .await;
 
+            // Whether the pass caught up with the source without reporting
+            // Paused yet.
+            let mut caught_up = false;
             let failure = match result {
                 Ok(outcome) => {
                     // Resume the next pass where this one stopped.
@@ -550,6 +559,8 @@ pub fn replicate_live(
                         if outcome.result.docs_read == 0 {
                             // No changes — emit Paused and wait
                             let _ = tx.send(ReplicationEvent::Paused).await;
+                        } else {
+                            caught_up = true;
                         }
                     }
                     last_result = Some(outcome.result);
@@ -584,10 +595,33 @@ pub fn replicate_live(
                 }
             }
 
-            // Wait for poll_interval or cancellation
-            tokio::select! {
-                _ = tokio::time::sleep(poll_interval) => {},
-                _ = cancel_clone.cancelled() => break 'live,
+            // Wait for a change on the source (its notifications, or
+            // poll_interval without them) or cancellation.
+            match notices.as_mut() {
+                Some(rx) => {
+                    // Changes made during the pass are replicated right away.
+                    if !drain_notices(rx) {
+                        if caught_up {
+                            let _ = tx.send(ReplicationEvent::Paused).await;
+                        }
+                        tokio::select! {
+                            notice = rx.recv() => {
+                                if matches!(notice, Err(broadcast::error::RecvError::Closed)) {
+                                    notices = None; // poll from now on
+                                } else {
+                                    drain_notices(rx);
+                                }
+                            }
+                            _ = cancel_clone.cancelled() => break 'live,
+                        }
+                    }
+                }
+                None => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(poll_interval) => {},
+                        _ = cancel_clone.cancelled() => break 'live,
+                    }
+                }
             }
         }
 
@@ -598,6 +632,16 @@ pub fn replicate_live(
     });
 
     (rx, ReplicationHandle { cancel })
+}
+
+/// Consume the change notices already queued; whether there were any (a
+/// lagging receiver had some too).
+fn drain_notices(rx: &mut broadcast::Receiver<ChangeNotice>) -> bool {
+    let mut any = false;
+    while let Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) = rx.try_recv() {
+        any = true;
+    }
+    any
 }
 
 /// Handle for a live replication task. Dropping this cancels the replication.
@@ -1985,6 +2029,184 @@ mod tests {
 
         assert!(target.get("new", GetOptions::default()).await.is_ok());
         assert!(target.get("old", GetOptions::default()).await.is_err());
+    }
+
+    /// A memory source that gets a new document written while the first
+    /// replication pass reads its changes feed (after the read).
+    struct WritesDuringFirstPass {
+        inner: MemoryAdapter,
+        written: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl Adapter for WritesDuringFirstPass {
+        async fn info(&self) -> Result<DbInfo> {
+            self.inner.info().await
+        }
+        async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
+            self.inner.get(id, opts).await
+        }
+        async fn bulk_docs(
+            &self,
+            docs: Vec<Document>,
+            opts: BulkDocsOptions,
+        ) -> Result<Vec<DocResult>> {
+            self.inner.bulk_docs(docs, opts).await
+        }
+        async fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
+            self.inner.all_docs(opts).await
+        }
+        async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
+            let changes = self.inner.changes(opts).await;
+            if !self.written.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                put_doc(&self.inner, "late", serde_json::json!({})).await;
+            }
+            changes
+        }
+        fn subscribe(&self) -> Option<broadcast::Receiver<ChangeNotice>> {
+            self.inner.subscribe()
+        }
+        async fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
+            self.inner.revs_diff(revs).await
+        }
+        async fn bulk_get(&self, docs: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
+            self.inner.bulk_get(docs).await
+        }
+        async fn put_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            rev: &str,
+            data: Vec<u8>,
+            content_type: &str,
+        ) -> Result<DocResult> {
+            self.inner
+                .put_attachment(doc_id, att_id, rev, data, content_type)
+                .await
+        }
+        async fn get_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            opts: GetAttachmentOptions,
+        ) -> Result<Vec<u8>> {
+            self.inner.get_attachment(doc_id, att_id, opts).await
+        }
+        async fn remove_attachment(
+            &self,
+            doc_id: &str,
+            att_id: &str,
+            rev: &str,
+        ) -> Result<DocResult> {
+            self.inner.remove_attachment(doc_id, att_id, rev).await
+        }
+        async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
+            self.inner.get_local(id).await
+        }
+        async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
+            self.inner.put_local(id, doc).await
+        }
+        async fn remove_local(&self, id: &str) -> Result<()> {
+            self.inner.remove_local(id).await
+        }
+        async fn compact(&self) -> Result<()> {
+            self.inner.compact().await
+        }
+        async fn destroy(&self) -> Result<()> {
+            self.inner.destroy().await
+        }
+    }
+
+    /// Live replication only reports `Paused` once caught up: a change made
+    /// during a pass is replicated by another pass first.
+    #[tokio::test(start_paused = true)]
+    async fn live_replication_pauses_only_when_caught_up() {
+        let inner = MemoryAdapter::new("source");
+        put_doc(&inner, "a", serde_json::json!({})).await;
+        let source = Arc::new(WritesDuringFirstPass {
+            inner,
+            written: std::sync::atomic::AtomicBool::new(false),
+        });
+        let target = Arc::new(MemoryAdapter::new("target"));
+        let (mut rx, handle) = replicate_live(
+            source,
+            target.clone(),
+            ReplicationOptions {
+                live: true,
+                poll_interval: Duration::from_secs(3600),
+                ..Default::default()
+            },
+        );
+        // Events are sent in order: both passes report their change before
+        // the first Paused.
+        let mut changes = 0;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(ReplicationEvent::Change { .. })) => changes += 1,
+                Ok(Some(ReplicationEvent::Paused)) => break,
+                Ok(Some(_)) => {}
+                other => panic!("no Paused: {other:?}"),
+            }
+        }
+        assert_eq!(changes, 2, "Paused before the change made during a pass");
+        for id in ["a", "late"] {
+            assert!(target.get(id, GetOptions::default()).await.is_ok(), "{id}");
+        }
+        handle.cancel();
+    }
+
+    /// F96: a local source announces its changes, so live replication
+    /// replicates them without waiting for a poll (on a paused clock a poll
+    /// would take an hour, and `wait_for` gives up after 5 s), and a change
+    /// made while a pass runs is not lost.
+    #[tokio::test(start_paused = true)]
+    async fn live_replication_wakes_on_source_notifications() {
+        let hour = Duration::from_secs(3600);
+        let source = Arc::new(MemoryAdapter::new("source"));
+        let target = Arc::new(MemoryAdapter::new("target"));
+        put_doc(source.as_ref(), "a", serde_json::json!({})).await;
+        let start = tokio::time::Instant::now();
+        let (mut rx, handle) = replicate_live(
+            source.clone(),
+            target.clone(),
+            ReplicationOptions {
+                live: true,
+                poll_interval: hour,
+                ..Default::default()
+            },
+        );
+        // Caught up after the first pass, which read `a`.
+        assert!(wait_for(&mut rx, |e| matches!(e, ReplicationEvent::Paused)).await);
+        assert!(target.get("a", GetOptions::default()).await.is_ok());
+        for id in ["b", "c"] {
+            put_doc(source.as_ref(), id, serde_json::json!({})).await;
+            assert!(wait_for(&mut rx, |e| matches!(e, ReplicationEvent::Paused)).await);
+            assert!(target.get(id, GetOptions::default()).await.is_ok(), "{id}");
+        }
+        // Writes racing with the passes.
+        let writer = {
+            let source = source.clone();
+            tokio::spawn(async move {
+                for i in 0..100 {
+                    put_doc(source.as_ref(), &format!("r{i}"), serde_json::json!({})).await;
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        writer.await.unwrap();
+        let done = tokio::time::timeout(Duration::from_secs(5), async {
+            while target.info().await.unwrap().doc_count < 103 {
+                assert!(rx.recv().await.is_some());
+            }
+        })
+        .await;
+        assert!(
+            done.is_ok(),
+            "{} docs",
+            target.info().await.unwrap().doc_count
+        );
+        assert!(start.elapsed() < hour, "waited {:?}", start.elapsed());
+        handle.cancel();
     }
 
     #[tokio::test]
