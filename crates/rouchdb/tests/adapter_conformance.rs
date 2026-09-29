@@ -2385,12 +2385,27 @@ async fn deep_documents_round_trip(mut fx: Fx) {
         fx.db().put("over", nested(MAX_NESTING_DEPTH + 1)).await,
         Err(RouchError::BadRequest(_))
     ));
+    // Both write modes report it on the document, with the same reason as
+    // `put` (and as the http adapter).
+    let too_deep = format!("Document nesting exceeds the maximum depth of {MAX_NESTING_DEPTH}");
     let mut over = nested(MAX_NESTING_DEPTH + 1);
     over["_id"] = "over".into();
+    let res = fx
+        .db()
+        .bulk_docs(vec![doc(over.clone())], BulkDocsOptions::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        (res[0].error.as_deref(), res[0].reason.as_deref()),
+        (Some("bad_request"), Some(too_deep.as_str()))
+    );
     over["_rev"] = format!("1-{}", hash32('a')).into();
     let res = write_replicated(fx.db(), over).await;
     assert!(!res.ok);
-    assert_eq!(res.error.as_deref(), Some("bad_request"));
+    assert_eq!(
+        (res.error.as_deref(), res.reason.as_deref()),
+        (Some("bad_request"), Some(too_deep.as_str()))
+    );
     fx.reopen();
 
     let db = fx.db();
