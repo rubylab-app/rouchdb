@@ -195,6 +195,10 @@ The `LiveChangesStream` operates through a simple state machine:
 3. **Waiting** -- when the buffer is exhausted, waits for a change notification (the adapter's, or the `ChangeReceiver` you passed) or, without one, polls on a timer. The stream subscribes before its first read, so no change committed in between is missed; a notification is only a wake-up, the changes themselves are always read from the feed (a subscriber that lags behind re-reads it).
 4. **Done** -- when the limit is reached or the channel closes.
 
+### After destroying the database
+
+A live changes stream keeps its position (`last_seq`) for its whole life. When the database it follows is destroyed and reused, the new database numbers its changes from 1 again, so a stream still positioned after the old database's changes misses them: it does not start over on its own (live replication does, see [Replication](replication.md)). Cancel the stream (drop it or call `ChangesHandle::cancel`) and create a new one from `Seq::zero()` after `destroy()`; never pass a `last_seq` from before the `destroy()` to a new stream.
+
 ## ChangeSender / ChangeReceiver
 
 The `ChangeSender` and `ChangeReceiver` pair provides a Tokio broadcast channel for notifying live streams when documents change.

@@ -299,7 +299,9 @@ while let Ok(event) = rx.try_recv() {
 
 ## Live (Continuous) Replication
 
-Live replication keeps running in the background, replicating new changes as they happen: a local source (memory, redb) announces each committed change, a remote one is polled every `poll_interval`. If either database is destroyed (and maybe reused) while the replication runs, it starts over and copies every document of the source again, even when the source is idle. This is the equivalent of PouchDB's `{ live: true }` option.
+Live replication keeps running in the background, replicating new changes as they happen: a local source (memory, redb) announces each committed change, a remote one is polled every `poll_interval`. This is the equivalent of PouchDB's `{ live: true }` option.
+
+If a **local** database (memory, redb) at either end is destroyed (and maybe reused) while the replication runs, the replication notices it and starts over, copying every document of the source again, even when the source is idle. This automatic recovery does **not** cover a **remote** database: see [Re-creating a remote database](#re-creating-a-remote-database).
 
 ```rust
 use rouchdb::{ReplicationOptions, ReplicationEvent};
@@ -356,6 +358,30 @@ let (rx, handle) = local.replicate_to_live(&remote, ReplicationOptions {
     ..Default::default()
 });
 ```
+
+### Re-creating a remote database
+
+The HTTP adapter identifies a remote database by the server's uuid and the database name. A remote database that is deleted and re-created under the same name therefore looks like the same database: a running live replication keeps its position, and a new replication resumes from the existing checkpoints. Neither copies the documents the re-created database lost, and simply retrying does not help.
+
+When you delete and re-create a remote database that takes part in a replication:
+
+1. Cancel every live replication to or from it (`handle.cancel()`).
+2. Re-create the database.
+3. Copy everything again with a one-shot replication that ignores the checkpoints:
+
+   ```rust
+   use rouchdb::{ReplicationOptions, Seq};
+
+   local.replicate_to_with_opts(&remote, ReplicationOptions {
+       since: Some(Seq::zero()),
+       checkpoint: false,
+       ..Default::default()
+   }).await?;
+   ```
+
+4. Start the live replication again.
+
+Destroying a **local** database (memory, redb) needs none of this: it gets a new identity, and replications from or to it start over on their own.
 
 ## Complete Example: Local-to-CouchDB Sync
 

@@ -274,6 +274,11 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 /// `poll_interval`.
 /// A failed fetch is reported as [`ChangesEvent::Error`]; a live stream then
 /// retries with a growing delay, a one-shot stream ends.
+///
+/// The stream keeps its position for its whole life. If the database is
+/// destroyed and reused, the new changes are numbered from 1 again and the
+/// stream does not start over: cancel it and create a new one from
+/// `Seq::zero()` after `destroy()`.
 pub struct LiveChangesStream {
     adapter: Arc<dyn Adapter>,
     receiver: Option<ChangeReceiver>,
