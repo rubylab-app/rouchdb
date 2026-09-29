@@ -227,6 +227,9 @@ pub struct HttpAdapter {
     /// cell when the database is destroyed, so it is created again on the
     /// next use.
     setup: std::sync::Mutex<std::sync::Arc<tokio::sync::OnceCell<()>>>,
+    /// The id derived from the server's uuid, once known: it does not change
+    /// while the server runs, and live replication asks for it every pass.
+    id: tokio::sync::OnceCell<String>,
 }
 
 impl HttpAdapter {
@@ -257,6 +260,7 @@ impl HttpAdapter {
             base_url,
             skip_setup: false,
             setup: Default::default(),
+            id: Default::default(),
         }
     }
 
@@ -413,7 +417,11 @@ impl Adapter for HttpAdapter {
         // URL of the same database maps to one replication id (and same-named
         // databases on different servers do not). A server that answers
         // without a uuid gets the URL without credentials; an unreachable one
-        // is an error, so a fallback id is never used by mistake.
+        // is an error, so a fallback id is never used by mistake. Only the
+        // uuid-based id is cached.
+        if let Some(id) = self.id.get() {
+            return Ok(id.clone());
+        }
         let (server, db) = self
             .base_url
             .rsplit_once('/')
@@ -429,7 +437,11 @@ impl Adapter for HttpAdapter {
             Err(_) => None,
         };
         Ok(match root.as_ref().and_then(|r| r.get("uuid")?.as_str()) {
-            Some(uuid) => format!("{}{}", uuid, db),
+            Some(uuid) => {
+                let id = format!("{}{}", uuid, db);
+                let _ = self.id.set(id.clone());
+                id
+            }
             None => url_without_credentials(&self.base_url),
         })
     }
@@ -1165,13 +1177,16 @@ mod tests {
 
     #[tokio::test]
     async fn id_is_server_uuid_plus_db_or_the_url_without_credentials() {
-        let (with_uuid, _) = recording_stub_server(json_response(
+        let (with_uuid, requests) = recording_stub_server(json_response(
             "200 OK",
             r#"{"couchdb":"Welcome","uuid":"abc123"}"#,
         ))
         .await;
         let db = HttpAdapter::new(&format!("{with_uuid}/userdb"));
         assert_eq!(db.id().await.unwrap(), "abc123userdb");
+        // The uuid-based id is cached (live replication asks every pass).
+        assert_eq!(db.id().await.unwrap(), "abc123userdb");
+        assert_eq!(requests.lock().unwrap().len(), 1);
 
         let (no_uuid, _) =
             recording_stub_server(json_response("200 OK", r#"{"couchdb":"Welcome"}"#)).await;

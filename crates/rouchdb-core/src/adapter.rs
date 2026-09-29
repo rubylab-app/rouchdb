@@ -46,8 +46,19 @@ pub trait Adapter: Send + Sync {
 
     /// A stable identifier for this database, used to derive replication
     /// ids so that replications with different peers never share a
-    /// checkpoint. Defaults to the database name; remote adapters should
-    /// include the server identity.
+    /// checkpoint.
+    ///
+    /// It must tell apart two databases that share a name, and should
+    /// change when [`destroy`](Adapter::destroy) empties the database: a
+    /// live replication compares it on every pass and starts over from the
+    /// peer's checkpoint when it changes, since the sequences of a
+    /// destroyed database start over too. The local adapters use a uuid of
+    /// their own (persisted in the file for redb, per instance in memory)
+    /// that `destroy` renews; the HTTP adapter uses the server's uuid plus
+    /// the database name.
+    ///
+    /// Defaults to the database name, which meets neither requirement:
+    /// override it.
     async fn id(&self) -> Result<String> {
         Ok(self.info().await?.db_name)
     }
@@ -127,7 +138,9 @@ pub trait Adapter: Send + Sync {
     /// checkpoints) and the security document included.
     ///
     /// The adapter stays usable afterwards and behaves as a new, empty
-    /// database (a remote one is re-created on its next use).
+    /// database (a remote one is re-created on its next use). A local
+    /// database also gets a new [`id`](Adapter::id), so replications with it
+    /// start over instead of resuming from the old database's checkpoints.
     async fn destroy(&self) -> Result<()>;
 
     /// Subscribe to the changes this adapter commits, if it can announce

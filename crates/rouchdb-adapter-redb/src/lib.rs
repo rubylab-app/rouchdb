@@ -443,8 +443,9 @@ impl RedbAdapter {
     /// # Ok::<(), rouchdb_core::error::RouchError>(())
     /// ```
     ///
-    /// The upgrade is one atomic transaction: after an error the file is
-    /// exactly as it was. **Read [`RedbAdapter::upgrade`] about the first
+    /// The upgrade is one atomic transaction: the file is upgraded
+    /// completely or not at all (see [`RedbAdapter::upgrade`] about what an
+    /// error leaves behind). **Read [`RedbAdapter::upgrade`] about the first
     /// compaction afterwards.**
     pub fn open_with(path: impl AsRef<Path>, name: &str, options: OpenOptions) -> Result<Self> {
         let (db, upgrade_report) = upgrade::open_database(path.as_ref(), &options)?;
@@ -482,6 +483,18 @@ impl RedbAdapter {
     /// ([`UpgradeReport::case_duplicate_bodies_discarded`],
     /// [`UpgradeReport::docs_with_changed_winner`]).
     ///
+    /// # Errors
+    ///
+    /// The transaction is committed with two-phase commit, so the file is
+    /// upgraded completely or not at all. An error **before the commit**
+    /// (while writing the backup or applying the upgrade) leaves the file
+    /// exactly as it was, and the backup made for that attempt is removed.
+    /// If **the commit itself** fails, the backup is kept and the error says
+    /// so: if the file still needs upgrading it was not changed (move the
+    /// backup elsewhere, or choose another backup path, before retrying);
+    /// otherwise the upgrade was committed and the backup is the copy of
+    /// the old file.
+    ///
     /// # Disk space and memory
     ///
     /// The upgrade needs about twice the file size of free disk space (redb
@@ -505,8 +518,14 @@ impl RedbAdapter {
 
     /// Report what [`RedbAdapter::upgrade`] would do to a file, without
     /// changing it: the file is only read (read transactions), so not a
-    /// byte of it changes and no disk space is used. It fails where the
-    /// upgrade would, with the same error.
+    /// byte of it changes and no disk space is used.
+    ///
+    /// It runs the upgrade's analysis: it validates every record and
+    /// computes the plan, so it refuses a file the upgrade would refuse for
+    /// its content, with the same error, and reports the same counts. It
+    /// does not exercise the rest of the upgrade (the backup path, writing
+    /// and verifying the backup, free disk space, writing and committing the
+    /// upgrade), which can therefore still fail.
     pub fn inspect_upgrade(path: impl AsRef<Path>) -> Result<UpgradeReport> {
         upgrade::upgrade_file(path.as_ref(), &UpgradePolicy::Refuse, true)
     }
@@ -809,6 +828,14 @@ impl Adapter for RedbAdapter {
         self.run(|db| db.info()).await
     }
 
+    /// The uuid stored in the file when the database was created (or last
+    /// destroyed), not its name: two files opened under the same name, or
+    /// one file before and after `destroy()`, never share replication
+    /// checkpoints, while reopening a file keeps its checkpoints.
+    async fn id(&self) -> Result<String> {
+        self.run(|db| db.id()).await
+    }
+
     async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
         let id = id.to_string();
         self.run(move |db| db.get(&id, opts)).await
@@ -952,6 +979,12 @@ impl Inner {
             meta.doc_del_count,
             meta.update_seq,
         ))
+    }
+
+    /// The database's persisted uuid, renewed by `destroy()`.
+    fn id(&self) -> Result<String> {
+        let read_txn = db_err!(self.db.begin_read())?;
+        Ok(read_meta(&db_err!(read_txn.open_table(META_TABLE))?)?.db_uuid)
     }
 
     fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {

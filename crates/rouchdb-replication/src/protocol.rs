@@ -8,6 +8,8 @@ use rouchdb_core::error::Result;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use rouchdb_query::CompiledSelector;
+
 use crate::checkpoint::Checkpointer;
 
 /// Filter for selective replication.
@@ -134,13 +136,20 @@ pub enum ReplicationEvent {
 
 /// Build a stable fingerprint of the active filter for the replication ID,
 /// so filtered and unfiltered replications use distinct checkpoints.
+///
+/// `DocIds` is encoded as the JSON array of its sorted, deduplicated ids, so
+/// distinct selections never share a fingerprint (`["a", "b"]` and
+/// `["a\u{0}b"]` did when the ids were joined with NUL). The `v2` tag keeps
+/// checkpoints written with that ambiguous encoding from being reused.
 fn filter_fingerprint(filter: &Option<ReplicationFilter>) -> String {
     match filter {
         None => "nofilter".to_string(),
         Some(ReplicationFilter::DocIds(ids)) => {
-            let mut sorted = ids.clone();
-            sorted.sort();
-            format!("docids:{}", sorted.join("\u{0}"))
+            let mut sorted: Vec<&str> = ids.iter().map(String::as_str).collect();
+            sorted.sort_unstable();
+            sorted.dedup();
+            let json = serde_json::to_string(&sorted).expect("strings serialize");
+            format!("docids-v2:{json}")
         }
         Some(ReplicationFilter::Selector(sel)) => format!("selector:{}", sel),
         // Never used for a checkpoint: see `ReplicationFilter::Custom`.
@@ -163,6 +172,18 @@ fn selector_view(doc: &Document) -> serde_json::Value {
         obj.insert("_deleted".into(), serde_json::Value::Bool(true));
     }
     serde_json::Value::Object(obj)
+}
+
+/// Compile the replication's selector filter, if any. An invalid selector
+/// is a `BadRequest`, returned before anything is read or written (a
+/// selector that failed to compile used to match nothing, so the
+/// replication "succeeded" without copying a document and could advance its
+/// checkpoint past them).
+fn compile_filter(filter: &Option<ReplicationFilter>) -> Result<Option<CompiledSelector>> {
+    match filter {
+        Some(ReplicationFilter::Selector(selector)) => Ok(Some(CompiledSelector::new(selector)?)),
+        _ => Ok(None),
+    }
 }
 
 /// Whether `new` is strictly later than `old`. Opaque CouchDB sequences are
@@ -202,14 +223,27 @@ async fn is_leaf(adapter: &dyn Adapter, id: &str, rev: &str) -> Result<bool> {
 ///
 /// This is a single pass: `live`, `retry`, `back_off_function` and
 /// `poll_interval` only apply to [`replicate_live`].
+///
+/// An invalid [`ReplicationFilter::Selector`] is `Err(BadRequest)`, returned
+/// before anything is read or written.
 pub async fn replicate(
     source: &dyn Adapter,
     target: &dyn Adapter,
     opts: ReplicationOptions,
 ) -> Result<ReplicationResult> {
+    let selector = compile_filter(&opts.filter)?;
     let checkpointer = new_checkpointer(source, target, &opts.filter).await?;
     let since = opts.since.clone();
-    let outcome = run_replication(source, target, &opts, &checkpointer, since, None).await?;
+    let outcome = run_replication(
+        source,
+        target,
+        &opts,
+        selector.as_ref(),
+        &checkpointer,
+        since,
+        None,
+    )
+    .await?;
     Ok(outcome.result)
 }
 
@@ -225,12 +259,14 @@ pub async fn replicate_with_events(
     opts: ReplicationOptions,
     events_tx: mpsc::Sender<ReplicationEvent>,
 ) -> Result<ReplicationResult> {
+    let selector = compile_filter(&opts.filter)?;
     let checkpointer = new_checkpointer(source, target, &opts.filter).await?;
     let since = opts.since.clone();
     let outcome = run_replication(
         source,
         target,
         &opts,
+        selector.as_ref(),
         &checkpointer,
         since,
         Some(&events_tx),
@@ -269,20 +305,28 @@ async fn new_checkpointer(
     target: &dyn Adapter,
     filter: &Option<ReplicationFilter>,
 ) -> Result<Checkpointer> {
-    Ok(Checkpointer::new(
-        &source.id().await?,
-        &target.id().await?,
-        &filter_fingerprint(filter),
-    ))
+    let ids = peer_ids(source, target).await?;
+    Ok(checkpointer_for(&ids, filter))
+}
+
+/// The identities ([`Adapter::id`]) of the source and the target.
+async fn peer_ids(source: &dyn Adapter, target: &dyn Adapter) -> Result<(String, String)> {
+    Ok((source.id().await?, target.id().await?))
+}
+
+fn checkpointer_for(ids: &(String, String), filter: &Option<ReplicationFilter>) -> Checkpointer {
+    Checkpointer::new(&ids.0, &ids.1, &filter_fingerprint(filter))
 }
 
 /// One replication pass shared by the one-shot and live paths. `since`
 /// overrides the checkpoint as the starting sequence. Does not emit
 /// `Complete`; callers decide when the replication as a whole is done.
+/// `selector` is the compiled `ReplicationFilter::Selector` of `opts`.
 async fn run_replication(
     source: &dyn Adapter,
     target: &dyn Adapter,
     opts: &ReplicationOptions,
+    selector: Option<&CompiledSelector>,
     checkpointer: &Checkpointer,
     since: Option<Seq>,
     events: Option<&mpsc::Sender<ReplicationEvent>>,
@@ -415,9 +459,8 @@ async fn run_replication(
 
         // Step 4.5: Apply Selector filter to fetched documents, including
         // the reserved fields a selector may test (`_id`, `_rev`, `_deleted`).
-        if let Some(ReplicationFilter::Selector(ref selector)) = opts.filter {
-            docs_to_write
-                .retain(|doc| rouchdb_query::matches_selector(&selector_view(doc), selector));
+        if let Some(selector) = selector {
+            docs_to_write.retain(|doc| selector.matches(&selector_view(doc)));
         }
 
         if !docs_to_write.is_empty() {
@@ -525,6 +568,16 @@ async fn run_replication(
 /// `ReplicationHandle` is cancelled/dropped.
 ///
 /// Events are emitted through the returned channel receiver.
+///
+/// Each pass checks the identity ([`Adapter::id`]) of both databases. When
+/// one changed (a memory or redb database that was destroyed, and maybe
+/// reused, gets a new one), the replication starts over from the new pair's
+/// checkpoint (none after a `destroy`, so from the start of the changes
+/// feed) instead of resuming from a sequence of the old database.
+///
+/// An invalid [`ReplicationFilter::Selector`] sends one `Error` event and
+/// ends the replication (even with `retry`) before anything is read or
+/// written.
 pub fn replicate_live(
     source: Arc<dyn Adapter>,
     target: Arc<dyn Adapter>,
@@ -540,6 +593,15 @@ pub fn replicate_live(
     let cancel_clone = cancel.clone();
 
     tokio::spawn(async move {
+        // An invalid selector can never succeed: report it and stop, even
+        // with `retry`, before anything is read or written.
+        let selector = match compile_filter(&opts.filter) {
+            Ok(selector) => selector,
+            Err(e) => {
+                let _ = tx.send(ReplicationEvent::Error(e.to_string())).await;
+                return;
+            }
+        };
         // Subscribed before the first pass, so a change made during a pass
         // wakes the next one up.
         let mut notices = source.subscribe();
@@ -553,19 +615,30 @@ pub fn replicate_live(
         // fails with an error.
         let mut since = opts.since.clone();
         let mut checkpointer: Option<Checkpointer> = None;
+        // The identities the cursor and the checkpointer belong to.
+        let mut session_ids: Option<(String, String)> = None;
 
         'live: loop {
             let result = async {
-                if checkpointer.is_none() {
-                    checkpointer = Some(
-                        new_checkpointer(source.as_ref(), target.as_ref(), &opts.filter).await?,
-                    );
+                // A peer that was destroyed (and possibly reused) since the
+                // last pass reports a new identity; its sequences start over,
+                // so the cursor would skip its changes. Start again from its
+                // checkpoint under the new identity (none: from the start).
+                let ids = peer_ids(source.as_ref(), target.as_ref()).await?;
+                if session_ids.as_ref().is_some_and(|old| *old != ids) {
+                    since = None;
+                    checkpointer = None;
                 }
+                if checkpointer.is_none() {
+                    checkpointer = Some(checkpointer_for(&ids, &opts.filter));
+                }
+                session_ids = Some(ids);
                 let checkpointer = checkpointer.as_ref().expect("initialized above");
                 run_replication(
                     source.as_ref(),
                     target.as_ref(),
                     &opts,
+                    selector.as_ref(),
                     checkpointer,
                     since.clone(),
                     Some(&tx),
@@ -745,6 +818,22 @@ mod tests {
             .unwrap_or_default()
     }
 
+    #[test]
+    fn docids_fingerprint_is_unambiguous_and_order_free() {
+        let fp = |ids: &[&str]| {
+            filter_fingerprint(&Some(ReplicationFilter::DocIds(
+                ids.iter().map(|s| s.to_string()).collect(),
+            )))
+        };
+        assert_ne!(fp(&["a", "b"]), fp(&["a\u{0}b"]));
+        assert_ne!(fp(&["a,b"]), fp(&["a", "b"]));
+        assert_ne!(fp(&["a\"", "b"]), fp(&["a\",\"b"]));
+        assert_eq!(fp(&["b", "a"]), fp(&["a", "b"]));
+        assert_eq!(fp(&["a", "b", "a"]), fp(&["a", "b"]));
+        // Not the pre-fix encoding, whose checkpoints may be ambiguous.
+        assert_eq!(fp(&["a", "b"]), r#"docids-v2:["a","b"]"#);
+    }
+
     #[tokio::test]
     async fn replicate_propagates_conflict_branches() {
         let source = MemoryAdapter::new("source");
@@ -873,13 +962,17 @@ mod tests {
         let id_b = new_checkpointer(&source, &b, &None).await.unwrap();
         assert_ne!(id_a.replication_id(), id_b.replication_id());
 
-        // Local adapters keep deriving it from the name, so their existing
-        // checkpoints stay valid.
-        let local = new_checkpointer(&source, &MemoryAdapter::new("userdb"), &None)
+        // Local adapters have an identity of their own, not their name: two
+        // same-named local databases never share a checkpoint.
+        let local_a = new_checkpointer(&source, &MemoryAdapter::new("userdb"), &None)
             .await
             .unwrap();
-        let before = Checkpointer::new("local", "userdb", "nofilter");
-        assert_eq!(local.replication_id(), before.replication_id());
+        let local_b = new_checkpointer(&source, &MemoryAdapter::new("userdb"), &None)
+            .await
+            .unwrap();
+        assert_ne!(local_a.replication_id(), local_b.replication_id());
+        let by_name = Checkpointer::new("local", "userdb", "nofilter");
+        assert_ne!(local_a.replication_id(), by_name.replication_id());
     }
 
     #[tokio::test]

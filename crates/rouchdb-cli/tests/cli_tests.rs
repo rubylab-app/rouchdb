@@ -1497,9 +1497,10 @@ async fn replicate_selector_copies_only_matching_docs() {
 }
 
 #[tokio::test]
-async fn replicate_source_and_target_names_select_the_checkpoint() {
-    // The replication id, and so the checkpoint, is derived from both
-    // database names, which default to the file stems ("test", "target").
+async fn replicate_checkpoint_follows_the_files_not_their_names() {
+    // The replication id, and so the checkpoint, is derived from the uuid
+    // stored in each file: it survives between runs, and the database names
+    // (which default to the file stems) do not select another checkpoint.
     let (_src_dir, src_path) = setup_db(&[
         ("a", serde_json::json!({"x": 1})),
         ("b", serde_json::json!({"x": 2})),
@@ -1523,20 +1524,9 @@ async fn replicate_source_and_target_names_select_the_checkpoint() {
         "resumes from the checkpoint"
     );
     assert_eq!(
-        replicate(&["--source-name", "other"]),
-        (2.into(), 0.into()),
-        "another source name is another replication"
-    );
-    assert_eq!(replicate(&["--source-name", "other"]), (0.into(), 0.into()));
-    assert_eq!(
-        replicate(&["--target-name", "other"]),
-        (2.into(), 0.into()),
-        "another target name is another replication"
-    );
-    assert_eq!(
-        replicate(&["--source-name", "test", "--target-name", "target"]),
+        replicate(&["--source-name", "other", "--target-name", "other"]),
         (0.into(), 0.into()),
-        "the default names are the file stems"
+        "the names do not select the checkpoint"
     );
 }
 
