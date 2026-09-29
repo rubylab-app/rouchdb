@@ -623,7 +623,8 @@ pub struct ChangeEvent {
     pub seq: Seq,
     pub id: String,
     pub changes: Vec<ChangeRev>,
-    #[serde(default)]
+    /// Omitted from the JSON when false, as CouchDB does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deleted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doc: Option<serde_json::Value>,

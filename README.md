@@ -219,6 +219,7 @@ Options:
       --admin <USER:PASSWORD>      Require admin credentials [env: ROUCHDB_ADMIN]
       --cors-origin <ORIGIN>       Allow CORS from this origin (repeatable) [env: ROUCHDB_CORS_ORIGINS]
       --max-request-size <BYTES>   Largest accepted request body [default: 67108864]
+      --session-timeout <SECONDS>  Idle lifetime of a _session cookie [default: 600]
 ```
 
 Security defaults: the server binds to `127.0.0.1`, **CORS is disabled** (so
@@ -227,7 +228,9 @@ database) and **authentication is off**. To require credentials, set
 `ROUCHDB_ADMIN=user:password` (or `--admin`); clients then authenticate with
 HTTP Basic auth (`http://user:password@host:5984/db`) or a `_session` cookie
 (Fauxton login), and only `/`, `/_session`, `/_uuids` and `/_utils` stay
-public. To let a browser app on another origin talk to the server, allow its
+public (wrong Basic credentials are rejected even there, as in CouchDB). As in
+CouchDB, a session cookie expires after 10 minutes without use
+(`--session-timeout`). To let a browser app on another origin talk to the server, allow its
 origin explicitly, e.g. `--cors-origin http://localhost:3000` (credentials are
 allowed for listed origins; `*` allows any origin without credentials). The
 server warns at startup when it listens on a non-loopback address without

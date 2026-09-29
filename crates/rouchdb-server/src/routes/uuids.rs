@@ -12,11 +12,12 @@ fn default_count() -> usize {
     1
 }
 
-/// GET /_uuids?count=N — generate UUIDs.
+/// GET /_uuids?count=N — generate UUIDs, as 32 lowercase hex digits like
+/// CouchDB's (no hyphens).
 pub async fn get_uuids(Query(query): Query<UuidsQuery>) -> Json<serde_json::Value> {
     let count = query.count.min(1000);
     let uuids: Vec<String> = (0..count)
-        .map(|_| uuid::Uuid::new_v4().to_string())
+        .map(|_| uuid::Uuid::new_v4().simple().to_string())
         .collect();
     Json(serde_json::json!({ "uuids": uuids }))
 }

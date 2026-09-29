@@ -8,21 +8,56 @@ use rouchdb_core::error::RouchError;
 use crate::error::AppError;
 use crate::state::AppState;
 
+/// Query-string parameters of `_all_docs`. Booleans and integers are kept as
+/// strings and parsed here, so invalid values get CouchDB's
+/// `query_parse_error` instead of a generic deserialization error.
 #[derive(Deserialize, Default)]
 pub struct AllDocsQuery {
-    pub include_docs: Option<bool>,
+    pub include_docs: Option<String>,
     pub startkey: Option<String>,
     pub start_key: Option<String>,
     pub endkey: Option<String>,
     pub end_key: Option<String>,
     pub key: Option<String>,
     pub keys: Option<String>,
-    pub limit: Option<u64>,
-    pub skip: Option<u64>,
-    pub descending: Option<bool>,
-    pub inclusive_end: Option<bool>,
-    pub conflicts: Option<bool>,
-    pub update_seq: Option<bool>,
+    pub limit: Option<String>,
+    pub skip: Option<String>,
+    pub descending: Option<String>,
+    pub inclusive_end: Option<String>,
+    pub conflicts: Option<String>,
+    pub update_seq: Option<String>,
+}
+
+fn query_parse_error(reason: String) -> AppError {
+    AppError(RouchError::BadRequest(reason))
+}
+
+/// Parse a boolean parameter (`true` / `false`), defaulting to `default`.
+fn parse_bool(raw: Option<&str>, default: bool) -> Result<bool, AppError> {
+    match raw {
+        None => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(other) => Err(query_parse_error(format!(
+            "Invalid boolean parameter: {other:?}"
+        ))),
+    }
+}
+
+/// Parse a non-negative integer parameter.
+fn parse_count(raw: Option<&str>) -> Result<Option<u64>, AppError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match raw.parse::<i64>() {
+        Ok(n) if n < 0 => Err(query_parse_error(format!(
+            "Invalid value for positive integer: {raw:?}"
+        ))),
+        Ok(n) => Ok(Some(n as u64)),
+        Err(_) => Err(query_parse_error(format!(
+            "Invalid value for integer: {raw:?}"
+        ))),
+    }
 }
 
 /// A decoded key parameter. `_all_docs` keys are document ids, and CouchDB
@@ -59,7 +94,13 @@ impl AllDocsQuery {
     /// Build the adapter options, or `None` when the requested range cannot
     /// match any document.
     fn into_options(self, keys: Option<Vec<String>>) -> Result<Option<AllDocsOptions>, AppError> {
-        let descending = self.descending.unwrap_or(false);
+        let descending = parse_bool(self.descending.as_deref(), false)?;
+        let include_docs = parse_bool(self.include_docs.as_deref(), false)?;
+        let inclusive_end = parse_bool(self.inclusive_end.as_deref(), true)?;
+        let conflicts = parse_bool(self.conflicts.as_deref(), false)?;
+        let update_seq = parse_bool(self.update_seq.as_deref(), false)?;
+        let limit = parse_count(self.limit.as_deref())?;
+        let skip = parse_count(self.skip.as_deref())?.unwrap_or(0);
         let start = parse_key(self.startkey.or(self.start_key))?;
         let end = parse_key(self.endkey.or(self.end_key))?;
         let key = parse_key(self.key)?;
@@ -92,28 +133,19 @@ impl AllDocsQuery {
         };
 
         Ok(Some(AllDocsOptions {
-            include_docs: self.include_docs.unwrap_or(false),
+            include_docs,
             start_key: id(start),
             end_key: id(end),
             key: id(key),
             keys,
-            limit: self.limit,
-            skip: self.skip.unwrap_or(0),
+            limit,
+            skip,
             descending,
-            inclusive_end: self.inclusive_end.unwrap_or(true),
-            conflicts: self.conflicts.unwrap_or(false),
-            update_seq: self.update_seq.unwrap_or(false),
+            inclusive_end,
+            conflicts,
+            update_seq,
         }))
     }
-}
-
-fn validate_db(db: &str, state: &AppState) -> Result<(), AppError> {
-    if db != state.db_name {
-        return Err(AppError(rouchdb_core::error::RouchError::NotFound(
-            format!("Database does not exist: {db}"),
-        )));
-    }
-    Ok(())
 }
 
 async fn run_all_docs(
@@ -121,7 +153,7 @@ async fn run_all_docs(
     query: AllDocsQuery,
     keys: Option<Vec<String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let descending = query.descending.unwrap_or(false);
+    let descending = query.descending.as_deref() == Some("true");
     let response = match query.into_options(keys)? {
         Some(opts) => state.db.all_docs(opts).await?,
         None => {
@@ -147,7 +179,7 @@ pub async fn get_all_docs(
     Path(db): Path<String>,
     Query(query): Query<AllDocsQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     run_all_docs(&state, query, None).await
 }
 
@@ -158,7 +190,7 @@ pub async fn post_all_docs(
     Query(query): Query<AllDocsQuery>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     let keys = match body.get("keys") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::Array(arr)) => Some(string_keys(arr)),

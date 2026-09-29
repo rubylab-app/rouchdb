@@ -5,8 +5,10 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
-use rouchdb::{BulkGetItem, ChangesOptions, ChangesStyle, GetOptions};
+use rouchdb::{AllDocsOptions, BulkGetItem, ChangesOptions, ChangesStyle, GetOptions, Revision};
 use rouchdb_core::error::RouchError;
+
+use super::set_location;
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -33,15 +35,6 @@ pub struct DeleteDocQuery {
     pub rev: Option<String>,
 }
 
-fn validate_db(db: &str, state: &AppState) -> Result<(), AppError> {
-    if db != state.db_name {
-        return Err(AppError(rouchdb_core::error::RouchError::NotFound(
-            format!("Database does not exist: {db}"),
-        )));
-    }
-    Ok(())
-}
-
 /// Strip the quotes (and a weak `W/` prefix) from an ETag header value.
 fn etag_value(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
     let raw = headers.get(name)?.to_str().ok()?.trim();
@@ -49,7 +42,7 @@ fn etag_value(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
     Some(raw.trim_matches('"').to_string())
 }
 
-fn etag_header(rev: &str) -> Option<HeaderValue> {
+pub(crate) fn etag_header(rev: &str) -> Option<HeaderValue> {
     HeaderValue::from_str(&format!("\"{rev}\"")).ok()
 }
 
@@ -77,6 +70,48 @@ pub(crate) fn resolve_rev(
     }
 }
 
+/// Reject a `?rev` that is not a revision (`N-hash`) with CouchDB's 400.
+pub(crate) fn check_rev_format(rev: Option<&str>) -> Result<(), AppError> {
+    if let Some(rev) = rev {
+        rev.parse::<Revision>()?;
+    }
+    Ok(())
+}
+
+/// CouchDB's 404 for a document read without `rev`: the reason is `deleted`
+/// when the winning revision is a deletion, `missing` otherwise.
+pub(crate) async fn doc_not_found(state: &AppState, docid: &str) -> AppError {
+    let deleted = state
+        .db
+        .all_docs(AllDocsOptions {
+            keys: Some(vec![docid.to_string()]),
+            ..AllDocsOptions::new()
+        })
+        .await
+        .ok()
+        .and_then(|response| response.rows.into_iter().find(|row| row.id == docid))
+        .is_some_and(|row| row.value.deleted == Some(true));
+    let reason = if deleted { "deleted" } else { "missing" };
+    AppError(RouchError::NotFound(reason.into()))
+}
+
+/// Read a document, turning a 404 into CouchDB's `missing` / `deleted`.
+pub(crate) async fn get_or_not_found(
+    state: &AppState,
+    docid: &str,
+    opts: GetOptions,
+) -> Result<rouchdb::Document, AppError> {
+    let rev_requested = opts.rev.is_some();
+    match state.db.get_with_opts(docid, opts).await {
+        Ok(doc) => Ok(doc),
+        Err(RouchError::NotFound(_)) if rev_requested => {
+            Err(AppError(RouchError::NotFound("missing".into())))
+        }
+        Err(RouchError::NotFound(_)) => Err(doc_not_found(state, docid).await),
+        Err(e) => Err(AppError(e)),
+    }
+}
+
 /// GET /{db}/{docid} — get a document.
 pub async fn get_doc(
     State(state): State<AppState>,
@@ -84,13 +119,14 @@ pub async fn get_doc(
     Query(query): Query<GetDocQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     if let Some(open_revs) = query.open_revs.as_deref() {
         return Ok(get_open_revs(&state, &docid, open_revs, &query)
             .await?
             .into_response());
     }
+    check_rev_format(query.rev.as_deref())?;
 
     let opts = GetOptions {
         rev: query.rev,
@@ -102,7 +138,7 @@ pub async fn get_doc(
         ..Default::default()
     };
 
-    let doc = state.db.get_with_opts(&docid, opts).await?;
+    let doc = get_or_not_found(&state, &docid, opts).await?;
     let etag = doc.rev.as_ref().and_then(|r| etag_header(&r.to_string()));
 
     // The revision is the document's ETag: answer a matching If-None-Match
@@ -196,7 +232,7 @@ pub async fn put_doc(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     let mut body = serde_json::Value::Object(super::json_object_body(&body)?);
 
     // Honor a `_deleted: true` body (CouchDB delete-via-PUT).
@@ -215,21 +251,27 @@ pub async fn put_doc(
                 "Missing _rev for delete".to_string(),
             ))
         })?;
-        state.db.remove(&docid, &rev_str).await?
+        state.db.remove(&docid, &rev_str).await
     } else if let Some(rev_str) = rev {
         // Strip _id and _rev from body data
         if let Some(obj) = body.as_object_mut() {
             obj.remove("_id");
             obj.remove("_rev");
         }
-        state.db.update(&docid, &rev_str, body).await?
+        state.db.update(&docid, &rev_str, body).await
     } else {
         // Strip _id from body data
         if let Some(obj) = body.as_object_mut() {
             obj.remove("_id");
             obj.remove("_rev");
         }
-        state.db.put(&docid, body).await?
+        state.db.put(&docid, body).await
+    };
+    let result = match result {
+        // Only an edit of a given revision can miss its document: editing a
+        // revision of a document that does not exist is a conflict in CouchDB.
+        Err(RouchError::NotFound(_)) => return Err(AppError(RouchError::Conflict)),
+        other => other?,
     };
 
     // A failed write returns Ok(DocResult { ok: false, .. }); map it to the
@@ -257,6 +299,7 @@ pub async fn put_doc(
     if let Some(etag) = etag {
         resp.headers_mut().insert(header::ETAG, etag);
     }
+    set_location(&mut resp, &headers, &[&db, &docid]);
     Ok(resp)
 }
 
@@ -266,13 +309,18 @@ pub async fn delete_doc(
     Path((db, docid)): Path<(String, String)>,
     Query(query): Query<DeleteDocQuery>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+) -> Result<Response, AppError> {
+    state.check_db(&db)?;
 
     // Without any revision CouchDB reports a conflict.
     let rev = resolve_rev(query.rev, None, &headers)?.ok_or(AppError(RouchError::Conflict))?;
 
-    let result = state.db.remove(&docid, &rev).await?;
+    let result = match state.db.remove(&docid, &rev).await {
+        Err(RouchError::NotFound(_)) => {
+            return Err(AppError(RouchError::NotFound("missing".into())));
+        }
+        other => other?,
+    };
     if !result.ok {
         return Err(AppError(match result.error.as_deref() {
             Some("not_found") => rouchdb_core::error::RouchError::NotFound(
@@ -281,9 +329,15 @@ pub async fn delete_doc(
             _ => rouchdb_core::error::RouchError::Conflict,
         }));
     }
-    Ok(Json(serde_json::json!({
+    let etag = result.rev.as_deref().and_then(etag_header);
+    let mut resp = Json(serde_json::json!({
         "ok": result.ok,
         "id": result.id,
         "rev": result.rev,
-    })))
+    }))
+    .into_response();
+    if let Some(etag) = etag {
+        resp.headers_mut().insert(header::ETAG, etag);
+    }
+    Ok(resp)
 }

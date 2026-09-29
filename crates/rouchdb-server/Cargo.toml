@@ -30,5 +30,6 @@ futures-util = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 http-body-util = "0.1"
+reqwest = { version = "0.12.17", default-features = false }
 tempfile = "3.1.0"
 tower = { version = "0.5.2", features = ["util"] }

@@ -109,7 +109,7 @@ async fn extractor_rejections_are_json() {
     assert_json_error(&resp, StatusCode::BAD_REQUEST, "bad_request");
 
     let resp = get(&app, "/db/_all_docs?limit=abc").await;
-    assert_json_error(&resp, StatusCode::BAD_REQUEST, "bad_request");
+    assert_json_error(&resp, StatusCode::BAD_REQUEST, "query_parse_error");
 }
 
 #[tokio::test]
@@ -117,7 +117,7 @@ async fn unsupported_method_is_json_405() {
     let app = app();
     let resp = raw(&app, Method::PATCH, "/db", None, "").await;
     assert_json_error(&resp, StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
-    assert_eq!(resp.header("allow"), Some("GET,HEAD,PUT,POST,DELETE"));
+    assert_eq!(resp.header("allow"), Some("DELETE,GET,HEAD,POST,PUT"));
 }
 
 #[tokio::test]

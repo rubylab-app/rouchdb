@@ -193,6 +193,20 @@ pub fn query_sorted(
     reduce_fn: Option<&ReduceFn>,
     opts: &ViewQueryOptions,
 ) -> Result<ViewResult> {
+    // Like CouchDB, a single-element `keys` is the same query as `key`
+    // (`keys` wins over `key`, as it does with several keys).
+    let single_key;
+    let opts = match opts.keys.as_deref() {
+        Some([key]) => {
+            single_key = ViewQueryOptions {
+                key: Some(key.clone()),
+                keys: None,
+                ..opts.clone()
+            };
+            &single_key
+        }
+        _ => opts,
+    };
     let reduce = reducer(reduce_fn, opts)?;
     let total = rows.len();
 
@@ -316,10 +330,13 @@ fn reducer<'a>(
                 "`include_docs` is invalid for reduce".into(),
             ));
         }
-        let grouped = opts.group_level.map(|l| l > 0).unwrap_or(opts.group);
-        if opts.keys.is_some() && !grouped {
+        // CouchDB needs exact grouping (`group=true`, no `group_level`)
+        // to reduce several keys, one row per key; a single key is `key`.
+        let exact_group = opts.group && opts.group_level.is_none();
+        let single_key = matches!(opts.keys.as_deref(), Some([_]));
+        if opts.keys.is_some() && !single_key && !exact_group {
             return Err(RouchError::BadRequest(
-                "multi-key fetches for reduce views must use `group=true`".into(),
+                "Multi-key fetches for reduce views must use `group=true`".into(),
             ));
         }
     }
@@ -1319,6 +1336,134 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(r.rows[0].value, serde_json::json!([["LA", "bob"]]));
+    }
+
+    #[test]
+    fn reduce_keys_need_exact_grouping_like_couchdb() {
+        // CouchDB 3.5.1 (`couch_mrview_util:validate_args`): with a reduce,
+        // a `keys` list of more than one key needs `group=true` and no
+        // `group_level`; a single key behaves like `key`.
+        use serde_json::json;
+        let rows: Vec<EmittedRow> = [("a1", "a"), ("a2", "a"), ("b1", "b")]
+            .into_iter()
+            .map(|(id, prefix)| EmittedRow {
+                id: id.into(),
+                key: json!([prefix, id]),
+                value: json!(1),
+            })
+            .collect();
+        let two = || Some(vec![json!(["a", "a1"]), json!(["a", "a2"])]);
+        let one = || Some(vec![json!(["a", "a1"])]);
+        let run = |opts: ViewQueryOptions| {
+            query_emitted(rows.clone(), Some(&ReduceFn::Count), &opts).map(|r| {
+                r.rows
+                    .into_iter()
+                    .map(|row| (row.key, row.value))
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        for opts in [
+            ViewQueryOptions {
+                keys: two(),
+                group_level: Some(1),
+                ..ViewQueryOptions::new()
+            },
+            ViewQueryOptions {
+                keys: two(),
+                group: true,
+                group_level: Some(1),
+                ..ViewQueryOptions::new()
+            },
+            ViewQueryOptions {
+                keys: two(),
+                group_level: Some(0),
+                ..ViewQueryOptions::new()
+            },
+            ViewQueryOptions {
+                keys: two(),
+                ..ViewQueryOptions::new()
+            },
+            ViewQueryOptions {
+                keys: Some(vec![]),
+                ..ViewQueryOptions::new()
+            },
+        ] {
+            match run(opts.clone()) {
+                Err(RouchError::BadRequest(reason)) => assert_eq!(
+                    reason,
+                    "Multi-key fetches for reduce views must use `group=true`"
+                ),
+                other => panic!("{opts:?} must be rejected, got {other:?}"),
+            }
+        }
+
+        let grouped = run(ViewQueryOptions {
+            keys: two(),
+            group: true,
+            ..ViewQueryOptions::new()
+        });
+        assert_eq!(
+            grouped.unwrap(),
+            [
+                (json!(["a", "a1"]), json!(1)),
+                (json!(["a", "a2"]), json!(1))
+            ]
+        );
+        let single = |group, group_level| {
+            run(ViewQueryOptions {
+                keys: one(),
+                group,
+                group_level,
+                ..ViewQueryOptions::new()
+            })
+            .unwrap()
+        };
+        assert_eq!(single(false, None), [(Value::Null, json!(1))]);
+        assert_eq!(single(false, Some(1)), [(json!(["a"]), json!(1))]);
+        assert_eq!(single(true, None), [(json!(["a", "a1"]), json!(1))]);
+        // `keys` wins over `key`, whatever its length.
+        let with_key = run(ViewQueryOptions {
+            key: Some(json!(["b", "b1"])),
+            keys: one(),
+            ..ViewQueryOptions::new()
+        });
+        assert_eq!(with_key.unwrap(), [(Value::Null, json!(1))]);
+        // Without the reduce any `keys` list is fine.
+        let map = query_emitted(
+            rows.clone(),
+            Some(&ReduceFn::Count),
+            &ViewQueryOptions {
+                keys: two(),
+                group_level: Some(1),
+                reduce: false,
+                ..ViewQueryOptions::new()
+            },
+        )
+        .unwrap();
+        assert_eq!(map.rows.len(), 2);
+        assert_eq!(map.offset, 0);
+    }
+
+    #[tokio::test]
+    async fn query_view_reduces_a_single_key_without_grouping() {
+        // `query_view` validates before mapping: a one-element `keys` must
+        // pass that check too (CouchDB treats it as `key`).
+        let db = setup_db().await;
+        let r = query_view(
+            &db,
+            &by_city,
+            Some(&ReduceFn::Count),
+            ViewQueryOptions {
+                keys: Some(vec![serde_json::json!("NYC")]),
+                ..ViewQueryOptions::new()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].key, Value::Null);
+        assert_eq!(r.rows[0].value, serde_json::json!(2));
     }
 
     #[tokio::test]

@@ -7,21 +7,12 @@ use crate::error::AppError;
 use crate::state::AppState;
 use rouchdb_core::error::RouchError;
 
-fn validate_db(db: &str, state: &AppState) -> Result<(), AppError> {
-    if db != state.db_name {
-        return Err(AppError(rouchdb_core::error::RouchError::NotFound(
-            format!("Database does not exist: {db}"),
-        )));
-    }
-    Ok(())
-}
-
 /// GET /{db}/_security — get database security document.
 pub async fn get_security(
     State(state): State<AppState>,
     Path(db): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     let sec = state.db.get_security().await?;
     Ok(Json(serde_json::to_value(&sec).unwrap()))
@@ -33,7 +24,7 @@ pub async fn put_security(
     Path(db): Path<String>,
     Json(raw): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     // Parse here (instead of via the extractor) so a malformed body yields the
     // standard CouchDB error JSON rather than axum's default rejection. Unknown
