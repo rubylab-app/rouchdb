@@ -97,15 +97,88 @@ impl PartialOrd for Revision {
 // AttachmentMeta
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// An attachment of a document revision, as CouchDB describes it in
+/// `_attachments`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AttachmentMeta {
     pub content_type: String,
+    /// Generation of the revision that uploaded the attachment's data
+    /// (CouchDB's `revpos`): a write that sends the data (inline, or with
+    /// `put_attachment`) sets it to the new revision's generation, even for
+    /// bytes identical to the stored ones; stubs and inherited attachments
+    /// keep it, and replicated revisions keep the revpos they carry.
+    /// `0` when unknown (stored before 0.5, or received without one).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub revpos: u64,
     pub digest: String,
     pub length: u64,
     #[serde(default)]
     pub stub: bool,
+    /// How the source stores the bytes (CouchDB reports `"gzip"` for
+    /// compressed attachments with `att_encoding_info=true`). Only kept
+    /// from stubs: rouchdb always stores and serves decoded bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    /// Size of the encoded bytes at the source (see `encoding`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoded_length: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Vec<u8>>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+impl AttachmentMeta {
+    /// An attachment with inline bytes, as written by `put_attachment` or
+    /// an inline `_attachments` member (digest and length computed; the
+    /// write sets `revpos`).
+    pub fn new(content_type: impl Into<String>, data: Vec<u8>) -> Self {
+        Self {
+            content_type: content_type.into(),
+            digest: attachment_digest(&data),
+            length: data.len() as u64,
+            data: Some(data),
+            ..Self::default()
+        }
+    }
+
+    /// The attachment as a CouchDB `_attachments` member: inline with the
+    /// base64 `data` when bytes are given, a stub otherwise. `revpos` is
+    /// written when known, `encoding`/`encoded_length` on stubs only (the
+    /// inline bytes are always decoded).
+    pub fn to_json(&self, data: Option<&[u8]>) -> serde_json::Value {
+        use base64::Engine;
+        let mut m = serde_json::Map::new();
+        m.insert("content_type".into(), self.content_type.clone().into());
+        if self.revpos > 0 {
+            m.insert("revpos".into(), self.revpos.into());
+        }
+        m.insert("digest".into(), self.digest.clone().into());
+        m.insert("length".into(), self.length.into());
+        match data {
+            Some(bytes) => {
+                m.insert("stub".into(), false.into());
+                m.insert(
+                    "data".into(),
+                    base64::engine::general_purpose::STANDARD
+                        .encode(bytes)
+                        .into(),
+                );
+            }
+            None => {
+                m.insert("stub".into(), true.into());
+                if let Some(encoding) = &self.encoding {
+                    m.insert("encoding".into(), encoding.clone().into());
+                }
+                if let Some(len) = self.encoded_length {
+                    m.insert("encoded_length".into(), len.into());
+                }
+            }
+        }
+        serde_json::Value::Object(m)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -266,24 +339,11 @@ impl Document {
         }
 
         if !self.attachments.is_empty() {
-            use base64::Engine;
-            let mut att_map = serde_json::Map::new();
-            for (name, att) in &self.attachments {
-                if let Ok(serde_json::Value::Object(mut m)) = serde_json::to_value(att) {
-                    // Inline attachment bytes must be emitted as a CouchDB
-                    // base64 string, not serde's default numeric byte array.
-                    if let Some(bytes) = &att.data {
-                        m.insert(
-                            "data".into(),
-                            serde_json::Value::String(
-                                base64::engine::general_purpose::STANDARD.encode(bytes),
-                            ),
-                        );
-                        m.insert("stub".into(), serde_json::Value::Bool(false));
-                    }
-                    att_map.insert(name.clone(), serde_json::Value::Object(m));
-                }
-            }
+            let att_map = self
+                .attachments
+                .iter()
+                .map(|(name, att)| (name.clone(), att.to_json(att.data.as_deref())))
+                .collect();
             obj.insert("_attachments".into(), serde_json::Value::Object(att_map));
         }
 
@@ -352,6 +412,7 @@ fn parse_attachment(name: &str, meta: &serde_json::Value) -> Result<AttachmentMe
         Some(_) => return Err(invalid("content_type must be a string")),
     };
 
+    let revpos = obj.get("revpos").and_then(|v| v.as_u64()).unwrap_or(0);
     if let Some(data) = obj.get("data") {
         use base64::Engine;
         let encoded = data
@@ -361,11 +422,8 @@ fn parse_attachment(name: &str, meta: &serde_json::Value) -> Result<AttachmentMe
             .decode(encoded)
             .map_err(|_| invalid("data is not valid base64"))?;
         return Ok(AttachmentMeta {
-            content_type,
-            digest: attachment_digest(&bytes),
-            length: bytes.len() as u64,
-            stub: false,
-            data: Some(bytes),
+            revpos,
+            ..AttachmentMeta::new(content_type, bytes)
         });
     }
 
@@ -376,23 +434,24 @@ fn parse_attachment(name: &str, meta: &serde_json::Value) -> Result<AttachmentMe
     // A stub refers to the parent revision's attachment of the same name
     // (CouchDB matches stubs by name), so its digest is optional.
     let is_stub = obj.get("stub").and_then(|v| v.as_bool()).unwrap_or(false);
-    match obj.get("digest").and_then(|v| v.as_str()) {
-        Some(digest) => Ok(AttachmentMeta {
-            content_type,
-            digest: digest.to_string(),
-            length: obj.get("length").and_then(|v| v.as_u64()).unwrap_or(0),
-            stub: true,
-            data: None,
-        }),
-        None if is_stub => Ok(AttachmentMeta {
-            content_type,
-            digest: String::new(),
-            length: obj.get("length").and_then(|v| v.as_u64()).unwrap_or(0),
-            stub: true,
-            data: None,
-        }),
-        None => Err(invalid("neither data nor a stub")),
-    }
+    let digest = match obj.get("digest").and_then(|v| v.as_str()) {
+        Some(digest) => digest.to_string(),
+        None if is_stub => String::new(),
+        None => return Err(invalid("neither data nor a stub")),
+    };
+    Ok(AttachmentMeta {
+        content_type,
+        revpos,
+        digest,
+        length: obj.get("length").and_then(|v| v.as_u64()).unwrap_or(0),
+        stub: true,
+        encoding: obj
+            .get("encoding")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        encoded_length: obj.get("encoded_length").and_then(|v| v.as_u64()),
+        data: None,
+    })
 }
 
 /// CouchDB attachment digest: `md5-` followed by the base64 MD5 of the bytes.
@@ -1005,6 +1064,7 @@ mod tests {
                 length: 3,
                 stub: false,
                 data: Some(b"hi!".to_vec()),
+                ..Default::default()
             },
         );
         let doc = Document {
@@ -1018,6 +1078,67 @@ mod tests {
         // CouchDB requires inline data as a base64 string, not a byte array.
         assert_eq!(json["_attachments"]["hi.txt"]["data"], "aGkh");
         assert_eq!(json["_attachments"]["hi.txt"]["stub"], false);
+    }
+
+    #[test]
+    fn attachment_revpos_and_encoding_round_trip() {
+        // A stub as CouchDB 3.5.1 lists it (`GET /db/e?att_encoding_info=true`).
+        let stub = serde_json::json!({"content_type": "text/plain", "revpos": 1,
+            "digest": "md5-Ew9RIaBldynHDFVo1PvkrA==", "length": 2400, "stub": true,
+            "encoding": "gzip", "encoded_length": 52});
+        let doc = Document::from_json(serde_json::json!({
+            "_id": "e", "_rev": "1-3b5073b1b7a6ec2abcd4b0d8e005da08",
+            "_attachments": {"big.txt": stub}
+        }))
+        .unwrap();
+        let meta = &doc.attachments["big.txt"];
+        assert_eq!(meta.revpos, 1);
+        assert_eq!(meta.encoding.as_deref(), Some("gzip"));
+        assert_eq!(meta.encoded_length, Some(52));
+        assert_eq!(doc.to_json()["_attachments"]["big.txt"], stub);
+
+        // Inline data is decoded bytes: its revpos is kept, an encoding is
+        // not (CouchDB ignores it too).
+        let doc = Document::from_json(serde_json::json!({
+            "_id": "d",
+            "_attachments": {"hi.txt": {"content_type": "text/plain", "revpos": 3,
+                "digest": "md5-O9yO4zjoapsrEQwYrCDNZw==", "data": "aGkh", "encoding": "gzip"}}
+        }))
+        .unwrap();
+        let meta = &doc.attachments["hi.txt"];
+        assert_eq!((meta.revpos, meta.encoding.as_deref()), (3, None));
+        // (The digest is recomputed from the bytes: CouchDB's is the MD5 of
+        // the gzip-compressed bytes it stores for text types.)
+        assert_eq!(
+            doc.to_json()["_attachments"]["hi.txt"],
+            serde_json::json!({"content_type": "text/plain", "revpos": 3,
+                "digest": attachment_digest(b"hi!"), "length": 3, "stub": false,
+                "data": "aGkh"})
+        );
+
+        // Without a revpos (unknown), none is written.
+        let doc = Document::from_json(serde_json::json!({
+            "_id": "d", "_attachments": {"x": {"stub": true, "digest": "md5-x", "length": 1}}
+        }))
+        .unwrap();
+        assert_eq!(doc.attachments["x"].revpos, 0);
+        assert!(doc.to_json()["_attachments"]["x"].get("revpos").is_none());
+        assert_eq!(
+            AttachmentMeta::new("text/plain", b"hi!".to_vec()).digest,
+            attachment_digest(b"hi!")
+        );
+        // The serde form omits an unknown revpos too.
+        let meta = |revpos| AttachmentMeta {
+            revpos,
+            ..AttachmentMeta::default()
+        };
+        assert!(
+            serde_json::to_value(meta(0))
+                .unwrap()
+                .get("revpos")
+                .is_none()
+        );
+        assert_eq!(serde_json::to_value(meta(3)).unwrap()["revpos"], 3);
     }
 
     #[test]
@@ -1145,6 +1266,7 @@ mod tests {
                 length: 100,
                 stub: true,
                 data: None,
+                ..Default::default()
             },
         );
         let doc = Document {
@@ -1372,6 +1494,7 @@ mod tests {
             length: 3,
             stub: true,
             data: None,
+            ..Default::default()
         }
     }
 

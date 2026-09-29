@@ -638,32 +638,13 @@ impl Adapter for MemoryAdapter {
                         if let Some(atts) = stored.rev_attachments.get(&rev_str)
                             && !atts.is_empty()
                         {
-                            use base64::Engine;
-                            let mut att_map = serde_json::Map::new();
-                            for (name, meta) in atts {
-                                let mut m = serde_json::Map::new();
-                                m.insert(
-                                    "content_type".into(),
-                                    serde_json::Value::String(meta.content_type.clone()),
-                                );
-                                m.insert(
-                                    "digest".into(),
-                                    serde_json::Value::String(meta.digest.clone()),
-                                );
-                                m.insert("length".into(), serde_json::json!(meta.length));
-                                if let Some(bytes) = inner.attachments.get(&meta.digest) {
-                                    m.insert(
-                                        "data".into(),
-                                        serde_json::Value::String(
-                                            base64::engine::general_purpose::STANDARD.encode(bytes),
-                                        ),
-                                    );
-                                    m.insert("stub".into(), serde_json::Value::Bool(false));
-                                } else {
-                                    m.insert("stub".into(), serde_json::Value::Bool(true));
-                                }
-                                att_map.insert(name.clone(), serde_json::Value::Object(m));
-                            }
+                            let att_map = atts
+                                .iter()
+                                .map(|(name, meta)| {
+                                    let bytes = inner.attachments.get(&meta.digest);
+                                    (name.clone(), meta.to_json(bytes.map(Vec::as_slice)))
+                                })
+                                .collect();
                             obj.insert("_attachments".into(), serde_json::Value::Object(att_map));
                         }
 
@@ -735,16 +716,7 @@ impl Adapter for MemoryAdapter {
             .cloned()
             .unwrap_or_default();
         let mut attachments = parent_atts.clone();
-        attachments.insert(
-            att_id.to_string(),
-            AttachmentMeta {
-                content_type: content_type.to_string(),
-                digest: String::new(),
-                length: data.len() as u64,
-                stub: false,
-                data: Some(data),
-            },
-        );
+        attachments.insert(att_id.to_string(), AttachmentMeta::new(content_type, data));
 
         let doc = Document {
             id: doc_id.to_string(),

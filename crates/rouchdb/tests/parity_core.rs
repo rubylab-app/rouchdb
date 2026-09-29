@@ -347,6 +347,7 @@ async fn document_json_roundtrip_is_lossless() {
         length: HELLO.len() as u64,
         stub,
         data: (!stub).then(|| HELLO.to_vec()),
+        ..Default::default()
     };
     let docs = [
         Document {

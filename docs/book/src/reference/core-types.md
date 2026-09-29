@@ -191,9 +191,12 @@ Metadata for a document attachment.
 ```rust
 pub struct AttachmentMeta {
     pub content_type: String,
+    pub revpos: u64,
     pub digest: String,
     pub length: u64,
     pub stub: bool,
+    pub encoding: Option<String>,
+    pub encoded_length: Option<u64>,
     pub data: Option<Vec<u8>>,
 }
 ```
@@ -201,10 +204,15 @@ pub struct AttachmentMeta {
 | Field | Type | Description |
 |-------|------|-------------|
 | `content_type` | `String` | MIME type (e.g., `"image/png"`). |
+| `revpos` | `u64` | Generation of the revision that uploaded the data (CouchDB's `revpos`). A write that sends the data (inline or with `put_attachment`) sets it to the new generation, even for identical bytes; stubs, body edits and replication keep it. `0` when unknown (stored before 0.5), and then omitted from the JSON. |
 | `digest` | `String` | Content digest for deduplication. |
 | `length` | `u64` | Size in bytes. |
 | `stub` | `bool` | If `true`, only metadata is present (no inline data). Defaults to `false`. |
+| `encoding` | `Option<String>` | How the source stores the bytes (CouchDB reports `"gzip"` with `att_encoding_info=true`). Kept from stubs only: rouchdb stores and serves decoded bytes. |
+| `encoded_length` | `Option<u64>` | Size of the encoded bytes at the source. |
 | `data` | `Option<Vec<u8>>` | Inline binary data, if available. Omitted from serialization when `None`. |
+
+`AttachmentMeta` implements `Default`; `AttachmentMeta::new(content_type, bytes)` builds an inline attachment (digest and length computed), and `meta.to_json(data)` gives the CouchDB `_attachments` member (inline with `data`, a stub otherwise).
 
 ---
 

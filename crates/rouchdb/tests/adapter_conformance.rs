@@ -3027,6 +3027,103 @@ async fn design_doc_round_trip_is_lossless(mut fx: Fx) {
 
 conformance!(f55: design_doc_round_trip_is_lossless);
 
+// === section: revpos ===
+
+/// Attachment `revpos` is the generation of the revision that uploaded the
+/// data, as in CouchDB 3.5.1 (the same writes as `attachments_match_couchdb`
+/// in `replication.rs`): stubs, body edits and a reopen keep it, a
+/// standalone upload and a re-upload of identical bytes set it, and
+/// `bulk_get` and replication carry it.
+async fn attachment_revpos_follows_couchdb(mut fx: Fx) {
+    let hello = serde_json::json!({"content_type": "application/octet-stream", "data": "aGVsbG8="});
+    let stub = serde_json::json!({"stub": true});
+    let db = fx.db();
+    let r1 = db
+        .put(
+            "d",
+            serde_json::json!({"v": 1, "_attachments": {"a.bin": hello}}),
+        )
+        .await
+        .unwrap()
+        .rev
+        .unwrap();
+    let r2 = db
+        .update(
+            "d",
+            &r1,
+            serde_json::json!({"v": 2, "_attachments": {"a.bin": stub}}),
+        )
+        .await
+        .unwrap()
+        .rev
+        .unwrap();
+    let r3 = db
+        .put_attachment(
+            "d",
+            "b.bin",
+            &r2,
+            b"xyz".to_vec(),
+            "application/octet-stream",
+        )
+        .await
+        .unwrap()
+        .rev
+        .unwrap();
+    db.update(
+        "d",
+        &r3,
+        serde_json::json!({"v": 4, "_attachments": {"a.bin": hello, "b.bin": stub}}),
+    )
+    .await
+    .unwrap();
+    fx.reopen();
+    let db = fx.db();
+
+    let stub_json = |revpos: u64, data: &[u8]| {
+        serde_json::json!({"content_type": "application/octet-stream", "revpos": revpos,
+            "digest": attachment_digest(data), "length": data.len(), "stub": true})
+    };
+    let expected =
+        serde_json::json!({"a.bin": stub_json(4, b"hello"), "b.bin": stub_json(3, b"xyz")});
+    assert_eq!(
+        db.get("d").await.unwrap().to_json()["_attachments"],
+        expected
+    );
+    let old = get_rev(db, "d", &r2).await.unwrap();
+    assert_eq!(
+        old.to_json()["_attachments"],
+        serde_json::json!({"a.bin": stub_json(1, b"hello")})
+    );
+
+    let got = db
+        .adapter()
+        .bulk_get(vec![BulkGetItem {
+            id: "d".into(),
+            rev: None,
+        }])
+        .await
+        .unwrap();
+    let doc = got.results[0].docs[0].ok.as_ref().unwrap();
+    assert_eq!(doc["_attachments"]["a.bin"]["revpos"], 4);
+    assert_eq!(doc["_attachments"]["a.bin"]["data"], "aGVsbG8=");
+    assert_eq!(doc["_attachments"]["b.bin"]["revpos"], 3);
+
+    let copy = fx.sibling("copy");
+    assert!(db.replicate_to(&copy).await.unwrap().ok);
+    assert_eq!(
+        copy.get("d").await.unwrap().to_json()["_attachments"],
+        expected
+    );
+    let back = fx.sibling("back");
+    assert!(back.replicate_from(&copy).await.unwrap().ok);
+    assert_eq!(
+        back.get("d").await.unwrap().to_json()["_attachments"],
+        expected
+    );
+}
+
+conformance!(revpos: attachment_revpos_follows_couchdb);
+
 conformance!(storage_fidelity:
     unusual_ids_survive_compact_and_purge,
     deep_documents_round_trip,

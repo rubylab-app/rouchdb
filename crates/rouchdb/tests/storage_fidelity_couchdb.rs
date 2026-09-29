@@ -368,9 +368,10 @@ async fn couch_get(url: &str, id: &str) -> serde_json::Value {
 }
 
 /// F55: design documents written to CouchDB by other clients (Fauxton-style
-/// PUTs with `views.lib`, options and custom members, Mango `_index`) go
-/// through `get_design` + `put_design` unchanged, over http and through a
-/// local database replicated from and back to CouchDB.
+/// PUTs with `views.lib`, options and custom members, a standalone
+/// attachment, Mango `_index`) go through `get_design` + `put_design`
+/// unchanged (attachment stubs and their `revpos` included), over http and
+/// through a local database replicated from and back to CouchDB.
 #[tokio::test]
 #[ignore = "requires CouchDB"]
 async fn couchdb_design_documents_round_trip() {
@@ -397,6 +398,20 @@ async fn couchdb_design_documents_round_trip() {
         .to_string(),
     )
     .await;
+    // An attachment (binary: CouchDB keeps it uncompressed, so its digest
+    // is the one rouchdb computes too).
+    let rev = couch_get(&url, "_design/app").await["_rev"].clone();
+    let resp = reqwest::Client::new()
+        .put(format!(
+            "{url}/_design/app/logo.bin?rev={}",
+            rev.as_str().unwrap()
+        ))
+        .header("Content-Type", "application/octet-stream")
+        .body(vec![0u8, 1, 2, 255])
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
     let resp = reqwest::Client::new()
         .post(format!("{url}/_index"))
         .json(&serde_json::json!({"index": {"fields": ["t"]}, "ddoc": "mango", "name": "by-t"}))
@@ -439,6 +454,7 @@ async fn couchdb_design_documents_round_trip() {
     assert_eq!(pushed["_rev"], expected["_rev"]);
     assert_eq!(pushed["custom"], "edited");
     assert!(pushed["views"].get("lib").is_none());
+    assert_eq!(pushed["_attachments"]["logo.bin"]["revpos"], 2);
     pushed["_rev"] = serde_json::Value::Null;
     expected["_rev"] = serde_json::Value::Null;
     assert_eq!(pushed, expected);
