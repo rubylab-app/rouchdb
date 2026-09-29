@@ -539,11 +539,29 @@ fn print_json(value: &serde_json::Value, pretty: bool) {
     }
 }
 
-#[tokio::main]
-async fn main() {
+/// Stack of the threads that run commands. Documents and selectors may be
+/// nested up to `MAX_NESTING_DEPTH` levels, which parsing and matching walk
+/// recursively: more than the 1 MiB main thread of Windows (or tokio's
+/// 2 MiB workers) holds.
+const STACK_SIZE: usize = 64 * 1024 * 1024;
+
+fn main() {
     let cli = Cli::parse();
 
-    let result = run(cli).await;
+    let result = std::thread::Builder::new()
+        .name("rouchdb".into())
+        .stack_size(STACK_SIZE)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(STACK_SIZE)
+                .build()
+                .map_err(rouchdb::RouchError::from)?
+                .block_on(run(cli))
+        })
+        .expect("cannot start the main thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     if let Err(e) = result {
         eprintln!("Error: {}", redact_credentials(&e.to_string()));
         process::exit(1);
