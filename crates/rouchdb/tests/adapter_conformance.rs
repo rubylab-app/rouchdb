@@ -2191,6 +2191,8 @@ async fn bulk_docs_generates_missing_ids(mut fx: Fx) {
     for r in &res {
         let id = uuid::Uuid::parse_str(&r.id).unwrap();
         assert_eq!(id.get_version_num(), 4, "{}", r.id);
+        // 32 hex digits, like the ids CouchDB generates.
+        assert_eq!(r.id, id.simple().to_string());
     }
     fx.reopen();
     for (r, v) in res.iter().zip([1, 2]) {

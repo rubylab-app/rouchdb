@@ -506,7 +506,8 @@ impl Database {
     /// Create a new document with an auto-generated ID.
     ///
     /// Equivalent to PouchDB's `db.post(doc)`. Uses the body's `_id` when it
-    /// has one, otherwise generates a UUID v4.
+    /// has one, otherwise generates a UUID v4, written like CouchDB's ids as
+    /// 32 lowercase hex digits.
     pub async fn post(&self, data: serde_json::Value) -> Result<DocResult> {
         let mut doc = Document {
             id: String::new(),
@@ -517,7 +518,7 @@ impl Database {
         };
         doc.prepare_for_write()?;
         if doc.id.is_empty() {
-            doc.id = uuid::Uuid::new_v4().to_string();
+            doc.id = uuid::Uuid::new_v4().simple().to_string();
         }
         self.write_one(doc).await
     }
@@ -1859,6 +1860,8 @@ mod tests {
         assert!(r1.ok);
         let uuid = uuid::Uuid::parse_str(&r1.id).expect("post generates a UUID id");
         assert_eq!(uuid.get_version_num(), 4, "{}", r1.id);
+        // Written like CouchDB's ids: 32 hex digits, no hyphens.
+        assert_eq!(r1.id, uuid.simple().to_string());
 
         let r2 = db.post(serde_json::json!({"name": "Bob"})).await.unwrap();
         assert!(r2.ok);

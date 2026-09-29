@@ -485,7 +485,14 @@ impl Adapter for HttpAdapter {
             match rouchdb_core::json::check_document_depth(&doc.data) {
                 Ok(()) => {
                     rejected.push(None);
-                    json_docs.push(doc.to_json());
+                    let mut json = doc.to_json();
+                    // Without an id the server generates one.
+                    if doc.id.is_empty()
+                        && let Some(obj) = json.as_object_mut()
+                    {
+                        obj.remove("_id");
+                    }
+                    json_docs.push(json);
                 }
                 Err(e) => {
                     let reason = match e {
@@ -1548,6 +1555,30 @@ mod tests {
         );
         assert_eq!(doc["_attachments"]["a.bin"]["data"], "AAH/");
         assert_eq!(doc["v"], 1);
+    }
+
+    /// A document without an id is sent without `_id`, so the server
+    /// generates one, as the local adapters do (CouchDB rejects `"_id": ""`).
+    #[tokio::test]
+    async fn bulk_docs_leaves_missing_ids_to_the_server() {
+        use rouchdb_core::document::{BulkDocsOptions, Document};
+        let (url, requests) = scripted_server(vec![(
+            "201 Created",
+            r#"[{"ok":true,"id":"39957e80528575124dadd8d248004e77","rev":"1-a"},{"ok":true,"id":"x","rev":"1-b"}]"#.into(),
+        )])
+        .await;
+        let docs = vec![
+            Document::from_json(serde_json::json!({"v": 1})).unwrap(),
+            Document::from_json(serde_json::json!({"_id": "x"})).unwrap(),
+        ];
+        assert_eq!(docs[0].id, "");
+        let results = adapter_at(&url)
+            .bulk_docs(docs, BulkDocsOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(results[0].id, "39957e80528575124dadd8d248004e77");
+        let body = only_request(&requests).json();
+        assert_eq!(body["docs"], serde_json::json!([{"v": 1}, {"_id": "x"}]));
     }
 
     #[tokio::test]

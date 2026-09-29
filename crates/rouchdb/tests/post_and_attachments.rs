@@ -8,6 +8,8 @@ use rouchdb::{AllDocsOptions, Database, DocResult, RouchError};
 fn assert_uuid_v4(id: &str) {
     let uuid = uuid::Uuid::parse_str(id).unwrap_or_else(|e| panic!("{id} is not a UUID: {e}"));
     assert_eq!(uuid.get_version_num(), 4, "{id}");
+    // 32 hex digits, like the ids CouchDB generates.
+    assert_eq!(id, uuid.simple().to_string());
 }
 
 /// The ids of all documents, sorted.
@@ -46,6 +48,34 @@ async fn post_to_couchdb() {
     assert_eq!(doc.data, serde_json::json!({"name": "Alice"}));
 
     assert_eq!(all_ids(&db).await, sorted_ids(&[&r1, &r2]));
+}
+
+/// Documents without an id get one from CouchDB over http, as the local
+/// adapters generate one: 32 hex digits either way.
+#[tokio::test]
+#[ignore = "requires CouchDB"]
+async fn bulk_docs_without_ids_over_http() {
+    let url = fresh_remote_db("post_bulk").await;
+    let db = Database::http(&url);
+    let docs = vec![
+        rouchdb::Document::from_json(serde_json::json!({"n": 1})).unwrap(),
+        rouchdb::Document::from_json(serde_json::json!({"_id": "named", "n": 2})).unwrap(),
+    ];
+    let results = db
+        .bulk_docs(docs, rouchdb::BulkDocsOptions::new())
+        .await
+        .unwrap();
+    assert!(results.iter().all(|r| r.ok), "{results:?}");
+    let generated = &results[0].id;
+    assert_eq!(generated.len(), 32, "{generated}");
+    assert!(
+        generated
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "{generated}"
+    );
+    assert_eq!(results[1].id, "named");
+    assert_eq!(db.get(generated).await.unwrap().data["n"], 1);
 }
 
 #[tokio::test]
