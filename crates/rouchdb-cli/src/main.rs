@@ -633,7 +633,7 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
                 // attachment data in the format `import` reads back.
                 let doc = db
                     .get_with_opts(
-                        &row.id,
+                        &row.key,
                         GetOptions {
                             conflicts: true,
                             ..Default::default()
@@ -643,7 +643,7 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
                 let mut json = doc.to_json();
                 if let Some(obj) = json.as_object_mut() {
                     if obj.remove("_conflicts").is_some() {
-                        conflicted.push(row.id);
+                        conflicted.push(row.key);
                     }
                     if !doc.attachments.is_empty() {
                         let mut names: Vec<&String> = doc.attachments.keys().collect();

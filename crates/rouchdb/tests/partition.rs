@@ -62,7 +62,7 @@ async fn expected(db: &Database, opts: &AllDocsOptions) -> Vec<serde_json::Value
         .unwrap();
     rows(&unpaged)
         .into_iter()
-        .filter(|r| r["id"].as_str().unwrap().starts_with(PREFIX))
+        .filter(|r| r["key"].as_str().unwrap().starts_with(PREFIX))
         .skip(opts.skip as usize)
         .take(opts.limit.map_or(usize::MAX, |l| l as usize))
         .collect()
@@ -220,14 +220,16 @@ async fn partition_all_docs_by_key_stays_in_the_partition() {
             })
             .await
             .unwrap();
-        // Request order, duplicates and the deleted document included.
+        // Request order, duplicates, the deleted document and a not_found
+        // row for the missing key of the partition included.
         assert_eq!(
             row_ids(&got),
-            ["users:c", "users:a", DELETED, "users:c"],
+            ["users:c", "users:a", "users:missing", DELETED, "users:c"],
             "{}",
             b.name
         );
-        assert_eq!(got.rows[2].value.deleted, Some(true), "{}", b.name);
+        assert!(got.rows[2].is_error(), "{}", b.name);
+        assert!(got.rows[3].is_deleted(), "{}", b.name);
 
         for (k, ids) in [
             ("users:b", vec!["users:b"]),

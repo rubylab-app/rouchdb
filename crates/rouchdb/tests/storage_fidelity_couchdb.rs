@@ -164,8 +164,10 @@ async fn missing_documents_and_bad_revisions_over_http() {
         .await
         .unwrap()
         .rows;
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].value.rev, r2);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], rouchdb::AllDocsRow::not_found("nodoc"));
+    assert_eq!(rows[1].rev().unwrap(), r2);
+    assert!(rows[1].is_deleted());
     // Upper-case revision ids are the same revisions.
     let r = db
         .put("u", serde_json::json!({}))

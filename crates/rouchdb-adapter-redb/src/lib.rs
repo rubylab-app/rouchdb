@@ -1061,30 +1061,32 @@ impl Inner {
                 None
             };
             Ok(Some(AllDocsRow {
-                id: doc_id.to_string(),
-                key: doc_id.to_string(),
-                value: AllDocsRowValue {
-                    rev: winner.to_string(),
-                    deleted: if deleted { Some(true) } else { None },
-                },
                 doc: doc_json,
+                ..AllDocsRow::document(
+                    doc_id,
+                    AllDocsRowValue {
+                        rev: winner.to_string(),
+                        deleted: deleted.then_some(true),
+                    },
+                )
             }))
         };
 
         if let Some(ref keys) = opts.keys {
-            // Rows follow the requested key order (reversed for descending),
-            // duplicates included; unknown keys are skipped.
+            // One row per requested key, in request order (reversed for
+            // descending), duplicates included; an unknown key gets a
+            // `not_found` row (CouchDB).
             let ordered: Vec<&String> = if opts.descending {
                 keys.iter().rev().collect()
             } else {
                 keys.iter().collect()
             };
             for key in ordered {
-                if let Some((tree, _)) = load_doc_record(&doc_table, key)?
-                    && let Some(row) = make_row(key, &tree, true)?
-                {
-                    rows.push(row);
-                }
+                let row = match load_doc_record(&doc_table, key)? {
+                    Some((tree, _)) => make_row(key, &tree, true)?,
+                    None => None,
+                };
+                rows.push(row.unwrap_or_else(|| AllDocsRow::not_found(key.as_str())));
             }
             rows = rows.into_iter().skip(skip).take(limit).collect();
         } else if let Some(ref key) = opts.key {
@@ -1950,7 +1952,7 @@ mod tests {
             ..AllDocsOptions::new()
         };
         let result = db.all_docs(opts).await.unwrap();
-        let ids: Vec<&str> = result.rows.iter().map(|r| r.id.as_str()).collect();
+        let ids: Vec<&str> = result.rows.iter().map(|r| r.key.as_str()).collect();
         assert_eq!(ids, vec!["c", "b"]);
         assert_eq!(result.total_rows, 4);
     }
@@ -2617,7 +2619,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let ids = |r: &AllDocsResponse| r.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        let ids = |r: &AllDocsResponse| r.rows.iter().map(|r| r.key.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&page), ["a", "b"]);
         assert_eq!(page.total_rows, 4);
         let range = db

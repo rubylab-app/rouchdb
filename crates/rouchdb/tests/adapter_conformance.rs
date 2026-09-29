@@ -135,7 +135,7 @@ fn hash_of(rev: &str) -> String {
 }
 
 fn row_ids(r: &AllDocsResponse) -> Vec<String> {
-    r.rows.iter().map(|r| r.id.clone()).collect()
+    r.rows.iter().map(|r| r.key.clone()).collect()
 }
 
 /// The change events as JSON, so a scenario can compare them exactly
@@ -269,7 +269,7 @@ async fn all_docs_ranges(fx: Fx) {
     for id in ["a", "b", "c", "d", "e"] {
         write(db, serde_json::json!({"_id": id, "n": id})).await;
     }
-    let ids = |r: &AllDocsResponse| r.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+    let ids = |r: &AllDocsResponse| r.rows.iter().map(|r| r.key.clone()).collect::<Vec<_>>();
     let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
     assert_eq!(ids(&all), ["a", "b", "c", "d", "e"]);
     assert_eq!(all.total_rows, 5);
@@ -375,7 +375,7 @@ async fn all_docs_ranges(fx: Fx) {
         .await
         .unwrap();
     assert_eq!(row_ids(&docs), ["d", "e", "k"]);
-    let rev = |i: usize| docs.rows[i].value.rev.clone();
+    let rev = |i: usize| docs.rows[i].rev().unwrap().to_string();
     assert_eq!(
         docs.rows[0].doc,
         Some(serde_json::json!({"_id": "d", "_rev": rev(0), "n": "d"}))
@@ -452,7 +452,7 @@ async fn long_history_survives_reopen(mut fx: Fx) {
     assert_eq!(db.info().await.unwrap().doc_count, 1);
     let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
     assert_eq!(row_ids(&all), ["d"]);
-    assert_eq!(all.rows[0].value.rev, rev);
+    assert_eq!(all.rows[0].rev().unwrap(), rev);
     // Still writable with the current rev, and no duplicate history.
     let next = write(db, serde_json::json!({"_id": "d", "_rev": rev, "v": 200})).await;
     assert_eq!(generation(&next), 201);
@@ -1264,15 +1264,18 @@ conformance!(f27: delete_drops_attachments, explicit_attachment_set_is_exact);
 
 // === section: f30 ===
 
-/// F30: `keys` returns rows in request order (duplicates included), skips
-/// unknown keys, reports deleted docs, and `descending` reverses the keys.
+/// F30: `keys` returns one row per requested key, in request order
+/// (duplicates included, reversed by `descending`), like CouchDB: a
+/// document, a deleted document (`value.deleted`, never a `doc`) or a
+/// `not_found` error row, and `skip`/`limit` count every kind of row.
 async fn all_docs_keys_order(fx: Fx) {
     let db = fx.db();
+    let mut revs = std::collections::HashMap::new();
     for id in ["a", "b", "c"] {
-        write(db, serde_json::json!({"_id": id})).await;
+        revs.insert(id, write(db, serde_json::json!({"_id": id})).await);
     }
     let r = write(db, serde_json::json!({"_id": "gone"})).await;
-    db.remove("gone", &r).await.unwrap();
+    let gone = db.remove("gone", &r).await.unwrap().rev.unwrap();
     let keys = |k: &[&str], descending: bool| AllDocsOptions {
         keys: Some(k.iter().map(|s| s.to_string()).collect()),
         descending,
@@ -1280,13 +1283,56 @@ async fn all_docs_keys_order(fx: Fx) {
     };
     let ids = |r: &AllDocsResponse| r.rows.iter().map(|r| r.key.clone()).collect::<Vec<_>>();
     let res = db
-        .all_docs(keys(&["c", "a", "c", "zz", "gone"], false))
+        .all_docs(AllDocsOptions {
+            include_docs: true,
+            ..keys(&["c", "a", "c", "zz", "gone"], false)
+        })
         .await
         .unwrap();
-    assert_eq!(ids(&res), ["c", "a", "c", "gone"]);
-    assert_eq!(res.rows[3].value.deleted, Some(true));
+    assert_eq!(ids(&res), ["c", "a", "c", "zz", "gone"]);
+    let row = |id: &str, rev: &str, deleted: Option<bool>, doc| AllDocsRow {
+        id: Some(id.into()),
+        key: id.into(),
+        value: Some(AllDocsRowValue {
+            rev: rev.into(),
+            deleted,
+        }),
+        doc,
+        error: None,
+    };
+    let body = |id: &str| Some(serde_json::json!({"_id": id, "_rev": revs[id]}));
+    assert_eq!(res.rows[0], row("c", &revs["c"], None, body("c")));
+    assert_eq!(res.rows[1], row("a", &revs["a"], None, body("a")));
+    assert_eq!(res.rows[2], res.rows[0]);
+    assert_eq!(res.rows[3], AllDocsRow::not_found("zz"));
+    assert_eq!(res.rows[3].error.as_deref(), Some("not_found"));
+    assert_eq!(res.rows[4], row("gone", &gone, Some(true), None));
+    assert!(res.rows[4].is_deleted() && !res.rows[4].is_error());
+
     let res = db.all_docs(keys(&["c", "a", "b"], true)).await.unwrap();
     assert_eq!(ids(&res), ["b", "a", "c"]);
+    // Reversed to [a, zz, gone, a]; skip and limit count the error row.
+    let res = db
+        .all_docs(AllDocsOptions {
+            skip: 1,
+            limit: Some(2),
+            ..keys(&["a", "gone", "zz", "a"], true)
+        })
+        .await
+        .unwrap();
+    assert_eq!(ids(&res), ["zz", "gone"]);
+    assert!(res.rows[0].is_error() && res.rows[1].is_deleted());
+    // `key` (not `keys`) never yields an error or deleted row.
+    for key in ["zz", "gone"] {
+        let res = db
+            .all_docs(AllDocsOptions {
+                key: Some(key.into()),
+                ..AllDocsOptions::new()
+            })
+            .await
+            .unwrap();
+        assert!(res.rows.is_empty(), "{key}: {:?}", res.rows);
+    }
     let res = db
         .all_docs(AllDocsOptions {
             key: Some("b".into()),
@@ -1640,8 +1686,8 @@ async fn live_leaf_beats_deeper_tombstone(mut fx: Fx) {
     assert_eq!((info.doc_count, info.doc_del_count), (1, 0));
     let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
     assert_eq!(row_ids(&all), ["d"]);
-    assert_eq!(all.rows[0].value.rev, live);
-    assert_eq!(all.rows[0].value.deleted, None);
+    assert_eq!(all.rows[0].rev().unwrap(), live);
+    assert_eq!(all.rows[0].value.as_ref().unwrap().deleted, None);
     let ch = db.changes(ChangesOptions::default()).await.unwrap();
     assert_eq!(
         changes_json(&ch),

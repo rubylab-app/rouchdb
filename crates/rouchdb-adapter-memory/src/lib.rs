@@ -347,11 +347,11 @@ impl Adapter for MemoryAdapter {
                 }
             }
 
-            if let Some(stored) = inner.docs.get(key.as_str()) {
-                let winner = match winning_rev(&stored.rev_tree) {
-                    Some(w) => w,
-                    None => continue,
-                };
+            let found = inner
+                .docs
+                .get(key.as_str())
+                .and_then(|stored| winning_rev(&stored.rev_tree).map(|w| (stored, w)));
+            if let Some((stored, winner)) = found {
                 let deleted = is_deleted(&stored.rev_tree);
 
                 // Skip deleted docs unless specific keys were requested
@@ -389,18 +389,18 @@ impl Adapter for MemoryAdapter {
                 };
 
                 rows.push(AllDocsRow {
-                    id: key.clone(),
-                    key: key.clone(),
-                    value: AllDocsRowValue {
-                        rev: winner.to_string(),
-                        deleted: if deleted { Some(true) } else { None },
-                    },
                     doc: doc_json,
+                    ..AllDocsRow::document(
+                        key.clone(),
+                        AllDocsRowValue {
+                            rev: winner.to_string(),
+                            deleted: deleted.then_some(true),
+                        },
+                    )
                 });
             } else if opts.keys.is_some() {
-                // For specific key lookups, include missing keys as errors
-                // (CouchDB returns {"key":"x","error":"not_found"})
-                // We skip these for now — they don't fit our row struct cleanly
+                // Every requested key gets a row (CouchDB).
+                rows.push(AllDocsRow::not_found(key.clone()));
             }
         }
 
@@ -1239,7 +1239,7 @@ mod tests {
         opts.include_docs = true;
         let result = db.all_docs(opts).await.unwrap();
         assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0].value.rev, rev);
+        assert_eq!(result.rows[0].rev().unwrap(), rev);
         assert_eq!(
             result.rows[0].doc,
             Some(serde_json::json!({"_id": "doc1", "_rev": rev, "name": "Alice"}))
@@ -1431,7 +1431,7 @@ mod tests {
             ..AllDocsOptions::new()
         };
         let result = db.all_docs(opts).await.unwrap();
-        let ids: Vec<&str> = result.rows.iter().map(|r| r.id.as_str()).collect();
+        let ids: Vec<&str> = result.rows.iter().map(|r| r.key.as_str()).collect();
         assert_eq!(ids, ["b"]);
         assert_eq!(result.total_rows, 4);
     }

@@ -13,7 +13,7 @@ fn assert_uuid_v4(id: &str) {
 /// The ids of all documents, sorted.
 async fn all_ids(db: &Database) -> Vec<String> {
     let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
-    all.rows.into_iter().map(|r| r.id).collect()
+    all.rows.into_iter().map(|r| r.key).collect()
 }
 
 fn sorted_ids(results: &[&DocResult]) -> Vec<String> {

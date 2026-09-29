@@ -50,5 +50,5 @@ pub fn backends(name: &str) -> Vec<Backend> {
 
 /// The ids of all-docs rows, in order.
 pub fn row_ids(response: &rouchdb::AllDocsResponse) -> Vec<String> {
-    response.rows.iter().map(|r| r.id.clone()).collect()
+    response.rows.iter().map(|r| r.key.clone()).collect()
 }

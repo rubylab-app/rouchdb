@@ -1127,7 +1127,7 @@ mod tests {
                 .unwrap();
                 assert!(result.ok);
                 let rows = target.all_docs(AllDocsOptions::new()).await.unwrap().rows;
-                rows.into_iter().map(|r| r.id).collect::<Vec<_>>()
+                rows.into_iter().map(|r| r.key).collect::<Vec<_>>()
             }
         };
 
@@ -1514,7 +1514,7 @@ mod tests {
             .unwrap()
             .rows
             .into_iter()
-            .map(|r| r.id)
+            .map(|r| r.key)
             .collect();
         assert_eq!(ids, vec!["a", "b"]);
     }
@@ -2180,7 +2180,7 @@ mod tests {
             .unwrap()
             .rows
             .into_iter()
-            .map(|r| r.id)
+            .map(|r| r.key)
             .collect()
     }
 

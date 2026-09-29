@@ -172,7 +172,7 @@ async fn cross_adapter_fidelity_memory_couchdb_redb() {
     assert!(digest.starts_with("md5-"), "{digest}");
     for (db, name) in [(&memory, "memory"), (&remote, "couchdb"), (&redb, "redb")] {
         let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
-        let mut listed: Vec<String> = all.rows.iter().map(|r| r.id.clone()).collect();
+        let mut listed: Vec<String> = all.rows.iter().map(|r| r.key.clone()).collect();
         listed.sort();
         assert_eq!(listed, ids, "{name}");
         for (id, body) in &bodies {

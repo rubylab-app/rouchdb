@@ -1275,7 +1275,7 @@ impl Partition<'_> {
         *high = Some(high.take().map_or(last.clone(), |k| k.min(last)));
 
         let mut response = self.db.all_docs(opts).await?;
-        response.rows.retain(|row| row.id.starts_with(&prefix));
+        response.rows.retain(|row| row.key.starts_with(&prefix));
         Ok(response)
     }
 
@@ -2462,7 +2462,7 @@ mod tests {
             db.put(id, serde_json::json!({})).await.unwrap();
         }
         let users = db.partition("users");
-        let ids = |r: AllDocsResponse| r.rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+        let ids = |r: AllDocsResponse| r.rows.into_iter().map(|r| r.key).collect::<Vec<_>>();
 
         let all = ids(users.all_docs(AllDocsOptions::new()).await.unwrap());
         assert_eq!(all, ["users:1", "users:2", "users:\u{1F600}"]);
@@ -3026,7 +3026,7 @@ mod tests {
             .unwrap()
             .rows
             .into_iter()
-            .map(|r| r.id)
+            .map(|r| r.key)
             .collect();
         assert_eq!(ids, ["ok"]);
         let stored = spy.inner.get("ok", GetOptions::default()).await.unwrap();

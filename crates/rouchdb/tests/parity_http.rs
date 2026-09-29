@@ -183,7 +183,7 @@ async fn replication_since_override_http() {
         .unwrap()
         .rows
         .into_iter()
-        .map(|r| r.id)
+        .map(|r| r.key)
         .collect();
     assert_eq!(ids, expected);
 }
@@ -279,7 +279,11 @@ async fn all_docs_conflicts_http() {
         .iter()
         .map(|r| {
             let doc = r.doc.as_ref().unwrap();
-            (r.id.clone(), r.value.rev.clone(), doc["_conflicts"].clone())
+            (
+                r.key.clone(),
+                r.rev().unwrap().to_string(),
+                doc["_conflicts"].clone(),
+            )
         })
         .collect();
     assert_eq!(

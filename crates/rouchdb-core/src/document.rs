@@ -582,19 +582,88 @@ impl Default for AllDocsOptions {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A row of an `_all_docs` response.
+///
+/// A range or `key` query only returns rows for live documents: `id` (equal
+/// to `key`) and `value` are set, and `doc` too with `include_docs`.
+///
+/// A `keys` query returns exactly one row per requested key, in request
+/// order (so `rows[i]` answers `keys[i]`), as CouchDB and PouchDB do:
+///
+/// - a live document: as above;
+/// - a deleted document: `value.deleted == Some(true)` and never a `doc`
+///   (CouchDB sends `"doc": null` under `include_docs`);
+/// - an unknown id: only `key` and `error: Some("not_found")` (see
+///   [`AllDocsRow::not_found`]).
+///
+/// The row is a struct with optional members rather than an enum so that it
+/// maps one-to-one onto the CouchDB/PouchDB JSON row and `row.key` is there
+/// for every kind of row; [`AllDocsRow::rev`], [`AllDocsRow::is_deleted`]
+/// and [`AllDocsRow::is_error`] cover the usual checks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AllDocsRow {
-    pub id: String,
+    /// The document id (`None` for an error row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The requested key; for a document row, its id.
     pub key: String,
-    pub value: AllDocsRowValue,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The winning revision (`None` for an error row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<AllDocsRowValue>,
+    /// The document body, with `include_docs`, for a live document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<serde_json::Value>,
+    /// Why there is no document for `key` (`"not_found"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl AllDocsRow {
+    /// The row of a live or deleted document.
+    pub fn document(id: impl Into<String>, value: AllDocsRowValue) -> Self {
+        let id = id.into();
+        Self {
+            key: id.clone(),
+            id: Some(id),
+            value: Some(value),
+            doc: None,
+            error: None,
+        }
+    }
+
+    /// The row of a requested key that names no document:
+    /// `{"key": key, "error": "not_found"}`.
+    pub fn not_found(key: impl Into<String>) -> Self {
+        Self {
+            id: None,
+            key: key.into(),
+            value: None,
+            doc: None,
+            error: Some("not_found".into()),
+        }
+    }
+
+    /// The winning revision, unless this is an error row.
+    pub fn rev(&self) -> Option<&str> {
+        self.value.as_ref().map(|v| v.rev.as_str())
+    }
+
+    /// Whether the row is a deleted document (only in `keys` queries).
+    pub fn is_deleted(&self) -> bool {
+        self.value.as_ref().and_then(|v| v.deleted) == Some(true)
+    }
+
+    /// Whether the row is an error row (a key with no document).
+    pub fn is_error(&self) -> bool {
+        self.error.is_some()
+    }
+}
+
+/// The `value` of an [`AllDocsRow`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AllDocsRowValue {
     pub rev: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted: Option<bool>,
 }
 
@@ -988,6 +1057,53 @@ mod tests {
 
         let repl = BulkDocsOptions::replication();
         assert!(!repl.new_edits);
+    }
+
+    #[test]
+    fn all_docs_rows_match_couchdb_json() {
+        // The three kinds of rows of a CouchDB 3.5.1 `keys` reply.
+        let live: AllDocsRow = serde_json::from_value(
+            serde_json::json!({"id": "a", "key": "a", "value": {"rev": "1-x"}}),
+        )
+        .unwrap();
+        let gone: AllDocsRow = serde_json::from_value(serde_json::json!(
+            {"id": "b", "key": "b", "value": {"rev": "2-y", "deleted": true}, "doc": null}
+        ))
+        .unwrap();
+        let missing: AllDocsRow =
+            serde_json::from_value(serde_json::json!({"key": "zz", "error": "not_found"})).unwrap();
+        assert_eq!(
+            (live.rev(), live.is_deleted(), live.is_error()),
+            (Some("1-x"), false, false)
+        );
+        assert_eq!(
+            (gone.rev(), gone.is_deleted(), gone.is_error()),
+            (Some("2-y"), true, false)
+        );
+        assert_eq!(
+            (missing.rev(), missing.is_deleted(), missing.is_error()),
+            (None, false, true)
+        );
+        assert_eq!(missing, AllDocsRow::not_found("zz"));
+        assert_eq!(
+            live,
+            AllDocsRow::document(
+                "a",
+                AllDocsRowValue {
+                    rev: "1-x".into(),
+                    deleted: None
+                }
+            )
+        );
+        // Serialized back without the members a row does not have.
+        assert_eq!(
+            serde_json::to_value(&missing).unwrap(),
+            serde_json::json!({"key": "zz", "error": "not_found"})
+        );
+        assert_eq!(
+            serde_json::to_value(&gone).unwrap(),
+            serde_json::json!({"id": "b", "key": "b", "value": {"rev": "2-y", "deleted": true}})
+        );
     }
 
     #[test]

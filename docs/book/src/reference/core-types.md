@@ -503,19 +503,33 @@ pub struct AllDocsResponse {
 
 ```rust
 pub struct AllDocsRow {
-    pub id: String,
+    pub id: Option<String>,
     pub key: String,
-    pub value: AllDocsRowValue,
+    pub value: Option<AllDocsRowValue>,
     pub doc: Option<serde_json::Value>,
+    pub error: Option<String>,
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | `String` | The document ID. |
-| `key` | `String` | The row key (same as `id` for `all_docs`). |
-| `value` | `AllDocsRowValue` | Contains the revision and optional deletion flag. |
-| `doc` | `Option<serde_json::Value>` | Full document body, present only when `include_docs` is `true`. |
+| `id` | `Option<String>` | The document ID; `None` for an error row. |
+| `key` | `String` | The requested key; for a document row, its ID. Set on every row. |
+| `value` | `Option<AllDocsRowValue>` | The winning revision and deletion flag; `None` for an error row. |
+| `doc` | `Option<serde_json::Value>` | Full document body, present only when `include_docs` is `true` and the document is not deleted. |
+| `error` | `Option<String>` | `Some("not_found")` when a key requested with `keys` names no document. |
+
+Range and `key` queries only return live documents, so `id` and `value` are always set there. A `keys` query returns exactly one row per requested key, in request order (reversed with `descending`, duplicates kept), so `rows[i]` answers `keys[i]`, as in CouchDB and PouchDB:
+
+| Requested key | Row |
+|---------------|-----|
+| a live document | `id`, `key`, `value`, and `doc` with `include_docs` |
+| a deleted document | `value.deleted == Some(true)`, never a `doc` (CouchDB sends `"doc": null`) |
+| an unknown ID | only `key` and `error: Some("not_found")` |
+
+`skip` and `limit` count every kind of row. Helpers: `row.rev()` (the winning revision, if any), `row.is_deleted()`, `row.is_error()`, and the constructors `AllDocsRow::document(id, value)` and `AllDocsRow::not_found(key)`.
+
+The row is a struct with optional members rather than an enum so it maps one-to-one onto the CouchDB/PouchDB JSON row and `row.key` works for every kind of row.
 
 ### AllDocsRowValue
 

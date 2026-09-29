@@ -515,7 +515,7 @@ async fn replication_selector_filter_only_matching() {
     assert_eq!(result.docs_written, 1);
     let all = target.all_docs(AllDocsOptions::new()).await.unwrap();
     assert_eq!(row_ids(&all), ["user1"]);
-    assert_eq!(all.rows[0].value.rev, user.rev.unwrap());
+    assert_eq!(all.rows[0].rev().unwrap(), user.rev.unwrap());
     assert!(matches!(
         target.get("inv1").await,
         Err(RouchError::NotFound(_))

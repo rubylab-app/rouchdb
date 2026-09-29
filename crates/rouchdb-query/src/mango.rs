@@ -219,12 +219,13 @@ pub async fn build_index(adapter: &dyn Adapter, def: &IndexDefinition) -> Result
 
     let mut entries: Vec<(Vec<serde_json::Value>, String)> = Vec::new();
 
+    // A range query only returns document rows, whose key is the id.
     for row in &all.rows {
-        if is_design_doc(&row.id) {
+        if is_design_doc(&row.key) {
             continue;
         }
         if let Some(ref doc_json) = row.doc {
-            entries.push((index_key(def, doc_json), row.id.clone()));
+            entries.push((index_key(def, doc_json), row.key.clone()));
         }
     }
 

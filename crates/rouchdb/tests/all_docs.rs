@@ -7,7 +7,7 @@ use common::fresh_remote_db;
 use rouchdb::{AllDocsOptions, AllDocsResponse, BulkDocsOptions, Database, Document};
 
 fn ids(result: &AllDocsResponse) -> Vec<&str> {
-    result.rows.iter().map(|r| r.id.as_str()).collect()
+    result.rows.iter().map(|r| r.key.as_str()).collect()
 }
 
 #[tokio::test]
@@ -36,7 +36,7 @@ async fn all_docs_include_docs() {
     assert_eq!(ids(&result), ["doc1", "doc2"]);
     for (row, (r, name)) in result.rows.iter().zip([(&r1, "Alice"), (&r2, "Bob")]) {
         let rev = r.rev.clone().unwrap();
-        assert_eq!(row.value.rev, rev);
+        assert_eq!(row.rev(), Some(rev.as_str()));
         assert_eq!(
             row.doc,
             Some(serde_json::json!({"_id": r.id, "_rev": rev, "name": name}))
@@ -174,7 +174,7 @@ async fn all_docs_conflicts_and_update_seq() {
         .await
         .unwrap();
     assert_eq!(ids(&result), ["doc1", "doc2"]);
-    assert_eq!(result.rows[0].value.rev, winner);
+    assert_eq!(result.rows[0].rev(), Some(winner.as_str()));
     let doc1 = result.rows[0].doc.as_ref().unwrap();
     assert_eq!(doc1["v"], "remote");
     assert_eq!(doc1["_conflicts"], serde_json::json!([local]));
@@ -194,4 +194,84 @@ async fn all_docs_conflicts_and_update_seq() {
 
     let plain = db.all_docs(AllDocsOptions::new()).await.unwrap();
     assert!(plain.update_seq.is_none());
+}
+
+/// Item 3 (F30): the rows of a `keys` query are the same on CouchDB, the
+/// memory and the redb adapter: one per requested key, in order, with
+/// deleted docs (`value.deleted`, no doc) and `not_found` error rows, and
+/// skip/limit/descending applied to that list. The documents are written
+/// with fixed revisions (replication mode) so the rows compare exactly.
+#[tokio::test]
+#[ignore = "requires CouchDB"]
+async fn keys_rows_match_couchdb() {
+    let url = fresh_remote_db("ad_keys_rows").await;
+    let dir = tempfile::tempdir().unwrap();
+    let backends = [
+        ("couchdb", Database::http(&url)),
+        ("memory", Database::memory("keys_rows")),
+        (
+            "redb",
+            Database::open(dir.path().join("db.redb"), "keys_rows").unwrap(),
+        ),
+    ];
+    let written = [
+        serde_json::json!({"_id": "a", "_rev": "1-aaa", "v": 1}),
+        serde_json::json!({"_id": "b", "_rev": "1-bbb", "v": 2}),
+        serde_json::json!({"_id": "b", "_rev": "2-ddd", "_deleted": true,
+            "_revisions": {"start": 2, "ids": ["ddd", "bbb"]}}),
+        serde_json::json!({"_id": "c", "_rev": "1-ccc"}),
+    ];
+    let queries = [
+        AllDocsOptions {
+            keys: Some(vec!["a".into(), "b".into(), "zz".into(), "a".into()]),
+            include_docs: true,
+            ..AllDocsOptions::new()
+        },
+        AllDocsOptions {
+            keys: Some(vec!["a".into(), "b".into(), "zz".into(), "c".into()]),
+            descending: true,
+            skip: 1,
+            limit: Some(2),
+            ..AllDocsOptions::new()
+        },
+        AllDocsOptions {
+            keys: Some(vec![]),
+            ..AllDocsOptions::new()
+        },
+    ];
+    let mut results = Vec::new();
+    for (name, db) in &backends {
+        for json in &written {
+            let doc = Document::from_json(json.clone()).unwrap();
+            db.bulk_docs(vec![doc], BulkDocsOptions::replication())
+                .await
+                .unwrap();
+        }
+        let mut rows = Vec::new();
+        for query in &queries {
+            let res = db.all_docs(query.clone()).await.unwrap();
+            assert_eq!(res.total_rows, 2, "{name}");
+            rows.push(serde_json::to_value(&res.rows).unwrap());
+        }
+        results.push((name, rows));
+    }
+    assert_eq!(
+        results[0].1[0],
+        serde_json::json!([
+            {"id": "a", "key": "a", "value": {"rev": "1-aaa"}, "doc": {"_id": "a", "_rev": "1-aaa", "v": 1}},
+            {"id": "b", "key": "b", "value": {"rev": "2-ddd", "deleted": true}},
+            {"key": "zz", "error": "not_found"},
+            {"id": "a", "key": "a", "value": {"rev": "1-aaa"}, "doc": {"_id": "a", "_rev": "1-aaa", "v": 1}},
+        ])
+    );
+    assert_eq!(
+        results[0].1[1],
+        serde_json::json!([
+            {"key": "zz", "error": "not_found"},
+            {"id": "b", "key": "b", "value": {"rev": "2-ddd", "deleted": true}},
+        ])
+    );
+    for (name, rows) in &results[1..] {
+        assert_eq!(rows, &results[0].1, "{name} differs from CouchDB");
+    }
 }

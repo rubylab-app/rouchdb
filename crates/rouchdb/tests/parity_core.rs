@@ -214,7 +214,7 @@ async fn all_docs_conflicts_lists_losing_revisions() {
             .await
             .unwrap();
         assert_eq!(row_ids(&result), ["doc1", "doc2"], "{}", b.name);
-        assert_eq!(result.rows[0].value.rev, winner, "{}", b.name);
+        assert_eq!(result.rows[0].rev().unwrap(), winner, "{}", b.name);
         let doc1 = result.rows[0].doc.as_ref().unwrap();
         assert_eq!(doc1["v"], "remote", "{}", b.name);
         assert_eq!(doc1["_conflicts"], serde_json::json!([loser]), "{}", b.name);

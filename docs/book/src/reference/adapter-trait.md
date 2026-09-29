@@ -163,8 +163,9 @@ This distinction is critical for correct replication behavior. When documents ar
 - Returns documents sorted by `_id` in CouchDB collation order.
 - Supports key range filtering via `start_key`, `end_key`, `key`, and `keys`.
 - When `include_docs` is true, the full document body is included in each row.
-- Deleted documents are excluded from results unless requested by specific key.
-- Supports `descending` order, `skip`, and `limit` for pagination.
+- Deleted documents are excluded from results unless requested with `keys`.
+- With `keys`, one row per requested key in request order (reversed for `descending`, duplicates kept): a deleted document is a row with `value.deleted == Some(true)` and no `doc`, an unknown ID is `AllDocsRow::not_found(key)`.
+- Supports `descending` order, `skip`, and `limit` for pagination (with `keys`, they count every row, error rows included).
 
 **`changes` behavior contract:**
 

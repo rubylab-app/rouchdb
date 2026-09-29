@@ -166,7 +166,8 @@ let response = db.all_docs(AllDocsOptions {
 }).await?;
 
 for row in &response.rows {
-    println!("{} rev={}", row.id, row.value.rev);
+    // `key` is the document ID; `rev()` is its winning revision.
+    println!("{} rev={}", row.key, row.rev().unwrap_or_default());
     if let Some(ref doc) = row.doc {
         println!("  data: {}", doc);
     }
@@ -186,6 +187,24 @@ for row in &response.rows {
 - `inclusive_end` -- whether to include `end_key` (default `true`).
 
 The response is an `AllDocsResponse` with `total_rows`, `offset`, and a `rows` vector of `AllDocsRow`.
+
+With `keys`, there is one row per requested key, in order, like CouchDB: a key that names no document gets an error row (`row.is_error()`, `row.error == Some("not_found")`, no `id` or `value`), and a deleted document a row with `row.is_deleted()` and no `doc`:
+
+```rust
+let response = db.all_docs(AllDocsOptions {
+    keys: Some(vec!["user:1".into(), "user:404".into()]),
+    include_docs: true,
+    ..AllDocsOptions::new()
+}).await?;
+for (key, row) in ["user:1", "user:404"].iter().zip(&response.rows) {
+    assert_eq!(&row.key, key);
+    match (&row.doc, row.is_error()) {
+        (Some(doc), _) => println!("{key}: {doc}"),
+        (None, true) => println!("{key}: not found"),
+        (None, false) => println!("{key}: deleted"),
+    }
+}
+```
 
 ## Error Handling
 
