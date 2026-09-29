@@ -19,13 +19,28 @@
 //!
 //! Every committed 0.5 file has the guard: it is written in the same
 //! transaction that creates the file or upgrades it, and `destroy` keeps it.
+//!
+//! # How an upgrade runs
+//!
+//! 1. Everything the upgrade will do is worked out from a read transaction
+//!    (`analyze`): the report, and a plan of the writes. A file the upgrade
+//!    would refuse is refused here, before any backup is written. A dry run
+//!    stops here, so it never writes to the file.
+//! 2. The backup, if any, is written and verified (`backup_logical`).
+//! 3. The plan is applied in one write transaction with two-phase commit
+//!    (`apply`): the file is upgraded completely or not at all.
 
-use std::collections::HashSet;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use redb::{MultimapTableHandle, ReadTransaction, TableError, TableHandle, WriteTransaction};
+use redb::{
+    MultimapTableHandle, ReadOnlyTable, ReadTransaction, TableError, TableHandle, WriteTransaction,
+};
+use rouchdb_core::merge::merge_tree;
+use rouchdb_core::rev_tree::root_to_leaf;
 
 use super::*;
 
@@ -101,6 +116,13 @@ const CURRENT_TABLES: [&str; 7] = [
 /// How many document ids an [`UpgradeReport`] lists per category.
 pub const REPORT_SAMPLE: usize = 50;
 
+/// redb's page cache for the databases the upgrade and the backup open.
+/// redb's default (1 GiB) would let the upgrade of a large file hold about
+/// that much memory: every attachment is read once to be re-keyed and once
+/// to be copied to the backup. The upgrade reads each record once or twice,
+/// so a large cache buys nothing.
+const UPGRADE_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Public API types
 // ---------------------------------------------------------------------------
@@ -111,13 +133,17 @@ pub const REPORT_SAMPLE: usize = 50;
 pub enum UpgradePolicy {
     /// Refuse files written by rouchdb <= 0.4 with
     /// [`RouchError::UpgradeRequired`], without modifying them (the
-    /// default).
+    /// default). Files written by unreleased 0.5 development builds, which
+    /// rouchdb 0.4 cannot open anyway, are upgraded as with
+    /// `WithBackup(None)`.
     #[default]
     Refuse,
     /// Upgrade after writing a verified backup of the file: to the given
-    /// path, or to `<file>.rouchdb-0.4.bak` next to it. The backup is a
-    /// complete copy that rouchdb 0.4 can still open. The upgrade is refused
-    /// if the backup path already exists.
+    /// path, or next to the file, to `<file>.rouchdb-0.4.bak` (a complete
+    /// copy that rouchdb 0.4 can still open) or, for a file written by a 0.5
+    /// development build, to `<file>.rouchdb-0.5-pre.bak` (a copy of that
+    /// file, which rouchdb 0.4 cannot open). The upgrade is refused if the
+    /// backup path already exists.
     WithBackup(Option<PathBuf>),
     /// Upgrade in place without a backup. The upgrade itself is atomic (it
     /// commits completely or not at all), but afterwards the file can no
@@ -153,7 +179,9 @@ pub enum StoredFormat {
     /// Written by rouchdb 0.1 - 0.4.
     Legacy,
     /// Written by an unreleased 0.5 development build (on-disk `schema` 1 or
-    /// 2 without the format guard). Upgraded automatically on open.
+    /// 2 without the format guard). Upgraded automatically on open, after a
+    /// backup to `<file>.rouchdb-0.5-pre.bak` unless
+    /// [`UpgradePolicy::InPlaceNoBackup`] is chosen.
     PreRelease {
         /// The schema number recorded in the file.
         schema: u32,
@@ -162,8 +190,25 @@ pub enum StoredFormat {
     Current,
 }
 
+/// A stored revision body the upgrade discarded: the file held the same
+/// revision under two spellings of its id that differ only in case (see
+/// [`UpgradeReport::case_duplicate_bodies_discarded`]), with different
+/// bodies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DiscardedRevision {
+    /// The document.
+    pub doc_id: String,
+    /// The revision id as it was stored, whose body was discarded.
+    pub rev: String,
+    /// The revision id as it was stored, whose body was kept (under its
+    /// lower-case id).
+    pub kept: String,
+}
+
 /// What an upgrade found and did. Counts describe the file after the
-/// upgrade; the id lists hold at most [`REPORT_SAMPLE`] ids each.
+/// upgrade; each `docs_with_…` list holds at most [`REPORT_SAMPLE`] ids (the
+/// matching `…_count` has the total).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct UpgradeReport {
@@ -177,6 +222,10 @@ pub struct UpgradeReport {
     pub upgraded: bool,
     /// Where the backup was written, if one was.
     pub backup: Option<PathBuf>,
+    /// Size of the file before the upgrade, in bytes. The upgrade needs
+    /// about twice this much free disk space, and about three times with a
+    /// backup (see the [`fmt::Display`] output).
+    pub file_size: u64,
     /// Live documents.
     pub doc_count: u64,
     /// Deleted documents.
@@ -207,6 +256,30 @@ pub struct UpgradeReport {
     /// rouchdb <= 0.4 in replicated writes) and rewritten in lower case,
     /// which is how 0.5 looks revisions up.
     pub revs_normalized: u64,
+    /// Revisions the file held under more than one spelling of their id
+    /// (differing only in case, such as `2-ABC…` and `2-abc…`), which 0.5
+    /// treats as one revision: each was merged into one lower-case revision.
+    /// When both spellings had a stored body, the bodies were compared: an
+    /// identical copy was dropped, a different one is listed in
+    /// [`case_duplicate_bodies_discarded`](Self::case_duplicate_bodies_discarded).
+    pub case_duplicate_revs_merged: u64,
+    /// Bodies of case-duplicate revisions that differed from the body kept,
+    /// and were discarded (all of them, not a sample; they remain in the
+    /// backup). The body kept is that of the spelling rouchdb 0.4 ranked
+    /// first: a leaf before an inner revision, a live leaf before a deleted
+    /// one, then the greater id in byte order (lower case sorts after upper
+    /// case), which is the order in which 0.4 picked the winning revision.
+    /// So if one spelling was the document's winning revision in 0.4, its
+    /// body is the one kept.
+    pub case_duplicate_bodies_discarded: Vec<DiscardedRevision>,
+    /// Documents whose winning revision is a different revision after the
+    /// upgrade (sample). Revision ids are compared by lower case: 0.4
+    /// compared upper-case ids as written (`B` sorts before `a`), 0.5
+    /// compares the lower-case ids, so the winner among conflicting
+    /// revisions can change.
+    pub docs_with_changed_winner: Vec<String>,
+    /// Total number of such documents.
+    pub docs_with_changed_winner_count: u64,
     /// Stored bodies of non-leaf (old) revisions. The first
     /// [`compact`](rouchdb_core::adapter::Adapter::compact) after the upgrade
     /// deletes them (rouchdb <= 0.4's `compact` did nothing).
@@ -220,6 +293,9 @@ pub struct UpgradeReport {
     pub docs_with_old_only_attachments_count: u64,
     /// Total number of documents with missing attachment bytes.
     pub docs_with_missing_attachments_count: u64,
+    /// Problems that did not stop the upgrade (for instance, the directory
+    /// holding the backup could not be synced after the backup was renamed).
+    pub warnings: Vec<String>,
 }
 
 impl UpgradeReport {
@@ -229,6 +305,7 @@ impl UpgradeReport {
             from,
             upgraded: false,
             backup: None,
+            file_size: fs::metadata(path).map(|m| m.len()).unwrap_or(0),
             doc_count: 0,
             doc_del_count: 0,
             attachments_rekeyed: 0,
@@ -239,11 +316,32 @@ impl UpgradeReport {
             local_conflicts_dropped: 0,
             local_attachments_dropped: 0,
             revs_normalized: 0,
+            case_duplicate_revs_merged: 0,
+            case_duplicate_bodies_discarded: Vec::new(),
+            docs_with_changed_winner: Vec::new(),
+            docs_with_changed_winner_count: 0,
             old_revision_bodies: 0,
             docs_with_old_only_attachments: Vec::new(),
             docs_with_old_only_attachments_count: 0,
             docs_with_missing_attachments_count: 0,
+            warnings: Vec::new(),
         }
+    }
+}
+
+/// `bytes` for people: `270.0 MB`.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["bytes", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} bytes", bytes)
+    } else {
+        format!("{:.1} {}", value, UNITS[unit])
     }
 }
 
@@ -261,13 +359,13 @@ impl fmt::Display for UpgradeReport {
         let state = match (self.from, self.upgraded) {
             (StoredFormat::Current, _) => "already current, nothing to do",
             (_, true) => "upgraded",
-            (_, false) => "not modified (dry run)",
+            (_, false) => "not modified (dry run: the file was only read)",
         };
         writeln!(f, "status: {}", state)?;
         if let Some(backup) = &self.backup {
             writeln!(f, "backup: {}", backup.display())?;
         }
-        writeln!(
+        write!(
             f,
             "documents: {} live, {} deleted",
             self.doc_count, self.doc_del_count
@@ -275,6 +373,7 @@ impl fmt::Display for UpgradeReport {
         if self.from == StoredFormat::Current {
             return Ok(());
         }
+        writeln!(f)?;
         writeln!(
             f,
             "attachment byte entries re-keyed by digest: {}",
@@ -296,6 +395,30 @@ impl fmt::Display for UpgradeReport {
         )?;
         writeln!(
             f,
+            "revisions stored under two spellings differing only in case, merged: {}",
+            self.case_duplicate_revs_merged
+        )?;
+        writeln!(
+            f,
+            "differing bodies of such revisions discarded (kept in the backup): {}",
+            self.case_duplicate_bodies_discarded.len()
+        )?;
+        for d in &self.case_duplicate_bodies_discarded {
+            writeln!(
+                f,
+                "  document {:?}: discarded the body of {}, kept the body of {}",
+                d.doc_id, d.rev, d.kept
+            )?;
+        }
+        writeln!(
+            f,
+            "documents whose winning revision changes (0.5 compares revision ids in lower \
+             case): {}{}",
+            self.docs_with_changed_winner_count,
+            sample_suffix(&self.docs_with_changed_winner)
+        )?;
+        writeln!(
+            f,
             "attachment references whose bytes were already missing: {} (in {} documents{})",
             self.missing_attachment_refs,
             self.docs_with_missing_attachments_count,
@@ -312,7 +435,94 @@ impl fmt::Display for UpgradeReport {
              (deleted by the first compact()): {}{}",
             self.docs_with_old_only_attachments_count,
             sample_suffix(&self.docs_with_old_only_attachments)
-        )
+        )?;
+        for warning in &self.warnings {
+            write!(f, "\nwarning: {}", warning)?;
+        }
+        self.write_notes(f)
+    }
+}
+
+impl UpgradeReport {
+    /// The advice after the facts, which depends on whether this was a dry
+    /// run, on the backup and on who wrote the file.
+    fn write_notes(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let legacy = self.from == StoredFormat::Legacy;
+        writeln!(f)?;
+        if !self.upgraded {
+            let schema = match self.from {
+                StoredFormat::PreRelease { schema } => schema,
+                _ => 0,
+            };
+            writeln!(f)?;
+            writeln!(
+                f,
+                "Disk space: the upgrade needs about twice the file size free (about {}): \
+                 redb copies what it changes and commits in two phases. The backup, written \
+                 by default, needs about the file size again: about three times the file \
+                 size (about {}) free when backing up.",
+                human_size(self.file_size.saturating_mul(2)),
+                human_size(self.file_size.saturating_mul(3))
+            )?;
+            write!(
+                f,
+                "Backup: unless told otherwise the upgrade first writes a verified backup to {}",
+                default_backup_path(&self.path, schema).display()
+            )?;
+            if legacy {
+                writeln!(
+                    f,
+                    ", which rouchdb 0.4 can still open. After the upgrade rouchdb 0.4 can no \
+                     longer open this file."
+                )?;
+            } else {
+                writeln!(
+                    f,
+                    " (a copy of the file as the development build left it; rouchdb 0.4 cannot \
+                     open it)."
+                )?;
+            }
+            write!(
+                f,
+                "WARNING: rouchdb 0.4 never compacted. The first compact() after the upgrade \
+                 will permanently delete the old revision bodies and the attachment bytes \
+                 counted above."
+            )
+        } else {
+            writeln!(f)?;
+            write!(
+                f,
+                "WARNING: rouchdb 0.4 never compacted. The first compact() after this upgrade \
+                 permanently deletes the old revision bodies and the attachment bytes counted \
+                 above. "
+            )?;
+            match (&self.backup, legacy) {
+                (Some(backup), true) => write!(
+                    f,
+                    "Keep the backup ({}) until you have checked that you do not need them: it \
+                     is a complete copy of the file as rouchdb 0.4 left it, and still opens in \
+                     rouchdb 0.4. This file no longer does.",
+                    backup.display()
+                ),
+                (Some(backup), false) => write!(
+                    f,
+                    "Keep the backup ({}) until you have checked that you do not need them: it \
+                     is a copy of the file as the 0.5 development build left it (rouchdb 0.4 \
+                     cannot open it; this version upgrades it again).",
+                    backup.display()
+                ),
+                (None, true) => write!(
+                    f,
+                    "No backup was written: make sure you have another copy before compacting \
+                     if you may need them. rouchdb 0.4 can no longer open this file."
+                ),
+                (None, false) => write!(
+                    f,
+                    "No backup was written: make sure you have another copy before compacting \
+                     if you may need them."
+                ),
+            }
+        }
     }
 }
 
@@ -321,6 +531,12 @@ fn sample_suffix(ids: &[String]) -> String {
         String::new()
     } else {
         format!(": {:?}", ids)
+    }
+}
+
+fn push_sample(sample: &mut Vec<String>, id: &str) {
+    if sample.len() < REPORT_SAMPLE {
+        sample.push(id.to_string());
     }
 }
 
@@ -445,6 +661,16 @@ fn create_current_tables(txn: &WriteTransaction) -> Result<()> {
     Ok(())
 }
 
+/// Open a database for the upgrade (or the backup) with a small cache: see
+/// [`UPGRADE_CACHE_BYTES`].
+fn open_for_upgrade(path: &Path) -> Result<Database> {
+    db_err!(
+        redb::Builder::new()
+            .set_cache_size(UPGRADE_CACHE_BYTES)
+            .open(path)
+    )
+}
+
 /// Open (or create) the file at `path` as `open_with` does.
 pub(crate) fn open_database(
     path: &Path,
@@ -482,11 +708,15 @@ pub(crate) fn open_database(
                     });
                 }
                 // Development builds of 0.5 already made these files
-                // unreadable by 0.4: finish their upgrade.
-                (UpgradePolicy::Refuse, _) => UpgradePolicy::InPlaceNoBackup,
+                // unreadable by 0.4: finish their upgrade, keeping a backup.
+                (UpgradePolicy::Refuse, _) => UpgradePolicy::WithBackup(None),
                 (policy, _) => policy.clone(),
             };
-            let report = run_upgrade(&db, path, schema, &policy, false)?;
+            // Upgrade through a handle with a small cache (see
+            // UPGRADE_CACHE_BYTES), then reopen with the default one.
+            drop(db);
+            let report = upgrade_file(path, &policy, false)?;
+            let (db, _) = open_database(path, &OpenOptions::new())?;
             Ok((db, Some(report)))
         }
     }
@@ -513,7 +743,7 @@ pub(crate) fn upgrade_file(
             path.display()
         )));
     }
-    let db = db_err!(Database::open(path))?;
+    let db = open_for_upgrade(path)?;
     match detect(&db, path)? {
         Detected::Empty => Err(RouchError::DatabaseError(format!(
             "{}: the file holds no database",
@@ -563,30 +793,37 @@ fn run_upgrade(
         StoredFormat::PreRelease { schema }
     };
 
+    // Read only: a refusal happens here, before any backup, and a dry run
+    // ends here without writing anything.
+    let plan = analyze(db, path, schema, from)?;
+    if dry_run {
+        return Ok(plan.report);
+    }
+
+    let mut warnings = Vec::new();
     let backup = match policy {
-        UpgradePolicy::WithBackup(dest) if !dry_run => {
+        UpgradePolicy::WithBackup(dest) => {
             let dest = dest
                 .clone()
                 .unwrap_or_else(|| default_backup_path(path, schema));
-            backup_logical(db, &dest)?;
+            warnings.extend(backup_logical(db, &dest)?);
             Some(dest)
         }
         _ => None,
     };
 
-    let prepared = (|| -> Result<(WriteTransaction, UpgradeReport)> {
+    let prepared = (|| -> Result<WriteTransaction> {
         let mut txn = db_err!(db.begin_write())?;
         // The primary commit slot must be valid even if the machine crashes
         // while this (large) commit is written.
         txn.set_two_phase_commit(true);
-        let mut report = UpgradeReport::new(path, from);
-        upgrade_contents(&txn, path, schema, &mut report)?;
+        apply(&txn, &plan)?;
         fault::hit("upgrade:before_commit")?;
-        Ok((txn, report))
+        Ok(txn)
     })();
 
-    let (txn, mut report) = match prepared {
-        Ok(prepared) => prepared,
+    let txn = match prepared {
+        Ok(txn) => txn,
         Err(e) => {
             // Nothing was committed: the file is exactly as it was, so the
             // backup is redundant (and would block a retry).
@@ -596,32 +833,84 @@ fn run_upgrade(
             return Err(e);
         }
     };
-    if dry_run {
-        db_err!(txn.abort())?;
-        return Ok(report);
-    }
     txn.commit().map_err(|e| {
         RouchError::DatabaseError(format!(
             "committing the upgrade of {} failed: {}{}",
             path.display(),
             e,
             match &backup {
-                Some(dest) => format!("; the backup at {} was kept", dest.display()),
+                Some(dest) => format!(
+                    ". The backup {} was kept: it is complete (it was verified before it got \
+                     that name). If rouchdb still reports that the file must be upgraded, the \
+                     file was not changed; move the backup elsewhere (or choose another \
+                     backup path) before retrying",
+                    dest.display()
+                ),
                 None => String::new(),
             }
         ))
     })?;
+    let mut report = plan.report;
     report.upgraded = true;
     report.backup = backup;
+    report.warnings.extend(warnings);
     Ok(report)
 }
 
 // ---------------------------------------------------------------------------
-// The upgrade itself (one write transaction)
+// Analysis (read only): the report and the plan of the writes
 // ---------------------------------------------------------------------------
 
+/// Everything the upgrade writes, worked out by [`analyze`].
+struct Plan {
+    report: UpgradeReport,
+    /// The new metadata record (counts, schema).
+    meta: MetaRecord,
+    /// The other entries of the old metadata table (the security document
+    /// of development builds).
+    meta_entries: Vec<(String, Vec<u8>)>,
+    /// Legacy attachment keys (`doc_id\0name`) and the digest of their bytes.
+    rekey: Vec<(String, String)>,
+    locals: Vec<LocalMove>,
+    /// Documents whose revision tree changes (upper-case ids), re-encoded.
+    doc_rewrites: Vec<(String, Vec<u8>)>,
+    bodies: Vec<BodyMove>,
+}
+
+/// A `_local/` document stored as an ordinary document.
+struct LocalMove {
+    id: String,
+    /// Its entry in the local store, unless it was deleted.
+    local: Option<(String, Vec<u8>)>,
+    body_keys: Vec<String>,
+    /// Its change entry, if it still owns that sequence.
+    change_seq: Option<u64>,
+}
+
+/// Stored bodies whose key holds an upper-case revision id: the bytes of
+/// `keep` are stored under `to` (the lower-case key) and every key in
+/// `remove` is deleted.
+struct BodyMove {
+    keep: String,
+    to: String,
+    remove: Vec<String>,
+}
+
+/// Open a table of an older file for reading; a table the file lacks reads
+/// as empty (`None`). The upgrade creates it.
+fn open_old<K: redb::Key + 'static, V: redb::Value + 'static>(
+    txn: &ReadTransaction,
+    def: TableDefinition<K, V>,
+) -> Result<Option<ReadOnlyTable<K, V>>> {
+    match txn.open_table(def) {
+        Ok(table) => Ok(Some(table)),
+        Err(TableError::TableDoesNotExist(_)) => Ok(None),
+        Err(e) => Err(RouchError::DatabaseError(e.to_string())),
+    }
+}
+
 /// An error for a record the upgrade cannot decode. The upgrade stops
-/// rather than skip data; nothing is committed.
+/// rather than skip data; nothing is changed.
 fn corrupt(path: &Path, what: String, e: impl fmt::Display) -> RouchError {
     RouchError::DatabaseError(format!(
         "cannot upgrade {}: {} cannot be decoded ({}). Nothing was changed. Repair or \
@@ -632,123 +921,279 @@ fn corrupt(path: &Path, what: String, e: impl fmt::Display) -> RouchError {
     ))
 }
 
-fn upgrade_contents(
-    txn: &WriteTransaction,
-    path: &Path,
-    schema: u32,
-    report: &mut UpgradeReport,
-) -> Result<()> {
+/// The version to use to fix a file the upgrade refuses.
+fn writer(from: StoredFormat) -> &'static str {
+    match from {
+        StoredFormat::Legacy => "rouchdb 0.4",
+        _ => "the rouchdb development build that wrote the file",
+    }
+}
+
+/// `rev` (`pos-hash`) with a 32-digit hexadecimal hash in lower case.
+fn normalize_rev_str(rev: &str) -> Cow<'_, str> {
+    match rev.split_once('-') {
+        Some((pos, hash)) => match normalize_rev_hash(hash) {
+            Cow::Owned(lower) => Cow::Owned(format!("{pos}-{lower}")),
+            Cow::Borrowed(_) => Cow::Borrowed(rev),
+        },
+        None => Cow::Borrowed(rev),
+    }
+}
+
+/// Work out the upgrade from a read transaction: nothing is written.
+fn analyze(db: &Database, path: &Path, schema: u32, from: StoredFormat) -> Result<Plan> {
+    let txn = db_err!(db.begin_read())?;
+    let mut report = UpgradeReport::new(path, from);
+
     // Every entry of the old metadata table: the metadata record, and the
     // security document of development builds.
-    let mut entries = Vec::new();
+    let mut meta_entries = Vec::new();
+    let mut meta_bytes = None;
     {
         let table = db_err!(txn.open_table(LEGACY_META_TABLE))?;
         for entry in db_err!(table.iter())? {
             let (key, value) = db_err!(entry)?;
-            entries.push((key.value().to_string(), value.value().to_vec()));
+            if key.value() == META_KEY {
+                meta_bytes = Some(value.value().to_vec());
+            } else {
+                meta_entries.push((key.value().to_string(), value.value().to_vec()));
+            }
         }
     }
-    let meta_bytes = entries
-        .iter()
-        .find(|(k, _)| k == META_KEY)
-        .map(|(_, v)| v.clone())
-        .ok_or_else(|| RouchError::DatabaseError("missing metadata".into()))?;
+    let meta_bytes =
+        meta_bytes.ok_or_else(|| RouchError::DatabaseError("missing metadata".into()))?;
     let mut meta: MetaRecord = serde_json::from_slice(&meta_bytes)
         .map_err(|e| corrupt(path, "the metadata record".into(), e))?;
 
-    create_tables(txn)?;
-    if schema < 1 {
-        report.attachments_rekeyed = migrate_attachments_to_digest_keys(txn)?;
-    }
-    fault::hit("upgrade:after_attachments")?;
-    move_local_docs(txn, path, report)?;
-    normalize_revs(txn, path, report)?;
-    scan(txn, path, &mut meta, report)?;
+    let docs = open_old(&txn, DOC_TABLE)?;
+    let revs = open_old(&txn, REV_DATA_TABLE)?;
+    let changes = open_old(&txn, CHANGES_TABLE)?;
+    let locals_table = open_old(&txn, LOCAL_TABLE)?;
+    let atts = open_old(&txn, ATTACHMENT_TABLE)?;
 
-    meta.schema = SCHEMA_VERSION;
+    // Schema 0 -> 1: attachment bytes were stored under `doc_id\0name` (so a
+    // later write of the same name overwrote the bytes older revisions point
+    // at). Each entry is re-keyed by its digest, which is what revision
+    // metadata references. The bytes are read one entry at a time.
+    let mut rekey = Vec::new();
+    let mut new_digests = HashSet::new();
+    if schema < 1
+        && let Some(atts) = &atts
     {
-        let mut table = db_err!(txn.open_table(META_TABLE))?;
-        for (key, value) in &entries {
-            if key != META_KEY {
-                db_err!(table.insert(key.as_str(), value.as_slice()))?;
+        for entry in db_err!(atts.iter())? {
+            let (key, value) = db_err!(entry)?;
+            if key.value().contains('\0') {
+                let digest = attachment_digest(value.value());
+                new_digests.insert(digest.clone());
+                rekey.push((key.value().to_string(), digest));
             }
         }
-        write_meta(&mut table, &meta)?;
     }
-    db_err!(txn.delete_table(LEGACY_META_TABLE))?;
-    create_current_tables(txn)?;
-    Ok(())
+    report.attachments_rekeyed = rekey.len() as u64;
+    let has_bytes = |digest: &str| -> Result<bool> {
+        Ok(new_digests.contains(digest)
+            || match &atts {
+                Some(atts) => db_err!(atts.get(digest))?.is_some(),
+                None => false,
+            })
+    };
+
+    let (locals, moved_bodies) = plan_local_moves(
+        path,
+        from,
+        docs.as_ref(),
+        revs.as_ref(),
+        changes.as_ref(),
+        locals_table.as_ref(),
+        &mut report,
+    )?;
+
+    let (bodies, mut duplicates) = plan_body_moves(
+        path,
+        docs.as_ref(),
+        revs.as_ref(),
+        &moved_bodies,
+        &mut report,
+    )?;
+    // Where each post-upgrade body key reads its bytes from.
+    let body_source: HashMap<&str, &str> = bodies
+        .iter()
+        .map(|m| (m.to.as_str(), m.keep.as_str()))
+        .collect();
+
+    // Every document: its revision tree after the upgrade, then the counts
+    // and the facts about attachments and old revisions.
+    meta.doc_count = 0;
+    meta.doc_del_count = 0;
+    let mut doc_rewrites = Vec::new();
+    let mut leaf_digests: HashSet<String> = HashSet::new();
+    let mut old_only_candidates: Vec<(String, HashSet<String>)> = Vec::new();
+    if let Some(docs) = &docs {
+        for entry in db_err!(docs.iter())? {
+            let (key, value) = db_err!(entry)?;
+            let id = key.value();
+            if id.starts_with("_local/") {
+                continue; // moved above
+            }
+            let (tree, seq) = decode_doc_record(value.value())
+                .map_err(|e| corrupt(path, format!("the record of document {:?}", id), e))?;
+            let tree = match normalize_doc_tree(&tree, id, &mut duplicates, &mut report) {
+                Some(normalized) => {
+                    doc_rewrites.push((id.to_string(), encode_doc_record(&normalized, seq)?));
+                    normalized
+                }
+                None => tree,
+            };
+            meta.adjust_counts(None, Some(is_deleted(&tree)));
+
+            let leaves: HashSet<String> = collect_leaves(&tree)
+                .iter()
+                .map(|l| l.rev_string())
+                .collect();
+            let mut old_digests = HashSet::new();
+            let mut missing = false;
+            let mut seen = HashSet::new();
+            let body_keys = match &revs {
+                Some(revs) => rev_data_keys(revs, id)?,
+                None => Vec::new(),
+            };
+            for body_key in body_keys {
+                let rev = normalize_rev_str(&body_key[id.len() + 1..]).into_owned();
+                if !seen.insert(rev.clone()) {
+                    continue; // another spelling of a revision already read
+                }
+                let target = rev_data_key(id, &rev);
+                let source = body_source
+                    .get(target.as_str())
+                    .copied()
+                    .unwrap_or(body_key.as_str());
+                let guard = match &revs {
+                    Some(revs) => db_err!(revs.get(source))?,
+                    None => None,
+                }
+                .ok_or_else(|| RouchError::DatabaseError("body vanished".into()))?;
+                let record: RevAttachmentsRecord =
+                    serde_json::from_slice(guard.value()).map_err(|e| {
+                        corrupt(path, format!("the body of {:?} revision {}", id, rev), e)
+                    })?;
+                let is_leaf = leaves.contains(&rev);
+                if !is_leaf {
+                    report.old_revision_bodies += 1;
+                }
+                for att in record.attachments.into_values() {
+                    if !has_bytes(&att.digest)? {
+                        report.missing_attachment_refs += 1;
+                        missing = true;
+                    } else if is_leaf {
+                        leaf_digests.insert(att.digest);
+                    } else {
+                        old_digests.insert(att.digest);
+                    }
+                }
+            }
+            if missing {
+                report.docs_with_missing_attachments_count += 1;
+                push_sample(&mut report.docs_with_missing_attachments, id);
+            }
+            if !old_digests.is_empty() {
+                old_only_candidates.push((id.to_string(), old_digests));
+            }
+        }
+    }
+
+    // Compaction keeps the bytes any leaf of any document references.
+    for (id, digests) in old_only_candidates {
+        if digests.iter().any(|d| !leaf_digests.contains(d)) {
+            report.docs_with_old_only_attachments_count += 1;
+            push_sample(&mut report.docs_with_old_only_attachments, &id);
+        }
+    }
+    report.case_duplicate_revs_merged = duplicates.len() as u64;
+    report.doc_count = meta.doc_count;
+    report.doc_del_count = meta.doc_del_count;
+    meta.schema = SCHEMA_VERSION;
+
+    Ok(Plan {
+        report,
+        meta,
+        meta_entries,
+        rekey,
+        locals,
+        doc_rewrites,
+        bodies,
+    })
 }
 
-/// Schema 0 -> 1: attachment bytes were stored under `doc_id\0name` (so a
-/// later write of the same name overwrote the bytes older revisions point
-/// at). Re-key every entry by its digest, which is what revision metadata
-/// references. Returns the number of entries re-keyed.
-fn migrate_attachments_to_digest_keys(txn: &WriteTransaction) -> Result<u64> {
-    let mut table = db_err!(txn.open_table(ATTACHMENT_TABLE))?;
-    let mut legacy_keys = Vec::new();
-    for entry in db_err!(table.iter())? {
-        let (key, _) = db_err!(entry)?;
-        if key.value().contains('\0') {
-            legacy_keys.push(key.value().to_string());
-        }
-    }
-    let mut count = 0;
-    for key in legacy_keys {
-        let bytes = db_err!(table.remove(key.as_str()))?.map(|g| g.value().to_vec());
-        if let Some(bytes) = bytes {
-            let digest = attachment_digest(&bytes);
-            let exists = db_err!(table.get(digest.as_str()))?.is_some();
-            if !exists {
-                db_err!(table.insert(digest.as_str(), bytes.as_slice()))?;
-            }
-            count += 1;
-        }
-    }
-    Ok(count)
-}
+type StrTable = ReadOnlyTable<&'static str, &'static [u8]>;
 
 /// rouchdb <= 0.4 stored `_local/` documents written through `bulk_docs`
 /// (`put("_local/x")`) as ordinary documents; 0.5 keeps them in the local
-/// store, where it looks them up. Move each one there with its current
-/// body, and remove its revision tree, bodies and change entry.
-fn move_local_docs(txn: &WriteTransaction, path: &Path, report: &mut UpgradeReport) -> Result<()> {
-    let mut docs = db_err!(txn.open_table(DOC_TABLE))?;
-    let mut revs = db_err!(txn.open_table(REV_DATA_TABLE))?;
-    let mut changes = db_err!(txn.open_table(CHANGES_TABLE))?;
-    let mut locals = db_err!(txn.open_table(LOCAL_TABLE))?;
-
+/// store, where it looks them up. Each one moves there with its current
+/// body; its revision tree, bodies and change entry are removed. Returns
+/// the moves and the body keys they remove.
+fn plan_local_moves(
+    path: &Path,
+    from: StoredFormat,
+    docs: Option<&StrTable>,
+    revs: Option<&StrTable>,
+    changes: Option<&ReadOnlyTable<u64, &'static [u8]>>,
+    locals: Option<&StrTable>,
+    report: &mut UpgradeReport,
+) -> Result<(Vec<LocalMove>, HashSet<String>)> {
+    let mut moves = Vec::new();
+    let mut moved_bodies = HashSet::new();
+    let Some(docs) = docs else {
+        return Ok((moves, moved_bodies));
+    };
     // '0' follows '/': the range holds exactly the ids starting "_local/".
-    let mut found = Vec::new();
     for entry in db_err!(docs.range("_local/".."_local0"))? {
         let (key, value) = db_err!(entry)?;
-        found.push((key.value().to_string(), value.value().to_vec()));
-    }
-
-    for (id, record) in found {
+        let id = key.value().to_string();
         let local_id = &id["_local/".len()..];
-        let (tree, seq) = decode_doc_record(&record)
+        let (tree, seq) = decode_doc_record(value.value())
             .map_err(|e| corrupt(path, format!("the record of document {:?}", id), e))?;
-        let body_keys = rev_data_keys(&revs, &id)?;
+        let body_keys = match revs {
+            Some(revs) => rev_data_keys(revs, &id)?,
+            None => Vec::new(),
+        };
 
-        match winning_rev(&tree) {
+        let local = match winning_rev(&tree) {
             Some(winner) if !is_deleted(&tree) => {
-                if db_err!(locals.get(local_id))?.is_some() {
+                if local_id.is_empty() {
+                    return Err(RouchError::DatabaseError(format!(
+                        "cannot upgrade {}: it holds a document with the id \"_local/\", a \
+                         local document with an empty name, which rouchdb 0.5 cannot read or \
+                         write. Nothing was changed. Copy its contents if you need them, delete \
+                         it with {}, then retry",
+                        path.display(),
+                        writer(from)
+                    )));
+                }
+                if let Some(locals) = locals
+                    && db_err!(locals.get(local_id))?.is_some()
+                {
                     return Err(RouchError::DatabaseError(format!(
                         "cannot upgrade {}: the document {:?} and the local document {:?} \
-                         (written with put_local) are distinct in rouchdb 0.4 but the same \
-                         document in 0.5. Nothing was changed. Remove one of them with \
-                         rouchdb 0.4, then retry",
+                         (written with put_local) are distinct in {} but the same document in \
+                         0.5. Nothing was changed. Remove one of them with {}, then retry",
                         path.display(),
                         id,
-                        local_id
+                        local_id,
+                        match from {
+                            StoredFormat::Legacy => "rouchdb 0.4",
+                            _ => "the development build that wrote the file",
+                        },
+                        writer(from)
                     )));
                 }
                 let key = rev_data_key(&id, &winner.to_string());
-                let stored: Option<RevDataRecord> = match db_err!(revs.get(key.as_str()))? {
-                    Some(guard) => Some(decode_body(guard.value()).map_err(|e| {
-                        corrupt(path, format!("the body of {:?} revision {}", id, winner), e)
-                    })?),
+                let stored: Option<RevDataRecord> = match revs {
+                    Some(revs) => match db_err!(revs.get(key.as_str()))? {
+                        Some(guard) => Some(decode_body(guard.value()).map_err(|e| {
+                            corrupt(path, format!("the body of {:?} revision {}", id, winner), e)
+                        })?),
+                        None => None,
+                    },
                     None => None,
                 };
                 // rouchdb 0.4 returned an empty body when none was stored.
@@ -766,104 +1211,218 @@ fn move_local_docs(txn: &WriteTransaction, path: &Path, report: &mut UpgradeRepo
                     serde_json::Value::String(format!("0-{}", winner.pos)),
                 );
                 let bytes = serde_json::to_vec(&serde_json::Value::Object(body))?;
-                db_err!(locals.insert(local_id, bytes.as_slice()))?;
                 report.local_docs_moved += 1;
                 report.local_attachments_dropped += attachments;
                 report.local_conflicts_dropped += collect_conflicts(&tree).len() as u64;
+                Some((local_id.to_string(), bytes))
             }
-            _ => report.local_tombstones_dropped += 1,
-        }
+            _ => {
+                report.local_tombstones_dropped += 1;
+                None
+            }
+        };
 
-        for key in body_keys {
-            db_err!(revs.remove(key.as_str()))?;
-        }
-        let owned_change = match db_err!(changes.get(seq))? {
-            Some(guard) => serde_json::from_slice::<ChangeRecord>(guard.value())
-                .is_ok_and(|change| change.doc_id == id),
+        let owned_change = match changes {
+            Some(changes) => match db_err!(changes.get(seq))? {
+                Some(guard) => serde_json::from_slice::<ChangeRecord>(guard.value())
+                    .is_ok_and(|change| change.doc_id == id),
+                None => false,
+            },
             None => false,
         };
-        if owned_change {
-            db_err!(changes.remove(seq))?;
-        }
-        db_err!(docs.remove(id.as_str()))?;
+        moved_bodies.extend(body_keys.iter().cloned());
+        moves.push(LocalMove {
+            id,
+            local,
+            body_keys,
+            change_seq: owned_change.then_some(seq),
+        });
     }
-    Ok(())
+    Ok((moves, moved_bodies))
 }
 
-/// Lower-case every 32-digit hexadecimal revision id in revision trees and
-/// body keys (rouchdb <= 0.4 stored ids of replicated writes as given; 0.5
-/// looks revisions up in canonical, lower-case form).
-fn normalize_revs(txn: &WriteTransaction, path: &Path, report: &mut UpgradeReport) -> Result<()> {
-    {
-        let mut docs = db_err!(txn.open_table(DOC_TABLE))?;
-        let mut rewrites = Vec::new();
-        for entry in db_err!(docs.iter())? {
-            let (key, value) = db_err!(entry)?;
-            let id = key.value();
-            let (mut tree, seq) = decode_doc_record(value.value())
-                .map_err(|e| corrupt(path, format!("the record of document {:?}", id), e))?;
-            let changed = normalize_tree(&mut tree);
-            if changed == 0 {
-                continue;
-            }
-            let mut seen = HashSet::new();
-            let mut duplicate = None;
-            traverse_rev_tree(&tree, |pos, node, _| {
-                if !seen.insert((pos, node.hash.clone())) && duplicate.is_none() {
-                    duplicate = Some(format!("{}-{}", pos, node.hash));
-                }
-            });
-            if let Some(rev) = duplicate {
-                return Err(RouchError::DatabaseError(format!(
-                    "cannot upgrade {}: document {:?} has revision {} both in upper and \
-                     lower case, which rouchdb 0.5 treats as the same revision. Nothing was \
-                     changed. Purge one of them with rouchdb 0.4, then retry",
-                    path.display(),
-                    id,
-                    rev
-                )));
-            }
-            report.revs_normalized += changed;
-            rewrites.push((id.to_string(), encode_doc_record(&tree, seq)?));
-        }
-        for (id, bytes) in rewrites {
-            db_err!(docs.insert(id.as_str(), bytes.as_slice()))?;
-        }
-    }
+/// How rouchdb 0.4 ranked a spelling of a revision id in a document's tree:
+/// greater is preferred (see [`UpgradeReport::case_duplicate_bodies_discarded`]).
+/// `(is a leaf, is a live leaf, is in the tree, the id as stored)`.
+type Rank = (bool, bool, bool, String);
 
-    let mut revs = db_err!(txn.open_table(REV_DATA_TABLE))?;
-    let mut renames = Vec::new();
+/// `(is a leaf, is deleted)` of every node of `tree`, by revision id as
+/// stored.
+fn node_info(tree: &RevTree) -> HashMap<String, (bool, bool)> {
+    let mut info = HashMap::new();
+    traverse_rev_tree(tree, |pos, node, _| {
+        info.insert(
+            format!("{}-{}", pos, node.hash),
+            (node.children.is_empty(), node.opts.deleted),
+        );
+    });
+    info
+}
+
+fn rank(info: &HashMap<String, (bool, bool)>, rev: &str) -> Rank {
+    match info.get(rev) {
+        Some(&(leaf, deleted)) => (leaf, leaf && !deleted, true, rev.to_string()),
+        None => (false, false, false, rev.to_string()),
+    }
+}
+
+/// Stored bodies keyed by a revision id with upper-case digits get the
+/// lower-case key. When several spellings of one revision have a body, the
+/// best-ranked one is kept (see
+/// [`UpgradeReport::case_duplicate_bodies_discarded`]) and the others are
+/// dropped: reported if their body differs. Returns the moves, and the
+/// merged revisions (as lower-case body keys).
+fn plan_body_moves(
+    path: &Path,
+    docs: Option<&StrTable>,
+    revs: Option<&StrTable>,
+    moved_bodies: &HashSet<String>,
+    report: &mut UpgradeReport,
+) -> Result<(Vec<BodyMove>, HashSet<String>)> {
+    let mut moves = Vec::new();
+    let mut duplicates = HashSet::new();
+    let Some(revs) = revs else {
+        return Ok((moves, duplicates));
+    };
+    // Lower-case key -> the keys spelling it with upper case.
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for entry in db_err!(revs.iter())? {
         let (key, _) = db_err!(entry)?;
         let key = key.value();
+        if moved_bodies.contains(key) {
+            continue;
+        }
         // Revision strings hold no NUL: the last one ends the document id.
         if let Some((doc_id, rev)) = key.rsplit_once('\0')
-            && let Some((pos, hash)) = rev.split_once('-')
-            && let std::borrow::Cow::Owned(lower) = normalize_rev_hash(hash)
+            && let Cow::Owned(lower) = normalize_rev_str(rev)
         {
-            renames.push((
-                key.to_string(),
-                rev_data_key(doc_id, &format!("{pos}-{lower}")),
-            ));
+            groups
+                .entry(rev_data_key(doc_id, &lower))
+                .or_default()
+                .push(key.to_string());
         }
     }
-    for (old, new) in renames {
-        if db_err!(revs.get(new.as_str()))?.is_some() {
-            return Err(RouchError::DatabaseError(format!(
-                "cannot upgrade {}: stored bodies {:?} and {:?} differ only in the case of \
-                 their revision id. Nothing was changed. Purge one of them with rouchdb 0.4, \
-                 then retry",
-                path.display(),
-                old,
-                new
-            )));
+
+    for (to, mut spellings) in groups {
+        if db_err!(revs.get(to.as_str()))?.is_some() {
+            spellings.push(to.clone());
         }
-        let bytes = db_err!(revs.remove(old.as_str()))?.map(|g| g.value().to_vec());
-        if let Some(bytes) = bytes {
-            db_err!(revs.insert(new.as_str(), bytes.as_slice()))?;
+        if spellings.len() == 1 {
+            let keep = spellings.pop().expect("one spelling");
+            moves.push(BodyMove {
+                keep: keep.clone(),
+                to,
+                remove: vec![keep],
+            });
+            continue;
         }
+
+        // The same revision under several spellings.
+        duplicates.insert(to.clone());
+        let (doc_id, _) = to.rsplit_once('\0').expect("a body key");
+        let ranks = match docs {
+            Some(docs) => match load_doc_record(docs, doc_id)
+                .map_err(|e| corrupt(path, format!("the record of document {:?}", doc_id), e))?
+            {
+                Some((tree, _)) => node_info(&tree),
+                None => HashMap::new(),
+            },
+            None => HashMap::new(),
+        };
+        let rev_of = |key: &str| key[doc_id.len() + 1..].to_string();
+        let keep = spellings
+            .iter()
+            .max_by_key(|key| rank(&ranks, &rev_of(key)))
+            .expect("spellings")
+            .clone();
+        let kept_bytes = db_err!(revs.get(keep.as_str()))?
+            .map(|g| g.value().to_vec())
+            .unwrap_or_default();
+        for other in spellings.iter().filter(|k| **k != keep) {
+            let bytes = db_err!(revs.get(other.as_str()))?
+                .map(|g| g.value().to_vec())
+                .unwrap_or_default();
+            if !same_body(&bytes, &kept_bytes) {
+                report
+                    .case_duplicate_bodies_discarded
+                    .push(DiscardedRevision {
+                        doc_id: doc_id.to_string(),
+                        rev: rev_of(other),
+                        kept: rev_of(&keep),
+                    });
+            }
+        }
+        let remove = spellings.into_iter().filter(|k| *k != to).collect();
+        moves.push(BodyMove { keep, to, remove });
     }
-    Ok(())
+    Ok((moves, duplicates))
+}
+
+/// Whether two stored bodies hold the same revision (same bytes, or the
+/// same JSON written differently).
+fn same_body(a: &[u8], b: &[u8]) -> bool {
+    if a == b {
+        return true;
+    }
+    match (
+        decode_body::<serde_json::Value>(a),
+        decode_body::<serde_json::Value>(b),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The revision tree of document `id` with lower-case revision ids, or
+/// `None` if it has no upper-case id. A revision present under several
+/// spellings becomes one node (its merged revisions are added to
+/// `duplicates`). Counts the normalized ids and a change of winner in
+/// `report`.
+fn normalize_doc_tree(
+    tree: &RevTree,
+    id: &str,
+    duplicates: &mut HashSet<String>,
+    report: &mut UpgradeReport,
+) -> Option<RevTree> {
+    let mut normalized = tree.clone();
+    let changed = normalize_tree(&mut normalized);
+    if changed == 0 {
+        return None;
+    }
+    report.revs_normalized += changed;
+
+    let mut spellings: HashMap<String, Vec<String>> = HashMap::new();
+    traverse_rev_tree(tree, |pos, node, _| {
+        spellings
+            .entry(format!("{}-{}", pos, normalize_rev_hash(&node.hash)))
+            .or_default()
+            .push(format!("{}-{}", pos, node.hash));
+    });
+    let merged: Vec<(String, Vec<String>)> =
+        spellings.into_iter().filter(|(_, s)| s.len() > 1).collect();
+    if !merged.is_empty() {
+        normalized = collapse(&normalized);
+        // A merged revision is deleted if the spelling 0.4 ranked first was.
+        let info = node_info(tree);
+        let mut deleted = HashMap::new();
+        for (rev, spelled) in &merged {
+            duplicates.insert(rev_data_key(id, rev));
+            let best = spelled
+                .iter()
+                .max_by_key(|s| rank(&info, s))
+                .expect("spellings");
+            deleted.insert(rev.clone(), info.get(best).is_some_and(|&(_, d)| d));
+        }
+        set_deleted(&mut normalized, &deleted);
+    }
+
+    let before = winning_rev(tree).map(|r| normalize_rev_str(&r.to_string()).into_owned());
+    let after = winning_rev(&normalized).map(|r| r.to_string());
+    if before != after {
+        report.docs_with_changed_winner_count += 1;
+        push_sample(&mut report.docs_with_changed_winner, id);
+    }
+    Some(normalized)
 }
 
 /// Lower-case the revision ids of `tree` (iteratively: histories can be
@@ -872,7 +1431,7 @@ fn normalize_tree(tree: &mut RevTree) -> u64 {
     let mut changed = 0;
     let mut stack: Vec<&mut RevNode> = tree.iter_mut().map(|p| &mut p.tree).collect();
     while let Some(node) = stack.pop() {
-        if let std::borrow::Cow::Owned(lower) = normalize_rev_hash(&node.hash) {
+        if let Cow::Owned(lower) = normalize_rev_hash(&node.hash) {
             node.hash = lower;
             changed += 1;
         }
@@ -881,79 +1440,102 @@ fn normalize_tree(tree: &mut RevTree) -> u64 {
     changed
 }
 
-/// Count the documents (the counts 0.5 maintains in its metadata) and
-/// collect the facts the report gives about attachments and old revisions.
-fn scan(
-    txn: &WriteTransaction,
-    path: &Path,
-    meta: &mut MetaRecord,
-    report: &mut UpgradeReport,
-) -> Result<()> {
-    let docs = db_err!(txn.open_table(DOC_TABLE))?;
-    let revs = db_err!(txn.open_table(REV_DATA_TABLE))?;
-    let atts = db_err!(txn.open_table(ATTACHMENT_TABLE))?;
-
-    meta.doc_count = 0;
-    meta.doc_del_count = 0;
-    let mut leaf_digests: HashSet<String> = HashSet::new();
-    let mut old_only_candidates: Vec<(String, HashSet<String>)> = Vec::new();
-
-    for entry in db_err!(docs.iter())? {
-        let (key, value) = db_err!(entry)?;
-        let id = key.value();
-        let (tree, _) = decode_doc_record(value.value())
-            .map_err(|e| corrupt(path, format!("the record of document {:?}", id), e))?;
-        meta.adjust_counts(None, Some(is_deleted(&tree)));
-
-        let leaves: HashSet<String> = collect_leaves(&tree)
-            .iter()
-            .map(|l| l.rev_string())
-            .collect();
-        let mut old_digests = HashSet::new();
-        let mut missing = false;
-        for body_key in rev_data_keys(&revs, id)? {
-            let rev = &body_key[id.len() + 1..];
-            let guard = db_err!(revs.get(body_key.as_str()))?
-                .ok_or_else(|| RouchError::DatabaseError("body vanished".into()))?;
-            let record: RevAttachmentsRecord = serde_json::from_slice(guard.value())
-                .map_err(|e| corrupt(path, format!("the body of {:?} revision {}", id, rev), e))?;
-            let is_leaf = leaves.contains(rev);
-            if !is_leaf {
-                report.old_revision_bodies += 1;
-            }
-            for att in record.attachments.into_values() {
-                if db_err!(atts.get(att.digest.as_str()))?.is_none() {
-                    report.missing_attachment_refs += 1;
-                    missing = true;
-                } else if is_leaf {
-                    leaf_digests.insert(att.digest);
-                } else {
-                    old_digests.insert(att.digest);
-                }
-            }
+/// Rebuild `tree`, in which some revisions appear more than once, by
+/// merging its root-to-leaf paths: each revision becomes one node, with
+/// the children of all its copies, available if any copy was.
+fn collapse(tree: &RevTree) -> RevTree {
+    let mut result: RevTree = Vec::new();
+    for (pos, nodes) in root_to_leaf(tree) {
+        let mut path: Option<RevNode> = None;
+        for (hash, opts, status) in nodes.into_iter().rev() {
+            path = Some(RevNode {
+                hash,
+                status,
+                opts,
+                children: path.into_iter().collect(),
+            });
         }
-        if missing {
-            report.docs_with_missing_attachments_count += 1;
-            if report.docs_with_missing_attachments.len() < REPORT_SAMPLE {
-                report.docs_with_missing_attachments.push(id.to_string());
-            }
-        }
-        if !old_digests.is_empty() {
-            old_only_candidates.push((id.to_string(), old_digests));
+        if let Some(node) = path {
+            // A rev_limit of 0 stems nothing.
+            result = merge_tree(&result, &RevPath { pos, tree: node }, 0).0;
         }
     }
+    result
+}
 
-    // Compaction keeps the bytes any leaf of any document references.
-    for (id, digests) in old_only_candidates {
-        if digests.iter().any(|d| !leaf_digests.contains(d)) {
-            report.docs_with_old_only_attachments_count += 1;
-            if report.docs_with_old_only_attachments.len() < REPORT_SAMPLE {
-                report.docs_with_old_only_attachments.push(id);
+/// Set the deleted flag of the nodes named in `deleted` (`pos-hash`).
+fn set_deleted(tree: &mut RevTree, deleted: &HashMap<String, bool>) {
+    let mut stack: Vec<(&mut RevNode, u64)> =
+        tree.iter_mut().map(|p| (&mut p.tree, p.pos)).collect();
+    while let Some((node, pos)) = stack.pop() {
+        if let Some(&flag) = deleted.get(&format!("{}-{}", pos, node.hash)) {
+            node.opts.deleted = flag;
+        }
+        stack.extend(node.children.iter_mut().map(|c| (c, pos + 1)));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Applying the plan (one write transaction)
+// ---------------------------------------------------------------------------
+
+fn apply(txn: &WriteTransaction, plan: &Plan) -> Result<()> {
+    create_tables(txn)?;
+    {
+        // One attachment in memory at a time.
+        let mut atts = db_err!(txn.open_table(ATTACHMENT_TABLE))?;
+        for (key, digest) in &plan.rekey {
+            let bytes = db_err!(atts.remove(key.as_str()))?.map(|g| g.value().to_vec());
+            if let Some(bytes) = bytes
+                && db_err!(atts.get(digest.as_str()))?.is_none()
+            {
+                db_err!(atts.insert(digest.as_str(), bytes.as_slice()))?;
             }
         }
     }
-    report.doc_count = meta.doc_count;
-    report.doc_del_count = meta.doc_del_count;
+    fault::hit("upgrade:after_attachments")?;
+
+    let mut docs = db_err!(txn.open_table(DOC_TABLE))?;
+    let mut revs = db_err!(txn.open_table(REV_DATA_TABLE))?;
+    {
+        let mut changes = db_err!(txn.open_table(CHANGES_TABLE))?;
+        let mut locals = db_err!(txn.open_table(LOCAL_TABLE))?;
+        for m in &plan.locals {
+            if let Some((local_id, bytes)) = &m.local {
+                db_err!(locals.insert(local_id.as_str(), bytes.as_slice()))?;
+            }
+            for key in &m.body_keys {
+                db_err!(revs.remove(key.as_str()))?;
+            }
+            if let Some(seq) = m.change_seq {
+                db_err!(changes.remove(seq))?;
+            }
+            db_err!(docs.remove(m.id.as_str()))?;
+        }
+    }
+    for (id, bytes) in &plan.doc_rewrites {
+        db_err!(docs.insert(id.as_str(), bytes.as_slice()))?;
+    }
+    for m in &plan.bodies {
+        let bytes = db_err!(revs.get(m.keep.as_str()))?.map(|g| g.value().to_vec());
+        for key in &m.remove {
+            db_err!(revs.remove(key.as_str()))?;
+        }
+        if let Some(bytes) = bytes {
+            db_err!(revs.insert(m.to.as_str(), bytes.as_slice()))?;
+        }
+    }
+    drop((docs, revs));
+
+    {
+        let mut table = db_err!(txn.open_table(META_TABLE))?;
+        for (key, value) in &plan.meta_entries {
+            db_err!(table.insert(key.as_str(), value.as_slice()))?;
+        }
+        write_meta(&mut table, &plan.meta)?;
+    }
+    db_err!(txn.delete_table(LEGACY_META_TABLE))?;
+    create_current_tables(txn)?;
     Ok(())
 }
 
@@ -977,12 +1559,16 @@ const BACKUP_TABLES: [(&str, bool); 6] = [
 /// (the file lock is held throughout, so nothing changes meanwhile) into
 /// `<dest>.partial`, committed, reopened and compared entry by entry with
 /// the source, synced, then renamed to `dest`. On any error the partial copy
-/// is removed; the source is only ever read.
-fn backup_logical(db: &Database, dest: &Path) -> Result<()> {
+/// is removed; the source is only ever read. Returns a warning if the
+/// directory could not be synced after the rename (the backup is complete
+/// then, but a crash soon after could undo the rename).
+fn backup_logical(db: &Database, dest: &Path) -> Result<Option<String>> {
     if dest.exists() {
         return Err(RouchError::DatabaseError(format!(
-            "backup destination {} already exists; move it away or choose another backup \
-             path (nothing was changed)",
+            "backup destination {} already exists; nothing was changed. If an earlier \
+             upgrade attempt of this file left it there, it is a complete backup (a backup \
+             gets its final name only after it has been verified): move it elsewhere to keep \
+             it, or choose another backup path, then retry",
             dest.display()
         )));
     }
@@ -998,8 +1584,10 @@ fn backup_logical(db: &Database, dest: &Path) -> Result<()> {
         .map_err(|e| {
             RouchError::DatabaseError(if e.kind() == std::io::ErrorKind::AlreadyExists {
                 format!(
-                    "{} exists, left by an interrupted backup; delete it and retry (nothing \
-                     was changed)",
+                    "{} exists: it is left over from an upgrade attempt that was interrupted \
+                     while writing the backup. It is not a complete backup, and the database \
+                     file was not changed by that attempt: delete it and retry (nothing was \
+                     changed)",
                     partial.display()
                 )
             } else {
@@ -1013,7 +1601,12 @@ fn backup_logical(db: &Database, dest: &Path) -> Result<()> {
 
     let result = copy_and_verify(db, &partial).and_then(|()| {
         fault::hit("backup:before_rename")?;
-        fs::File::open(&partial)?.sync_all()?;
+        // redb's commit already made the copy durable. Opened for writing:
+        // Windows cannot flush a file opened read-only.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&partial)?
+            .sync_all()?;
         if dest.exists() {
             return Err(RouchError::DatabaseError(format!(
                 "backup destination {} appeared during the backup",
@@ -1021,7 +1614,6 @@ fn backup_logical(db: &Database, dest: &Path) -> Result<()> {
             )));
         }
         fs::rename(&partial, dest)?;
-        sync_parent_dir(dest)?;
         Ok(())
     });
     if let Err(e) = result {
@@ -1032,7 +1624,20 @@ fn backup_logical(db: &Database, dest: &Path) -> Result<()> {
             e
         )));
     }
-    Ok(())
+    // The backup is complete under its final name. Only the durability of
+    // the rename depends on the directory sync.
+    let synced = fault::hit("backup:sync_dir")
+        .map_err(|e| std::io::Error::other(e.to_string()))
+        .and_then(|()| sync_parent_dir(dest));
+    Ok(synced.err().map(|e| {
+        format!(
+            "the backup {} is complete, but its directory could not be synced after the \
+             rename ({}): if the machine crashes soon, the backup may reappear as {}",
+            dest.display(),
+            e,
+            partial.display()
+        )
+    }))
 }
 
 fn copy_and_verify(db: &Database, partial: &Path) -> Result<()> {
@@ -1060,7 +1665,11 @@ fn copy_and_verify(db: &Database, partial: &Path) -> Result<()> {
     }
 
     {
-        let backup = db_err!(Database::create(partial))?;
+        let backup = db_err!(
+            redb::Builder::new()
+                .set_cache_size(UPGRADE_CACHE_BYTES)
+                .create(partial)
+        )?;
         let mut txn = db_err!(backup.begin_write())?;
         txn.set_two_phase_commit(true);
         for &(name, u64_keys) in &tables {
@@ -1074,7 +1683,7 @@ fn copy_and_verify(db: &Database, partial: &Path) -> Result<()> {
     }
 
     fault::hit("backup:verify")?;
-    let backup = db_err!(Database::open(partial))?;
+    let backup = open_for_upgrade(partial)?;
     let copy = db_err!(backup.begin_read())?;
     let mut copied: Vec<String> = db_err!(copy.list_tables())?
         .map(|t| t.name().to_string())
@@ -1583,7 +2192,12 @@ mod tests {
         std::fs::write(dir.path().join("i.bak.partial"), b"half").unwrap();
         let err = RedbAdapter::upgrade(&path, UpgradePolicy::WithBackup(Some(interrupted.clone())))
             .expect_err("refused");
-        assert!(err.to_string().contains("interrupted backup"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("left over from an upgrade attempt that was interrupted"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("delete it"), "{err}");
         assert_eq!(
             std::fs::read(dir.path().join("i.bak.partial")).unwrap(),
             b"half"
@@ -1651,17 +2265,86 @@ mod tests {
         assert_eq!(snapshot(&backup), before);
     }
 
+    /// The dry run reports exactly what the upgrade then does.
+    #[tokio::test]
+    async fn dry_run_reports_what_the_upgrade_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.redb");
+        sample_legacy(&path);
+        let mut dry = RedbAdapter::inspect_upgrade(&path).unwrap();
+        let real = RedbAdapter::upgrade(&path, UpgradePolicy::WithBackup(None)).unwrap();
+        dry.upgraded = true;
+        dry.backup = real.backup.clone();
+        assert_eq!(dry, real);
+    }
+
+    /// A directory that cannot be synced after the backup's rename is a
+    /// warning: the backup is complete, the upgrade goes on.
+    #[tokio::test]
+    async fn a_failed_directory_sync_is_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.redb");
+        sample_legacy(&path);
+        let before = snapshot(&path);
+        fault::set(Some("backup:sync_dir"));
+        let result = RedbAdapter::upgrade(&path, UpgradePolicy::WithBackup(None));
+        fault::set(None);
+        let report = result.unwrap();
+        assert!(report.upgraded);
+        let backup = default_backup_path(&path, 0);
+        assert_eq!(snapshot(&backup), before);
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        let text = report.to_string();
+        assert!(text.contains("warning: the backup"), "{text}");
+        assert!(text.contains("injected failure"), "{text}");
+        assert_guarded(&path);
+    }
+
+    /// Without a backup, the advice does not mention one.
+    #[tokio::test]
+    async fn the_advice_matches_the_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.redb");
+        sample_legacy(&path);
+        let report = RedbAdapter::upgrade(&path, UpgradePolicy::InPlaceNoBackup).unwrap();
+        let text = report.to_string();
+        assert!(text.contains("No backup was written"), "{text}");
+        assert!(
+            text.contains("rouchdb 0.4 can no longer open this file"),
+            "{text}"
+        );
+        assert!(!text.contains("Keep the backup"), "{text}");
+
+        let path = dir.path().join("old2.redb");
+        sample_legacy(&path);
+        let report = RedbAdapter::upgrade(&path, UpgradePolicy::WithBackup(None)).unwrap();
+        let text = report.to_string();
+        assert!(text.contains("Keep the backup"), "{text}");
+        assert!(text.contains("still opens in rouchdb 0.4"), "{text}");
+    }
+
     #[tokio::test]
     async fn dry_run_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("old.redb");
         sample_legacy(&path);
         let before = snapshot(&path);
+        let raw = std::fs::read(&path).unwrap();
         let report = RedbAdapter::inspect_upgrade(&path).unwrap();
         assert!(!report.upgraded);
         assert_eq!(report.local_docs_moved, 1);
         assert_eq!(report.doc_count, 3);
-        assert!(report.to_string().contains("dry run"));
+        assert_eq!(report.file_size, raw.len() as u64);
+        let text = report.to_string();
+        assert!(text.contains("dry run"), "{text}");
+        assert!(text.contains("three times the file size"), "{text}");
+        assert!(text.contains("old.redb.rouchdb-0.4.bak"), "{text}");
+        assert!(text.contains("will permanently delete"), "{text}");
+        // Only read: not a byte of the file changed (not even its size).
+        assert!(
+            std::fs::read(&path).unwrap() == raw,
+            "the dry run modified the file"
+        );
         assert_eq!(snapshot(&path), before);
         assert!(!default_backup_path(&path, 0).exists());
         // Refuse is not an upgrade policy for upgrade().
@@ -1788,30 +2471,342 @@ mod tests {
         assert!(diff.results.is_empty(), "{:?}", diff.results);
     }
 
+    fn one_rev_tree() -> RevTree {
+        vec![build_path_from_revs(
+            1,
+            &[hex(1)],
+            NodeOpts::default(),
+            RevStatus::Available,
+        )]
+    }
+
+    /// A tree of single-revision roots (conflicting leaves) `(pos-hash,
+    /// deleted)`.
+    fn leaves_tree(leaves: &[(&str, bool)]) -> RevTree {
+        leaves
+            .iter()
+            .map(|(rev, deleted)| {
+                let (pos, hash) = rev.split_once('-').unwrap();
+                build_path_from_revs(
+                    pos.parse().unwrap(),
+                    &[hash.to_string()],
+                    NodeOpts { deleted: *deleted },
+                    RevStatus::Available,
+                )
+            })
+            .collect()
+    }
+
+    fn deleted_body(data: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({"data": data, "deleted": true})).unwrap()
+    }
+
+    /// The same revision stored under two spellings of its id: merged into
+    /// one lower-case revision; an identical body is dropped silently, a
+    /// different one is reported, and the body kept is the one of the
+    /// spelling 0.4 ranked first.
     #[tokio::test]
-    async fn case_duplicates_are_refused() {
+    async fn case_duplicates_are_merged_and_differing_bodies_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.redb");
+        let upper = "ABCDEF0123456789ABCDEF0123456789";
+        let lower = upper.to_ascii_lowercase();
+        let up = format!("1-{upper}");
+        let low = format!("1-{lower}");
+        legacy_file(&path, |txn| {
+            // Identical bodies: nothing to report.
+            put(
+                txn,
+                DOC_TABLE,
+                "same",
+                &legacy_record(&leaves_tree(&[(&up, false), (&low, false)]), 1),
+            );
+            // Different bodies, both live leaves: 0.4's winner is the
+            // greater id, the lower-case one.
+            put(
+                txn,
+                DOC_TABLE,
+                "differ",
+                &legacy_record(&leaves_tree(&[(&up, false), (&low, false)]), 2),
+            );
+            // Different bodies, the lower-case spelling deleted: 0.4's
+            // winner is the live upper-case one.
+            put(
+                txn,
+                DOC_TABLE,
+                "live-upper",
+                &legacy_record(&leaves_tree(&[(&up, false), (&low, true)]), 3),
+            );
+            // Only the upper-case spelling is in the tree, but a body is
+            // stored under both.
+            put(
+                txn,
+                DOC_TABLE,
+                "orphan",
+                &legacy_record(&leaves_tree(&[(&up, false)]), 4),
+            );
+            for id in ["same", "differ", "live-upper", "orphan"] {
+                let same = id == "same";
+                put(
+                    txn,
+                    REV_DATA_TABLE,
+                    &rev_data_key(id, &up),
+                    &body(
+                        serde_json::json!({"spelling": "upper"}),
+                        serde_json::json!({}),
+                    ),
+                );
+                let lower_body = if id == "live-upper" {
+                    deleted_body(serde_json::json!({"spelling": "lower"}))
+                } else if same {
+                    body(
+                        serde_json::json!({"spelling": "upper"}),
+                        serde_json::json!({}),
+                    )
+                } else {
+                    body(
+                        serde_json::json!({"spelling": "lower"}),
+                        serde_json::json!({}),
+                    )
+                };
+                put(txn, REV_DATA_TABLE, &rev_data_key(id, &low), &lower_body);
+            }
+            for (seq, id) in ["same", "differ", "live-upper", "orphan"]
+                .iter()
+                .enumerate()
+            {
+                change(txn, seq as u64 + 1, id);
+            }
+        });
+        let before = snapshot(&path);
+
+        let dry = RedbAdapter::inspect_upgrade(&path).unwrap();
+        let report = RedbAdapter::upgrade(&path, UpgradePolicy::WithBackup(None)).unwrap();
+        assert_eq!(report.case_duplicate_revs_merged, 4);
+        let discarded = |id: &str, rev: &str, kept: &str| DiscardedRevision {
+            doc_id: id.into(),
+            rev: rev.into(),
+            kept: kept.into(),
+        };
+        assert_eq!(
+            report.case_duplicate_bodies_discarded,
+            [
+                discarded("differ", &up, &low),
+                discarded("live-upper", &low, &up),
+                discarded("orphan", &low, &up),
+            ]
+        );
+        let text = report.to_string();
+        assert!(
+            text.contains(&format!(
+                "document \"differ\": discarded the body of {up}, kept the body of {low}"
+            )),
+            "{text}"
+        );
+        // The dry run found the same.
+        assert_eq!(
+            dry.case_duplicate_bodies_discarded,
+            report.case_duplicate_bodies_discarded
+        );
+        // The backup has every body.
+        let backup = report.backup.clone().unwrap();
+        assert_eq!(snapshot(&backup), before);
+
+        let db = RedbAdapter::open(&path, "old").unwrap();
+        for (id, spelling, deleted) in [
+            ("same", "upper", false),
+            ("differ", "lower", false),
+            ("live-upper", "upper", false),
+            ("orphan", "upper", false),
+        ] {
+            let doc = db.get(id, GetOptions::default()).await.unwrap();
+            assert_eq!(doc.rev.unwrap().to_string(), low, "{id}");
+            assert_eq!(doc.data["spelling"], spelling, "{id}");
+            assert_eq!(doc.deleted, deleted, "{id}");
+            // One revision, no conflict with itself.
+            let opened = db
+                .get(
+                    id,
+                    GetOptions {
+                        conflicts: true,
+                        revs: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(opened.data.get("_conflicts").is_none(), "{id}: {opened:?}");
+        }
+        assert_eq!(db.info().await.unwrap().doc_count, 4);
+        // No upper-case key is left.
+        let txn = db.inner.db.begin_read().unwrap();
+        let revs = txn.open_table(REV_DATA_TABLE).unwrap();
+        for entry in revs.iter().unwrap() {
+            let (key, _) = entry.unwrap();
+            assert!(!key.value().contains(upper), "{:?}", key.value());
+        }
+    }
+
+    /// The same revision in two places of one tree (a stemmed branch under
+    /// one spelling, the full branch under the other) becomes one node that
+    /// keeps both histories.
+    #[tokio::test]
+    async fn case_duplicates_across_branches_are_joined() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("old.redb");
         let upper = "ABCDEF0123456789ABCDEF0123456789";
         legacy_file(&path, |txn| {
             let mut tree = vec![build_path_from_revs(
-                1,
-                &[upper.to_string()],
+                2,
+                &[upper.to_string(), hex(1)],
                 NodeOpts::default(),
                 RevStatus::Available,
             )];
+            // 2-abc.. -> 3-..., stored as its own root.
             tree.push(build_path_from_revs(
-                1,
-                &[upper.to_ascii_lowercase()],
+                3,
+                &[hex(3), upper.to_ascii_lowercase()],
                 NodeOpts::default(),
                 RevStatus::Available,
             ));
-            put(txn, DOC_TABLE, "dup", &legacy_record(&tree, 1));
+            put(txn, DOC_TABLE, "j", &legacy_record(&tree, 1));
+            put(
+                txn,
+                REV_DATA_TABLE,
+                &rev_data_key("j", &format!("3-{}", hex(3))),
+                &body(serde_json::json!({"v": 3}), serde_json::json!({})),
+            );
+            change(txn, 1, "j");
         });
+        let report = RedbAdapter::upgrade(&path, UpgradePolicy::InPlaceNoBackup).unwrap();
+        assert_eq!(report.case_duplicate_revs_merged, 1);
+        assert!(report.case_duplicate_bodies_discarded.is_empty());
+        let db = RedbAdapter::open(&path, "old").unwrap();
+        let doc = db
+            .get(
+                "j",
+                GetOptions {
+                    revs: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(doc.rev.unwrap().to_string(), format!("3-{}", hex(3)));
+        // One branch: 3 -> 2 -> 1.
+        assert_eq!(
+            doc.data["_revisions"]["ids"],
+            serde_json::json!([hex(3), upper.to_ascii_lowercase(), hex(1)])
+        );
+    }
+
+    /// 0.4 compared upper-case ids as written ('B' < 'a'), 0.5 compares the
+    /// lower-case ids: the winner of a conflict can change, and is reported.
+    #[tokio::test]
+    async fn winner_changes_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.redb");
+        let b_upper = format!("2-B{}", "0".repeat(31));
+        let a_lower = format!("2-a{}", "0".repeat(31));
+        legacy_file(&path, |txn| {
+            put(
+                txn,
+                DOC_TABLE,
+                "w",
+                &legacy_record(&leaves_tree(&[(&b_upper, false), (&a_lower, false)]), 1),
+            );
+            put(
+                txn,
+                REV_DATA_TABLE,
+                &rev_data_key("w", &b_upper),
+                &body(serde_json::json!({"side": "b"}), serde_json::json!({})),
+            );
+            put(
+                txn,
+                REV_DATA_TABLE,
+                &rev_data_key("w", &a_lower),
+                &body(serde_json::json!({"side": "a"}), serde_json::json!({})),
+            );
+            change(txn, 1, "w");
+            // Upper case, but the same winner.
+            put(
+                txn,
+                DOC_TABLE,
+                "u",
+                &legacy_record(
+                    &leaves_tree(&[(&format!("1-{}", "F".repeat(32)), false)]),
+                    2,
+                ),
+            );
+            change(txn, 2, "u");
+        });
+        let dry = RedbAdapter::inspect_upgrade(&path).unwrap();
+        assert_eq!(dry.docs_with_changed_winner, ["w"]);
+        assert_eq!(dry.docs_with_changed_winner_count, 1);
+        let report = RedbAdapter::upgrade(&path, UpgradePolicy::InPlaceNoBackup).unwrap();
+        assert_eq!(report.docs_with_changed_winner, ["w"]);
+        assert!(
+            report
+                .to_string()
+                .contains("documents whose winning revision changes (0.5 compares revision ids in lower case): 1: [\"w\"]"),
+            "{report}"
+        );
+        let db = RedbAdapter::open(&path, "old").unwrap();
+        let doc = db.get("w", GetOptions::default()).await.unwrap();
+        assert_eq!(doc.data["side"], "b");
+    }
+
+    /// `_local/` (an empty local name) has no place in 0.5: refused before
+    /// anything is written, unless it was deleted.
+    #[tokio::test]
+    async fn an_empty_local_id_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.redb");
+        sample_legacy(&path);
+        {
+            let db = Database::open(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            put(
+                &txn,
+                DOC_TABLE,
+                "_local/",
+                &legacy_record(&one_rev_tree(), 10),
+            );
+            put(
+                &txn,
+                REV_DATA_TABLE,
+                &rev_data_key("_local/", &format!("1-{}", hex(1))),
+                &body(serde_json::json!({"x": 1}), serde_json::json!({})),
+            );
+            txn.commit().unwrap();
+        }
         let before = snapshot(&path);
-        let err = RedbAdapter::upgrade(&path, UpgradePolicy::InPlaceNoBackup).expect_err("refused");
-        assert!(err.to_string().contains("\"dup\""), "{err}");
+        for result in [
+            RedbAdapter::inspect_upgrade(&path),
+            RedbAdapter::upgrade(&path, UpgradePolicy::WithBackup(None)),
+        ] {
+            let msg = result.expect_err("refused").to_string();
+            assert!(
+                msg.contains("\"_local/\"")
+                    && msg.contains("Nothing was changed")
+                    && msg.contains("delete it with rouchdb 0.4"),
+                "{msg}"
+            );
+        }
         assert_eq!(snapshot(&path), before);
+        assert!(!default_backup_path(&path, 0).exists());
+
+        // Once deleted in 0.4 it is a tombstone, which is dropped.
+        {
+            let db = Database::open(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            let mut tree = one_rev_tree();
+            tree[0].tree.opts.deleted = true;
+            put(&txn, DOC_TABLE, "_local/", &legacy_record(&tree, 10));
+            txn.commit().unwrap();
+        }
+        let report = RedbAdapter::upgrade(&path, UpgradePolicy::InPlaceNoBackup).unwrap();
+        assert_eq!(report.local_tombstones_dropped, 2);
     }
 
     #[tokio::test]
@@ -1888,14 +2883,90 @@ mod tests {
             }
             txn.commit().unwrap();
         }
+        let before = snapshot(&path);
         let db = RedbAdapter::open(&path, "dev").unwrap();
-        let report = db.upgrade_report().unwrap();
+        let report = db.upgrade_report().unwrap().clone();
         assert_eq!(report.from, StoredFormat::PreRelease { schema: 2 });
-        assert!(report.upgraded && report.backup.is_none());
+        // A plain open backs the file up first, under a name that says 0.4
+        // cannot open it.
+        let backup = default_backup_path(&path, 2);
+        assert!(backup.ends_with("dev.redb.rouchdb-0.5-pre.bak"));
+        assert!(report.upgraded);
+        assert_eq!(report.backup.as_deref(), Some(backup.as_path()));
+        assert_eq!(snapshot(&backup), before);
+        let text = report.to_string();
+        assert!(text.contains("development build"), "{text}");
+        assert!(text.contains("rouchdb 0.4 cannot open it"), "{text}");
+        assert!(!text.contains("still opens in rouchdb 0.4"), "{text}");
         assert_eq!(db.get_security().await.unwrap().admins.names, ["alice"]);
         assert_eq!(db.info().await.unwrap().doc_count, 1);
         drop(db);
         assert_guarded(&path);
+    }
+
+    /// Turn a current file back into the layout of a development build.
+    fn make_pre_release(path: &Path) {
+        let db = Database::open(path).unwrap();
+        let txn = db.begin_write().unwrap();
+        let entries: Vec<(String, Vec<u8>)> = {
+            let meta = txn.open_table(META_TABLE).unwrap();
+            meta.iter()
+                .unwrap()
+                .map(|e| {
+                    let (k, v) = e.unwrap();
+                    (k.value().to_string(), v.value().to_vec())
+                })
+                .collect()
+        };
+        txn.delete_table(GUARD_TABLE).unwrap();
+        txn.delete_table(META_TABLE).unwrap();
+        {
+            let mut legacy = txn.open_table(LEGACY_META_TABLE).unwrap();
+            for (k, v) in &entries {
+                legacy.insert(k.as_str(), v.as_slice()).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pre_release_files_can_be_upgraded_without_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dev.redb");
+        drop(RedbAdapter::open(&path, "dev").unwrap());
+        make_pre_release(&path);
+        let db = RedbAdapter::open_with(
+            &path,
+            "dev",
+            OpenOptions::new().upgrade(UpgradePolicy::InPlaceNoBackup),
+        )
+        .unwrap();
+        let report = db.upgrade_report().unwrap();
+        assert!(report.upgraded && report.backup.is_none());
+        let text = report.to_string();
+        assert!(text.contains("No backup was written"), "{text}");
+        assert!(!text.contains("rouchdb 0.4 can no longer"), "{text}");
+        assert!(!default_backup_path(&path, 2).exists());
+
+        // A refusal names the development build, not 0.4.
+        drop(db);
+        make_pre_release(&path);
+        {
+            let db = Database::open(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            put(
+                &txn,
+                DOC_TABLE,
+                "_local/",
+                &legacy_record(&one_rev_tree(), 1),
+            );
+            txn.commit().unwrap();
+        }
+        let err = RedbAdapter::open(&path, "dev").err().expect("refused");
+        let msg = err.to_string();
+        assert!(msg.contains("development build"), "{msg}");
+        assert!(!msg.contains("rouchdb 0.4,"), "{msg}");
+        assert!(!default_backup_path(&path, 2).exists());
     }
 
     #[tokio::test]

@@ -585,9 +585,15 @@ async fn a_0_4_file_is_refused_then_upgraded_with_a_backup() {
     }
     assert_eq!(snapshot(&path), original);
 
-    // 2. A dry run reports without changing anything.
+    // 2. A dry run reports without changing anything: it only reads, so
+    //    not a byte of the file changes.
+    let raw = std::fs::read(&path).unwrap();
     let dry = RedbAdapter::inspect_upgrade(&path).unwrap();
     assert!(!dry.upgraded);
+    assert!(
+        std::fs::read(&path).unwrap() == raw,
+        "the dry run modified the file"
+    );
     assert_eq!(snapshot(&path), original);
 
     // 3. The upgrade, with the default backup.
@@ -605,21 +611,13 @@ async fn a_0_4_file_is_refused_then_upgraded_with_a_backup() {
     assert_eq!(report.docs_with_old_only_attachments, ["old-att"]);
     // 4 entries keyed by (doc, name); "shared bytes" twice.
     assert_eq!(report.attachments_rekeyed, 5);
-    let dry_counts = (
-        dry.doc_count,
-        dry.local_docs_moved,
-        dry.revs_normalized,
-        dry.missing_attachment_refs,
-    );
-    assert_eq!(
-        dry_counts,
-        (
-            report.doc_count,
-            report.local_docs_moved,
-            report.revs_normalized,
-            report.missing_attachment_refs
-        )
-    );
+    assert_eq!(report.case_duplicate_revs_merged, 0);
+    assert!(report.docs_with_changed_winner.is_empty());
+    // The dry run reported exactly what the upgrade did.
+    let mut dry = dry;
+    dry.upgraded = true;
+    dry.backup = report.backup.clone();
+    assert_eq!(dry, report);
 
     // 4. Every document, revision body, attachment and local document reads
     //    the same through 0.5.
@@ -643,6 +641,75 @@ async fn a_0_4_file_is_refused_then_upgraded_with_a_backup() {
     assert_eq!(snapshot(&backup), original);
     let db = open_0_4(&backup).unwrap();
     assert_eq!(facts_0_4(&db, &written).await, facts_04);
+}
+
+/// 0.4 accepted a replicated revision id in upper case, and then the same
+/// revision in lower case as a different one. 0.5 merges the two spellings
+/// (reporting a body that differs), and reports the documents whose winning
+/// revision changes because 0.5 compares the ids in lower case.
+#[tokio::test]
+async fn case_duplicates_and_winner_changes_written_by_0_4() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("case.redb");
+    {
+        let db = RedbAdapter04::open(&path, "case").unwrap();
+        let lower = UPPER.to_ascii_lowercase();
+        replicate04(&db, "dup", &format!("1-{UPPER}"), json!({"from": "upper"})).await;
+        replicate04(&db, "dup", &format!("1-{lower}"), json!({"from": "lower"})).await;
+        replicate04(&db, "same", &format!("1-{UPPER}"), json!({"v": 1})).await;
+        replicate04(&db, "same", &format!("1-{lower}"), json!({"v": 1})).await;
+        let b = format!("1-B{}", "0".repeat(31));
+        let a = format!("1-a{}", "0".repeat(31));
+        replicate04(&db, "win", &b, json!({"side": "b"})).await;
+        replicate04(&db, "win", &a, json!({"side": "a"})).await;
+        let winner = db.get("win", doc04::GetOptions::default()).await.unwrap();
+        assert_eq!(winner.data["side"], "a", "0.4 ranks 'a' above 'B'");
+    }
+    let raw = std::fs::read(&path).unwrap();
+    let dry = RedbAdapter::inspect_upgrade(&path).unwrap();
+    assert!(std::fs::read(&path).unwrap() == raw);
+    let report = RedbAdapter::upgrade(&path, UpgradePolicy::WithBackup(None)).unwrap();
+    assert_eq!(
+        dry.case_duplicate_bodies_discarded,
+        report.case_duplicate_bodies_discarded
+    );
+    assert_eq!(report.case_duplicate_revs_merged, 2);
+    // 0.4's winner of "dup" was the lower-case spelling (it sorts last):
+    // its body is kept, the other one is reported.
+    assert_eq!(report.case_duplicate_bodies_discarded.len(), 1);
+    let d = &report.case_duplicate_bodies_discarded[0];
+    assert_eq!(
+        (d.doc_id.as_str(), d.rev.as_str()),
+        ("dup", format!("1-{UPPER}").as_str())
+    );
+    assert_eq!(report.docs_with_changed_winner, ["win"]);
+
+    let db = RedbAdapter::open(&path, "case").unwrap();
+    let dup = db.get("dup", doc05::GetOptions::default()).await.unwrap();
+    assert_eq!(dup.data["from"], "lower");
+    assert_eq!(
+        db.get("same", doc05::GetOptions::default())
+            .await
+            .unwrap()
+            .data["v"],
+        1
+    );
+    let win = db.get("win", doc05::GetOptions::default()).await.unwrap();
+    assert_eq!(win.data["side"], "b");
+    drop(db);
+    // The backup still has both bodies, for 0.4.
+    let backup = open_0_4(&dir.path().join("case.redb.rouchdb-0.4.bak")).unwrap();
+    let old = backup
+        .get(
+            "dup",
+            doc04::GetOptions {
+                rev: Some(format!("1-{UPPER}")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(old.data["from"], "upper");
 }
 
 /// The silent history loss found in review: 0.4 writing to a document 0.5

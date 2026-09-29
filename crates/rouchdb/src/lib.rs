@@ -54,7 +54,7 @@ pub use rouchdb_adapter_http::auth::{AuthClient, Session, UserContext};
 pub use rouchdb_adapter_http::{HttpAdapter, HttpAdapterOptions};
 pub use rouchdb_adapter_memory::MemoryAdapter;
 pub use rouchdb_adapter_redb::{
-    OpenOptions, RedbAdapter, StoredFormat, UpgradePolicy, UpgradeReport,
+    DiscardedRevision, OpenOptions, RedbAdapter, StoredFormat, UpgradePolicy, UpgradeReport,
 };
 
 // Re-export subsystems

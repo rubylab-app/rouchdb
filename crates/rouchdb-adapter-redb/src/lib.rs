@@ -36,7 +36,9 @@ macro_rules! db_err {
 
 // After `db_err!`, which it uses.
 mod upgrade;
-pub use upgrade::{OpenOptions, REPORT_SAMPLE, StoredFormat, UpgradePolicy, UpgradeReport};
+pub use upgrade::{
+    DiscardedRevision, OpenOptions, REPORT_SAMPLE, StoredFormat, UpgradePolicy, UpgradeReport,
+};
 
 // ---------------------------------------------------------------------------
 // Table definitions for redb
@@ -413,8 +415,9 @@ impl RedbAdapter {
     /// the file (it fails to open it, with an error saying the file requires
     /// rouchdb >= 0.5), and so it does files created by 0.5.
     ///
-    /// Files written by unreleased 0.5 development builds are finished
-    /// upgrading automatically. A file written by a newer rouchdb (an
+    /// Files written by unreleased 0.5 development builds (which 0.4 cannot
+    /// open either) are upgraded automatically, after a verified backup to
+    /// `<file>.rouchdb-0.5-pre.bak`. A file written by a newer rouchdb (an
     /// unknown on-disk format) is refused rather than misread. Opening a file
     /// that is already current writes nothing.
     pub fn open(path: impl AsRef<Path>, name: &str) -> Result<Self> {
@@ -469,7 +472,23 @@ impl RedbAdapter {
     /// revision ids, counts the documents, moves the metadata to its new
     /// table and installs the format guard that makes rouchdb 0.4 refuse the
     /// file. A record it cannot decode stops it with an error naming the
-    /// record (nothing is skipped, nothing is changed).
+    /// record (nothing is skipped, nothing is changed); so does a file it
+    /// cannot represent (a `_local/` document stored under two names, or one
+    /// named just `_local/`), before any backup is written.
+    ///
+    /// Lower-casing revision ids can merge two spellings of one revision
+    /// (`2-ABC…` and `2-abc…`) and can change which conflicting revision
+    /// wins: the report lists both
+    /// ([`UpgradeReport::case_duplicate_bodies_discarded`],
+    /// [`UpgradeReport::docs_with_changed_winner`]).
+    ///
+    /// # Disk space and memory
+    ///
+    /// The upgrade needs about twice the file size of free disk space (redb
+    /// copies every page it changes and commits in two phases), and the
+    /// backup about the file size again: about three times the file size
+    /// when backing up. Memory stays small whatever the file size: records
+    /// and attachments are processed one at a time, with a small page cache.
     ///
     /// # The first compaction after upgrading deletes old data
     ///
@@ -485,7 +504,9 @@ impl RedbAdapter {
     }
 
     /// Report what [`RedbAdapter::upgrade`] would do to a file, without
-    /// changing it (the upgrade runs and is rolled back).
+    /// changing it: the file is only read (read transactions), so not a
+    /// byte of it changes and no disk space is used. It fails where the
+    /// upgrade would, with the same error.
     pub fn inspect_upgrade(path: impl AsRef<Path>) -> Result<UpgradeReport> {
         upgrade::upgrade_file(path.as_ref(), &UpgradePolicy::Refuse, true)
     }
