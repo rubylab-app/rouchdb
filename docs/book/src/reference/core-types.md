@@ -473,15 +473,17 @@ pub struct ViewQueryOptions {
 | `keys` | `Option<Vec<serde_json::Value>>` | `None` | Return only rows matching any of these keys, in the given order. Several keys exclude `key`, `start_key` and `end_key`. |
 | `start_key` | `Option<serde_json::Value>` | `None` | Start of key range (inclusive). A range no row can be in is a `BadRequest`. |
 | `end_key` | `Option<serde_json::Value>` | `None` | End of key range (inclusive by default). |
-| `inclusive_end` | `bool` | `true` (via `ViewQueryOptions::new()`) | Whether the `end_key` is included in the range. |
+| `inclusive_end` | `bool` | `true` | Whether the `end_key` is included in the range. |
 | `descending` | `bool` | `false` | Reverse row order. |
 | `skip` | `u64` | `0` | Number of rows to skip. |
 | `limit` | `Option<u64>` | `None` | Maximum number of rows to return. |
 | `include_docs` | `bool` | `false` | Include full document body in each row. |
-| `reduce` | `bool` | `false` | Whether to run the reduce function. |
+| `reduce` | `bool` | `true` | Whether to run the reduce function, if one is given. |
 | `group` | `bool` | `false` | Group results by key (requires a reduce; without one it is a `BadRequest`). |
 | `group_level` | `Option<u64>` | `None` | Group to this many array elements of the key (above 0 it requires a reduce). |
 | `stale` | `StaleOption` | `False` | `False` rebuilds the index before querying (default). `Ok` uses a potentially stale index. `UpdateAfter` returns stale results then rebuilds. |
+
+`ViewQueryOptions::default()` is the same as `ViewQueryOptions::new()` (CouchDB's defaults above). (Before 0.5, `Default` left `reduce` and `inclusive_end` off.)
 
 ---
 

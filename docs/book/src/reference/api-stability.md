@@ -80,7 +80,7 @@ let rows = db.all_docs(AllDocsOptions {
 }).await?;
 ```
 
-A literal that lists every field stops compiling when a field is added; **adding a field with a default value is not considered a breaking change**, so always end the literal with `..Default::default()` (or `..X::new()`, where `new()` exists and differs from `default()`, as for `ViewQueryOptions`). This covers `GetOptions`, `BulkDocsOptions`, `AllDocsOptions`, `ChangesOptions`, `GetAttachmentOptions`, `FindOptions`, `ViewQueryOptions`, `ChangesStreamOptions`, `ReplicationOptions`, `HttpAdapterOptions` and `IndexDefinition`.
+A literal that lists every field stops compiling when a field is added; **adding a field with a default value is not considered a breaking change**, so always end the literal with `..Default::default()` (for every option struct that has a `new()`, `default()` is the same). This covers `GetOptions`, `BulkDocsOptions`, `AllDocsOptions`, `ChangesOptions`, `GetAttachmentOptions`, `FindOptions`, `ViewQueryOptions`, `ChangesStreamOptions`, `ReplicationOptions`, `HttpAdapterOptions` and `IndexDefinition`.
 
 Data you both build and read follows the same rule, and has constructors where they read better:
 
