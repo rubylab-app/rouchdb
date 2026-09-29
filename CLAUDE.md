@@ -103,7 +103,7 @@ All documents are `serde_json::Value` (dynamic JSON). `Document` struct holds `i
 
 ### Server Architecture (`rouchdb-server/src/`)
 
-Axum 0.8 HTTP server. Single-db mode: one `.redb` file = one database. Route order matters — specific `_`-prefixed routes before `/{db}/{docid}` catch-all. State: `AppState { db: Arc<Database>, db_name: String }`. CORS configured to mirror request origin with credentials support (required for Fauxton). Error mapping: `RouchError` → CouchDB JSON `{"error": "...", "reason": "..."}`.
+Axum 0.8 HTTP server. Single-db mode: one `.redb` file = one database. Route order matters — specific `_`-prefixed routes before `/{db}/{docid}` catch-all. State: `AppState { db: Arc<Database>, db_name: String }`. CORS is off unless `ServerConfig::cors_origins` / `--cors-origin` lists origins; optional admin auth via `ServerConfig::admin` / `--admin`. Error mapping: `RouchError` → CouchDB JSON `{"error": "...", "reason": "..."}`.
 
 Reports CouchDB 3.3.3 at `GET /` so Fauxton enables all UI panels. `POST /_session` accepts both JSON and form-encoded data (Fauxton sends form data). Sets `AuthSession` cookie for browser-based auth flow.
 
@@ -117,7 +117,7 @@ Clap-based CLI. Read commands: `info`, `get`, `all-docs`, `find`, `changes`, `du
 
 - **Edition 2024**, resolver 3, stable Rust (no nightly features). MSRV 1.88 (`rust-version`); the dev/CI toolchain is pinned in `rust-toolchain.toml`
 - Workspace-level `version` in root `Cargo.toml` — all crate versions must stay in sync
-- Internal dependency versions must match workspace version (e.g., `rouchdb-core = { path = "../rouchdb-core", version = "0.4.0" }`)
+- Internal dependency versions must match workspace version (e.g., `rouchdb-core = { path = "../rouchdb-core", version = "0.5.0" }`)
 - All async via Tokio; tests use `#[tokio::test]`
 - CouchDB integration tests are `#[ignore = "requires CouchDB"]` — they need CouchDB at `http://admin:password@localhost:15984` (override with `COUCHDB_URL` env var). Create their databases with `common::fresh_remote_db` (an RAII guard that deletes it on drop, names start with `rouchdb_test_`) and take host/credentials from `common::couchdb()`; never log in as the admin with a wrong password (CouchDB locks the account)
 - A test that exposes a known unfixed bug is marked `#[ignore = "blocked on Fxx"]` and named `blocked_on_fxx_*` rather than weakened; `scripts/test-couchdb.sh` skips those by name and `scripts/test-blocked.sh` checks they still fail

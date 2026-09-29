@@ -8,7 +8,7 @@ Agrega RouchDB a tu proyecto:
 
 ```toml
 [dependencies]
-rouchdb = "0.4"
+rouchdb = "0.5"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
