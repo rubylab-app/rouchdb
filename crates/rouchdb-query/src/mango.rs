@@ -24,7 +24,23 @@ use rouchdb_core::document::{AllDocsOptions, ChangeEvent};
 use rouchdb_core::error::{Result, RouchError};
 
 /// Definition of a Mango index.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Set the members you need and fill the rest with `..Default::default()`:
+/// fields may be added in minor releases (CouchDB indexes also have a
+/// `partial_filter_selector`, for instance), and a literal that lists every
+/// field would then stop compiling.
+///
+/// ```
+/// use rouchdb_query::{IndexDefinition, SortField};
+///
+/// let def = IndexDefinition {
+///     name: "by-age".into(),
+///     fields: vec![SortField::Simple("age".into())],
+///     ..Default::default()
+/// };
+/// # let _ = def;
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IndexDefinition {
     /// Index name (auto-generated if not provided).
     pub name: String,
@@ -36,7 +52,11 @@ pub struct IndexDefinition {
 }
 
 /// Information about an existing index.
+///
+/// `#[non_exhaustive]` (like the other result types of this module): fields
+/// may be added in minor releases. Build it with [`IndexInfo::new`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct IndexInfo {
     /// Index name.
     pub name: String,
@@ -46,14 +66,32 @@ pub struct IndexInfo {
     pub def: IndexFields,
 }
 
+impl IndexInfo {
+    pub fn new(name: impl Into<String>, ddoc: Option<String>, fields: Vec<SortField>) -> Self {
+        Self {
+            name: name.into(),
+            ddoc,
+            def: IndexFields::new(fields),
+        }
+    }
+}
+
 /// The fields portion of an index definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct IndexFields {
     pub fields: Vec<SortField>,
 }
 
+impl IndexFields {
+    pub fn new(fields: Vec<SortField>) -> Self {
+        Self { fields }
+    }
+}
+
 /// Result of creating an index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CreateIndexResponse {
     /// `"created"` or `"exists"`.
     pub result: String,
@@ -61,8 +99,18 @@ pub struct CreateIndexResponse {
     pub name: String,
 }
 
+impl CreateIndexResponse {
+    pub fn new(result: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            result: result.into(),
+            name: name.into(),
+        }
+    }
+}
+
 /// Response from `explain()` describing how a query would be executed.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ExplainResponse {
     pub dbname: String,
     pub index: ExplainIndex,
@@ -70,8 +118,25 @@ pub struct ExplainResponse {
     pub fields: Option<Vec<String>>,
 }
 
+impl ExplainResponse {
+    pub fn new(
+        dbname: impl Into<String>,
+        index: ExplainIndex,
+        selector: serde_json::Value,
+        fields: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            dbname: dbname.into(),
+            index,
+            selector,
+            fields,
+        }
+    }
+}
+
 /// Description of the index used by a query.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ExplainIndex {
     pub ddoc: Option<String>,
     pub name: String,
@@ -80,15 +145,45 @@ pub struct ExplainIndex {
     pub def: IndexFields,
 }
 
+impl ExplainIndex {
+    /// Index `name` of type `index_type` (`"json"`, `"special"`, ...) over
+    /// `fields`.
+    pub fn new(
+        ddoc: Option<String>,
+        name: impl Into<String>,
+        index_type: impl Into<String>,
+        fields: Vec<SortField>,
+    ) -> Self {
+        Self {
+            ddoc,
+            name: name.into(),
+            index_type: index_type.into(),
+            def: IndexFields::new(fields),
+        }
+    }
+}
+
 /// A built in-memory index: entries of (composite_key, doc_id) sorted by key
 /// (CouchDB collation) and then by doc id.
+///
+/// `#[non_exhaustive]`: build it with [`build_index`] or [`BuiltIndex::new`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BuiltIndex {
     pub def: IndexDefinition,
     pub entries: Vec<(Vec<serde_json::Value>, String)>,
 }
 
 impl BuiltIndex {
+    /// An index with this definition and no entries yet (fill it with
+    /// [`BuiltIndex::apply_changes`]).
+    pub fn new(def: IndexDefinition) -> Self {
+        Self {
+            def,
+            entries: Vec::new(),
+        }
+    }
+
     /// Find doc IDs matching a simple equality/range selector on the indexed fields.
     ///
     /// The result is a superset of the matching documents: only `$eq`, `$gt`,
@@ -238,6 +333,23 @@ pub async fn build_index(adapter: &dyn Adapter, def: &IndexDefinition) -> Result
 }
 
 /// Options for a Mango find query.
+///
+/// Set the options you need and fill the rest with `..Default::default()`:
+/// fields may be added in minor releases (CouchDB also has `use_index`,
+/// `bookmark`, ...), and a literal that lists every field would then stop
+/// compiling.
+///
+/// ```
+/// use rouchdb_query::FindOptions;
+/// use serde_json::json;
+///
+/// let opts = FindOptions {
+///     selector: json!({"age": {"$gte": 21}}),
+///     limit: Some(10),
+///     ..Default::default()
+/// };
+/// # let _ = opts;
+/// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FindOptions {
     /// The selector (query) to match documents against.
@@ -261,8 +373,12 @@ pub struct FindOptions {
 /// Deserializing accepts a field name or an object with exactly one field
 /// whose direction is `"asc"` or `"desc"`, and rejects anything else (as
 /// CouchDB does with `invalid_sort_field`).
+///
+/// `#[non_exhaustive]`: a typed form may be added in a minor release; use
+/// [`SortField::try_field_and_direction`] rather than matching on it.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum SortField {
     /// Simple field name (ascending).
     Simple(String),
@@ -341,6 +457,9 @@ impl SortField {
     }
 }
 
+/// The direction of a [`SortField`].
+///
+/// Exhaustive on purpose: a sort is ascending or descending.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SortDirection {
     Asc,
@@ -348,9 +467,19 @@ pub enum SortDirection {
 }
 
 /// Result of a find query.
+///
+/// `#[non_exhaustive]`: fields may be added in minor releases (CouchDB also
+/// returns `bookmark` and `warning`). Build it with [`FindResponse::new`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct FindResponse {
     pub docs: Vec<serde_json::Value>,
+}
+
+impl FindResponse {
+    pub fn new(docs: Vec<serde_json::Value>) -> Self {
+        Self { docs }
+    }
 }
 
 /// Execute a Mango find query against an adapter.
@@ -2035,20 +2164,13 @@ mod tests {
 
     #[tokio::test]
     async fn apply_changes_drops_deleted_and_design_documents() {
-        use rouchdb_core::document::{ChangeRev, Seq};
         let db = aged_adapter().await;
         let mut index = build_index(&db, &age_index()).await.unwrap();
-        let change =
-            |seq: u64, id: &str, deleted: bool, doc: Option<serde_json::Value>| ChangeEvent {
-                seq: Seq::Num(seq),
-                id: id.into(),
-                changes: vec![ChangeRev {
-                    rev: format!("{seq}-x"),
-                }],
-                deleted,
-                doc,
-                conflicts: None,
-            };
+        let change = |seq: u64, id: &str, deleted: bool, doc: Option<serde_json::Value>| {
+            ChangeEvent::new(seq, id, [format!("{seq}-x")])
+                .with_deleted(deleted)
+                .with_doc(doc)
+        };
         index.apply_changes(&[
             // Deleted: leaves the index even though its tombstone has a body.
             change(

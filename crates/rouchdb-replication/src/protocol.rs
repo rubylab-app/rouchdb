@@ -11,6 +11,11 @@ use tokio_util::sync::CancellationToken;
 use crate::checkpoint::Checkpointer;
 
 /// Filter for selective replication.
+///
+/// `#[non_exhaustive]`: new kinds of filters (such as CouchDB design
+/// document filters) may be added in minor releases, so a `match` on it
+/// needs a catch-all arm.
+#[non_exhaustive]
 pub enum ReplicationFilter {
     /// Replicate only these document IDs.
     DocIds(Vec<String>),
@@ -40,6 +45,20 @@ impl Clone for ReplicationFilter {
 }
 
 /// Replication configuration.
+///
+/// Set the options you need and fill the rest with `..Default::default()`:
+/// fields may be added in minor releases, and a literal that lists every
+/// field would then stop compiling.
+///
+/// ```
+/// use rouchdb_replication::ReplicationOptions;
+///
+/// let opts = ReplicationOptions {
+///     batch_size: 50,
+///     ..Default::default()
+/// };
+/// # let _ = opts;
+/// ```
 pub struct ReplicationOptions {
     /// Number of documents to process per batch.
     pub batch_size: u64,
@@ -83,7 +102,10 @@ impl Default for ReplicationOptions {
 }
 
 /// Result of a completed replication.
+///
+/// `#[non_exhaustive]`: fields may be added in minor releases.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ReplicationResult {
     pub ok: bool,
     pub docs_read: u64,
@@ -93,9 +115,17 @@ pub struct ReplicationResult {
 }
 
 /// Events emitted during replication for progress tracking.
+///
+/// `#[non_exhaustive]`: new events may be added in minor releases, so a
+/// `match` on it needs a catch-all arm, and `Change` may gain fields (match
+/// it as `Change { docs_read, .. }`).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ReplicationEvent {
-    Change { docs_read: u64 },
+    #[non_exhaustive]
+    Change {
+        docs_read: u64,
+    },
     Paused,
     Active,
     Complete(ReplicationResult),
@@ -348,10 +378,7 @@ async fn run_replication(
         let mut bulk_get_items: Vec<BulkGetItem> = Vec::new();
         for (doc_id, diff_result) in &diff.results {
             for missing_rev in &diff_result.missing {
-                bulk_get_items.push(BulkGetItem {
-                    id: doc_id.clone(),
-                    rev: Some(missing_rev.clone()),
-                });
+                bulk_get_items.push(BulkGetItem::new(doc_id).with_rev(missing_rev));
             }
         }
 
@@ -1432,12 +1459,11 @@ mod tests {
                 .into_iter()
                 .partition(|d| Some(d.id.as_str()) == self.reject);
             let mut results = self.inner.bulk_docs(docs, opts).await?;
-            results.extend(rejected.into_iter().map(|d| DocResult {
-                ok: false,
-                id: d.id,
-                rev: d.rev.map(|r| r.to_string()),
-                error: Some("forbidden".into()),
-                reason: Some("rejected by validate_doc_update".into()),
+            results.extend(rejected.into_iter().map(|d| {
+                let mut result =
+                    DocResult::error(d.id, "forbidden", "rejected by validate_doc_update");
+                result.rev = d.rev.map(|r| r.to_string());
+                result
             }));
             if new_edits {
                 return Ok(results);
@@ -1687,13 +1713,11 @@ mod tests {
             };
             let (rejected, docs): (Vec<_>, Vec<_>) = docs.into_iter().partition(|d| d.id == bad_id);
             let mut results = self.inner.bulk_docs(docs, opts).await?;
-            results.extend(rejected.into_iter().map(|d| DocResult {
-                ok: false,
-                id: d.id,
-                rev: None,
-                error: Some(error.clone()),
-                reason: Some("injected".into()),
-            }));
+            results.extend(
+                rejected
+                    .into_iter()
+                    .map(|d| DocResult::error(d.id, error.clone(), "injected")),
+            );
             Ok(results)
         }
         async fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
@@ -1731,25 +1755,18 @@ mod tests {
                     .filter(|d| d.ok.as_ref().is_some_and(|ok| ok["_rev"] == rev.as_str()))
                 {
                     doc.ok = None;
-                    doc.error = Some(BulkGetError {
-                        id: id.clone(),
-                        rev: rev.clone(),
-                        error: "not_found".into(),
-                        reason: "missing".into(),
-                    });
+                    doc.error = Some(BulkGetError::new(&id, &rev, "not_found", "missing"));
                 }
             }
             if let Some((id, error)) = self.faults.lock().unwrap().bulk_get_error.clone() {
                 for result in resp.results.iter_mut().filter(|r| r.id == id) {
                     for doc in &mut result.docs {
-                        let rev = doc.ok.as_ref().unwrap()["_rev"].as_str().unwrap().into();
+                        let rev = doc.ok.as_ref().unwrap()["_rev"]
+                            .as_str()
+                            .unwrap()
+                            .to_string();
                         doc.ok = None;
-                        doc.error = Some(BulkGetError {
-                            id: id.clone(),
-                            rev,
-                            error: error.clone(),
-                            reason: "injected".into(),
-                        });
+                        doc.error = Some(BulkGetError::new(&id, rev, &error, "injected"));
                     }
                 }
             }

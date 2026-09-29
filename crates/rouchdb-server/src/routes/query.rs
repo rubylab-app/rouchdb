@@ -5,7 +5,7 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use serde::Deserialize;
 
-use rouchdb::{AllDocsOptions, Database, FindOptions, IndexDefinition, SortField};
+use rouchdb::{AllDocsOptions, Database, FindOptions, IndexDefinition, SortDirection, SortField};
 use rouchdb_core::error::RouchError;
 
 use crate::error::AppError;
@@ -118,17 +118,15 @@ fn valid_field(field: &SortField) -> bool {
     match field {
         SortField::Simple(name) => !name.is_empty(),
         SortField::WithDirection(map) => map.len() == 1,
+        other => other.try_field_and_direction().is_ok(),
     }
 }
 
 /// Field name and `"asc"` / `"desc"` of a (valid) sort field.
 fn field_dir(field: &SortField) -> (&str, &'static str) {
-    match field {
-        SortField::Simple(name) => (name, "asc"),
-        SortField::WithDirection(map) => {
-            let (name, dir) = map.iter().next().expect("validated sort field");
-            (name, if dir == "desc" { "desc" } else { "asc" })
-        }
+    match field.field_and_direction() {
+        (name, SortDirection::Asc) => (name, "asc"),
+        (name, SortDirection::Desc) => (name, "desc"),
     }
 }
 

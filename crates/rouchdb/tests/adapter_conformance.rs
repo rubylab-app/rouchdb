@@ -1290,23 +1290,16 @@ async fn all_docs_keys_order(fx: Fx) {
         .await
         .unwrap();
     assert_eq!(ids(&res), ["c", "a", "c", "zz", "gone"]);
-    let row = |id: &str, rev: &str, deleted: Option<bool>, doc| AllDocsRow {
-        id: Some(id.into()),
-        key: id.into(),
-        value: Some(AllDocsRowValue {
-            rev: rev.into(),
-            deleted,
-        }),
-        doc,
-        error: None,
+    let row = |id: &str, rev: &str, deleted: bool, doc: Option<serde_json::Value>| {
+        AllDocsRow::document(id, AllDocsRowValue::new(rev, deleted)).with_doc(doc)
     };
     let body = |id: &str| Some(serde_json::json!({"_id": id, "_rev": revs[id]}));
-    assert_eq!(res.rows[0], row("c", &revs["c"], None, body("c")));
-    assert_eq!(res.rows[1], row("a", &revs["a"], None, body("a")));
+    assert_eq!(res.rows[0], row("c", &revs["c"], false, body("c")));
+    assert_eq!(res.rows[1], row("a", &revs["a"], false, body("a")));
     assert_eq!(res.rows[2], res.rows[0]);
     assert_eq!(res.rows[3], AllDocsRow::not_found("zz"));
     assert_eq!(res.rows[3].error.as_deref(), Some("not_found"));
-    assert_eq!(res.rows[4], row("gone", &gone, Some(true), None));
+    assert_eq!(res.rows[4], row("gone", &gone, true, None));
     assert!(res.rows[4].is_deleted() && !res.rows[4].is_error());
 
     let res = db.all_docs(keys(&["c", "a", "b"], true)).await.unwrap();

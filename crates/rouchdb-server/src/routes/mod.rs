@@ -231,13 +231,7 @@ mod tests {
     use axum::response::IntoResponse;
 
     fn failed(error: &str, reason: &str) -> rouchdb::DocResult {
-        rouchdb::DocResult {
-            ok: false,
-            id: "doc".into(),
-            rev: None,
-            error: Some(error.into()),
-            reason: Some(reason.into()),
-        }
+        rouchdb::DocResult::error("doc", error, reason)
     }
 
     /// A failed single-document write keeps CouchDB's status: a conflict is
@@ -246,13 +240,7 @@ mod tests {
     /// other failure a 400 with the write's reason.
     #[tokio::test]
     async fn write_result_maps_failures_to_couchdb_errors() {
-        let ok = rouchdb::DocResult {
-            ok: true,
-            id: "doc".into(),
-            rev: Some("1-a".into()),
-            error: None,
-            reason: None,
-        };
+        let ok = rouchdb::DocResult::ok("doc", "1-a");
         assert!(write_result(ok).is_ok_and(|r| r.rev.as_deref() == Some("1-a")));
 
         for (result, status, error, reason) in [

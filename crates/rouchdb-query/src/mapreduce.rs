@@ -15,14 +15,32 @@ use rouchdb_core::document::{AllDocsOptions, GetOptions};
 use rouchdb_core::error::{Result, RouchError};
 
 /// A key-value pair emitted by a map function.
+///
+/// `#[non_exhaustive]`: build it with [`EmittedRow::new`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EmittedRow {
     pub id: String,
     pub key: serde_json::Value,
     pub value: serde_json::Value,
 }
 
+impl EmittedRow {
+    /// Document `id` emitted `key` and `value`.
+    pub fn new(id: impl Into<String>, key: serde_json::Value, value: serde_json::Value) -> Self {
+        Self {
+            id: id.into(),
+            key,
+            value,
+        }
+    }
+}
+
 /// Built-in reduce functions matching CouchDB's built-ins.
+///
+/// `#[non_exhaustive]`: more built-ins (such as CouchDB's
+/// `_approx_count_distinct`) may be added in minor releases.
+#[non_exhaustive]
 pub enum ReduceFn {
     /// Sum numeric values (arrays element-wise, objects field by field).
     Sum,
@@ -39,6 +57,25 @@ pub enum ReduceFn {
 }
 
 /// Options for querying a view.
+///
+/// Start from [`ViewQueryOptions::new`] (CouchDB's defaults) and set the
+/// options you need, filling the rest with `..ViewQueryOptions::new()` (or
+/// `..Default::default()`, which leaves `reduce` and `inclusive_end` off):
+/// fields may be added in minor releases, and a literal that lists every
+/// field would then stop compiling.
+///
+/// ```
+/// use rouchdb_query::ViewQueryOptions;
+/// use serde_json::json;
+///
+/// let opts = ViewQueryOptions {
+///     key: Some(json!("alice")),
+///     include_docs: true,
+///     reduce: false,
+///     ..ViewQueryOptions::new()
+/// };
+/// assert!(opts.inclusive_end);
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct ViewQueryOptions {
     /// Only return rows with this exact key. With `start_key` or `end_key`
@@ -81,7 +118,11 @@ pub struct ViewQueryOptions {
 }
 
 /// Controls whether the index is rebuilt before querying.
+///
+/// `#[non_exhaustive]`: CouchDB's newer `update` parameter (`true`, `false`,
+/// `lazy`) may be mapped to new variants in a minor release.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StaleOption {
     /// Always rebuild the index before querying (default).
     #[default]
@@ -104,7 +145,11 @@ impl ViewQueryOptions {
 }
 
 /// Result of querying a view.
+///
+/// `#[non_exhaustive]`, like [`ViewRow`]: fields may be added in minor
+/// releases (CouchDB can also return `update_seq`).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ViewResult {
     /// Rows in the whole view (for a reduce query, the number of reduced rows
     /// before skip/limit).
@@ -117,6 +162,7 @@ pub struct ViewResult {
 
 /// A single row in a view result.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ViewRow {
     pub id: Option<String>,
     pub key: serde_json::Value,
