@@ -284,3 +284,31 @@ async fn design_docs_round_trip_every_member() {
     let with_revs = get(&app, "/db/_design/app?revs=true").await.json();
     assert_eq!(with_revs["_revisions"]["start"], 2);
 }
+
+#[tokio::test]
+async fn big_numbers_are_served_as_stored() {
+    // With rouchdb's `arbitrary-precision` feature (serde_json's
+    // `arbitrary_precision`), numbers keep their exact text through the
+    // server; without it, an integer beyond u64 becomes a float.
+    let big: serde_json::Value = serde_json::from_str("18446744073709551616").unwrap();
+    let exact = serde_json::to_string(&big).unwrap() == "18446744073709551616";
+    let app = app();
+    let resp = send(
+        &app,
+        req(
+            Method::PUT,
+            "/db/n",
+            &[],
+            Some(serde_json::from_str(r#"{"big":18446744073709551616,"dec":1.50}"#).unwrap()),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::CREATED);
+    let body = String::from_utf8(get(&app, "/db/n").await.body.to_vec()).unwrap();
+    assert_eq!(
+        body.contains(r#""big":18446744073709551616"#),
+        exact,
+        "{body}"
+    );
+    assert_eq!(body.contains(r#""dec":1.50"#), exact, "{body}");
+}
