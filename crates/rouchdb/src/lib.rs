@@ -2842,7 +2842,7 @@ mod tests {
         inner.put_security(security("alice")).await.unwrap();
         spy.calls.lock().unwrap().clear();
 
-        assert_eq!(pa.id().await.unwrap(), "spy");
+        assert_eq!(pa.id().await.unwrap(), inner.id().await.unwrap());
         assert_eq!(pa.info().await.unwrap().update_seq, Seq::Num(2));
         assert_eq!(
             pa.get("d", GetOptions::default())

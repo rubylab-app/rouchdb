@@ -43,6 +43,10 @@ struct StoredDoc {
 #[derive(Debug)]
 struct Inner {
     name: String,
+    /// This database's identity ([`Adapter::id`]): unique per instance and
+    /// renewed by `destroy()`, so same-named databases, or one database
+    /// before and after `destroy()`, never share replication checkpoints.
+    uuid: String,
     /// Documents keyed by ID.
     docs: HashMap<String, StoredDoc>,
     /// Sequence counter (monotonically increasing).
@@ -81,6 +85,7 @@ impl MemoryAdapter {
             notices: broadcast::channel(NOTICE_CAPACITY).0,
             inner: Arc::new(RwLock::new(Inner {
                 name: name.to_string(),
+                uuid: Uuid::new_v4().to_string(),
                 docs: HashMap::new(),
                 update_seq: 0,
                 changes: BTreeMap::new(),
@@ -174,6 +179,10 @@ impl Adapter for MemoryAdapter {
             doc_del_count,
             inner.update_seq,
         ))
+    }
+
+    async fn id(&self) -> Result<String> {
+        Ok(self.inner.read().await.uuid.clone())
     }
 
     async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
@@ -865,6 +874,7 @@ impl Adapter for MemoryAdapter {
         inner.attachments.clear();
         inner.update_seq = 0;
         inner.purge_seq = 0;
+        inner.uuid = Uuid::new_v4().to_string();
         Ok(())
     }
 
