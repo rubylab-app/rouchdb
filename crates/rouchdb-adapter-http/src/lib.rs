@@ -150,27 +150,12 @@ struct CouchDbAllDocsResponse {
     total_rows: u64,
     // CouchDB sends `"offset": null` when `keys` are posted.
     offset: Option<u64>,
-    rows: Vec<CouchDbAllDocsRow>,
+    /// When `keys` are posted, keys that do not exist come back as
+    /// `{"key": "x", "error": "not_found"}` rows, which `AllDocsRow` keeps.
+    rows: Vec<AllDocsRow>,
     /// Present when `update_seq=true` was requested.
     #[serde(default)]
     update_seq: Option<serde_json::Value>,
-}
-
-/// A row of `_all_docs`. When `keys` are posted, keys that do not exist come
-/// back as `{"key": "x", "error": "not_found"}` with no `id` or `value`.
-#[derive(Debug, Deserialize)]
-struct CouchDbAllDocsRow {
-    id: Option<String>,
-    key: String,
-    value: Option<CouchDbAllDocsRowValue>,
-    doc: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CouchDbAllDocsRowValue {
-    rev: String,
-    #[serde(default)]
-    deleted: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -603,23 +588,7 @@ impl Adapter for HttpAdapter {
         Ok(AllDocsResponse {
             total_rows: result.total_rows,
             offset: result.offset.unwrap_or(0),
-            // Skip `not_found` rows for missing keys, like the local adapters.
-            rows: result
-                .rows
-                .into_iter()
-                .filter_map(|r| {
-                    let (id, value) = (r.id?, r.value?);
-                    Some(AllDocsRow {
-                        id,
-                        key: r.key,
-                        value: AllDocsRowValue {
-                            rev: value.rev,
-                            deleted: value.deleted,
-                        },
-                        doc: r.doc,
-                    })
-                })
-                .collect(),
+            rows: result.rows,
             update_seq: result.update_seq.as_ref().map(parse_seq),
         })
     }
@@ -1814,6 +1783,38 @@ mod tests {
         );
         assert_eq!(requests[2].line(), "POST /db/_all_docs");
         assert_eq!(requests[2].json(), serde_json::json!({"keys": ["a", "b"]}));
+    }
+
+    #[tokio::test]
+    async fn all_docs_keys_keeps_error_and_deleted_rows() {
+        use rouchdb_core::document::{AllDocsOptions, AllDocsRow};
+        // Verbatim CouchDB 3.5.1 reply to `POST _all_docs?include_docs=true`
+        // with `{"keys": ["a", "b", "zz"]}` where `b` is deleted: every key
+        // gets a row, in order, so `keys[i]` matches `rows[i]`.
+        let reply = r#"{"total_rows":2,"offset":null,"rows":[
+            {"id":"a","key":"a","value":{"rev":"1-7a7e4b29f3af401e69b6f86e4c26b727"},"doc":{"_id":"a","_rev":"1-7a7e4b29f3af401e69b6f86e4c26b727","v":1}},
+            {"id":"b","key":"b","value":{"rev":"2-cc42f3106b98bc7ad82f91bf2382e1df","deleted":true},"doc":null},
+            {"key":"zz","error":"not_found"}
+        ]}"#;
+        let (url, _) = scripted_server(vec![("200 OK", reply.into())]).await;
+        let res = adapter_at(&url)
+            .all_docs(AllDocsOptions {
+                keys: Some(vec!["a".into(), "b".into(), "zz".into()]),
+                include_docs: true,
+                ..AllDocsOptions::new()
+            })
+            .await
+            .unwrap();
+        let keys: Vec<&str> = res.rows.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, ["a", "b", "zz"]);
+        assert_eq!(
+            res.rows[0].rev(),
+            Some("1-7a7e4b29f3af401e69b6f86e4c26b727")
+        );
+        assert_eq!(res.rows[0].doc.as_ref().unwrap()["v"], 1);
+        assert!(res.rows[1].is_deleted() && res.rows[1].doc.is_none());
+        assert_eq!(res.rows[2], AllDocsRow::not_found("zz"));
+        assert_eq!((res.total_rows, res.offset), (2, 0));
     }
 
     #[tokio::test]

@@ -43,7 +43,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 // Re-export core types
-pub use rouchdb_core::adapter::Adapter;
+pub use rouchdb_core::adapter::{Adapter, ChangeNotice};
 pub use rouchdb_core::document::*;
 pub use rouchdb_core::error::{Result, RouchError};
 pub use rouchdb_core::json::MAX_NESTING_DEPTH;
@@ -285,13 +285,7 @@ impl Adapter for PluginAdapter {
         data: Vec<u8>,
         content_type: &str,
     ) -> Result<DocResult> {
-        let attachment = AttachmentMeta {
-            content_type: content_type.to_string(),
-            digest: rouchdb_core::document::attachment_digest(&data),
-            length: data.len() as u64,
-            stub: false,
-            data: Some(data.clone()),
-        };
+        let attachment = AttachmentMeta::new(content_type, data.clone());
         self.validate_attachment_edit(doc_id, rev, |atts| {
             atts.insert(att_id.to_string(), attachment);
         })
@@ -1038,26 +1032,12 @@ impl Database {
     /// Like `put`, a failed write (e.g. `RouchError::Conflict`) is an error,
     /// never `Ok` with `ok: false`.
     ///
-    /// `DesignDocument` only models JavaScript views and a few fields. When
-    /// updating (`ddoc.rev` is set), everything else in the revision being
-    /// replaced (`views.lib`, Mango index views, view and ddoc `options`,
-    /// custom fields) is carried over, so a `get_design` + `put_design`
-    /// round trip does not drop it.
+    /// The document is written exactly as given, like a `PUT`: since
+    /// `DesignDocument` keeps every member of a design document (see its
+    /// docs), a `get_design` + `put_design` round trip changes nothing but
+    /// what was edited, and a member removed from the struct is removed.
     pub async fn put_design(&self, ddoc: DesignDocument) -> Result<DocResult> {
-        let mut json = ddoc.to_json();
-        if let Some(ref rev) = ddoc.rev {
-            let opts = GetOptions {
-                rev: Some(rev.clone()),
-                ..Default::default()
-            };
-            match self.adapter.get(&ddoc.id, opts).await {
-                Ok(parent) => keep_unmodeled_design_fields(&mut json, &parent.to_json()),
-                // A missing or stale revision is reported by the write.
-                Err(RouchError::NotFound(_)) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        let mut doc = Document::from_json(json)?;
+        let mut doc = Document::from_json(ddoc.to_json())?;
         doc.prepare_for_write()?;
         self.write_one(doc).await
     }
@@ -1378,7 +1358,7 @@ impl Partition<'_> {
         };
 
         let mut response = self.db.all_docs(opts).await?;
-        response.rows.retain(|row| row.id.starts_with(&prefix));
+        response.rows.retain(|row| row.key.starts_with(&prefix));
         if let Some((skip, limit)) = page {
             let limit = limit.map_or(usize::MAX, |l| l as usize);
             response.rows = response
@@ -1602,60 +1582,6 @@ fn encode_path_segment(segment: &str) -> String {
 
 /// Batch size for reading a changes feed filtered by a selector.
 const SELECTOR_CHANGES_BATCH: u64 = 500;
-
-/// Fields of a design document that `DesignDocument` models.
-const MODELED_DESIGN_FIELDS: [&str; 9] = [
-    "_id",
-    "_rev",
-    "views",
-    "filters",
-    "validate_doc_update",
-    "shows",
-    "lists",
-    "updates",
-    "language",
-];
-
-/// Copy into `new` (a serialized `DesignDocument`) what `DesignDocument`
-/// cannot represent from the `parent` revision: unknown top-level fields,
-/// views it skips (`lib`, Mango indexes with a non-string `map`) and extra
-/// fields of view definitions (such as `options`).
-fn keep_unmodeled_design_fields(new: &mut serde_json::Value, parent: &serde_json::Value) {
-    let (Some(new), Some(parent)) = (new.as_object_mut(), parent.as_object()) else {
-        return;
-    };
-    for (key, value) in parent {
-        if !key.starts_with('_') && !MODELED_DESIGN_FIELDS.contains(&key.as_str()) {
-            new.entry(key.clone()).or_insert_with(|| value.clone());
-        }
-    }
-
-    let Some(parent_views) = parent.get("views").and_then(|v| v.as_object()) else {
-        return;
-    };
-    let views = new.entry("views").or_insert_with(|| serde_json::json!({}));
-    let Some(views) = views.as_object_mut() else {
-        return;
-    };
-    for (name, def) in parent_views {
-        let modeled = name != "lib" && def.get("map").is_some_and(|m| m.is_string());
-        match views.get_mut(name) {
-            // Extra fields of a view that is still defined.
-            Some(serde_json::Value::Object(view)) if modeled => {
-                for (field, value) in def.as_object().into_iter().flatten() {
-                    if field != "map" && field != "reduce" {
-                        view.entry(field.clone()).or_insert_with(|| value.clone());
-                    }
-                }
-            }
-            // A view removed through the struct stays removed.
-            _ if modeled => {}
-            _ => {
-                views.entry(name.clone()).or_insert_with(|| def.clone());
-            }
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2585,7 +2511,7 @@ mod tests {
             db.put(id, serde_json::json!({})).await.unwrap();
         }
         let users = db.partition("users");
-        let ids = |r: AllDocsResponse| r.rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+        let ids = |r: AllDocsResponse| r.rows.into_iter().map(|r| r.key).collect::<Vec<_>>();
 
         let all = ids(users.all_docs(AllDocsOptions::new()).await.unwrap());
         assert_eq!(all, ["users:1", "users:2", "users:\u{1F600}"]);
@@ -3149,7 +3075,7 @@ mod tests {
             .unwrap()
             .rows
             .into_iter()
-            .map(|r| r.id)
+            .map(|r| r.key)
             .collect();
         assert_eq!(ids, ["ok"]);
         let stored = spy.inner.get("ok", GetOptions::default()).await.unwrap();

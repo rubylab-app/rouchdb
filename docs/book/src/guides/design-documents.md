@@ -8,32 +8,22 @@ Design documents are special documents with IDs starting with `_design/`. They d
 
 ```rust
 use rouchdb::{Database, DesignDocument, ViewDef};
-use std::collections::HashMap;
 
 let db = Database::memory("mydb");
 
-let ddoc = DesignDocument {
-    id: "_design/myapp".into(),
-    rev: None,
-    views: {
-        let mut v = HashMap::new();
-        v.insert("by_type".into(), ViewDef {
-            map: "function(doc) { emit(doc.type, 1); }".into(),
-            reduce: Some("_count".into()),
-        });
-        v
-    },
-    filters: HashMap::new(),
-    validate_doc_update: None,
-    shows: HashMap::new(),
-    lists: HashMap::new(),
-    updates: HashMap::new(),
-    language: Some("javascript".into()),
-};
+let ddoc = DesignDocument::new("myapp")
+    .with_view(
+        "by_type",
+        ViewDef::new("function(doc) { emit(doc.type, 1); }").with_reduce("_count"),
+    );
 
 let result = db.put_design(ddoc).await?;
 assert!(result.ok);
 ```
+
+`DesignDocument` also implements `Default`, so a struct literal only lists
+what it sets: `DesignDocument { id: "_design/myapp".into(), language:
+Some("javascript".into()), ..Default::default() }`.
 
 ### Reading a Design Document
 
@@ -51,12 +41,14 @@ Read the document, modify it, and put it back with the current revision:
 
 ```rust
 let mut ddoc = db.get_design("myapp").await?;
-ddoc.views.insert("by_name".into(), ViewDef {
-    map: "function(doc) { emit(doc.name); }".into(),
-    reduce: None,
-});
+ddoc.views.insert("by_name".into(), ViewDef::new("function(doc) { emit(doc.name); }"));
 let result = db.put_design(ddoc).await?;
 ```
+
+`put_design` writes exactly the given document, like a CouchDB `PUT`. Since
+`DesignDocument` keeps every member of the design document (see below), a
+`get_design` + `put_design` round trip changes only what you edited, and a
+member you remove from the struct is removed from the database.
 
 ### Deleting a Design Document
 
@@ -72,13 +64,19 @@ db.delete_design("myapp", &rev).await?;
 |-------|------|-------------|
 | `id` | `String` | Must start with `_design/`. |
 | `rev` | `Option<String>` | Current revision (set after reading). |
-| `views` | `HashMap<String, ViewDef>` | Named view definitions with map and optional reduce. |
-| `filters` | `HashMap<String, String>` | Named filter functions. |
+| `views` | `HashMap<String, ViewDef>` | JavaScript views (a string `map` and optional `reduce`), by name. |
+| `other_views` | `serde_json::Map<String, Value>` | The other members of `views`, verbatim: the `lib` CommonJS library and the views of a Mango (`language: "query"`) index design document, whose `map` is an object. A name in both maps is written from `views`. |
+| `filters` | `HashMap<String, Value>` | Filter functions (CouchDB accepts a string or an object). |
 | `validate_doc_update` | `Option<String>` | Validation function source. |
-| `shows` | `HashMap<String, String>` | Show functions. |
-| `lists` | `HashMap<String, String>` | List functions. |
-| `updates` | `HashMap<String, String>` | Update handler functions. |
-| `language` | `Option<String>` | Language for the functions (e.g., `"javascript"`). |
+| `shows` | `HashMap<String, Value>` | Show functions. |
+| `lists` | `HashMap<String, Value>` | List functions. |
+| `updates` | `HashMap<String, Value>` | Update handler functions. |
+| `language` | `Option<String>` | Language for the functions (e.g., `"javascript"`, `"query"`). |
+| `extra` | `serde_json::Map<String, Value>` | Every other member, verbatim: `options`, `autoupdate`, `rewrites`, `_attachments`, custom fields, ... |
+
+`ViewDef` has `map`, `reduce` and `extra` (the other members of the view,
+such as `options`). Empty `views`, `filters`, `shows`, `lists` and `updates`
+objects are not written back (CouchDB treats them like absent ones).
 
 ## ViewEngine (Rust-Native Views)
 

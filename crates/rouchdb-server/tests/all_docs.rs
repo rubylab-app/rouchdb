@@ -112,6 +112,16 @@ async fn non_string_keys_sort_before_every_doc_id() {
     assert!(ids(&get(&app, &uri).await).is_empty());
 }
 
+/// The `key` of every row (error rows included).
+fn keys(resp: &Resp) -> Vec<serde_json::Value> {
+    resp.json()["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["key"].clone())
+        .collect()
+}
+
 #[tokio::test]
 async fn keys_query_parameter() {
     let (_db, app) = seeded().await;
@@ -121,7 +131,11 @@ async fn keys_query_parameter() {
     )
     .await;
     assert_eq!(resp.status, StatusCode::OK);
-    assert_eq!(ids(&resp), ["c", "a"]);
+    assert_eq!(keys(&resp), [json!("c"), json!("a"), json!(1)]);
+    assert_eq!(
+        resp.json()["rows"][2],
+        json!({"key": 1, "error": "not_found"})
+    );
 
     let resp = get(&app, &format!("/db/_all_docs?keys={}", q(json!("a")))).await;
     assert_eq!(resp.status, StatusCode::BAD_REQUEST);
@@ -136,7 +150,7 @@ async fn keys_in_post_body() {
     let (_db, app) = seeded().await;
     let resp = post(&app, "/db/_all_docs", json!({"keys": ["b", 7, "a"]})).await;
     assert_eq!(resp.status, StatusCode::OK);
-    assert_eq!(ids(&resp), ["b", "a"]);
+    assert_eq!(keys(&resp), [json!("b"), json!(7), json!("a")]);
 
     let resp = post(&app, "/db/_all_docs", json!({})).await;
     assert_eq!(ids(&resp), ["_design/x", "a", "b", "c"]);
@@ -147,6 +161,69 @@ async fn keys_in_post_body() {
         resp.json(),
         json!({"error": "bad_request", "reason": "`keys` body member must be an array."})
     );
+}
+
+#[tokio::test]
+async fn keys_rows_match_couchdb() {
+    // CouchDB 3.5.1 answers `keys` with one row per key, in order: live
+    // docs, deleted docs (`"doc": null` under include_docs) and a
+    // `not_found` row for an unknown id or a non-string key; `offset` is
+    // null, and skip/limit/descending apply to that list of rows.
+    let (db, app) = seeded().await;
+    let ra = db.get("a").await.unwrap().rev.unwrap().to_string();
+    let rb = db.get("b").await.unwrap().rev.unwrap().to_string();
+    let rb = db.remove("b", &rb).await.unwrap().rev.unwrap();
+    let resp = post(
+        &app,
+        "/db/_all_docs?include_docs=true",
+        json!({"keys": ["a", "b", 1, "zz"]}),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(
+        resp.json(),
+        json!({"total_rows": 3, "offset": null, "rows": [
+            {"id": "a", "key": "a", "value": {"rev": ra}, "doc": {"_id": "a", "_rev": ra}},
+            {"id": "b", "key": "b", "value": {"rev": rb, "deleted": true}, "doc": null},
+            {"key": 1, "error": "not_found"},
+            {"key": "zz", "error": "not_found"},
+        ]})
+    );
+
+    // Without include_docs there is no `doc` member at all.
+    let resp = post(&app, "/db/_all_docs", json!({"keys": ["b"]})).await;
+    assert_eq!(
+        resp.json()["rows"],
+        json!([{"id": "b", "key": "b", "value": {"rev": rb, "deleted": true}}])
+    );
+
+    // Descending reverses the keys: [c, "zz", 1, a].
+    let resp = post(
+        &app,
+        "/db/_all_docs?descending=true",
+        json!({"keys": ["a", 1, "zz", "c"]}),
+    )
+    .await;
+    assert_eq!(keys(&resp), [json!("c"), json!("zz"), json!(1), json!("a")]);
+    assert_eq!(resp.json()["rows"][3]["value"]["rev"], json!(ra));
+    // Skip and limit apply to that list, error rows included.
+    let resp = post(
+        &app,
+        "/db/_all_docs?descending=true&skip=1&limit=2",
+        json!({"keys": ["a", 1, "zz", "c"]}),
+    )
+    .await;
+    assert_eq!(
+        resp.json()["rows"],
+        json!([{"key": "zz", "error": "not_found"}, {"key": 1, "error": "not_found"}])
+    );
+    let resp = post(
+        &app,
+        "/db/_all_docs?skip=1&limit=1",
+        json!({"keys": ["a", "c", "zz"]}),
+    )
+    .await;
+    assert_eq!(keys(&resp), [json!("c")]);
 }
 
 #[tokio::test]
@@ -163,7 +240,7 @@ async fn http_adapter_all_docs_against_server() {
         })
         .await
         .unwrap();
-    let got: Vec<_> = resp.rows.iter().map(|r| r.id.as_str()).collect();
+    let got: Vec<_> = resp.rows.iter().map(|r| r.key.as_str()).collect();
     assert_eq!(got, ["b", "c"]);
 
     let resp = remote
@@ -174,5 +251,16 @@ async fn http_adapter_all_docs_against_server() {
         .await
         .unwrap();
     assert_eq!(resp.rows.len(), 1);
-    assert_eq!(resp.rows[0].id, "a");
+    assert_eq!(resp.rows[0].id.as_deref(), Some("a"));
+
+    // Error rows survive the round trip through the server.
+    let resp = remote
+        .all_docs(rouchdb::AllDocsOptions {
+            keys: Some(vec!["zz".into(), "a".into()]),
+            ..rouchdb::AllDocsOptions::new()
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp.rows[0], rouchdb::AllDocsRow::not_found("zz"));
+    assert_eq!(resp.rows[1].id.as_deref(), Some("a"));
 }

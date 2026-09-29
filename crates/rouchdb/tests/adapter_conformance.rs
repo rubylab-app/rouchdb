@@ -135,7 +135,7 @@ fn hash_of(rev: &str) -> String {
 }
 
 fn row_ids(r: &AllDocsResponse) -> Vec<String> {
-    r.rows.iter().map(|r| r.id.clone()).collect()
+    r.rows.iter().map(|r| r.key.clone()).collect()
 }
 
 /// The change events as JSON, so a scenario can compare them exactly
@@ -269,7 +269,7 @@ async fn all_docs_ranges(fx: Fx) {
     for id in ["a", "b", "c", "d", "e"] {
         write(db, serde_json::json!({"_id": id, "n": id})).await;
     }
-    let ids = |r: &AllDocsResponse| r.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+    let ids = |r: &AllDocsResponse| r.rows.iter().map(|r| r.key.clone()).collect::<Vec<_>>();
     let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
     assert_eq!(ids(&all), ["a", "b", "c", "d", "e"]);
     assert_eq!(all.total_rows, 5);
@@ -375,7 +375,7 @@ async fn all_docs_ranges(fx: Fx) {
         .await
         .unwrap();
     assert_eq!(row_ids(&docs), ["d", "e", "k"]);
-    let rev = |i: usize| docs.rows[i].value.rev.clone();
+    let rev = |i: usize| docs.rows[i].rev().unwrap().to_string();
     assert_eq!(
         docs.rows[0].doc,
         Some(serde_json::json!({"_id": "d", "_rev": rev(0), "n": "d"}))
@@ -452,7 +452,7 @@ async fn long_history_survives_reopen(mut fx: Fx) {
     assert_eq!(db.info().await.unwrap().doc_count, 1);
     let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
     assert_eq!(row_ids(&all), ["d"]);
-    assert_eq!(all.rows[0].value.rev, rev);
+    assert_eq!(all.rows[0].rev().unwrap(), rev);
     // Still writable with the current rev, and no duplicate history.
     let next = write(db, serde_json::json!({"_id": "d", "_rev": rev, "v": 200})).await;
     assert_eq!(generation(&next), 201);
@@ -1264,15 +1264,18 @@ conformance!(f27: delete_drops_attachments, explicit_attachment_set_is_exact);
 
 // === section: f30 ===
 
-/// F30: `keys` returns rows in request order (duplicates included), skips
-/// unknown keys, reports deleted docs, and `descending` reverses the keys.
+/// F30: `keys` returns one row per requested key, in request order
+/// (duplicates included, reversed by `descending`), like CouchDB: a
+/// document, a deleted document (`value.deleted`, never a `doc`) or a
+/// `not_found` error row, and `skip`/`limit` count every kind of row.
 async fn all_docs_keys_order(fx: Fx) {
     let db = fx.db();
+    let mut revs = std::collections::HashMap::new();
     for id in ["a", "b", "c"] {
-        write(db, serde_json::json!({"_id": id})).await;
+        revs.insert(id, write(db, serde_json::json!({"_id": id})).await);
     }
     let r = write(db, serde_json::json!({"_id": "gone"})).await;
-    db.remove("gone", &r).await.unwrap();
+    let gone = db.remove("gone", &r).await.unwrap().rev.unwrap();
     let keys = |k: &[&str], descending: bool| AllDocsOptions {
         keys: Some(k.iter().map(|s| s.to_string()).collect()),
         descending,
@@ -1280,13 +1283,56 @@ async fn all_docs_keys_order(fx: Fx) {
     };
     let ids = |r: &AllDocsResponse| r.rows.iter().map(|r| r.key.clone()).collect::<Vec<_>>();
     let res = db
-        .all_docs(keys(&["c", "a", "c", "zz", "gone"], false))
+        .all_docs(AllDocsOptions {
+            include_docs: true,
+            ..keys(&["c", "a", "c", "zz", "gone"], false)
+        })
         .await
         .unwrap();
-    assert_eq!(ids(&res), ["c", "a", "c", "gone"]);
-    assert_eq!(res.rows[3].value.deleted, Some(true));
+    assert_eq!(ids(&res), ["c", "a", "c", "zz", "gone"]);
+    let row = |id: &str, rev: &str, deleted: Option<bool>, doc| AllDocsRow {
+        id: Some(id.into()),
+        key: id.into(),
+        value: Some(AllDocsRowValue {
+            rev: rev.into(),
+            deleted,
+        }),
+        doc,
+        error: None,
+    };
+    let body = |id: &str| Some(serde_json::json!({"_id": id, "_rev": revs[id]}));
+    assert_eq!(res.rows[0], row("c", &revs["c"], None, body("c")));
+    assert_eq!(res.rows[1], row("a", &revs["a"], None, body("a")));
+    assert_eq!(res.rows[2], res.rows[0]);
+    assert_eq!(res.rows[3], AllDocsRow::not_found("zz"));
+    assert_eq!(res.rows[3].error.as_deref(), Some("not_found"));
+    assert_eq!(res.rows[4], row("gone", &gone, Some(true), None));
+    assert!(res.rows[4].is_deleted() && !res.rows[4].is_error());
+
     let res = db.all_docs(keys(&["c", "a", "b"], true)).await.unwrap();
     assert_eq!(ids(&res), ["b", "a", "c"]);
+    // Reversed to [a, zz, gone, a]; skip and limit count the error row.
+    let res = db
+        .all_docs(AllDocsOptions {
+            skip: 1,
+            limit: Some(2),
+            ..keys(&["a", "gone", "zz", "a"], true)
+        })
+        .await
+        .unwrap();
+    assert_eq!(ids(&res), ["zz", "gone"]);
+    assert!(res.rows[0].is_error() && res.rows[1].is_deleted());
+    // `key` (not `keys`) never yields an error or deleted row.
+    for key in ["zz", "gone"] {
+        let res = db
+            .all_docs(AllDocsOptions {
+                key: Some(key.into()),
+                ..AllDocsOptions::new()
+            })
+            .await
+            .unwrap();
+        assert!(res.rows.is_empty(), "{key}: {:?}", res.rows);
+    }
     let res = db
         .all_docs(AllDocsOptions {
             key: Some("b".into()),
@@ -1298,6 +1344,38 @@ async fn all_docs_keys_order(fx: Fx) {
 }
 
 conformance!(f30: all_docs_keys_order);
+
+/// Accepted difference (book: "Differences from CouchDB"): the local
+/// adapters report the `skip` as `offset`, like PouchDB's, where CouchDB
+/// reports the global position of the first row (see
+/// `offset_is_the_global_position_on_couchdb` in `all_docs.rs`).
+async fn accepted_divergence_all_docs_offset_is_the_skip(fx: Fx) {
+    let db = fx.db();
+    for id in ["a", "b", "c", "d", "e"] {
+        write(db, serde_json::json!({"_id": id})).await;
+    }
+    let from_c = db
+        .all_docs(AllDocsOptions {
+            start_key: Some("c".into()),
+            skip: 1,
+            ..AllDocsOptions::new()
+        })
+        .await
+        .unwrap();
+    assert_eq!(row_ids(&from_c), ["d", "e"]);
+    assert_eq!((from_c.total_rows, from_c.offset), (5, 1));
+    let keys = db
+        .all_docs(AllDocsOptions {
+            keys: Some(vec!["a".into(), "b".into()]),
+            skip: 1,
+            ..AllDocsOptions::new()
+        })
+        .await
+        .unwrap();
+    assert_eq!((row_ids(&keys), keys.offset), (vec!["b".to_string()], 1));
+}
+
+conformance!(accepted_divergence: accepted_divergence_all_docs_offset_is_the_skip);
 
 // === section: f68 ===
 
@@ -1640,8 +1718,8 @@ async fn live_leaf_beats_deeper_tombstone(mut fx: Fx) {
     assert_eq!((info.doc_count, info.doc_del_count), (1, 0));
     let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
     assert_eq!(row_ids(&all), ["d"]);
-    assert_eq!(all.rows[0].value.rev, live);
-    assert_eq!(all.rows[0].value.deleted, None);
+    assert_eq!(all.rows[0].rev().unwrap(), live);
+    assert_eq!(all.rows[0].value.as_ref().unwrap().deleted, None);
     let ch = db.changes(ChangesOptions::default()).await.unwrap();
     assert_eq!(
         changes_json(&ch),
@@ -2801,17 +2879,7 @@ async fn local_ids_are_local_documents(mut fx: Fx) {
 /// Q-API-7: a failed `put_design` is an error, like `put`.
 async fn put_design_conflict_is_an_error(fx: Fx) {
     let db = fx.db();
-    let ddoc = || DesignDocument {
-        id: "_design/app".into(),
-        rev: None,
-        views: std::collections::HashMap::new(),
-        filters: std::collections::HashMap::new(),
-        validate_doc_update: None,
-        shows: std::collections::HashMap::new(),
-        lists: std::collections::HashMap::new(),
-        updates: std::collections::HashMap::new(),
-        language: None,
-    };
+    let ddoc = || DesignDocument::new("app");
     assert!(db.put_design(ddoc()).await.unwrap().ok);
     assert!(matches!(
         db.put_design(ddoc()).await,
@@ -2952,6 +3020,158 @@ async fn old_edit_of_deleted_document_conflicts(fx: Fx) {
     let r4 = db.put("d", serde_json::json!({"v": 3})).await.unwrap();
     assert_eq!(generation(r4.rev.as_deref().unwrap()), 4);
 }
+
+// === section: f55 ===
+
+/// F55: a design document goes through `get_design` + `put_design`
+/// unchanged, whatever it holds (`views.lib`, Mango index views, view and
+/// ddoc `options`, object-valued functions, custom fields, attachments), and
+/// survives a reopen; the server's Mango indexes read it back.
+async fn design_doc_round_trip_is_lossless(mut fx: Fx) {
+    let raw = serde_json::json!({
+        "language": "query",
+        "views": {
+            "lib": {"util": "exports.x = 1;"},
+            "by-age": {"map": {"fields": {"age": "asc"}, "partial_filter_selector": {}},
+                "reduce": "_count", "options": {"def": {"fields": ["age"]}}},
+            "js": {"map": "function(doc){ emit(doc._id); }", "options": {"local_seq": true}}
+        },
+        "filters": {"f": "function(doc){ return true; }", "erl": {"src": "x"}},
+        "options": {"partitioned": false},
+        "autoupdate": false,
+        "rewrites": [{"from": "/a", "to": "/b"}],
+        "custom": {"n": [1, 2.5, null, true, "s"]},
+        "_attachments": {"a.txt": {"content_type": "text/plain", "data": "aGk="}}
+    });
+    let r1 = fx
+        .db()
+        .put("_design/app", raw.clone())
+        .await
+        .unwrap()
+        .rev
+        .unwrap();
+    let ddoc = fx.db().get_design("app").await.unwrap();
+    assert_eq!(ddoc.rev.as_deref(), Some(r1.as_str()));
+    assert!(ddoc.extra["_attachments"]["a.txt"]["stub"] == true);
+    let r2 = fx.db().put_design(ddoc).await.unwrap().rev.unwrap();
+    assert_eq!(generation(&r2), 2);
+    fx.reopen();
+    let db = fx.db();
+    let stored = db.get("_design/app").await.unwrap();
+    let mut expected = raw.clone();
+    expected.as_object_mut().unwrap().remove("_attachments");
+    assert_eq!(stored.data, expected);
+    assert_eq!(stored.attachments["a.txt"].length, 2);
+    assert_eq!(
+        db.get_attachment("_design/app", "a.txt").await.unwrap(),
+        b"hi"
+    );
+    let mut again = db.get_design("app").await.unwrap().to_json();
+    let obj = again.as_object_mut().unwrap();
+    assert_eq!(obj.remove("_id"), Some(serde_json::json!("_design/app")));
+    assert_eq!(obj.remove("_rev"), Some(serde_json::json!(r2)));
+    assert_eq!(obj.remove("_attachments").unwrap()["a.txt"]["stub"], true);
+    assert_eq!(again, expected);
+}
+
+conformance!(f55: design_doc_round_trip_is_lossless);
+
+// === section: revpos ===
+
+/// Attachment `revpos` is the generation of the revision that uploaded the
+/// data, as in CouchDB 3.5.1 (the same writes as `attachments_match_couchdb`
+/// in `replication.rs`): stubs, body edits and a reopen keep it, a
+/// standalone upload and a re-upload of identical bytes set it, and
+/// `bulk_get` and replication carry it.
+async fn attachment_revpos_follows_couchdb(mut fx: Fx) {
+    let hello = serde_json::json!({"content_type": "application/octet-stream", "data": "aGVsbG8="});
+    let stub = serde_json::json!({"stub": true});
+    let db = fx.db();
+    let r1 = db
+        .put(
+            "d",
+            serde_json::json!({"v": 1, "_attachments": {"a.bin": hello}}),
+        )
+        .await
+        .unwrap()
+        .rev
+        .unwrap();
+    let r2 = db
+        .update(
+            "d",
+            &r1,
+            serde_json::json!({"v": 2, "_attachments": {"a.bin": stub}}),
+        )
+        .await
+        .unwrap()
+        .rev
+        .unwrap();
+    let r3 = db
+        .put_attachment(
+            "d",
+            "b.bin",
+            &r2,
+            b"xyz".to_vec(),
+            "application/octet-stream",
+        )
+        .await
+        .unwrap()
+        .rev
+        .unwrap();
+    db.update(
+        "d",
+        &r3,
+        serde_json::json!({"v": 4, "_attachments": {"a.bin": hello, "b.bin": stub}}),
+    )
+    .await
+    .unwrap();
+    fx.reopen();
+    let db = fx.db();
+
+    let stub_json = |revpos: u64, data: &[u8]| {
+        serde_json::json!({"content_type": "application/octet-stream", "revpos": revpos,
+            "digest": attachment_digest(data), "length": data.len(), "stub": true})
+    };
+    let expected =
+        serde_json::json!({"a.bin": stub_json(4, b"hello"), "b.bin": stub_json(3, b"xyz")});
+    assert_eq!(
+        db.get("d").await.unwrap().to_json()["_attachments"],
+        expected
+    );
+    let old = get_rev(db, "d", &r2).await.unwrap();
+    assert_eq!(
+        old.to_json()["_attachments"],
+        serde_json::json!({"a.bin": stub_json(1, b"hello")})
+    );
+
+    let got = db
+        .adapter()
+        .bulk_get(vec![BulkGetItem {
+            id: "d".into(),
+            rev: None,
+        }])
+        .await
+        .unwrap();
+    let doc = got.results[0].docs[0].ok.as_ref().unwrap();
+    assert_eq!(doc["_attachments"]["a.bin"]["revpos"], 4);
+    assert_eq!(doc["_attachments"]["a.bin"]["data"], "aGVsbG8=");
+    assert_eq!(doc["_attachments"]["b.bin"]["revpos"], 3);
+
+    let copy = fx.sibling("copy");
+    assert!(db.replicate_to(&copy).await.unwrap().ok);
+    assert_eq!(
+        copy.get("d").await.unwrap().to_json()["_attachments"],
+        expected
+    );
+    let back = fx.sibling("back");
+    assert!(back.replicate_from(&copy).await.unwrap().ok);
+    assert_eq!(
+        back.get("d").await.unwrap().to_json()["_attachments"],
+        expected
+    );
+}
+
+conformance!(revpos: attachment_revpos_follows_couchdb);
 
 conformance!(storage_fidelity:
     unusual_ids_survive_compact_and_purge,

@@ -225,6 +225,7 @@ impl Op {
                     lists: HashMap::new(),
                     updates: HashMap::new(),
                     language: None,
+                    ..Default::default()
                 })
                 .await
             }

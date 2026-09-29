@@ -5,6 +5,17 @@ use async_trait::async_trait;
 use crate::document::*;
 use crate::error::Result;
 
+/// A change an adapter committed, announced to the subscribers of
+/// [`Adapter::subscribe`]: one notice per changed document, sent after the
+/// write is visible to readers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeNotice {
+    /// The sequence of the change.
+    pub seq: Seq,
+    /// The id of the changed document.
+    pub doc_id: String,
+}
+
 /// The trait all storage adapters must implement.
 ///
 /// This mirrors PouchDB's internal adapter interface (underscore-prefixed
@@ -105,6 +116,20 @@ pub trait Adapter: Send + Sync {
     /// The adapter stays usable afterwards and behaves as a new, empty
     /// database (a remote one is re-created on its next use).
     async fn destroy(&self) -> Result<()>;
+
+    /// Subscribe to the changes this adapter commits, if it can announce
+    /// them; `None` (the default) means it cannot, and live changes feeds
+    /// and live replication poll it instead.
+    ///
+    /// Subscribe *before* reading the changes feed: every change committed
+    /// after the call is announced. Notices are hints to read the feed
+    /// again, not a replacement for it: a receiver that falls behind gets
+    /// [`RecvError::Lagged`](tokio::sync::broadcast::error::RecvError) and
+    /// must re-read from the last sequence it processed. Writes of local
+    /// (`_local/`) documents are not announced.
+    fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<ChangeNotice>> {
+        None
+    }
 
     /// Close the database, releasing any held resources.
     /// Default implementation is a no-op.
@@ -208,6 +233,13 @@ mod tests {
         async fn destroy(&self) -> Result<()> {
             unimplemented!()
         }
+    }
+
+    #[test]
+    fn default_adapter_has_no_change_notifications() {
+        // Implementors that do not announce changes keep compiling and are
+        // polled by live feeds.
+        assert!(Minimal.subscribe().is_none());
     }
 
     #[tokio::test]

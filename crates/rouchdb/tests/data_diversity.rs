@@ -38,7 +38,7 @@ async fn assert_roundtrip(prefix: &str, docs: &[(&str, serde_json::Value)]) {
         (&redb, "pulled redb"),
     ] {
         let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
-        let mut listed: Vec<String> = all.rows.iter().map(|r| r.id.clone()).collect();
+        let mut listed: Vec<String> = all.rows.iter().map(|r| r.key.clone()).collect();
         listed.sort();
         assert_eq!(listed, ids, "{name}");
         for (id, rev, body) in &written {
@@ -202,7 +202,7 @@ async fn special_id_with_unicode() {
     assert_eq!(doc.data, serde_json::json!({"v": 1}));
     let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
     assert_eq!(all.rows.len(), 1);
-    assert_eq!(all.rows[0].id, id);
+    assert_eq!(all.rows[0].key, id);
 }
 
 #[tokio::test]

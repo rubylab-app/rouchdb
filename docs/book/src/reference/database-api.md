@@ -192,7 +192,7 @@ All replication methods implement the CouchDB replication protocol: checkpoint r
 | `checkpoint` | `bool` | `true` | Set to `false` to disable checkpoint saving/reading. |
 | `live` | `bool` | `false` | Enable continuous replication (used with `replicate_to_live`). |
 | `retry` | `bool` | `false` | Automatically retry on failure (live mode). |
-| `poll_interval` | `Duration` | `500ms` | How often to poll for new changes in live mode. |
+| `poll_interval` | `Duration` | `500ms` | How often to poll for new changes in live mode when the adapter cannot announce them (`Adapter::subscribe` returns `None`, e.g. HTTP); memory and redb wake the stream up on each change. |
 | `back_off_function` | `Option<Box<dyn Fn(u32) -> Duration>>` | `None` | Custom backoff function for retries. Receives retry count, returns delay. |
 
 ### ReplicationFilter
@@ -252,7 +252,7 @@ println!("Index: {} ({})", explanation.index.name, explanation.index.index_type)
 
 | Method | Signature | Return Type | Description |
 |--------|-----------|-------------|-------------|
-| `put_design` | `async fn put_design(&self, ddoc: DesignDocument)` | `Result<DocResult>` | Create or update a design document. Like `put`, a failed write (e.g. `RouchError::Conflict`) is an error. |
+| `put_design` | `async fn put_design(&self, ddoc: DesignDocument)` | `Result<DocResult>` | Create or update a design document, written exactly as given (`DesignDocument` keeps every member, so a `get_design` + `put_design` round trip is lossless). Like `put`, a failed write (e.g. `RouchError::Conflict`) is an error. |
 | `get_design` | `async fn get_design(&self, name: &str)` | `Result<DesignDocument>` | Retrieve a design document by short name (without `_design/` prefix). |
 | `delete_design` | `async fn delete_design(&self, name: &str, rev: &str)` | `Result<DocResult>` | Delete a design document. |
 | `view_cleanup` | `async fn view_cleanup(&self)` | `Result<()>` | Remove unused view indexes. |

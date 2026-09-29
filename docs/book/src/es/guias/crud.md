@@ -122,7 +122,8 @@ let response = db.all_docs(AllDocsOptions {
 println!("Total: {} documentos", response.total_rows);
 
 for row in &response.rows {
-    println!("{}: rev {}", row.id, row.value.rev);
+    // `key` es el ID del documento; `rev()`, su revision ganadora.
+    println!("{}: rev {}", row.key, row.rev().unwrap_or_default());
     if let Some(ref doc) = row.doc {
         println!("  datos: {}", doc);
     }
@@ -147,7 +148,9 @@ let users = db.all_docs(AllDocsOptions {
     ..AllDocsOptions::new()
 }).await?;
 
-// Documentos especificos por ID
+// Documentos especificos por ID: una fila por clave, en orden. Una clave
+// sin documento da una fila de error (`row.is_error()`, sin `id` ni `value`)
+// y un documento borrado, una fila con `row.is_deleted()` y sin `doc`.
 let specific = db.all_docs(AllDocsOptions {
     keys: Some(vec!["user:1".into(), "user:2".into()]),
     include_docs: true,

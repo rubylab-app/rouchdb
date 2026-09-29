@@ -18,6 +18,11 @@ default = ["rustls-tls"]
 rustls-tls = ["rouchdb-adapter-http/rustls-tls"]
 rustls-tls-native-roots = ["rouchdb-adapter-http/rustls-tls-native-roots"]
 native-tls = ["rouchdb-adapter-http/native-tls"]
+# Keep JSON numbers exactly as written (serde_json's `arbitrary_precision`),
+# so integers beyond i64/u64 and decimals beyond f64 round-trip unchanged
+# through every adapter and replication. Off by default; see the book's
+# "Differences from CouchDB" page.
+arbitrary-precision = ["serde_json/arbitrary_precision"]
 
 [dependencies]
 async-trait = "0.1.68"

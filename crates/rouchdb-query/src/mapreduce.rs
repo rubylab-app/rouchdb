@@ -148,20 +148,21 @@ pub async fn query_view(
     let mut emitted: Vec<EmittedRow> = Vec::new();
     let mut docs: HashMap<String, Value> = HashMap::new();
 
+    // A range query only returns document rows, whose key is the id.
     for row in all.rows {
-        if row.id.starts_with("_design/") {
+        if row.key.starts_with("_design/") {
             continue;
         }
         if let Some(doc_json) = row.doc {
             for (key, value) in map_fn(&doc_json) {
                 emitted.push(EmittedRow {
-                    id: row.id.clone(),
+                    id: row.key.clone(),
                     key,
                     value,
                 });
             }
             if opts.include_docs {
-                docs.insert(row.id, doc_json);
+                docs.insert(row.key, doc_json);
             }
         }
     }
@@ -492,9 +493,10 @@ async fn attach_docs_from(
                 ..AllDocsOptions::new()
             })
             .await?;
+        // Only live documents carry a doc; their key is the id.
         for row in response.rows {
             if let Some(doc) = row.doc {
-                fetched.insert(row.id, doc);
+                fetched.insert(row.key, doc);
             }
         }
     }

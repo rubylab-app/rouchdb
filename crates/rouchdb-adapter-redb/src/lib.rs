@@ -5,10 +5,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
-use rouchdb_core::adapter::Adapter;
+use rouchdb_core::adapter::{Adapter, ChangeNotice};
 use rouchdb_core::document::*;
 use rouchdb_core::error::{Result, RouchError};
 use rouchdb_core::json::MAX_NESTING_DEPTH;
@@ -123,11 +123,23 @@ struct RevAttachmentsRecord {
     attachments: HashMap<String, AttachmentRecord>,
 }
 
+/// Stored attachment metadata. The members added in 0.5 default when a
+/// record written by an earlier version is read.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct AttachmentRecord {
     content_type: String,
     digest: String,
     length: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    revpos: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encoding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encoded_length: Option<u64>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -371,7 +383,13 @@ struct Inner {
     /// Serializes writers before they reach redb (which would otherwise park
     /// one blocking thread per waiting writer).
     write_lock: Mutex<()>,
+    /// Change notifications, sent once a write is committed.
+    notices: broadcast::Sender<ChangeNotice>,
 }
+
+/// Change notices buffered per subscriber before it lags (and re-reads the
+/// changes feed).
+const NOTICE_CAPACITY: usize = 1024;
 
 impl RedbAdapter {
     /// Open or create a database at the given path.
@@ -432,6 +450,7 @@ impl RedbAdapter {
                 db,
                 name: name.to_string(),
                 write_lock: Mutex::new(()),
+                notices: broadcast::channel(NOTICE_CAPACITY).0,
             }),
             rev_limit: DEFAULT_REV_LIMIT,
         })
@@ -629,9 +648,12 @@ fn records_to_meta(records: &HashMap<String, AttachmentRecord>) -> HashMap<Strin
                 name.clone(),
                 AttachmentMeta {
                     content_type: r.content_type.clone(),
+                    revpos: r.revpos,
                     digest: r.digest.clone(),
                     length: r.length,
                     stub: true,
+                    encoding: r.encoding.clone(),
+                    encoded_length: r.encoded_length,
                     data: None,
                 },
             )
@@ -648,6 +670,9 @@ fn meta_to_records(atts: &HashMap<String, AttachmentMeta>) -> HashMap<String, At
                     content_type: m.content_type.clone(),
                     digest: m.digest.clone(),
                     length: m.length,
+                    revpos: m.revpos,
+                    encoding: m.encoding.clone(),
+                    encoded_length: m.encoded_length,
                 },
             )
         })
@@ -855,6 +880,10 @@ impl Adapter for RedbAdapter {
         self.run_write(move |db| db.purge(req)).await
     }
 
+    fn subscribe(&self) -> Option<broadcast::Receiver<ChangeNotice>> {
+        Some(self.inner.notices.subscribe())
+    }
+
     async fn get_security(&self) -> Result<SecurityDocument> {
         self.run(|db| db.get_security()).await
     }
@@ -866,6 +895,28 @@ impl Adapter for RedbAdapter {
 
 /// The storage operations, run synchronously (see `RedbAdapter::run`).
 impl Inner {
+    /// Commit a write transaction, then announce the changes it recorded
+    /// after sequence `since` to the subscribers (read from the transaction
+    /// before it commits, only when someone listens).
+    fn commit_announcing(&self, txn: redb::WriteTransaction, since: u64) -> Result<()> {
+        let mut notices = Vec::new();
+        if self.notices.receiver_count() > 0 {
+            let changes = db_err!(txn.open_table(CHANGES_TABLE))?;
+            for entry in db_err!(changes.range(since + 1..))? {
+                let (seq, record) = db_err!(entry)?;
+                let record: ChangeRecord = serde_json::from_slice(record.value())?;
+                notices.push(ChangeNotice {
+                    seq: Seq::Num(seq.value()),
+                    doc_id: record.doc_id,
+                });
+            }
+        }
+        db_err!(txn.commit())?;
+        for notice in notices {
+            let _ = self.notices.send(notice);
+        }
+        Ok(())
+    }
     fn info(&self) -> Result<DbInfo> {
         // Counts and update_seq live in one metadata record, so they always
         // reflect the same committed state without scanning documents.
@@ -991,6 +1042,7 @@ impl Inner {
 
         // Read current metadata
         let mut meta = read_meta(&db_err!(write_txn.open_table(META_TABLE))?)?;
+        let since = meta.update_seq;
 
         {
             let mut tables = WriteTables::open(&write_txn)?;
@@ -1007,7 +1059,7 @@ impl Inner {
         // Write updated metadata
         write_meta(&mut db_err!(write_txn.open_table(META_TABLE))?, &meta)?;
 
-        db_err!(write_txn.commit())?;
+        self.commit_announcing(write_txn, since)?;
 
         Ok(results)
     }
@@ -1061,30 +1113,32 @@ impl Inner {
                 None
             };
             Ok(Some(AllDocsRow {
-                id: doc_id.to_string(),
-                key: doc_id.to_string(),
-                value: AllDocsRowValue {
-                    rev: winner.to_string(),
-                    deleted: if deleted { Some(true) } else { None },
-                },
                 doc: doc_json,
+                ..AllDocsRow::document(
+                    doc_id,
+                    AllDocsRowValue {
+                        rev: winner.to_string(),
+                        deleted: deleted.then_some(true),
+                    },
+                )
             }))
         };
 
         if let Some(ref keys) = opts.keys {
-            // Rows follow the requested key order (reversed for descending),
-            // duplicates included; unknown keys are skipped.
+            // One row per requested key, in request order (reversed for
+            // descending), duplicates included; an unknown key gets a
+            // `not_found` row (CouchDB).
             let ordered: Vec<&String> = if opts.descending {
                 keys.iter().rev().collect()
             } else {
                 keys.iter().collect()
             };
             for key in ordered {
-                if let Some((tree, _)) = load_doc_record(&doc_table, key)?
-                    && let Some(row) = make_row(key, &tree, true)?
-                {
-                    rows.push(row);
-                }
+                let row = match load_doc_record(&doc_table, key)? {
+                    Some((tree, _)) => make_row(key, &tree, true)?,
+                    None => None,
+                };
+                rows.push(row.unwrap_or_else(|| AllDocsRow::not_found(key.as_str())));
             }
             rows = rows.into_iter().skip(skip).take(limit).collect();
         } else if let Some(ref key) = opts.key {
@@ -1352,33 +1406,10 @@ impl Inner {
                     // Include inline attachments so replication carries
                     // their bytes end-to-end.
                     if !atts.is_empty() {
-                        use base64::Engine;
                         let mut att_map = serde_json::Map::new();
-                        for (name, rec) in &atts {
-                            let mut m = serde_json::Map::new();
-                            m.insert(
-                                "content_type".into(),
-                                serde_json::Value::String(rec.content_type.clone()),
-                            );
-                            m.insert(
-                                "digest".into(),
-                                serde_json::Value::String(rec.digest.clone()),
-                            );
-                            m.insert("length".into(), serde_json::json!(rec.length));
-                            match load_blob(&att_table, &rec.digest)? {
-                                Some(bytes) => {
-                                    m.insert(
-                                        "data".into(),
-                                        serde_json::Value::String(
-                                            base64::engine::general_purpose::STANDARD.encode(bytes),
-                                        ),
-                                    );
-                                }
-                                None => {
-                                    m.insert("stub".into(), serde_json::Value::Bool(true));
-                                }
-                            }
-                            att_map.insert(name.clone(), serde_json::Value::Object(m));
+                        for (name, meta) in records_to_meta(&atts) {
+                            let bytes = load_blob(&att_table, &meta.digest)?;
+                            att_map.insert(name, meta.to_json(bytes.as_deref()));
                         }
                         obj.insert("_attachments".into(), serde_json::Value::Object(att_map));
                     }
@@ -1411,6 +1442,7 @@ impl Inner {
     ) -> Result<DocResult> {
         let write_txn = db_err!(self.db.begin_write())?;
         let mut meta = read_meta(&db_err!(write_txn.open_table(META_TABLE))?)?;
+        let since = meta.update_seq;
 
         let result = {
             let mut tables = WriteTables::open(&write_txn)?;
@@ -1424,16 +1456,7 @@ impl Inner {
             let rd = load_rev_data(&tables.revs, doc_id, &rev)?.ok_or(RouchError::Conflict)?;
             let parent_atts = records_to_meta(&rd.attachments);
             let mut attachments = parent_atts.clone();
-            attachments.insert(
-                att_id.to_string(),
-                AttachmentMeta {
-                    content_type: content_type.to_string(),
-                    digest: String::new(),
-                    length: data.len() as u64,
-                    stub: false,
-                    data: Some(data),
-                },
-            );
+            attachments.insert(att_id.to_string(), AttachmentMeta::new(content_type, data));
             let doc = Document {
                 id: doc_id.to_string(),
                 rev: Some(parent),
@@ -1447,7 +1470,7 @@ impl Inner {
         };
 
         write_meta(&mut db_err!(write_txn.open_table(META_TABLE))?, &meta)?;
-        db_err!(write_txn.commit())?;
+        self.commit_announcing(write_txn, since)?;
         Ok(result)
     }
 
@@ -1492,6 +1515,7 @@ impl Inner {
     ) -> Result<DocResult> {
         let write_txn = db_err!(self.db.begin_write())?;
         let mut meta = read_meta(&db_err!(write_txn.open_table(META_TABLE))?)?;
+        let since = meta.update_seq;
 
         let result = {
             let mut tables = WriteTables::open(&write_txn)?;
@@ -1527,7 +1551,7 @@ impl Inner {
         };
 
         write_meta(&mut db_err!(write_txn.open_table(META_TABLE))?, &meta)?;
-        db_err!(write_txn.commit())?;
+        self.commit_announcing(write_txn, since)?;
         Ok(result)
     }
 
@@ -1638,6 +1662,7 @@ impl Inner {
     fn purge(&self, req: HashMap<String, Vec<String>>) -> Result<PurgeResponse> {
         let write_txn = db_err!(self.db.begin_write())?;
         let mut meta = read_meta(&db_err!(write_txn.open_table(META_TABLE))?)?;
+        let since = meta.update_seq;
         let mut purged = HashMap::new();
         let mut bumped = false;
 
@@ -1691,7 +1716,7 @@ impl Inner {
         }
         meta.purge_seq += 1;
         write_meta(&mut db_err!(write_txn.open_table(META_TABLE))?, &meta)?;
-        db_err!(write_txn.commit())?;
+        self.commit_announcing(write_txn, since)?;
 
         Ok(PurgeResponse {
             purge_seq: Some(meta.purge_seq),
@@ -1956,7 +1981,7 @@ mod tests {
             ..AllDocsOptions::new()
         };
         let result = db.all_docs(opts).await.unwrap();
-        let ids: Vec<&str> = result.rows.iter().map(|r| r.id.as_str()).collect();
+        let ids: Vec<&str> = result.rows.iter().map(|r| r.key.as_str()).collect();
         assert_eq!(ids, vec!["c", "b"]);
         assert_eq!(result.total_rows, 4);
     }
@@ -2012,6 +2037,50 @@ mod tests {
             db.get_local("ck1").await,
             Err(RouchError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn subscribers_are_notified_after_each_committed_change() {
+        use rouchdb_core::adapter::ChangeNotice;
+        let dir = tempfile::tempdir().unwrap();
+        let db = RedbAdapter::open(dir.path().join("n.redb"), "test").unwrap();
+        let mut rx = db.subscribe().expect("the redb adapter announces changes");
+        let doc = |id: &str| Document::from_json(serde_json::json!({"_id": id})).unwrap();
+        let results = db
+            .bulk_docs(vec![doc("a"), doc("b")], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        let notice = |seq: u64, id: &str| ChangeNotice {
+            seq: Seq::Num(seq),
+            doc_id: id.into(),
+        };
+        assert_eq!(rx.try_recv().unwrap(), notice(1, "a"));
+        assert_eq!(rx.try_recv().unwrap(), notice(2, "b"));
+        db.bulk_docs(vec![doc("a")], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        db.put_local("cp", serde_json::json!({})).await.unwrap();
+        assert!(rx.try_recv().is_err());
+        let rev = results[0].rev.clone().unwrap();
+        let r2 = db
+            .put_attachment("a", "x", &rev, b"x".to_vec(), "text/plain")
+            .await
+            .unwrap()
+            .rev
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap(), notice(3, "a"));
+        db.remove_attachment("a", "x", &r2).await.unwrap();
+        assert_eq!(rx.try_recv().unwrap(), notice(4, "a"));
+        let purged = db
+            .purge(HashMap::from([(
+                "b".to_string(),
+                vec![results[1].rev.clone().unwrap()],
+            )]))
+            .await
+            .unwrap();
+        assert_eq!(purged.purged["b"].len(), 1);
+        // A fully purged document has no change left to announce.
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -2623,7 +2692,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let ids = |r: &AllDocsResponse| r.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        let ids = |r: &AllDocsResponse| r.rows.iter().map(|r| r.key.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&page), ["a", "b"]);
         assert_eq!(page.total_rows, 4);
         let range = db
@@ -2996,5 +3065,37 @@ mod tests {
         let err = db.get("legacy", GetOptions::default()).await.unwrap_err();
         assert!(err.to_string().contains("exceeds the maximum"), "{err}");
         db.compact().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attachment_metadata_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("att.redb");
+        let doc = Document::from_json(serde_json::json!({
+            "_id": "d",
+            "_attachments": {"a.txt": {"content_type": "text/plain", "data": "aGk="}}
+        }))
+        .unwrap();
+        let expected = serde_json::json!({"a.txt": {"content_type": "text/plain", "revpos": 1,
+            "digest": attachment_digest(b"hi"), "length": 2, "stub": true}});
+        {
+            let db = RedbAdapter::open(&path, "t").unwrap();
+            db.bulk_docs(vec![doc], BulkDocsOptions::new())
+                .await
+                .unwrap();
+        }
+        let db = RedbAdapter::open(&path, "t").unwrap();
+        let got = db.get("d", GetOptions::default()).await.unwrap();
+        assert_eq!(got.to_json()["_attachments"], expected);
+        let bulk = db
+            .bulk_get(vec![BulkGetItem {
+                id: "d".into(),
+                rev: None,
+            }])
+            .await
+            .unwrap();
+        let doc = bulk.results[0].docs[0].ok.as_ref().unwrap();
+        assert_eq!(doc["_attachments"]["a.txt"]["revpos"], 1);
+        assert_eq!(doc["_attachments"]["a.txt"]["data"], "aGk=");
     }
 }

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use backends::{Backend, KINDS, backends, row_ids};
 use rouchdb::{
-    AllDocsOptions, BulkDocsOptions, ChangesOptions, ChangesStreamOptions, Database,
+    AllDocsOptions, AllDocsRow, BulkDocsOptions, ChangesOptions, ChangesStreamOptions, Database,
     DesignDocument, Document, FindOptions, GetOptions, Revision, RouchError, Seq, SortField,
     ViewDef, ViewEngine, ViewQueryOptions, query_view,
 };
@@ -205,19 +205,26 @@ async fn all_docs_paging_and_range_edge_cases() {
         .await;
         assert_eq!(row_ids(&range), ["b", "c"], "{}", b.name);
 
-        // Keys that do not exist are left out.
+        // Keys that do not exist get a `not_found` row, as in CouchDB.
         let keys = query(AllDocsOptions {
             keys: Some(vec!["a".into(), "nonexistent".into(), "c".into()]),
             ..AllDocsOptions::new()
         })
         .await;
-        assert_eq!(row_ids(&keys), ["a", "c"], "{}", b.name);
+        assert_eq!(row_ids(&keys), ["a", "nonexistent", "c"], "{}", b.name);
+        assert_eq!(
+            keys.rows[1],
+            AllDocsRow::not_found("nonexistent"),
+            "{}",
+            b.name
+        );
         let unknown = query(AllDocsOptions {
             keys: Some(vec!["fake1".into(), "fake2".into()]),
             ..AllDocsOptions::new()
         })
         .await;
-        assert!(unknown.rows.is_empty(), "{}", b.name);
+        assert!(unknown.rows.iter().all(AllDocsRow::is_error), "{}", b.name);
+        assert_eq!(row_ids(&unknown), ["fake1", "fake2"], "{}", b.name);
     }
 }
 
@@ -229,10 +236,10 @@ async fn all_docs_paging_and_range_edge_cases() {
 async fn design_doc_full_roundtrip() {
     for b in backends("test") {
         let db = &b.db;
-        let named = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+        let named = |pairs: &[(&str, &str)]| -> HashMap<String, serde_json::Value> {
             pairs
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .map(|(k, v)| (k.to_string(), serde_json::json!(v)))
                 .collect()
         };
         let ddoc = DesignDocument {
@@ -244,6 +251,7 @@ async fn design_doc_full_roundtrip() {
                     ViewDef {
                         map: "function(doc) { emit(doc.type, 1); }".into(),
                         reduce: Some("_count".into()),
+                        ..Default::default()
                     },
                 ),
                 (
@@ -251,6 +259,7 @@ async fn design_doc_full_roundtrip() {
                     ViewDef {
                         map: "function(doc) { emit(doc.name, null); }".into(),
                         reduce: None,
+                        ..Default::default()
                     },
                 ),
             ]),
@@ -260,6 +269,7 @@ async fn design_doc_full_roundtrip() {
             lists: named(&[("all", "function(head,req) {}")]),
             updates: named(&[("bump", "function(doc,req) {}")]),
             language: Some("javascript".into()),
+            ..Default::default()
         };
 
         let result = db.put_design(ddoc.clone()).await.unwrap();
@@ -397,8 +407,16 @@ async fn sync_is_idempotent() {
         for db in [a, b] {
             let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
             assert_eq!(row_ids(&all), ["doc1", "doc2"], "{kind}");
-            assert_eq!(all.rows[0].value.rev, *r1.rev.as_ref().unwrap(), "{kind}");
-            assert_eq!(all.rows[1].value.rev, *r2.rev.as_ref().unwrap(), "{kind}");
+            assert_eq!(
+                all.rows[0].rev().unwrap(),
+                *r1.rev.as_ref().unwrap(),
+                "{kind}"
+            );
+            assert_eq!(
+                all.rows[1].rev().unwrap(),
+                *r2.rev.as_ref().unwrap(),
+                "{kind}"
+            );
             let info = db.info().await.unwrap();
             assert_eq!((info.doc_count, info.doc_del_count), (2, 0), "{kind}");
         }
