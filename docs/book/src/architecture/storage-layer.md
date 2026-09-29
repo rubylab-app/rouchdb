@@ -2,109 +2,89 @@
 
 The `rouchdb-adapter-redb` crate provides persistent local storage backed by
 [redb](https://github.com/cberner/redb), a pure-Rust embedded key-value store
-with ACID transactions. This document describes the table schema, key/value
-formats, serialization approach, and transactional guarantees.
+with ACID transactions. This document describes the on-disk format of
+rouchdb 0.5 (tables, keys and values), how files written by older versions
+are upgraded, and the transactional guarantees.
 
 ## Why redb
 
 - **Pure Rust, no C dependencies.** Eliminates build complexity and
   cross-compilation issues.
 - **ACID transactions.** Crash-safe reads and writes out of the box.
-- **Typed tables.** `redb::TableDefinition` encodes key and value types at
-  compile time.
+- **Typed tables.** `redb::TableDefinition` encodes key and value types, and
+  redb checks them every time a table is opened (the format guard below
+  relies on this).
 - **Single-file database.** One `.redb` file per database, easy to manage.
 
 ## Table Schema
 
-The adapter defines six tables:
+A 0.5 file has seven tables:
 
 ```
-+-------------------+---------------+-----------------+
-| Table             | Key Type      | Value Type      |
-+-------------------+---------------+-----------------+
-| DOC_TABLE         | &str          | &[u8]           |
-| REV_DATA_TABLE    | &str          | &[u8]           |
-| CHANGES_TABLE     | u64           | &[u8]           |
-| LOCAL_TABLE       | &str          | &[u8]           |
-| ATTACHMENT_TABLE  | &str          | &[u8]           |
-| META_TABLE        | &str          | &[u8]           |
-+-------------------+---------------+-----------------+
++--------------------------+----------------+-------------+-----------------+
+| Constant                 | Table name     | Key type    | Value type      |
++--------------------------+----------------+-------------+-----------------+
+| DOC_TABLE                | "docs"         | &str        | &[u8]           |
+| REV_DATA_TABLE           | "rev_data"     | &str        | &[u8]           |
+| CHANGES_TABLE            | "changes"      | u64         | &[u8]           |
+| LOCAL_TABLE              | "local_docs"   | &str        | &[u8]           |
+| ATTACHMENT_TABLE         | "attachments"  | &str        | &[u8]           |
+| META_TABLE               | "rouchdb_meta" | &str        | &[u8]           |
+| GUARD_TABLE (the guard)  | "metadata"     | &str        | FormatGuard     |
++--------------------------+----------------+-------------+-----------------+
 ```
 
-All value types are `&[u8]` -- the adapter serializes Rust structs to JSON
-bytes using `serde_json::to_vec` and deserializes with `serde_json::from_slice`.
+Except for the guard, values are JSON (`serde_json::to_vec` /
+`from_slice`) or raw attachment bytes.
 
 ### DOC_TABLE (`"docs"`)
 
-**Purpose:** Stores document metadata, including the full revision tree and the
-current sequence number.
+**Purpose:** Stores each document's revision tree and current sequence
+number.
 
-**Key:** Document ID as a string (`&str`).
+**Key:** Document ID (`&str`).
 
-**Value:** JSON-serialized `DocRecord`:
+**Value:** JSON `DocRecord`: the revision tree as a flat, pre-order list of
+nodes, each pointing at its parent's index. Flat storage keeps
+(de)serialization depth constant however long the history is.
 
 ```rust
 struct DocRecord {
-    rev_tree: Vec<SerializedRevPath>,
+    revs: Vec<FlatRevNode>,
     seq: u64,
 }
 
-struct SerializedRevPath {
+struct FlatRevNode {
     pos: u64,
-    tree: SerializedRevNode,
-}
-
-struct SerializedRevNode {
     hash: String,
-    status: String,      // "available" or "missing"
-    deleted: bool,
-    children: Vec<SerializedRevNode>,
+    parent: Option<u32>, // index of the parent node; absent for a root
+    missing: bool,       // omitted when false; true: the body is not stored
+    deleted: bool,       // omitted when false
 }
 ```
 
-The `DocRecord` contains:
-
-- `rev_tree` -- the complete revision tree, serialized as a recursive
-  JSON structure. Each node stores its hash, availability status, deleted
-  flag, and children. This is a direct serialization of the in-memory
-  `RevTree` / `RevPath` / `RevNode` types.
-- `seq` -- the most recent change sequence number for this document.
-  Used to update the changes table when the document is modified (the old
-  change entry at this sequence is removed and a new one is inserted).
-
-**Example stored value:**
+**Example stored value** (`1-a1b2…` compacted away, `2-f7e8…` its child):
 
 ```json
-{
-  "rev_tree": [
-    {
-      "pos": 1,
-      "tree": {
-        "hash": "a1b2c3d4e5f6...",
-        "status": "missing",
-        "deleted": false,
-        "children": [
-          {
-            "hash": "f7e8d9c0b1a2...",
-            "status": "available",
-            "deleted": false,
-            "children": []
-          }
-        ]
-      }
-    }
-  ],
-  "seq": 42
-}
+{"revs":[{"pos":1,"hash":"a1b2c3d4...","missing":true},
+         {"pos":2,"hash":"f7e8d9c0...","parent":0}],
+ "seq":42}
 ```
+
+rouchdb ≤ 0.4 stored a nested record (`{"rev_tree": [{"pos", "tree":
+{"hash", "status", "deleted", "children": [...]}}], "seq"}`), two JSON levels
+per generation. Such records are still read (deep ones on a thread with a
+large stack and serde_json's recursion limit disabled) and are rewritten flat
+the next time the document is written. A record that cannot be decoded is an
+error, never a missing document.
 
 ### REV_DATA_TABLE (`"rev_data"`)
 
-**Purpose:** Stores the actual JSON body for each revision.
+**Purpose:** Stores the body and attachment metadata of each stored
+revision.
 
-**Key:** Composite key `"{doc_id}\0{rev_str}"` -- the document ID and full
-revision string (e.g., `"3-abc123"`) separated by a null byte. The null byte
-ensures that keys for the same document are contiguous in the table.
+**Key:** `"{doc_id}\0{rev}"`, e.g. `"doc1\03-abc123…"`. Revision ids are
+stored in canonical form (32-digit hex ids in lower case).
 
 Document ids may themselves contain NUL (CouchDB accepts `"a\u0000b"`), so
 the key range of `a` (`"a\0"` .. `"a\x01"`) also holds the keys of `a\0b`.
@@ -112,56 +92,38 @@ Revision ids never contain NUL (they are rejected), so a key in that range
 whose remainder contains a NUL belongs to a longer id and is skipped when
 the bodies of `a` are listed (compaction, purge).
 
-```rust
-fn rev_data_key(doc_id: &str, rev_str: &str) -> String {
-    format!("{}\0{}", doc_id, rev_str)
-}
-```
-
-**Value:** JSON-serialized `RevDataRecord`:
+**Value:** JSON `RevDataRecord`:
 
 ```rust
 struct RevDataRecord {
-    data: serde_json::Value,
+    data: serde_json::Value,                        // body without _id, _rev, ...
     deleted: bool,
+    attachments: HashMap<String, AttachmentRecord>, // omitted when empty
+}
+
+struct AttachmentRecord {
+    content_type: String,
+    digest: String,              // "md5-<base64>", the ATTACHMENT_TABLE key
+    length: u64,
+    revpos: u64,                 // omitted when 0 (attachments stored by 0.4)
+    encoding: Option<String>,    // omitted when absent
+    encoded_length: Option<u64>, // omitted when absent
 }
 ```
-
-- `data` -- the document body (everything except `_id`, `_rev`, `_deleted`,
-  `_attachments`, and `_revisions`).
-- `deleted` -- whether this specific revision is a deletion tombstone.
-
-Note that the `data` field stores the user's JSON as-is. CouchDB underscore
-fields (`_id`, `_rev`, etc.) are stripped before storage and re-injected on
-read.
 
 ### CHANGES_TABLE (`"changes"`)
 
-**Purpose:** Implements the changes feed. Each entry represents the most
-recent change for a document.
+**Purpose:** The changes feed. Each document has one entry, at its most
+recent sequence.
 
-**Key:** Sequence number (`u64`). This is a monotonically increasing integer,
-incremented by 1 on every document write.
+**Key:** Sequence number (`u64`), incremented by 1 on every document write.
 
-**Value:** JSON-serialized `ChangeRecord`:
+**Value:** JSON `ChangeRecord { doc_id: String, deleted: bool }` (`deleted`:
+whether the document's winning revision is a deletion).
 
-```rust
-struct ChangeRecord {
-    doc_id: String,
-    deleted: bool,
-}
-```
-
-When a document is updated, the adapter:
-
-1. Removes the old change entry at the document's previous sequence number
-2. Inserts a new entry at the new sequence number
-
-This means each document appears at most once in the changes table, at its
-most recent sequence. Querying `changes(since: N)` performs a range scan over
-`(N+1..)`.
-
-**Example table state after 5 writes:**
+When a document is written, the entry at its previous sequence is removed
+and a new one inserted, so `changes(since: N)` is a range scan over
+`(N+1..)`:
 
 ```
 Seq | doc_id   | deleted
@@ -171,66 +133,83 @@ Seq | doc_id   | deleted
   5 | "doc3"   | true       (doc3 was deleted)
 ```
 
-Sequences 1 and 2 no longer appear because those entries were replaced when
-their documents were updated.
-
 ### LOCAL_TABLE (`"local_docs"`)
 
-**Purpose:** Stores local documents that are not replicated. The primary use
-case is replication checkpoints (`_local/{replication_id}`).
+**Purpose:** Local documents: not replicated, not in `all_docs` or the
+changes feed, no revision tree. Replication checkpoints live here.
 
-**Key:** Local document ID as a string (`&str`). The `_local/` prefix used
-in CouchDB's HTTP API is stripped -- the key is just the ID portion.
+**Key:** The id without its `_local/` prefix.
 
-**Value:** Raw JSON bytes (`serde_json::Value` serialized with `to_vec`).
-A local document written through `bulk_docs` / `Database::put` with a
-`_local/` id carries its revision (`"_rev": "0-N"`) in the body, like the
-server's `PUT /{db}/_local/{id}`.
+**Value:** The JSON body. A local document written through `bulk_docs` /
+`Database::put` with a `_local/` id carries its revision (`"_rev": "0-N"`)
+in the body, like the server's `PUT /{db}/_local/{id}`.
 
-Local documents do not have revision trees or sequence numbers. They are
-simple key-value pairs that can be read, written, and deleted. They do not
-appear in the changes feed or in `_all_docs` results.
+rouchdb ≤ 0.4 stored `_local/…` documents written through `bulk_docs` in
+`docs` like any other document; the upgrade moves them here (see below).
 
 ### ATTACHMENT_TABLE (`"attachments"`)
 
-**Purpose:** Stores raw attachment binary data, keyed by content digest.
+**Purpose:** Attachment bytes, content-addressed.
 
-**Key:** Content digest as a string (`&str`), e.g., `"md5-abc123..."`.
+**Key:** The digest (`"md5-<base64 of the MD5>"`), as referenced by
+`AttachmentRecord::digest`.
 
-**Value:** Raw bytes of the attachment (`&[u8]`).
+**Value:** The raw bytes.
 
-Content-addressable storage means identical attachments are stored only once
-regardless of how many documents reference them.
+Identical bytes are stored once, whichever documents and revisions reference
+them. Bytes stay while any stored revision references them; `compact()`
+deletes the rest. (rouchdb ≤ 0.4 keyed bytes by `"{doc_id}\0{name}"`, so
+re-attaching a name overwrote the bytes older revisions referenced.)
 
-> **Note:** Attachment support in the redb adapter is not yet fully
-> implemented. The table is created on initialization but the `put_attachment`
-> and `get_attachment` methods currently return errors.
+### META_TABLE (`"rouchdb_meta"`)
 
-### META_TABLE (`"metadata"`)
+**Purpose:** Database metadata.
 
-**Purpose:** Global database metadata.
-
-**Key:** Always the string `"meta"` (single-row table).
-
-**Value:** JSON-serialized `MetaRecord`:
+**Keys:** `"meta"` (the `MetaRecord`) and `"security"` (the security
+document, once one is set).
 
 ```rust
 struct MetaRecord {
-    update_seq: u64,
-    db_uuid: String,
+    update_seq: u64,    // highest sequence number
+    db_uuid: String,    // random, reset by destroy()
+    schema: u32,        // on-disk layout version (currently 2)
+    purge_seq: u64,     // number of purge requests applied
+    doc_count: u64,     // live documents, maintained on every write
+    doc_del_count: u64, // deleted documents
 }
 ```
 
-- `update_seq` -- the current highest sequence number. Incremented on every
-  document write. Used by `info()` to report the database's update sequence.
-- `db_uuid` -- a random UUID generated when the database is first created.
-  Reset when the database is destroyed.
+`info()` and `all_docs().total_rows` read the counts from this record
+instead of scanning documents. A file whose `schema` is higher than this
+version knows is refused unchanged.
+
+### The format guard (`"metadata"`)
+
+rouchdb ≤ 0.4 kept its metadata in a table named `"metadata"` and opens it
+as `Table<&str, &[u8]>` in `RedbAdapter::open`. A 0.4 build must never use a
+0.5 file: it cannot decode flat document records, would treat those
+documents as missing and replace their history on its next write, and cannot
+find digest-keyed attachments.
+
+So in a 0.5 file `"metadata"` is a guard table whose value type,
+`FormatGuard`, is zero-sized and named
+`rouchdb-format-2 (this file requires rouchdb >= 0.5)`. redb refuses to open
+a table with a different type, so rouchdb 0.1–0.4 fail in `open` with
+
+```
+database error: metadata is of type Table<&str, rouchdb-format-2 (this file requires rouchdb >= 0.5)>
+```
+
+before writing anything. The guard is created in the same transaction that
+creates or upgrades the file, `destroy()` keeps it, and its type name must
+never change (every 0.5 file stores it). A future incompatible format would
+install a different guard type; 0.5 reports that type's name when it cannot
+open such a file.
 
 ## Serialization Approach
 
-All structured data is serialized to JSON bytes using `serde_json::to_vec` and
-deserialized with `serde_json::from_slice`. This was chosen over binary
-formats (bincode, MessagePack) for several reasons:
+Structured values are JSON. This was chosen over binary formats (bincode,
+MessagePack) for:
 
 1. **Debuggability.** JSON values can be inspected with standard tools.
 2. **Compatibility.** The serialized format closely mirrors what CouchDB
@@ -238,151 +217,142 @@ formats (bincode, MessagePack) for several reasons:
 3. **Flexibility.** Document bodies are already `serde_json::Value`, so no
    format conversion is needed.
 
-The revision tree requires a separate set of "serialized" types
-(`SerializedRevPath`, `SerializedRevNode`) because the in-memory types
-(`RevPath`, `RevNode`) use an enum for `RevStatus` and a struct for
-`NodeOpts`. The serialized types flatten these into simple strings and bools:
+Document bodies may be nested up to `MAX_NESTING_DEPTH` (1000) levels; they
+are decoded with a matching recursion limit.
 
-```
-RevStatus::Available  ->  "available"
-RevStatus::Missing    ->  "missing"
-NodeOpts { deleted }  ->  bool field `deleted`
-```
+## Opening and Initialization
 
-Conversion functions handle the mapping:
+`RedbAdapter::open` (and `open_with`) opens or creates the file, then looks
+at it in a read transaction:
 
-```rust
-fn rev_tree_to_serialized(tree: &RevTree) -> Vec<SerializedRevPath>
-fn serialized_to_rev_tree(paths: &[SerializedRevPath]) -> RevTree
-```
+| The file has | `open` |
+|--------------|--------|
+| no tables (a new file) | creates, in one write transaction, the seven tables, a fresh `MetaRecord` (`update_seq` 0, new UUID, current `schema`) and the guard |
+| the guard (a 0.5 file) | writes nothing (unless a table is missing); a newer `schema` is refused |
+| an unguarded `"metadata"` without `schema` (rouchdb ≤ 0.4) | returns `RouchError::UpgradeRequired` and changes nothing, unless `OpenOptions::upgrade` allows the upgrade |
+| an unguarded `"metadata"` with `schema` 1 or 2 (unreleased 0.5 builds) | finishes the upgrade automatically |
+| other tables only | refuses the file ("not a rouchdb database") |
+| a `"metadata"` table of another type | refuses the file, naming that type |
+
+## Upgrading Files Written by rouchdb ≤ 0.4
+
+`RedbAdapter::upgrade(path, policy)`, `rouchdb migrate <path>` and
+`open_with` with `UpgradePolicy::WithBackup` / `InPlaceNoBackup` run the
+upgrade; `RedbAdapter::inspect_upgrade` (`rouchdb migrate --dry-run`) runs it
+and rolls it back.
+
+**Backup** (`WithBackup`, default path `<file>.rouchdb-0.4.bak`). While the
+file is open (redb's file lock is held), every table is copied entry by
+entry from one read transaction into `<backup>.partial` with the same table
+types, committed, reopened and compared entry by entry (keys and values)
+with the source, synced, then renamed to the backup path and the directory
+synced. The backup path must not exist; on any error the partial copy is
+removed and the source, which is only read, is unchanged. The backup opens
+in 0.4 exactly like the original. A table rouchdb did not create makes the
+backup fail (copy the file yourself and upgrade without a backup).
+
+**Upgrade.** One write transaction with two-phase commit, so an error or a
+crash at any point leaves the file as it was:
+
+1. Read every entry of the old `"metadata"` table.
+2. Re-key attachment bytes from `"{doc_id}\0{name}"` to their digest.
+3. Move `_local/…` documents from `docs` to `local_docs`: the winning
+   revision's body, with `"_rev": "0-N"` (`N` = its generation); deleted
+   ones are dropped; their bodies and change entries are removed. A
+   collision with an existing local document stops the upgrade.
+4. Lower-case upper-case 32-digit hex revision ids in revision trees and body
+   keys. An id stored in both cases stops the upgrade.
+5. Count live and deleted documents, and collect the report's facts
+   (attachment references without bytes, old revision bodies, attachment
+   bytes only old revisions reference).
+6. Write the `MetaRecord` (and the security document, if any) to
+   `rouchdb_meta`, delete the old `"metadata"` table and create the guard.
+
+A record that cannot be decoded stops the upgrade with an error naming it;
+nothing is skipped. `UpgradeReport` holds the counts.
+
+**The first `compact()` after the upgrade** deletes every non-leaf body 0.4
+kept (0.4's `compact` did nothing) and the attachment bytes only those bodies
+referenced.
 
 ## Write Serialization
 
-All document writes go through `bulk_docs`, which acquires a Tokio `RwLock`
-before beginning a redb write transaction:
-
-```rust
-pub struct RedbAdapter {
-    db: Arc<Database>,
-    name: String,
-    write_lock: Arc<RwLock<()>>,
-}
-```
-
-The write lock is necessary because document writes are read-modify-write
-operations: they must read the current `DocRecord`, merge the new revision
-into the tree, and write the updated record back. Without the lock, two
-concurrent writes to the same document could read the same tree, merge
-independently, and one would overwrite the other's changes.
-
-redb provides its own transaction isolation (write transactions are
-serialized at the redb level), but the Tokio lock ensures that the
-Rust-level read-modify-write sequence is atomic.
-
-The flow within a single `bulk_docs` call:
+Every storage operation runs on Tokio's blocking thread pool
+(`spawn_blocking`), since redb commits fsync. Writers first take an async
+`Mutex`, so waiting writers do not each hold a blocking thread, then run one
+redb write transaction:
 
 ```
-1. Acquire write_lock
-2. Begin redb write transaction
-3. Read META_TABLE to get current update_seq
+1. Acquire the write lock
+2. Begin a redb write transaction
+3. Read the MetaRecord (update_seq, counts)
 4. For each document:
-   a. Read existing DocRecord from DOC_TABLE (if any)
-   b. Deserialize revision tree
-   c. Generate new revision (or accept as-is for replication)
-   d. merge_tree(existing_tree, new_path, rev_limit)
-   e. Increment update_seq
-   f. Remove old CHANGES_TABLE entry (if document existed before)
-   g. Write updated DocRecord to DOC_TABLE
-   h. Write RevDataRecord to REV_DATA_TABLE
-   i. Write ChangeRecord to CHANGES_TABLE
-5. Write updated MetaRecord to META_TABLE
-6. Commit transaction
-7. Release write_lock
+   a. Read its DocRecord (a decode error aborts the batch)
+   b. Plan the edit with rouchdb_core::write (conflicts, revision id,
+      attachment inheritance, stemming)
+   c. Store new attachment bytes under their digest
+   d. Increment update_seq; remove the old CHANGES_TABLE entry
+   e. Write the DocRecord, the RevDataRecord and the ChangeRecord; drop the
+      bodies of stemmed revisions; adjust the document counts
+5. Write the MetaRecord
+6. Commit, then notify change subscribers
 ```
 
-If any step fails, the redb transaction is not committed and all changes are
-rolled back. The write lock is released when the `_lock` guard is dropped.
+If any step fails, the transaction is not committed and nothing changes.
 
 ## Two Write Modes
 
 ### `new_edits=true` (Normal Writes)
 
-Used for local application writes. The adapter:
+Used for local application writes:
 
-1. Checks for conflicts -- the provided `_rev` must match the current
-   winning revision.
-2. Generates a new revision hash from `MD5(prev_rev + deleted + json_body)`.
-3. Builds a `RevPath` with `[new_hash, prev_hash]` and merges it.
+1. The provided `_rev` is checked against the tree as CouchDB does (a stale
+   or unknown revision is a `conflict`).
+2. The new revision id comes from `generate_rev_hash`: MD5 over the parent
+   revision, the deleted flag, the body and the attachment set.
+3. The path `[new, parent]` is merged into the tree and stemmed to the
+   revision limit.
 
 ### `new_edits=false` (Replication Writes)
 
-Used during replication. The adapter:
+Used during replication:
 
-1. Does **not** check for conflicts.
-2. Accepts the revision ID from the source document as-is.
-3. If the document includes `_revisions` metadata, builds a full-ancestry
-   `RevPath` using `build_path_from_revs` and merges the entire chain.
-4. Strips `_revisions` from the stored document body.
-
-This mode allows the target to reconstruct the source's revision tree
-faithfully, including branches that represent conflicts.
+1. No conflict check.
+2. The revision id is accepted as sent (in canonical form).
+3. With `_revisions`, the whole ancestry is merged
+   (`build_path_from_revs`); `_revisions` is not stored.
+4. Attachment stubs must refer to bytes already stored (`missing_stub`
+   otherwise).
 
 ## Transactional Guarantees
 
-- **Atomicity.** All documents in a single `bulk_docs` call are written in
-  one redb transaction. Either all succeed or none do.
-- **Durability.** Once `commit()` returns, data is persisted to disk (redb
-  uses fsync).
-- **Consistency.** The sequence number in `META_TABLE` always matches the
-  highest key in `CHANGES_TABLE`. The revision tree in `DOC_TABLE` always
-  reflects all revisions whose data exists in `REV_DATA_TABLE`.
-- **Isolation.** Concurrent reads (using `begin_read`) see a consistent
-  snapshot and are not blocked by writes.
+- **Atomicity.** A `bulk_docs` call, an attachment write, a purge, a
+  compaction and an upgrade are each one redb transaction.
+- **Durability.** Once `commit()` returns, data is on disk (redb fsyncs).
+- **Consistency.** The sequence and counts in the `MetaRecord` always match
+  the documents; each document has exactly one change entry.
+- **Isolation.** Reads (`begin_read`) see a consistent snapshot and are not
+  blocked by writes.
 
-## Initialization
+## Compaction, Purge and Destroy
 
-When `RedbAdapter::open` is called:
-
-1. `Database::create` opens or creates the `.redb` file.
-2. A write transaction creates all six tables (redb creates tables on first
-   open within a write transaction).
-3. If `META_TABLE` has no `"meta"` entry, a fresh `MetaRecord` is inserted
-   with `update_seq: 0` and a new UUID.
-
-## Destroy
-
-`destroy()` drains all entries from all six tables and resets the metadata
-to `update_seq: 0` with a fresh UUID. The database file itself is not
-deleted -- it remains on disk but is empty, and the handle keeps working as
-a new, empty database.
-
-## Revision Hash Generation
-
-```rust
-fn generate_rev_hash(
-    doc_data: &serde_json::Value,
-    deleted: bool,
-    prev_rev: Option<&str>,
-) -> String
-```
-
-The hash is computed as:
-
-```
-MD5( [prev_rev_string] + ("1" if deleted else "0") + json_serialized_body )
-```
-
-This is deterministic: the same edit on the same predecessor always produces
-the same hash. The hex-encoded MD5 digest becomes the hash portion of the
-revision ID (e.g., `"2-a1b2c3d4..."`).
+- `compact()` keeps only the bodies of leaf revisions (marking the others
+  missing) and deletes attachment bytes no remaining body references.
+- `purge()` removes leaf revisions (and ancestors no other leaf needs), their
+  bodies and, when the tree becomes empty, the document.
+- `destroy()` deletes and recreates every table except the guard, and resets
+  the metadata (new UUID, `update_seq` 0, no security document). The file
+  stays on disk, still a 0.5 file, and the handle keeps working as a new,
+  empty database.
 
 ## Key Format Summary
 
 ```
-DOC_TABLE:         "doc1"                   -> DocRecord JSON
-REV_DATA_TABLE:    "doc1\03-a1b2c3..."      -> RevDataRecord JSON
-CHANGES_TABLE:     42                        -> ChangeRecord JSON
-LOCAL_TABLE:       "replication-id-hash"     -> arbitrary JSON
-ATTACHMENT_TABLE:  "md5-digest..."           -> raw bytes
-META_TABLE:        "meta"                    -> MetaRecord JSON
+docs:          "doc1"                 -> DocRecord JSON (flat; legacy nested readable)
+rev_data:      "doc1\03-a1b2c3..."    -> RevDataRecord JSON
+changes:       42                     -> ChangeRecord JSON
+local_docs:    "replication-id-hash"  -> JSON body
+attachments:   "md5-<base64>"         -> raw bytes
+rouchdb_meta:  "meta" / "security"    -> MetaRecord JSON / security document
+metadata:      "format"               -> FormatGuard (zero bytes; its type is the point)
 ```

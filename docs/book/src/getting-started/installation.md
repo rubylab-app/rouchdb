@@ -1,5 +1,7 @@
 # Installation
 
+> **Upgrading from 0.4?** 0.5 does not open `.redb` files written by 0.4 until you upgrade them once, with `rouchdb migrate app.redb` (which writes a verified backup first) or `Database::open_with` + `UpgradePolicy::WithBackup`; afterwards 0.4 cannot open them, and the first `compact()` deletes old revision bodies. See [Migrating from 0.4 to 0.5](../upgrading/0.4-to-0.5.md#redb-files-upgrade-once-explicitly).
+
 ## Full Package
 
 Add RouchDB to your project with all features:
@@ -85,6 +87,9 @@ This installs the `rouchdb` binary. Usage examples:
 ```bash
 # Show database info
 rouchdb info mydb.redb
+
+# Upgrade a file written by rouchdb 0.4 (writes a verified backup first)
+rouchdb migrate mydb.redb
 
 # Get a document by ID
 rouchdb get mydb.redb user:alice

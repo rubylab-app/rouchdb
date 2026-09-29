@@ -34,6 +34,8 @@ let db = Database::open("path/to/mydb.redb", "mydb")?;
 
 The first argument is the filesystem path for the redb file. The second is the logical database name (used in replication checkpoints and `db.info()`).
 
+A file written by rouchdb 0.4 or earlier is refused with `RouchError::UpgradeRequired` and left untouched; upgrade it once with `rouchdb migrate <path>` (which writes a verified backup first) or open it with `Database::open_with(path, name, OpenOptions::new().upgrade(UpgradePolicy::WithBackup(None)))`. Files written by 0.5 cannot be opened by 0.4. See [Migrating from 0.4 to 0.5](../upgrading/0.4-to-0.5.md#redb-files-upgrade-once-explicitly).
+
 **When to use:**
 - Production local-first applications.
 - Any scenario where data must survive process restarts.

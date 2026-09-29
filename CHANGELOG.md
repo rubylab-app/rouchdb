@@ -8,7 +8,16 @@ This project follows [Semantic Versioning](https://semver.org/). Since we are pr
 
 ## [0.5.0] - 2026-09-29
 
-CouchDB-fidelity release. Two audits (a bug audit of every crate and a test-quality audit with mutation testing) drove fixes that were each checked against **CouchDB 3.5.1** as the reference. Many of them change observable behavior: single-document writes return errors, several option and result types changed shape, the server is locked down by default, Mango and views follow CouchDB's semantics, and redb files are upgraded in place. **Read the [migration guide](docs/book/src/upgrading/0.4-to-0.5.md) before upgrading.**
+> **Upgrading from 0.4 with redb (`Database::open`) files? Read this first.**
+> 0.5 does **not** open a `.redb` file written by 0.4: it returns `RouchError::UpgradeRequired` and leaves the file untouched. Upgrade each file **once**, explicitly:
+>
+> ```sh
+> rouchdb migrate app.redb        # writes a verified backup to app.redb.rouchdb-0.4.bak first
+> ```
+>
+> (or `RedbAdapter::upgrade(path, UpgradePolicy::WithBackup(None))`, or `Database::open_with(path, name, OpenOptions::new().upgrade(UpgradePolicy::WithBackup(None)))`). After the upgrade, and for every file 0.5 creates, **0.4 refuses to open the file** (with an error saying it requires rouchdb >= 0.5) instead of misreading it (a 0.4 build writing to a 0.5 file would silently replace document histories). **The first `compact()` after the upgrade permanently deletes old revision bodies** and attachment bytes only old revisions reference (0.4 never compacted); keep the backup until you have checked the upgrade report. See [Upgrading redb files](#upgrading-redb-files).
+
+CouchDB-fidelity release. Two audits (a bug audit of every crate and a test-quality audit with mutation testing) drove fixes that were each checked against **CouchDB 3.5.1** as the reference. Many of them change observable behavior: single-document writes return errors, several option and result types changed shape, the server is locked down by default, Mango and views follow CouchDB's semantics, and the redb file format changed. **Read the [migration guide](docs/book/src/upgrading/0.4-to-0.5.md) before upgrading.**
 
 Thanks to **@stn (Akira Ishino)** for the first external contribution (#7).
 
@@ -36,7 +45,7 @@ Thanks to **@stn (Akira Ishino)** for the first external contribution (#7).
 
 #### Documents and storage
 
-- **redb files are upgraded the first time a 0.5 build opens them**, even for a read-only use such as `rouchdb info`, and **0.4 may no longer read their attachments afterwards**. Back up the `.redb` file before opening it with 0.5 if you may need 0.4 again. See [Upgrading redb files](#upgrading-redb-files). (#12, #18)
+- **redb files written by 0.4 must be upgraded explicitly** (`rouchdb migrate <path>`, `RedbAdapter::upgrade`, or `open_with` with an `UpgradePolicy`); `open` refuses them with the new `RouchError::UpgradeRequired` without modifying them, and **0.4 cannot open upgraded files or files created by 0.5**. `RouchError` has this new variant (exhaustive `match`es need an arm). See [Upgrading redb files](#upgrading-redb-files). (#12, #18)
 - **Writes are validated like CouchDB** (`new_edits` mode): unknown `_`-prefixed members, non-object bodies, reserved `_` ids and wrongly typed `_id`, `_rev`, `_deleted` or `_attachments` are `BadRequest`. Read-only metadata (`_conflicts`, `_revs_info`, `_revisions`) is dropped, so writing back a `get()` result is safe. Local adapters report an invalid document's bare reason in `bulk_docs` results (no `bad request: ` prefix), like the HTTP adapter and CouchDB. (#12, #22)
 - **Generated ids** (`Database::post`, local `bulk_docs` without `_id`, server `POST /{db}`) are 32 lower-case hex digits (still UUID v4) instead of hyphenated UUIDs; over HTTP a document without an id is sent without `_id`, so CouchDB generates it. (#22)
 - **`_local/` ids are local documents** on every adapter: `put`, `update`, `remove`, `bulk_docs` and `get` with a `_local/…` id use `0-N` revisions without MVCC, the documents are not listed by `all_docs`, not in the changes feed and not replicated. Replicated `_local/` documents are ignored, as in CouchDB. (#18)
@@ -131,6 +140,7 @@ Thanks to **@stn (Akira Ishino)** for the first external contribution (#7).
 - **Core API**: the `rouchdb_core::write` module (storage-independent edit rules shared by the memory and redb adapters), `Document::prepare_for_write`, `rev_tree::path_from_revisions`, `rouchdb_core::json` (`MAX_NESTING_DEPTH`, `from_slice`, `from_input`, `value_depth`, `text_depth`, `check_document_depth`), `merge::{merge_and_stem, stem_revs, revs_diff_one}`, `write::{local_doc_id, plan_local_write, local_document, LocalWrite}`, `Revision::normalized`, `document::normalize_rev_hash`, `PlannedWrite::stemmed`. (#12, #18, #22)
 - **Type helpers**: `AllDocsRow::{rev, is_deleted, is_error}` and the `AllDocsRow::{document, not_found}` constructors; `DesignDocument::new`, `with_view`, `with_filter`, `ViewDef::new`, `with_reduce` and `Default` for both; `AttachmentMeta::new` and `to_json`. (#21)
 - **redb**: purge, persistent security documents, and `with_rev_limit`. (#12, #18)
+- **redb file upgrades**: `RedbAdapter::open_with` / `Database::open_with` with `OpenOptions` and `UpgradePolicy` (`Refuse` (default), `WithBackup(Option<PathBuf>)`, `InPlaceNoBackup`), `RedbAdapter::upgrade`, `RedbAdapter::inspect_upgrade` (dry run), `RedbAdapter::upgrade_report` and `UpgradeReport`; `rouchdb migrate <path> [--backup <path>] [--no-backup] [--dry-run]` in the CLI and `rouchdb-server --upgrade`. See [Upgrading redb files](#upgrading-redb-files).
 - **Docs**: a "Differences from CouchDB" book page (object key order, local `all_docs` `offset`, numbers, attachment digests) and a [0.4 → 0.5 migration guide](docs/book/src/upgrading/0.4-to-0.5.md). (#21)
 
 ### Fixed
@@ -216,11 +226,19 @@ Thanks to **@stn (Akira Ishino)** for the first external contribution (#7).
 
 ### Upgrading redb files
 
-- **Opening a file written by rouchdb ≤ 0.4 with any 0.5 build runs a one-time upgrade** in `RedbAdapter::open`, even for read-only uses such as `rouchdb info` or `rouchdb get`: attachment bytes are re-keyed by digest and document counts are computed (tracked by a `schema` field in the metadata record). Revision trees stay in the old nested format until each document is next written, then are rewritten flat; both formats are readable.
-- **Downgrade is not supported.** After the first 0.5 open, 0.4 may no longer read the file's attachments (digest-keyed), and once a 0.5 build has written a document, 0.4 cannot read its (flat) revision record. **Back up the `.redb` file before opening it with 0.5** if you may need to go back. (#12)
-- Files written by a newer rouchdb (higher `schema`) are refused with a clear error and left untouched. (#18)
+0.4 and 0.5 cannot share a file: 0.4 does not understand the flat document records, digest-keyed attachments and local-document layout 0.5 writes, and before this release it would treat such documents as missing and **replace their whole history on its next write**. So:
+
+- **0.5 refuses 0.4 files unless told to upgrade them.** `RedbAdapter::open` / `Database::open` return `RouchError::UpgradeRequired` for a file written by rouchdb ≤ 0.4, and the file is not modified. This applies to every open, including `rouchdb info` and `rouchdb-server` (which print how to upgrade).
+- **Upgrade once, with a backup:** `rouchdb migrate app.redb` (or `RedbAdapter::upgrade(path, UpgradePolicy::WithBackup(None))`, or `open_with` with that policy). The backup is written first to `app.redb.rouchdb-0.4.bak` (or `--backup <path>`): every table is copied from one read transaction, committed, reopened and compared entry by entry with the original, synced, then renamed into place; it opens in 0.4 exactly like the original. The upgrade is refused if the backup path already exists, and any failure removes the partial copy. `--no-backup` / `UpgradePolicy::InPlaceNoBackup` skip it; `--dry-run` / `RedbAdapter::inspect_upgrade` report without changing anything. No free-space check is made beforehand: running out of space fails the backup or the upgrade, which then leaves the file as it was.
+- **The upgrade is one atomic transaction** (two-phase commit): an error at any point leaves the file exactly as it was (and removes the backup made for that attempt, which is then redundant). It re-keys attachment bytes by digest, counts the documents, **moves `_local/…` documents that 0.4 stored as ordinary documents** (written through `put`/`bulk_docs`) to the local document store where 0.5 looks for them (latest body kept, revision `0-N` with `N` its generation; deleted ones dropped), **rewrites revision ids stored in upper-case hex** (accepted by 0.4 through `new_edits: false`) in lower case so 0.5 can address them, moves the metadata to a new `rouchdb_meta` table, and installs the format guard. Revision trees stay in the old nested format until each document is next written; both formats are readable.
+- **It prints (and `UpgradeReport` holds) what it found**: live/deleted documents, attachment entries re-keyed, `_local/` documents moved, revisions normalized, attachment references whose bytes 0.4 had already lost (0.4 kept one copy per document and name, so re-attaching a name overwrote the bytes of older revisions), old revision bodies, and documents whose attachment bytes only old revisions reference.
+- **A record the upgrade cannot decode stops it** with an error naming the document or revision (nothing is skipped and nothing is changed): repair or remove that record with 0.4, then retry. Likewise a `_local/x` document that collides with a local document `x` written by `put_local`, or a revision stored in both upper and lower case.
+- **The format guard: 0.4 refuses 0.5 files.** The `metadata` table of every file written by 0.5 (new, upgraded, or destroyed and reused) has a value type named `rouchdb-format-2 (this file requires rouchdb >= 0.5)`. rouchdb 0.1–0.4 fail in `open` with `metadata is of type Table<&str, rouchdb-format-2 (this file requires rouchdb >= 0.5)>` and write nothing. **Downgrade is not supported**: keep the backup if you may need 0.4.
+- **The first `compact()` after upgrading deletes old data.** 0.4's `compact` did nothing; 0.5 keeps only leaf revision bodies and the attachment bytes they reference. The first compaction therefore permanently deletes every old revision body and the attachment bytes only old revisions reference (often attachments 0.4 dropped from a document whose body was updated without them). Check the upgrade report (and keep the backup) before compacting.
+- Files written by unreleased 0.5 development builds (metadata `schema` 1 or 2 without the guard) are finished upgrading automatically on open, keeping their security document. Files written by a newer rouchdb are refused with a clear error and left untouched, as are redb files rouchdb did not create.
 - Attachments stored by 0.4 read back with `revpos` 0. (#21)
-- Bodies of stemmed revisions left by older versions are ignored and removed by the next `compact()`. Bodies deeper than 1000 levels written by older versions (unreadable before) give a clear error. Revisions stored in upper-case hex through `new_edits: false` stay as stored but can no longer be addressed by id (CouchDB and PouchDB never produce them). (#18)
+- Bodies of stemmed revisions left by older versions are ignored and removed by the next `compact()`. Bodies deeper than 1000 levels written by older versions (unreadable before) give a clear error. (#18)
+- `rouchdb-adapter-redb` now requires redb ≥ 2.3 (two-phase commit).
 
 ---
 

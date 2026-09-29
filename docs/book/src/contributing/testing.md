@@ -290,6 +290,10 @@ A test must be able to fail. In particular:
 - Check the preconditions a test relies on (for example, which revision of a conflict wins) and that a rejected write left the database unchanged (same `update_seq`, same revision).
 - Do not accept every outcome (`assert!(r.is_ok() || r.is_err())`, `match` arms that all do nothing). Assert the behavior CouchDB has, and verify it against a real CouchDB when in doubt.
 
+## On-Disk Compatibility Tests
+
+`crates/rouchdb-compat-tests` (never published) links the rouchdb 0.4.0 release from crates.io next to this version. Its tests write realistic data with 0.4, then check that 0.5 refuses the file without changing it, that the upgrade keeps every document, revision body, attachment and local document, that the backup is identical to the original, and that 0.4 refuses upgraded and newly created files without writing to them. They run with the unit tests (`cargo test --workspace`). Any change to the redb on-disk format must keep them passing, and should add a scenario there.
+
 ## Benchmarks
 
 Criterion benchmarks live in the `rouchdb-bench` crate:

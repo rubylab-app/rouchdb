@@ -13,7 +13,8 @@ use rouchdb::Database;
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `memory` | `fn memory(name: &str) -> Self` | Create an in-memory database. Data is lost when the `Database` is dropped. Useful for testing. |
-| `open` | `fn open(path: impl AsRef<Path>, name: &str) -> Result<Self>` | Open or create a persistent database backed by [redb](https://github.com/cberner/redb). Returns an error if the file cannot be opened or created. |
+| `open` | `fn open(path: impl AsRef<Path>, name: &str) -> Result<Self>` | Open or create a persistent database backed by [redb](https://github.com/cberner/redb). Returns an error if the file cannot be opened or created, and `RouchError::UpgradeRequired` (without modifying it) for a file written by rouchdb 0.4 or earlier. |
+| `open_with` | `fn open_with(path: impl AsRef<Path>, name: &str, options: OpenOptions) -> Result<Self>` | Like `open`; `OpenOptions::new().upgrade(UpgradePolicy::WithBackup(None))` upgrades a 0.4 file after writing a verified backup (see [Migrating from 0.4 to 0.5](../upgrading/0.4-to-0.5.md#redb-files-upgrade-once-explicitly)). |
 | `http` | `fn http(url: &str) -> Self` | Connect to a remote CouchDB-compatible server. The URL should include the database name (e.g., `http://localhost:5984/mydb`). |
 | `http_with_auth` | `fn http_with_auth(url: &str, auth: &AuthClient) -> Self` | Connect to CouchDB with cookie authentication. The `AuthClient` must have been logged in via `auth.login()` first. |
 | `from_adapter` | `fn from_adapter(adapter: Arc<dyn Adapter>) -> Self` | Create a `Database` from any custom adapter implementation. Use this when you need to provide your own storage backend. |
