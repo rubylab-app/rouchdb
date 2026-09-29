@@ -23,6 +23,8 @@ const IDS: &[&str] = &[
     "users:c",
     "users:\u{e9}",
     "users:\u{1F600}",
+    "users:\u{10FFFF}",
+    "users:\u{10FFFF}z",
     "users;",
     "usersX:1",
     "users_:1",
@@ -137,13 +139,6 @@ fn range_queries() -> Vec<AllDocsOptions> {
     for (start_key, end_key) in bounds {
         for descending in [false, true] {
             for inclusive_end in [true, false] {
-                // Known bug: when descending, an exclusive end bound that
-                // falls outside the partition drops the `users:` document
-                // (see blocked_on_q_api_1_partition_all_docs_edge_ids).
-                let end_outside = end_key.as_deref().is_none_or(|e| e < PREFIX);
-                if descending && !inclusive_end && end_outside {
-                    continue;
-                }
                 for (i, (skip, limit)) in paging.into_iter().enumerate() {
                     queries.push(AllDocsOptions {
                         start_key: start_key.clone(),
@@ -176,6 +171,8 @@ async fn partition_all_docs_equals_the_filtered_database_query() {
                 "{}: {opts:?}",
                 b.name
             );
+            // The local adapters report the skip that was applied.
+            assert_eq!(got.offset, opts.skip, "{}: {opts:?}", b.name);
         }
     }
 }
@@ -252,8 +249,7 @@ async fn partition_all_docs_by_key_stays_in_the_partition() {
 /// Every document of the partition is listed, whatever its id, and an
 /// exclusive end is only applied to the caller's own end key.
 #[tokio::test]
-#[ignore = "blocked on Q-API-1: partition bounds drop edge ids"]
-async fn blocked_on_q_api_1_partition_all_docs_edge_ids() {
+async fn partition_all_docs_edge_ids() {
     for b in backends("partition") {
         let edge = ["users:", "users:a", "users:\u{10FFFF}", "users:\u{10FFFF}z"];
         for id in edge.iter().chain(&["users9", "users;"]) {

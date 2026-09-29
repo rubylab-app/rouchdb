@@ -1231,6 +1231,49 @@ fn doc_result_error(result: DocResult) -> RouchError {
     }
 }
 
+/// Restrict an `all_docs` range query to a partition, whose ids are, in id
+/// (byte) order, exactly those in `[prefix, after)` (`after` is the prefix
+/// with its final `:` bumped to `;`).
+///
+/// A bound outside the partition is replaced by the partition's own, with
+/// the inclusiveness that bound needs: `inclusive_end` stays the caller's
+/// only while the end key is the caller's.
+///
+/// Descending, the upper bound is the start key, which is always inclusive,
+/// so a document whose id is `after` itself comes first. The query then
+/// asks for one row more without skipping and returns the caller's
+/// `(skip, limit)`, to apply once the rows outside the partition are gone.
+fn clamp_to_partition(
+    opts: &mut AllDocsOptions,
+    prefix: &str,
+    after: &str,
+) -> Option<(u64, Option<u64>)> {
+    let mut page = None;
+    if opts.descending {
+        if !opts.start_key.as_deref().is_some_and(|k| k < after) {
+            opts.start_key = Some(after.to_string());
+            page = Some((opts.skip, opts.limit));
+            opts.limit = opts
+                .limit
+                .map(|l| l.saturating_add(opts.skip).saturating_add(1));
+            opts.skip = 0;
+        }
+        if !opts.end_key.as_deref().is_some_and(|k| k >= prefix) {
+            opts.end_key = Some(prefix.to_string());
+            opts.inclusive_end = true;
+        }
+    } else {
+        if !opts.start_key.as_deref().is_some_and(|k| k >= prefix) {
+            opts.start_key = Some(prefix.to_string());
+        }
+        if !opts.end_key.as_deref().is_some_and(|k| k < after) {
+            opts.end_key = Some(after.to_string());
+            opts.inclusive_end = false;
+        }
+    }
+    page
+}
+
 /// Escape regex metacharacters in a string for safe use in a regex pattern.
 fn regex_escape(s: &str) -> String {
     let mut escaped = String::with_capacity(s.len() * 2);
@@ -1253,9 +1296,6 @@ impl Partition<'_> {
     /// return no rows.
     pub async fn all_docs(&self, mut opts: AllDocsOptions) -> Result<AllDocsResponse> {
         let prefix = format!("{}:", self.name);
-        // Every id of the partition sorts between these (byte order).
-        let first = prefix.clone();
-        let last = format!("{}:{}", self.name, char::MAX);
 
         if let Some(ref mut keys) = opts.keys {
             keys.retain(|k| k.starts_with(&prefix));
@@ -1264,18 +1304,24 @@ impl Partition<'_> {
             opts.key = None;
             opts.keys = Some(Vec::new());
         }
-
-        // The start key is the upper bound when descending.
-        let (low, high) = if opts.descending {
-            (&mut opts.end_key, &mut opts.start_key)
+        let page = if opts.key.is_none() && opts.keys.is_none() {
+            clamp_to_partition(&mut opts, &prefix, &format!("{};", self.name))
         } else {
-            (&mut opts.start_key, &mut opts.end_key)
+            None
         };
-        *low = Some(low.take().map_or(first.clone(), |k| k.max(first)));
-        *high = Some(high.take().map_or(last.clone(), |k| k.min(last)));
 
         let mut response = self.db.all_docs(opts).await?;
         response.rows.retain(|row| row.id.starts_with(&prefix));
+        if let Some((skip, limit)) = page {
+            let limit = limit.map_or(usize::MAX, |l| l as usize);
+            response.rows = response
+                .rows
+                .into_iter()
+                .skip(skip as usize)
+                .take(limit)
+                .collect();
+            response.offset = response.offset.saturating_add(skip);
+        }
         Ok(response)
     }
 
