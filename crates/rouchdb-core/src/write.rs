@@ -141,6 +141,8 @@ pub fn plan_new_edit(
         _ => {}
     }
 
+    let new_pos = parent.as_ref().map(|r| r.pos + 1).unwrap_or(1);
+
     // Resolve the final attachment set before hashing, so the revision id
     // covers the attachments.
     let empty = HashMap::new();
@@ -154,9 +156,14 @@ pub fn plan_new_edit(
     } else {
         for (name, mut meta) in doc.attachments {
             if let Some(bytes) = meta.data.take() {
+                // New data: uploaded by this revision (CouchDB sets revpos
+                // even when the bytes equal the stored ones).
                 meta.digest = crate::document::attachment_digest(&bytes);
                 meta.length = bytes.len() as u64;
                 meta.stub = true;
+                meta.revpos = new_pos;
+                meta.encoding = None;
+                meta.encoded_length = None;
                 new_blobs.push((meta.digest.clone(), bytes));
                 attachments.insert(name, meta);
             } else {
@@ -180,7 +187,6 @@ pub fn plan_new_edit(
     }
 
     let parent_str = parent.as_ref().map(|r| r.to_string());
-    let new_pos = parent.as_ref().map(|r| r.pos + 1).unwrap_or(1);
     let new_hash = generate_rev_hash(&doc.data, doc.deleted, parent_str.as_deref(), &attachments);
     let rev = Revision::new(new_pos, new_hash.clone());
 
@@ -285,6 +291,8 @@ pub fn plan_replicated_edit(
     let mut attachments = HashMap::new();
     let mut new_blobs = Vec::new();
     let mut required_blobs = Vec::new();
+    // A replicated revision keeps the revpos (and, for stubs, the encoding)
+    // it was sent with.
     for (name, mut meta) in doc.attachments {
         if let Some(bytes) = meta.data.take() {
             meta.digest = crate::document::attachment_digest(&bytes);
@@ -468,13 +476,7 @@ mod tests {
     }
 
     fn inline(bytes: &[u8]) -> AttachmentMeta {
-        AttachmentMeta {
-            content_type: "text/plain".into(),
-            digest: String::new(),
-            length: 0,
-            stub: false,
-            data: Some(bytes.to_vec()),
-        }
+        AttachmentMeta::new("text/plain", bytes.to_vec())
     }
 
     fn write(tree: Option<&RevTree>, d: Document) -> PlannedWrite {
@@ -813,6 +815,90 @@ mod tests {
     }
 
     #[test]
+    fn revpos_is_the_generation_that_uploaded_the_data() {
+        // CouchDB 3.5.1: data sent with a write (even bytes identical to the
+        // stored ones) gets the new revision's generation; stubs and
+        // inherited attachments keep the revpos they had.
+        let mut d = doc("d", None, serde_json::json!({}));
+        d.attachments.insert("a".into(), inline(b"AAA"));
+        let w1 = write(None, d);
+        assert_eq!(w1.attachments["a"].revpos, 1);
+
+        let w2 = plan_new_edit(
+            Some(&w1.tree),
+            doc("d", Some(&w1.rev.to_string()), serde_json::json!({"v": 2})),
+            Some(&w1.attachments),
+            true,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(w2.attachments["a"].revpos, 1);
+
+        let mut d3 = doc("d", Some(&w2.rev.to_string()), serde_json::json!({}));
+        d3.attachments.insert(
+            "a".into(),
+            AttachmentMeta {
+                stub: true,
+                revpos: 9,
+                ..AttachmentMeta::default()
+            },
+        );
+        d3.attachments.insert("b".into(), inline(b"BBB"));
+        let w3 = plan_new_edit(Some(&w2.tree), d3, Some(&w2.attachments), true, 1000).unwrap();
+        assert_eq!(
+            (w3.attachments["a"].revpos, w3.attachments["b"].revpos),
+            (1, 3)
+        );
+
+        let mut d4 = doc("d", Some(&w3.rev.to_string()), serde_json::json!({}));
+        let mut same = inline(b"AAA");
+        same.revpos = 1; // an incoming revpos does not count for new data
+        d4.attachments.insert("a".into(), same);
+        d4.attachments.insert(
+            "b".into(),
+            AttachmentMeta {
+                stub: true,
+                ..AttachmentMeta::default()
+            },
+        );
+        let w4 = plan_new_edit(Some(&w3.tree), d4, Some(&w3.attachments), true, 1000).unwrap();
+        assert_eq!(
+            (w4.attachments["a"].revpos, w4.attachments["b"].revpos),
+            (4, 3)
+        );
+        assert_eq!(w4.attachments["a"].digest, w1.attachments["a"].digest);
+    }
+
+    #[test]
+    fn replicated_attachments_keep_revpos_and_encoding() {
+        let mut d = doc(
+            "d",
+            Some("3-c"),
+            serde_json::json!({"_revisions": {"start": 3, "ids": ["c", "b", "a"]}}),
+        );
+        let mut data = inline(b"AAA");
+        data.revpos = 2;
+        d.attachments.insert("a".into(), data);
+        // A stub as CouchDB lists it with `att_encoding_info=true`.
+        let stub = AttachmentMeta {
+            content_type: "text/plain".into(),
+            revpos: 1,
+            digest: "md5-Ew9RIaBldynHDFVo1PvkrA==".into(),
+            length: 2400,
+            stub: true,
+            encoding: Some("gzip".into()),
+            encoded_length: Some(52),
+            data: None,
+        };
+        d.attachments.insert("s".into(), stub.clone());
+        let ReplicatedWrite::Write(w) = plan_replicated_edit(None, d, false, 1000).unwrap() else {
+            panic!("a new revision must be written");
+        };
+        assert_eq!(w.attachments["a"].revpos, 2);
+        assert_eq!(json(&w.attachments["s"]), json(&stub));
+    }
+
+    #[test]
     fn unknown_stub_is_missing_stub() {
         let w1 = write(None, doc("d", None, serde_json::json!({})));
         let mut d = doc("d", Some(&w1.rev.to_string()), serde_json::json!({}));
@@ -824,6 +910,7 @@ mod tests {
                 length: 3,
                 stub: true,
                 data: None,
+                ..Default::default()
             },
         );
         let err = plan_new_edit(Some(&w1.tree), d, Some(&HashMap::new()), true, 1000).unwrap_err();
@@ -912,6 +999,7 @@ mod tests {
             length: 99,
             stub: true,
             data: None,
+            ..Default::default()
         };
         // Same name, other (or no) digest: the parent's attachment is kept.
         for digest in ["md5-other", ""] {

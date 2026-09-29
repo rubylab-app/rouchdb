@@ -214,7 +214,7 @@ async fn all_docs_conflicts_lists_losing_revisions() {
             .await
             .unwrap();
         assert_eq!(row_ids(&result), ["doc1", "doc2"], "{}", b.name);
-        assert_eq!(result.rows[0].value.rev, winner, "{}", b.name);
+        assert_eq!(result.rows[0].rev().unwrap(), winner, "{}", b.name);
         let doc1 = result.rows[0].doc.as_ref().unwrap();
         assert_eq!(doc1["v"], "remote", "{}", b.name);
         assert_eq!(doc1["_conflicts"], serde_json::json!([loser]), "{}", b.name);
@@ -347,6 +347,7 @@ async fn document_json_roundtrip_is_lossless() {
         length: HELLO.len() as u64,
         stub,
         data: (!stub).then(|| HELLO.to_vec()),
+        ..Default::default()
     };
     let docs = [
         Document {
@@ -620,7 +621,7 @@ async fn security_document_roundtrip_and_overwrite() {
 // =========================================================================
 
 #[tokio::test]
-async fn post_generates_uuid_v4_ids() {
+async fn post_generates_uuid_v4_ids_as_32_hex_digits() {
     for b in backends("test") {
         let db = &b.db;
         let mut ids = Vec::new();
@@ -630,6 +631,8 @@ async fn post_generates_uuid_v4_ids() {
             let uuid = uuid::Uuid::parse_str(&r.id)
                 .unwrap_or_else(|e| panic!("{}: {} is not a UUID: {e}", b.name, r.id));
             assert_eq!(uuid.get_version_num(), 4, "{}: {}", b.name, r.id);
+            // Like CouchDB's generated ids: no hyphens.
+            assert_eq!(r.id, uuid.simple().to_string(), "{}", b.name);
             assert!(!ids.contains(&r.id), "{}: duplicate id {}", b.name, r.id);
             assert_eq!(db.get(&r.id).await.unwrap().data["i"], i);
             ids.push(r.id);

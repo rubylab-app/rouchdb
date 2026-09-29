@@ -150,27 +150,12 @@ struct CouchDbAllDocsResponse {
     total_rows: u64,
     // CouchDB sends `"offset": null` when `keys` are posted.
     offset: Option<u64>,
-    rows: Vec<CouchDbAllDocsRow>,
+    /// When `keys` are posted, keys that do not exist come back as
+    /// `{"key": "x", "error": "not_found"}` rows, which `AllDocsRow` keeps.
+    rows: Vec<AllDocsRow>,
     /// Present when `update_seq=true` was requested.
     #[serde(default)]
     update_seq: Option<serde_json::Value>,
-}
-
-/// A row of `_all_docs`. When `keys` are posted, keys that do not exist come
-/// back as `{"key": "x", "error": "not_found"}` with no `id` or `value`.
-#[derive(Debug, Deserialize)]
-struct CouchDbAllDocsRow {
-    id: Option<String>,
-    key: String,
-    value: Option<CouchDbAllDocsRowValue>,
-    doc: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CouchDbAllDocsRowValue {
-    rev: String,
-    #[serde(default)]
-    deleted: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -476,33 +461,73 @@ impl Adapter for HttpAdapter {
         opts: BulkDocsOptions,
     ) -> Result<Vec<DocResult>> {
         self.ensure_setup().await?;
-        let json_docs: Vec<serde_json::Value> = docs.iter().map(|d| d.to_json()).collect();
+        // A document nested deeper than rouchdb stores them is rejected on
+        // its own, as the local adapters do: CouchDB would accept it, but
+        // it could not be read back.
+        let mut rejected: Vec<Option<DocResult>> = Vec::with_capacity(docs.len());
+        let mut json_docs = Vec::with_capacity(docs.len());
+        for doc in &docs {
+            match rouchdb_core::json::check_document_depth(&doc.data) {
+                Ok(()) => {
+                    rejected.push(None);
+                    let mut json = doc.to_json();
+                    // Without an id the server generates one.
+                    if doc.id.is_empty()
+                        && let Some(obj) = json.as_object_mut()
+                    {
+                        obj.remove("_id");
+                    }
+                    json_docs.push(json);
+                }
+                Err(e) => {
+                    let reason = match e {
+                        RouchError::BadRequest(reason) => reason,
+                        other => other.to_string(),
+                    };
+                    rejected.push(Some(rouchdb_core::write::error_result(
+                        &doc.id,
+                        "bad_request",
+                        &reason,
+                    )));
+                }
+            }
+        }
 
-        let request = CouchDbBulkDocsRequest {
-            docs: json_docs,
-            new_edits: if opts.new_edits { None } else { Some(false) },
+        let results: Vec<CouchDbBulkDocsResult> = if json_docs.is_empty() {
+            Vec::new()
+        } else {
+            let request = CouchDbBulkDocsRequest {
+                docs: json_docs,
+                new_edits: if opts.new_edits { None } else { Some(false) },
+            };
+            let resp = self
+                .client
+                .post(self.url("_bulk_docs"))
+                .json(&request)
+                .send()
+                .await
+                .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+            let resp = self.check_error(resp).await?;
+            read_json(resp).await?
         };
+        let mut results = results.into_iter().map(|r| DocResult {
+            ok: r.ok.unwrap_or(r.error.is_none()),
+            id: r.id.unwrap_or_default(),
+            rev: r.rev,
+            error: r.error,
+            reason: r.reason,
+        });
 
-        let resp = self
-            .client
-            .post(self.url("_bulk_docs"))
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
-        let resp = self.check_error(resp).await?;
-
-        let results: Vec<CouchDbBulkDocsResult> = read_json(resp).await?;
-
-        Ok(results
+        if !opts.new_edits {
+            // CouchDB lists only the documents it could not write.
+            let mut failed: Vec<DocResult> = rejected.into_iter().flatten().collect();
+            failed.extend(results);
+            return Ok(failed);
+        }
+        // One result per document, in order.
+        Ok(rejected
             .into_iter()
-            .map(|r| DocResult {
-                ok: r.ok.unwrap_or(r.error.is_none()),
-                id: r.id.unwrap_or_default(),
-                rev: r.rev,
-                error: r.error,
-                reason: r.reason,
-            })
+            .filter_map(|r| r.or_else(|| results.next()))
             .collect())
     }
 
@@ -563,23 +588,7 @@ impl Adapter for HttpAdapter {
         Ok(AllDocsResponse {
             total_rows: result.total_rows,
             offset: result.offset.unwrap_or(0),
-            // Skip `not_found` rows for missing keys, like the local adapters.
-            rows: result
-                .rows
-                .into_iter()
-                .filter_map(|r| {
-                    let (id, value) = (r.id?, r.value?);
-                    Some(AllDocsRow {
-                        id,
-                        key: r.key,
-                        value: AllDocsRowValue {
-                            rev: value.rev,
-                            deleted: value.deleted,
-                        },
-                        doc: r.doc,
-                    })
-                })
-                .collect(),
+            rows: result.rows,
             update_seq: result.update_seq.as_ref().map(parse_seq),
         })
     }
@@ -851,6 +860,7 @@ impl Adapter for HttpAdapter {
     }
 
     async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
+        rouchdb_core::json::check_document_depth(&doc)?;
         self.ensure_setup().await?;
         let url = self.url(&format!("_local/{}", urlencoded(id)));
         let resp = self
@@ -1516,6 +1526,30 @@ mod tests {
         assert_eq!(doc["v"], 1);
     }
 
+    /// A document without an id is sent without `_id`, so the server
+    /// generates one, as the local adapters do (CouchDB rejects `"_id": ""`).
+    #[tokio::test]
+    async fn bulk_docs_leaves_missing_ids_to_the_server() {
+        use rouchdb_core::document::{BulkDocsOptions, Document};
+        let (url, requests) = scripted_server(vec![(
+            "201 Created",
+            r#"[{"ok":true,"id":"39957e80528575124dadd8d248004e77","rev":"1-a"},{"ok":true,"id":"x","rev":"1-b"}]"#.into(),
+        )])
+        .await;
+        let docs = vec![
+            Document::from_json(serde_json::json!({"v": 1})).unwrap(),
+            Document::from_json(serde_json::json!({"_id": "x"})).unwrap(),
+        ];
+        assert_eq!(docs[0].id, "");
+        let results = adapter_at(&url)
+            .bulk_docs(docs, BulkDocsOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(results[0].id, "39957e80528575124dadd8d248004e77");
+        let body = only_request(&requests).json();
+        assert_eq!(body["docs"], serde_json::json!([{"v": 1}, {"_id": "x"}]));
+    }
+
     #[tokio::test]
     async fn bulk_docs_with_new_edits_reports_each_doc() {
         use rouchdb_core::document::{BulkDocsOptions, Document};
@@ -1547,6 +1581,102 @@ mod tests {
                 (false, "x", Some("1-b"), Some("conflict")),
             ]
         );
+    }
+
+    /// `{"_id": id, "v": [[...[1]...]]}`, `depth` containers deep.
+    fn nested_doc(id: &str, depth: usize) -> rouchdb_core::document::Document {
+        let mut v = serde_json::json!(1);
+        for _ in 1..depth {
+            v = serde_json::Value::Array(vec![v]);
+        }
+        rouchdb_core::document::Document::from_json(serde_json::json!({"_id": id, "v": v})).unwrap()
+    }
+
+    /// Like the local adapters, a document nested deeper than rouchdb stores
+    /// them is rejected on its own (CouchDB would store it, but rouchdb
+    /// could not read it back); the others are written.
+    #[tokio::test]
+    async fn bulk_docs_rejects_too_deep_documents_like_local_adapters() {
+        use super::MAX_NESTING_DEPTH;
+        use rouchdb_core::document::BulkDocsOptions;
+        let (url, requests) = scripted_server(vec![
+            (
+                "201 Created",
+                r#"[{"ok":true,"id":"a","rev":"1-a"},{"ok":true,"id":"c","rev":"1-c"}]"#.into(),
+            ),
+            ("201 Created", "[]".into()),
+        ])
+        .await;
+        let db = adapter_at(&url);
+        let docs = vec![
+            nested_doc("a", MAX_NESTING_DEPTH),
+            nested_doc("b", MAX_NESTING_DEPTH + 1),
+            nested_doc("c", 1),
+        ];
+        let results = db.bulk_docs(docs, BulkDocsOptions::new()).await.unwrap();
+        let reason = format!("Document nesting exceeds the maximum depth of {MAX_NESTING_DEPTH}");
+        let summary: Vec<_> = results
+            .iter()
+            .map(|r| (r.ok, r.id.as_str(), r.error.as_deref(), r.reason.as_deref()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (true, "a", None, None),
+                (false, "b", Some("bad_request"), Some(reason.as_str())),
+                (true, "c", None, None),
+            ]
+        );
+
+        // Replication mode: CouchDB lists only failures.
+        let mut too_deep = nested_doc("r", MAX_NESTING_DEPTH + 1);
+        too_deep.rev = Some("1-abc".parse().unwrap());
+        let results = db
+            .bulk_docs(
+                vec![too_deep, replicated_doc()],
+                BulkDocsOptions::replication(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(
+            (results[0].id.as_str(), results[0].error.as_deref()),
+            ("r", Some("bad_request"))
+        );
+
+        // One request per call, without the rejected documents; a call
+        // with nothing left to write sends none.
+        let only_deep = vec![nested_doc("b", MAX_NESTING_DEPTH + 1)];
+        let results = db
+            .bulk_docs(only_deep, BulkDocsOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].ok);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let ids = |i: usize| -> Vec<String> {
+            let body: serde_json::Value =
+                rouchdb_core::json::from_slice(&requests[i].body, usize::MAX).unwrap();
+            body["docs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(ids(0), ["a", "c"]);
+        assert_eq!(ids(1), ["d"]);
+    }
+
+    #[tokio::test]
+    async fn put_local_rejects_too_deep_documents() {
+        use super::MAX_NESTING_DEPTH;
+        let (url, requests) = scripted_server(vec![]).await;
+        let deep = nested_doc("x", MAX_NESTING_DEPTH + 1).data;
+        let err = adapter_at(&url).put_local("cp", deep).await.unwrap_err();
+        assert!(matches!(err, RouchError::BadRequest(_)), "{err:?}");
+        assert!(requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1653,6 +1783,38 @@ mod tests {
         );
         assert_eq!(requests[2].line(), "POST /db/_all_docs");
         assert_eq!(requests[2].json(), serde_json::json!({"keys": ["a", "b"]}));
+    }
+
+    #[tokio::test]
+    async fn all_docs_keys_keeps_error_and_deleted_rows() {
+        use rouchdb_core::document::{AllDocsOptions, AllDocsRow};
+        // Verbatim CouchDB 3.5.1 reply to `POST _all_docs?include_docs=true`
+        // with `{"keys": ["a", "b", "zz"]}` where `b` is deleted: every key
+        // gets a row, in order, so `keys[i]` matches `rows[i]`.
+        let reply = r#"{"total_rows":2,"offset":null,"rows":[
+            {"id":"a","key":"a","value":{"rev":"1-7a7e4b29f3af401e69b6f86e4c26b727"},"doc":{"_id":"a","_rev":"1-7a7e4b29f3af401e69b6f86e4c26b727","v":1}},
+            {"id":"b","key":"b","value":{"rev":"2-cc42f3106b98bc7ad82f91bf2382e1df","deleted":true},"doc":null},
+            {"key":"zz","error":"not_found"}
+        ]}"#;
+        let (url, _) = scripted_server(vec![("200 OK", reply.into())]).await;
+        let res = adapter_at(&url)
+            .all_docs(AllDocsOptions {
+                keys: Some(vec!["a".into(), "b".into(), "zz".into()]),
+                include_docs: true,
+                ..AllDocsOptions::new()
+            })
+            .await
+            .unwrap();
+        let keys: Vec<&str> = res.rows.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, ["a", "b", "zz"]);
+        assert_eq!(
+            res.rows[0].rev(),
+            Some("1-7a7e4b29f3af401e69b6f86e4c26b727")
+        );
+        assert_eq!(res.rows[0].doc.as_ref().unwrap()["v"], 1);
+        assert!(res.rows[1].is_deleted() && res.rows[1].doc.is_none());
+        assert_eq!(res.rows[2], AllDocsRow::not_found("zz"));
+        assert_eq!((res.total_rows, res.offset), (2, 0));
     }
 
     #[tokio::test]

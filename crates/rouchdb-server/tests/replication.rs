@@ -360,8 +360,8 @@ async fn assert_same_docs(a: &Database, b: &Database) {
         rows.iter()
             .map(|r| {
                 (
-                    r.id.clone(),
-                    r.value.rev.clone(),
+                    r.key.clone(),
+                    r.rev().unwrap().to_string(),
                     r.doc.clone().unwrap()["n"].clone(),
                 )
             })

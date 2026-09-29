@@ -191,9 +191,12 @@ Metadata for a document attachment.
 ```rust
 pub struct AttachmentMeta {
     pub content_type: String,
+    pub revpos: u64,
     pub digest: String,
     pub length: u64,
     pub stub: bool,
+    pub encoding: Option<String>,
+    pub encoded_length: Option<u64>,
     pub data: Option<Vec<u8>>,
 }
 ```
@@ -201,10 +204,15 @@ pub struct AttachmentMeta {
 | Field | Type | Description |
 |-------|------|-------------|
 | `content_type` | `String` | MIME type (e.g., `"image/png"`). |
+| `revpos` | `u64` | Generation of the revision that uploaded the data (CouchDB's `revpos`). A write that sends the data (inline or with `put_attachment`) sets it to the new generation, even for identical bytes; stubs, body edits and replication keep it. `0` when unknown (stored before 0.5), and then omitted from the JSON. |
 | `digest` | `String` | Content digest for deduplication. |
 | `length` | `u64` | Size in bytes. |
 | `stub` | `bool` | If `true`, only metadata is present (no inline data). Defaults to `false`. |
+| `encoding` | `Option<String>` | How the source stores the bytes (CouchDB reports `"gzip"` with `att_encoding_info=true`). Kept from stubs only: rouchdb stores and serves decoded bytes. |
+| `encoded_length` | `Option<u64>` | Size of the encoded bytes at the source. |
 | `data` | `Option<Vec<u8>>` | Inline binary data, if available. Omitted from serialization when `None`. |
+
+`AttachmentMeta` implements `Default`; `AttachmentMeta::new(content_type, bytes)` builds an inline attachment (digest and length computed), and `meta.to_json(data)` gives the CouchDB `_attachments` member (inline with `data`, a stub otherwise).
 
 ---
 
@@ -304,9 +312,9 @@ pub struct BulkDocsOptions {
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `new_edits` | `bool` | `true` (via `BulkDocsOptions::new()`) | When `true`, the adapter generates new revisions and checks for conflicts. When `false` (replication mode), revisions are accepted as-is and merged into the revision tree. |
+| `new_edits` | `bool` | `true` | When `true`, the adapter generates new revisions and checks for conflicts. When `false` (replication mode), revisions are accepted as-is and merged into the revision tree. |
 
-**Note:** The `Default` trait implementation sets `new_edits` to `false`. Use `BulkDocsOptions::new()` for user-mode writes (which sets `new_edits: true`) and `BulkDocsOptions::replication()` for replication-mode writes (which sets `new_edits: false`).
+`BulkDocsOptions::default()` is the same as `BulkDocsOptions::new()` (user-mode writes, `new_edits: true`); replication mode must be requested explicitly with `BulkDocsOptions::replication()`. (Before 0.5, `Default` meant replication mode.)
 
 | Constructor | `new_edits` Value | Use Case |
 |-------------|-------------------|----------|
@@ -345,11 +353,11 @@ pub struct AllDocsOptions {
 | `descending` | `bool` | `false` | Return rows in descending key order. |
 | `skip` | `u64` | `0` | Number of rows to skip before returning results. |
 | `limit` | `Option<u64>` | `None` | Maximum number of rows to return. |
-| `inclusive_end` | `bool` | `true` (via `AllDocsOptions::new()`) | Whether the `end_key` is included in the range. |
+| `inclusive_end` | `bool` | `true` | Whether the `end_key` is included in the range. |
 | `conflicts` | `bool` | `false` | Include `_conflicts` for each document (requires `include_docs`). |
 | `update_seq` | `bool` | `false` | Include the current `update_seq` in the response. |
 
-**Note:** Use `AllDocsOptions::new()` instead of `Default::default()` to get `inclusive_end: true`, which matches CouchDB's default behavior.
+`AllDocsOptions::default()` is the same as `AllDocsOptions::new()`: `inclusive_end: true`, like CouchDB. (Before 0.5, `Default` set `inclusive_end: false`.)
 
 ---
 
@@ -447,9 +455,9 @@ pub struct ViewQueryOptions {
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `key` | `Option<serde_json::Value>` | `None` | Return only rows with this exact key. |
-| `keys` | `Option<Vec<serde_json::Value>>` | `None` | Return only rows matching any of these keys, in the given order. |
-| `start_key` | `Option<serde_json::Value>` | `None` | Start of key range (inclusive). |
+| `key` | `Option<serde_json::Value>` | `None` | Return only rows with this exact key (with `start_key` or `end_key`, the other bound of the range). |
+| `keys` | `Option<Vec<serde_json::Value>>` | `None` | Return only rows matching any of these keys, in the given order. Several keys exclude `key`, `start_key` and `end_key`. |
+| `start_key` | `Option<serde_json::Value>` | `None` | Start of key range (inclusive). A range no row can be in is a `BadRequest`. |
 | `end_key` | `Option<serde_json::Value>` | `None` | End of key range (inclusive by default). |
 | `inclusive_end` | `bool` | `true` (via `ViewQueryOptions::new()`) | Whether the `end_key` is included in the range. |
 | `descending` | `bool` | `false` | Reverse row order. |
@@ -457,8 +465,8 @@ pub struct ViewQueryOptions {
 | `limit` | `Option<u64>` | `None` | Maximum number of rows to return. |
 | `include_docs` | `bool` | `false` | Include full document body in each row. |
 | `reduce` | `bool` | `false` | Whether to run the reduce function. |
-| `group` | `bool` | `false` | Group results by key (requires `reduce: true`). |
-| `group_level` | `Option<u64>` | `None` | Group to this many array elements of the key (requires `reduce: true`). |
+| `group` | `bool` | `false` | Group results by key (requires a reduce; without one it is a `BadRequest`). |
+| `group_level` | `Option<u64>` | `None` | Group to this many array elements of the key (above 0 it requires a reduce). |
 | `stale` | `StaleOption` | `False` | `False` rebuilds the index before querying (default). `Ok` uses a potentially stale index. `UpdateAfter` returns stale results then rebuilds. |
 
 ---
@@ -495,7 +503,7 @@ pub struct AllDocsResponse {
 | Field | Type | Description |
 |-------|------|-------------|
 | `total_rows` | `u64` | Total number of non-deleted documents in the database. |
-| `offset` | `u64` | Number of rows skipped. |
+| `offset` | `u64` | Local adapters: the `skip` applied (like PouchDB). CouchDB / HTTP adapter: the global position of the first row (`0` for `keys` queries, where CouchDB sends `null`). See [Differences from CouchDB](./differences.md#all_docs-offset-of-the-local-adapters). |
 | `rows` | `Vec<AllDocsRow>` | The result rows. |
 | `update_seq` | `Option<Seq>` | The current update sequence, present when `update_seq: true` was requested. |
 
@@ -503,19 +511,33 @@ pub struct AllDocsResponse {
 
 ```rust
 pub struct AllDocsRow {
-    pub id: String,
+    pub id: Option<String>,
     pub key: String,
-    pub value: AllDocsRowValue,
+    pub value: Option<AllDocsRowValue>,
     pub doc: Option<serde_json::Value>,
+    pub error: Option<String>,
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | `String` | The document ID. |
-| `key` | `String` | The row key (same as `id` for `all_docs`). |
-| `value` | `AllDocsRowValue` | Contains the revision and optional deletion flag. |
-| `doc` | `Option<serde_json::Value>` | Full document body, present only when `include_docs` is `true`. |
+| `id` | `Option<String>` | The document ID; `None` for an error row. |
+| `key` | `String` | The requested key; for a document row, its ID. Set on every row. |
+| `value` | `Option<AllDocsRowValue>` | The winning revision and deletion flag; `None` for an error row. |
+| `doc` | `Option<serde_json::Value>` | Full document body, present only when `include_docs` is `true` and the document is not deleted. |
+| `error` | `Option<String>` | `Some("not_found")` when a key requested with `keys` names no document. |
+
+Range and `key` queries only return live documents, so `id` and `value` are always set there. A `keys` query returns exactly one row per requested key, in request order (reversed with `descending`, duplicates kept), so `rows[i]` answers `keys[i]`, as in CouchDB and PouchDB:
+
+| Requested key | Row |
+|---------------|-----|
+| a live document | `id`, `key`, `value`, and `doc` with `include_docs` |
+| a deleted document | `value.deleted == Some(true)`, never a `doc` (CouchDB sends `"doc": null`) |
+| an unknown ID | only `key` and `error: Some("not_found")` |
+
+`skip` and `limit` count every kind of row. Helpers: `row.rev()` (the winning revision, if any), `row.is_deleted()`, `row.is_error()`, and the constructors `AllDocsRow::document(id, value)` and `AllDocsRow::not_found(key)`.
+
+The row is a struct with optional members rather than an enum so it maps one-to-one onto the CouchDB/PouchDB JSON row and `row.key` works for every kind of row.
 
 ### AllDocsRowValue
 
@@ -614,7 +636,7 @@ pub struct ViewResult {
 | Field | Type | Description |
 |-------|------|-------------|
 | `total_rows` | `u64` | Total number of rows emitted by the map function (before skip/limit). |
-| `offset` | `u64` | Number of rows skipped. |
+| `offset` | `u64` | Local adapters: the `skip` applied (like PouchDB). CouchDB / HTTP adapter: the global position of the first row (`0` for `keys` queries, where CouchDB sends `null`). See [Differences from CouchDB](./differences.md#all_docs-offset-of-the-local-adapters). |
 | `rows` | `Vec<ViewRow>` | The result rows. |
 
 ### ViewRow

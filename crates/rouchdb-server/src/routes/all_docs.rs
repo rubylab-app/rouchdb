@@ -2,10 +2,11 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use serde::Deserialize;
 
-use rouchdb::AllDocsOptions;
+use rouchdb::{AllDocsOptions, AllDocsRow};
 use rouchdb_core::error::RouchError;
 
 use crate::error::AppError;
+use crate::extract::JsonBody;
 use crate::state::AppState;
 
 /// Query-string parameters of `_all_docs`. Booleans and integers are kept as
@@ -83,17 +84,29 @@ fn parse_key(raw: Option<String>) -> Result<Option<KeyParam>, AppError> {
     }))
 }
 
-/// Keep the string ids of a `keys` array (other values never match an id).
+/// The string ids of a `keys` array, in order (other values never match an
+/// id: they get a `not_found` row, see [`keys_response`]).
 fn string_keys(keys: &[serde_json::Value]) -> Vec<String> {
     keys.iter()
         .filter_map(|k| k.as_str().map(String::from))
         .collect()
 }
 
+/// A parsed `_all_docs` request.
+enum Request {
+    /// A range or `key` query.
+    Range(AllDocsOptions),
+    /// A range that cannot match any document.
+    Empty { descending: bool },
+    /// A `keys` query: every requested key (any JSON value, in request
+    /// order) and the options, whose `keys` are the string ones.
+    Keys(AllDocsOptions, Vec<serde_json::Value>),
+}
+
 impl AllDocsQuery {
-    /// Build the adapter options, or `None` when the requested range cannot
-    /// match any document.
-    fn into_options(self, keys: Option<Vec<String>>) -> Result<Option<AllDocsOptions>, AppError> {
+    /// Parse the request; `keys` are those of a POST body, which take
+    /// precedence over `?keys=`.
+    fn into_request(self, keys: Option<Vec<serde_json::Value>>) -> Result<Request, AppError> {
         let descending = parse_bool(self.descending.as_deref(), false)?;
         let include_docs = parse_bool(self.include_docs.as_deref(), false)?;
         let inclusive_end = parse_bool(self.inclusive_end.as_deref(), true)?;
@@ -108,7 +121,7 @@ impl AllDocsQuery {
         let keys = match (keys, self.keys) {
             (Some(keys), _) => Some(keys),
             (None, Some(raw)) => match parse_json(&raw)? {
-                serde_json::Value::Array(arr) => Some(string_keys(&arr)),
+                serde_json::Value::Array(arr) => Some(arr),
                 _ => {
                     return Err(AppError(RouchError::BadRequest(
                         "`keys` parameter must be an array.".into(),
@@ -125,38 +138,100 @@ impl AllDocsQuery {
             && (matches!(key, Some(KeyParam::BeforeAll))
                 || matches!(upper, Some(KeyParam::BeforeAll)))
         {
-            return Ok(None);
+            return Ok(Request::Empty { descending });
         }
         let id = |k: Option<KeyParam>| match k {
             Some(KeyParam::Id(s)) => Some(s),
             _ => None,
         };
 
-        Ok(Some(AllDocsOptions {
+        let opts = AllDocsOptions {
             include_docs,
             start_key: id(start),
             end_key: id(end),
             key: id(key),
-            keys,
+            keys: keys.as_deref().map(string_keys),
             limit,
             skip,
             descending,
             inclusive_end,
             conflicts,
             update_seq,
-        }))
+        };
+        Ok(match keys {
+            Some(keys) => Request::Keys(opts, keys),
+            None => Request::Range(opts),
+        })
     }
+}
+
+/// Answer a `keys` request the way CouchDB does: one row per key, in
+/// request order (reversed for `descending`), a non-string key (never a
+/// document id) being a `not_found` row, with `skip` and `limit` applied to
+/// that list of rows and a null `offset`.
+async fn keys_response(
+    state: &AppState,
+    opts: AllDocsOptions,
+    mut keys: Vec<serde_json::Value>,
+) -> Result<serde_json::Value, AppError> {
+    if opts.descending {
+        keys.reverse();
+    }
+    // The adapter answers the string keys, in the final order; skip and
+    // limit also count the rows of the other keys, so they are applied here.
+    let response = state
+        .db
+        .all_docs(AllDocsOptions {
+            keys: Some(string_keys(&keys)),
+            descending: false,
+            skip: 0,
+            limit: None,
+            ..opts.clone()
+        })
+        .await?;
+    let mut found = response.rows.into_iter();
+    let rows: Vec<serde_json::Value> = keys
+        .into_iter()
+        .filter_map(|key| match key {
+            serde_json::Value::String(_) => {
+                found.next().map(|row| row_json(row, opts.include_docs))
+            }
+            key => Some(serde_json::json!({"key": key, "error": "not_found"})),
+        })
+        .skip(opts.skip as usize)
+        .take(opts.limit.map_or(usize::MAX, |l| l as usize))
+        .collect();
+    let mut body = serde_json::json!({
+        "total_rows": response.total_rows,
+        "offset": null,
+        "rows": rows,
+    });
+    if let Some(seq) = response.update_seq {
+        body["update_seq"] = serde_json::to_value(seq).unwrap_or_default();
+    }
+    Ok(body)
+}
+
+/// A row as CouchDB serializes it: under `include_docs`, a deleted
+/// document has `"doc": null`.
+fn row_json(row: AllDocsRow, include_docs: bool) -> serde_json::Value {
+    let null_doc = include_docs && !row.is_error() && row.doc.is_none();
+    let mut json = serde_json::to_value(row).unwrap_or_default();
+    if null_doc && let Some(obj) = json.as_object_mut() {
+        obj.insert("doc".into(), serde_json::Value::Null);
+    }
+    json
 }
 
 async fn run_all_docs(
     state: &AppState,
     query: AllDocsQuery,
-    keys: Option<Vec<String>>,
+    keys: Option<Vec<serde_json::Value>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let descending = query.descending.as_deref() == Some("true");
-    let response = match query.into_options(keys)? {
-        Some(opts) => state.db.all_docs(opts).await?,
-        None => {
+    let response = match query.into_request(keys)? {
+        Request::Keys(opts, keys) => return Ok(Json(keys_response(state, opts, keys).await?)),
+        Request::Range(opts) => state.db.all_docs(opts).await?,
+        Request::Empty { descending } => {
             // Empty range: still report total_rows, like CouchDB.
             let mut response = state
                 .db
@@ -188,12 +263,12 @@ pub async fn post_all_docs(
     State(state): State<AppState>,
     Path(db): Path<String>,
     Query(query): Query<AllDocsQuery>,
-    Json(body): Json<serde_json::Value>,
+    JsonBody(body): JsonBody<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     state.check_db(&db)?;
     let keys = match body.get("keys") {
         None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::Array(arr)) => Some(string_keys(arr)),
+        Some(serde_json::Value::Array(arr)) => Some(arr.clone()),
         Some(_) => {
             return Err(AppError(RouchError::BadRequest(
                 "`keys` body member must be an array.".into(),

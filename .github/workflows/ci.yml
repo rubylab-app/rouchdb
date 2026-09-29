@@ -84,6 +84,12 @@ jobs:
       - name: Run unit tests
         run: cargo test --workspace --locked --no-fail-fast
 
+      # The opt-in `arbitrary-precision` feature (serde_json's
+      # arbitrary_precision) changes how every crate handles numbers, so the
+      # whole suite runs with it too (big_numbers.rs pins both modes).
+      - name: Run unit tests with arbitrary-precision numbers
+        run: cargo test --workspace --locked --no-fail-fast --features rouchdb/arbitrary-precision
+
   couchdb:
     name: CouchDB integration tests
     runs-on: ubuntu-latest
@@ -131,6 +137,12 @@ jobs:
       # fails if a test leaves one of its rouchdb_test_* databases behind.
       - name: Run CouchDB tests
         run: bash scripts/test-couchdb.sh --locked
+
+      # Big integers against CouchDB, with exact numbers. (Only this test:
+      # the parity tests compare CouchDB's normalized decimals, such as 0.0
+      # for -0.0, which the feature keeps as written.)
+      - name: Run the CouchDB number test with arbitrary-precision
+        run: cargo test -p rouchdb --test big_numbers --locked --features arbitrary-precision -- --ignored
 
       # xfail check, non-blocking: flags blocked tests that pass now, i.e.
       # bugs that seem fixed while the test is still marked as blocked.

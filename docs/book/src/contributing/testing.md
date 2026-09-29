@@ -326,9 +326,16 @@ Three more workflows measure test quality. They never block a merge:
 | Workflow | When | What |
 |----------|------|------|
 | `coverage.yml` | push to `main` | Line coverage (cargo-llvm-cov) of the unit tests, doctests and CouchDB suite: job summary plus an lcov artifact |
-| `mutants.yml` | pull requests that change `crates/*/src` | `cargo mutants --in-diff` on the changed code (`--timeout 120`): mutants no test catches are listed in the job summary |
+| `mutants.yml` | pull requests that change `crates/*/src` | `cargo mutants --in-diff` on the changed code; every mutant runs the whole workspace suite, CouchDB tests included, against the same `couchdb:3.5.1` service as the CI job (`--timeout 300` per test run, 75 minutes in all). Mutants no test catches (missed or timed out) are listed in the job summary and the `mutants-out` artifact, and the job still passes; it fails only if cargo-mutants does, e.g. when the unmutated code fails its tests |
 | `nightly.yml` | daily, or by hand | Flaky-test detection: `scripts/repeat-tests.sh` runs the unit suite (Linux and macOS) and the CouchDB suite 5 times and lists every test that failed in any run |
 
 `bash scripts/repeat-tests.sh 5 bash scripts/test-couchdb.sh` does the same locally.
+
+To run the mutants of one file locally the way `mutants.yml` does, with CouchDB running (arguments after the first `--` go to `cargo test`, after the second to the test binaries):
+
+```bash
+cargo mutants -f crates/rouchdb-adapter-http/src/lib.rs --test-workspace=true --timeout 300 \
+  -- --tests -- --include-ignored --skip blocked_on_
+```
 
 The blocking jobs use the toolchain pinned in `rust-toolchain.toml`. To move to a newer Rust, bump it there and fix any new lints in the same PR. The benchmarks can be run on a GitHub runner from the Actions tab (the manual "Benchmarks" workflow); shared runners are noisy, so use those numbers for trends only.

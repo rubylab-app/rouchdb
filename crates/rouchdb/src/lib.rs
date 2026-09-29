@@ -43,7 +43,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 // Re-export core types
-pub use rouchdb_core::adapter::Adapter;
+pub use rouchdb_core::adapter::{Adapter, ChangeNotice};
 pub use rouchdb_core::document::*;
 pub use rouchdb_core::error::{Result, RouchError};
 pub use rouchdb_core::json::MAX_NESTING_DEPTH;
@@ -88,6 +88,13 @@ pub trait Plugin: Send + Sync {
     /// source's body is kept under the source's revision id), and a document
     /// it drops or rejects with `Forbidden`, `Unauthorized` or `BadRequest`
     /// is reported as denied while the rest of the batch is still written.
+    ///
+    /// `put_attachment` and `remove_attachment` call it with the revision
+    /// they create: the parent's body and its attachments with the change
+    /// applied (a new attachment carries its data). It can reject the write
+    /// (the error is returned unchanged, and dropping the document is
+    /// `Forbidden`), but its changes are ignored: the stored body already
+    /// went through the plugins when it was written.
     async fn before_write(&self, _docs: &mut Vec<Document>) -> Result<()> {
         Ok(())
     }
@@ -117,6 +124,50 @@ fn denial(error: &RouchError) -> Option<&'static str> {
         RouchError::Forbidden(_) | RouchError::BadRequest(_) => Some("forbidden"),
         RouchError::Unauthorized => Some("unauthorized"),
         _ => None,
+    }
+}
+
+impl PluginAdapter {
+    /// Run `before_write` on the revision an attachment write creates: the
+    /// document at `rev` with `edit` applied to its attachments (a document
+    /// with no body when `rev` cannot be read, which the write itself then
+    /// reports). As for replicated documents, plugins only accept or reject
+    /// it: the stored body already went through them, so their changes are
+    /// not applied. A rejection is returned as is; dropping the document is
+    /// `Forbidden`.
+    async fn validate_attachment_edit(
+        &self,
+        doc_id: &str,
+        rev: &str,
+        edit: impl FnOnce(&mut HashMap<String, AttachmentMeta>),
+    ) -> Result<()> {
+        let opts = GetOptions {
+            rev: Some(rev.to_string()),
+            ..Default::default()
+        };
+        let mut doc = match self.inner.get(doc_id, opts).await {
+            Ok(doc) => doc,
+            Err(_) => Document {
+                id: doc_id.to_string(),
+                rev: rev.parse().ok(),
+                deleted: false,
+                data: serde_json::json!({}),
+                attachments: HashMap::new(),
+            },
+        };
+        doc.deleted = false;
+        edit(&mut doc.attachments);
+        let mut docs = vec![doc];
+        for plugin in &self.plugins {
+            plugin.before_write(&mut docs).await?;
+            if docs.is_empty() {
+                return Err(RouchError::Forbidden(format!(
+                    "dropped by plugin {}",
+                    plugin.name()
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -234,6 +285,11 @@ impl Adapter for PluginAdapter {
         data: Vec<u8>,
         content_type: &str,
     ) -> Result<DocResult> {
+        let attachment = AttachmentMeta::new(content_type, data.clone());
+        self.validate_attachment_edit(doc_id, rev, |atts| {
+            atts.insert(att_id.to_string(), attachment);
+        })
+        .await?;
         let result = self
             .inner
             .put_attachment(doc_id, att_id, rev, data, content_type)
@@ -254,6 +310,10 @@ impl Adapter for PluginAdapter {
     }
 
     async fn remove_attachment(&self, doc_id: &str, att_id: &str, rev: &str) -> Result<DocResult> {
+        self.validate_attachment_edit(doc_id, rev, |atts| {
+            atts.remove(att_id);
+        })
+        .await?;
         let result = self.inner.remove_attachment(doc_id, att_id, rev).await?;
         for plugin in &self.plugins {
             plugin.after_write(std::slice::from_ref(&result)).await?;
@@ -440,7 +500,8 @@ impl Database {
     /// Create a new document with an auto-generated ID.
     ///
     /// Equivalent to PouchDB's `db.post(doc)`. Uses the body's `_id` when it
-    /// has one, otherwise generates a UUID v4.
+    /// has one, otherwise generates a UUID v4, written like CouchDB's ids as
+    /// 32 lowercase hex digits.
     pub async fn post(&self, data: serde_json::Value) -> Result<DocResult> {
         let mut doc = Document {
             id: String::new(),
@@ -451,7 +512,7 @@ impl Database {
         };
         doc.prepare_for_write()?;
         if doc.id.is_empty() {
-            doc.id = uuid::Uuid::new_v4().to_string();
+            doc.id = uuid::Uuid::new_v4().simple().to_string();
         }
         self.write_one(doc).await
     }
@@ -971,26 +1032,12 @@ impl Database {
     /// Like `put`, a failed write (e.g. `RouchError::Conflict`) is an error,
     /// never `Ok` with `ok: false`.
     ///
-    /// `DesignDocument` only models JavaScript views and a few fields. When
-    /// updating (`ddoc.rev` is set), everything else in the revision being
-    /// replaced (`views.lib`, Mango index views, view and ddoc `options`,
-    /// custom fields) is carried over, so a `get_design` + `put_design`
-    /// round trip does not drop it.
+    /// The document is written exactly as given, like a `PUT`: since
+    /// `DesignDocument` keeps every member of a design document (see its
+    /// docs), a `get_design` + `put_design` round trip changes nothing but
+    /// what was edited, and a member removed from the struct is removed.
     pub async fn put_design(&self, ddoc: DesignDocument) -> Result<DocResult> {
-        let mut json = ddoc.to_json();
-        if let Some(ref rev) = ddoc.rev {
-            let opts = GetOptions {
-                rev: Some(rev.clone()),
-                ..Default::default()
-            };
-            match self.adapter.get(&ddoc.id, opts).await {
-                Ok(parent) => keep_unmodeled_design_fields(&mut json, &parent.to_json()),
-                // A missing or stale revision is reported by the write.
-                Err(RouchError::NotFound(_)) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        let mut doc = Document::from_json(json)?;
+        let mut doc = Document::from_json(ddoc.to_json())?;
         doc.prepare_for_write()?;
         self.write_one(doc).await
     }
@@ -1231,6 +1278,49 @@ fn doc_result_error(result: DocResult) -> RouchError {
     }
 }
 
+/// Restrict an `all_docs` range query to a partition, whose ids are, in id
+/// (byte) order, exactly those in `[prefix, after)` (`after` is the prefix
+/// with its final `:` bumped to `;`).
+///
+/// A bound outside the partition is replaced by the partition's own, with
+/// the inclusiveness that bound needs: `inclusive_end` stays the caller's
+/// only while the end key is the caller's.
+///
+/// Descending, the upper bound is the start key, which is always inclusive,
+/// so a document whose id is `after` itself comes first. The query then
+/// asks for one row more without skipping and returns the caller's
+/// `(skip, limit)`, to apply once the rows outside the partition are gone.
+fn clamp_to_partition(
+    opts: &mut AllDocsOptions,
+    prefix: &str,
+    after: &str,
+) -> Option<(u64, Option<u64>)> {
+    let mut page = None;
+    if opts.descending {
+        if !opts.start_key.as_deref().is_some_and(|k| k < after) {
+            opts.start_key = Some(after.to_string());
+            page = Some((opts.skip, opts.limit));
+            opts.limit = opts
+                .limit
+                .map(|l| l.saturating_add(opts.skip).saturating_add(1));
+            opts.skip = 0;
+        }
+        if !opts.end_key.as_deref().is_some_and(|k| k >= prefix) {
+            opts.end_key = Some(prefix.to_string());
+            opts.inclusive_end = true;
+        }
+    } else {
+        if !opts.start_key.as_deref().is_some_and(|k| k >= prefix) {
+            opts.start_key = Some(prefix.to_string());
+        }
+        if !opts.end_key.as_deref().is_some_and(|k| k < after) {
+            opts.end_key = Some(after.to_string());
+            opts.inclusive_end = false;
+        }
+    }
+    page
+}
+
 /// Escape regex metacharacters in a string for safe use in a regex pattern.
 fn regex_escape(s: &str) -> String {
     let mut escaped = String::with_capacity(s.len() * 2);
@@ -1253,9 +1343,6 @@ impl Partition<'_> {
     /// return no rows.
     pub async fn all_docs(&self, mut opts: AllDocsOptions) -> Result<AllDocsResponse> {
         let prefix = format!("{}:", self.name);
-        // Every id of the partition sorts between these (byte order).
-        let first = prefix.clone();
-        let last = format!("{}:{}", self.name, char::MAX);
 
         if let Some(ref mut keys) = opts.keys {
             keys.retain(|k| k.starts_with(&prefix));
@@ -1264,26 +1351,40 @@ impl Partition<'_> {
             opts.key = None;
             opts.keys = Some(Vec::new());
         }
-
-        // The start key is the upper bound when descending.
-        let (low, high) = if opts.descending {
-            (&mut opts.end_key, &mut opts.start_key)
+        let page = if opts.key.is_none() && opts.keys.is_none() {
+            clamp_to_partition(&mut opts, &prefix, &format!("{};", self.name))
         } else {
-            (&mut opts.start_key, &mut opts.end_key)
+            None
         };
-        *low = Some(low.take().map_or(first.clone(), |k| k.max(first)));
-        *high = Some(high.take().map_or(last.clone(), |k| k.min(last)));
 
         let mut response = self.db.all_docs(opts).await?;
-        response.rows.retain(|row| row.id.starts_with(&prefix));
+        response.rows.retain(|row| row.key.starts_with(&prefix));
+        if let Some((skip, limit)) = page {
+            let limit = limit.map_or(usize::MAX, |l| l as usize);
+            response.rows = response
+                .rows
+                .into_iter()
+                .skip(skip as usize)
+                .take(limit)
+                .collect();
+            response.offset = response.offset.saturating_add(skip);
+        }
         Ok(response)
     }
 
     /// Run a Mango find query scoped to this partition.
     pub async fn find(&self, mut opts: FindOptions) -> Result<FindResponse> {
+        // Validate the selector as a whole selector first: in a combinator
+        // some invalid ones (`{"$gt": 1}`) would be accepted.
+        CompiledSelector::new(&opts.selector)?;
         let escaped = regex_escape(&self.name);
         let partition_filter = serde_json::json!({"_id": {"$regex": format!("^{}:", escaped)}});
-        opts.selector = serde_json::json!({"$and": [opts.selector, partition_filter]});
+        opts.selector = match opts.selector {
+            // `{}` matches every document, but inside `$and` it would be an
+            // equality test with `{}` that no document passes.
+            serde_json::Value::Object(ref map) if map.is_empty() => partition_filter,
+            selector => serde_json::json!({"$and": [selector, partition_filter]}),
+        };
         self.db.find(opts).await
     }
 
@@ -1481,60 +1582,6 @@ fn encode_path_segment(segment: &str) -> String {
 
 /// Batch size for reading a changes feed filtered by a selector.
 const SELECTOR_CHANGES_BATCH: u64 = 500;
-
-/// Fields of a design document that `DesignDocument` models.
-const MODELED_DESIGN_FIELDS: [&str; 9] = [
-    "_id",
-    "_rev",
-    "views",
-    "filters",
-    "validate_doc_update",
-    "shows",
-    "lists",
-    "updates",
-    "language",
-];
-
-/// Copy into `new` (a serialized `DesignDocument`) what `DesignDocument`
-/// cannot represent from the `parent` revision: unknown top-level fields,
-/// views it skips (`lib`, Mango indexes with a non-string `map`) and extra
-/// fields of view definitions (such as `options`).
-fn keep_unmodeled_design_fields(new: &mut serde_json::Value, parent: &serde_json::Value) {
-    let (Some(new), Some(parent)) = (new.as_object_mut(), parent.as_object()) else {
-        return;
-    };
-    for (key, value) in parent {
-        if !key.starts_with('_') && !MODELED_DESIGN_FIELDS.contains(&key.as_str()) {
-            new.entry(key.clone()).or_insert_with(|| value.clone());
-        }
-    }
-
-    let Some(parent_views) = parent.get("views").and_then(|v| v.as_object()) else {
-        return;
-    };
-    let views = new.entry("views").or_insert_with(|| serde_json::json!({}));
-    let Some(views) = views.as_object_mut() else {
-        return;
-    };
-    for (name, def) in parent_views {
-        let modeled = name != "lib" && def.get("map").is_some_and(|m| m.is_string());
-        match views.get_mut(name) {
-            // Extra fields of a view that is still defined.
-            Some(serde_json::Value::Object(view)) if modeled => {
-                for (field, value) in def.as_object().into_iter().flatten() {
-                    if field != "map" && field != "reduce" {
-                        view.entry(field.clone()).or_insert_with(|| value.clone());
-                    }
-                }
-            }
-            // A view removed through the struct stays removed.
-            _ if modeled => {}
-            _ => {
-                views.entry(name.clone()).or_insert_with(|| def.clone());
-            }
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1739,6 +1786,8 @@ mod tests {
         assert!(r1.ok);
         let uuid = uuid::Uuid::parse_str(&r1.id).expect("post generates a UUID id");
         assert_eq!(uuid.get_version_num(), 4, "{}", r1.id);
+        // Written like CouchDB's ids: 32 hex digits, no hyphens.
+        assert_eq!(r1.id, uuid.simple().to_string());
 
         let r2 = db.post(serde_json::json!({"name": "Bob"})).await.unwrap();
         assert!(r2.ok);
@@ -2462,7 +2511,7 @@ mod tests {
             db.put(id, serde_json::json!({})).await.unwrap();
         }
         let users = db.partition("users");
-        let ids = |r: AllDocsResponse| r.rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+        let ids = |r: AllDocsResponse| r.rows.into_iter().map(|r| r.key).collect::<Vec<_>>();
 
         let all = ids(users.all_docs(AllDocsOptions::new()).await.unwrap());
         assert_eq!(all, ["users:1", "users:2", "users:\u{1F600}"]);
@@ -3026,7 +3075,7 @@ mod tests {
             .unwrap()
             .rows
             .into_iter()
-            .map(|r| r.id)
+            .map(|r| r.key)
             .collect();
         assert_eq!(ids, ["ok"]);
         let stored = spy.inner.get("ok", GetOptions::default()).await.unwrap();

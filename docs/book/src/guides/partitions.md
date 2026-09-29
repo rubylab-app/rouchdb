@@ -61,7 +61,7 @@ let result = partition.all_docs(AllDocsOptions {
 
 // Only returns tenant-a documents
 for row in &result.rows {
-    assert!(row.id.starts_with("tenant-a:"));
+    assert!(row.key.starts_with("tenant-a:"));
 }
 ```
 

@@ -125,9 +125,11 @@ The `AttachmentMeta` fields:
 | Field | Type | Description |
 |-------|------|-------------|
 | `content_type` | `String` | The MIME type (e.g., `"image/png"`). |
+| `revpos` | `u64` | Generation of the revision that uploaded the data, as in CouchDB: a write that sends the bytes sets it, stubs and body-only edits keep it, and replication carries it both ways. |
 | `digest` | `String` | A content-addressed hash of the data (e.g., `"md5-abc123..."`). |
 | `length` | `u64` | Size of the attachment in bytes. |
 | `stub` | `bool` | If `true`, the `data` field is absent and only metadata is present. This is the common case when reading documents. |
+| `encoding`, `encoded_length` | `Option<String>`, `Option<u64>` | How the source stores the bytes (CouchDB's `"gzip"` for compressed attachments), kept from stubs that carry it. |
 | `data` | `Option<Vec<u8>>` | The raw binary data, present only when explicitly included. |
 
 ## Digest-Based Deduplication

@@ -23,6 +23,8 @@ const IDS: &[&str] = &[
     "users:c",
     "users:\u{e9}",
     "users:\u{1F600}",
+    "users:\u{10FFFF}",
+    "users:\u{10FFFF}z",
     "users;",
     "usersX:1",
     "users_:1",
@@ -62,7 +64,7 @@ async fn expected(db: &Database, opts: &AllDocsOptions) -> Vec<serde_json::Value
         .unwrap();
     rows(&unpaged)
         .into_iter()
-        .filter(|r| r["id"].as_str().unwrap().starts_with(PREFIX))
+        .filter(|r| r["key"].as_str().unwrap().starts_with(PREFIX))
         .skip(opts.skip as usize)
         .take(opts.limit.map_or(usize::MAX, |l| l as usize))
         .collect()
@@ -115,6 +117,8 @@ fn range_queries() -> Vec<AllDocsOptions> {
         (key("a"), None),
         (None, key("zzz")),
         (key("users"), key("users;")),
+        (key("users;"), None),
+        (None, key("users;")),
         (key("users2"), key("usersX:1")),
         (key("users:b"), None),
         (None, key("users:b")),
@@ -137,13 +141,6 @@ fn range_queries() -> Vec<AllDocsOptions> {
     for (start_key, end_key) in bounds {
         for descending in [false, true] {
             for inclusive_end in [true, false] {
-                // Known bug: when descending, an exclusive end bound that
-                // falls outside the partition drops the `users:` document
-                // (see blocked_on_q_api_1_partition_all_docs_edge_ids).
-                let end_outside = end_key.as_deref().is_none_or(|e| e < PREFIX);
-                if descending && !inclusive_end && end_outside {
-                    continue;
-                }
                 for (i, (skip, limit)) in paging.into_iter().enumerate() {
                     queries.push(AllDocsOptions {
                         start_key: start_key.clone(),
@@ -176,6 +173,8 @@ async fn partition_all_docs_equals_the_filtered_database_query() {
                 "{}: {opts:?}",
                 b.name
             );
+            // The local adapters report the skip that was applied.
+            assert_eq!(got.offset, opts.skip, "{}: {opts:?}", b.name);
         }
     }
 }
@@ -220,14 +219,16 @@ async fn partition_all_docs_by_key_stays_in_the_partition() {
             })
             .await
             .unwrap();
-        // Request order, duplicates and the deleted document included.
+        // Request order, duplicates, the deleted document and a not_found
+        // row for the missing key of the partition included.
         assert_eq!(
             row_ids(&got),
-            ["users:c", "users:a", DELETED, "users:c"],
+            ["users:c", "users:a", "users:missing", DELETED, "users:c"],
             "{}",
             b.name
         );
-        assert_eq!(got.rows[2].value.deleted, Some(true), "{}", b.name);
+        assert!(got.rows[2].is_error(), "{}", b.name);
+        assert!(got.rows[3].is_deleted(), "{}", b.name);
 
         for (k, ids) in [
             ("users:b", vec!["users:b"]),
@@ -252,8 +253,7 @@ async fn partition_all_docs_by_key_stays_in_the_partition() {
 /// Every document of the partition is listed, whatever its id, and an
 /// exclusive end is only applied to the caller's own end key.
 #[tokio::test]
-#[ignore = "blocked on Q-API-1: partition bounds drop edge ids"]
-async fn blocked_on_q_api_1_partition_all_docs_edge_ids() {
+async fn partition_all_docs_edge_ids() {
     for b in backends("partition") {
         let edge = ["users:", "users:a", "users:\u{10FFFF}", "users:\u{10FFFF}z"];
         for id in edge.iter().chain(&["users9", "users;"]) {
@@ -331,6 +331,55 @@ async fn partition_with_empty_name_is_the_colon_prefix() {
                 .await
                 .unwrap();
         assert_eq!(row_ids(&got), [":", "::x", ":doc1"], "{}", b.name);
+    }
+}
+
+#[tokio::test]
+async fn partition_find_takes_any_selector_the_database_takes() {
+    for b in backends("partition") {
+        for id in ["users:a", "users:b", "orders:1", "users"] {
+            b.db.put(id, serde_json::json!({"o": {}})).await.unwrap();
+        }
+        let users = b.db.partition("users");
+        let find = |selector: serde_json::Value| {
+            users.find(FindOptions {
+                selector,
+                ..Default::default()
+            })
+        };
+        let ids = |r: rouchdb::FindResponse| -> Vec<String> {
+            r.docs
+                .iter()
+                .map(|d| d["_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // `{}` matches every document of the partition, as `{}` does in
+        // the database (nested in a combinator it would match none).
+        assert_eq!(
+            ids(find(serde_json::json!({})).await.unwrap()),
+            ["users:a", "users:b"],
+            "{}",
+            b.name
+        );
+        assert_eq!(
+            ids(find(serde_json::json!({"o": {}})).await.unwrap()),
+            ["users:a", "users:b"],
+            "{}",
+            b.name
+        );
+        // A selector the database rejects is rejected in a partition too,
+        // although it would be valid inside a combinator.
+        for selector in [
+            serde_json::json!({"$gt": 1}),
+            serde_json::json!({"$not": {}}),
+        ] {
+            let result = find(selector.clone()).await;
+            assert!(
+                matches!(result, Err(RouchError::BadRequest(_))),
+                "{}: {selector}: {result:?}",
+                b.name
+            );
+        }
     }
 }
 

@@ -1127,6 +1127,93 @@ async fn push_carries_attachment_bytes_to_couchdb() {
         state["d"].attachments["a.bin"],
         ("application/octet-stream".to_string(), bytes)
     );
+    // The revision that uploaded the bytes, not 0.
+    assert_eq!(doc["_attachments"]["a.bin"]["revpos"], 2);
+}
+
+/// Run the attachment writes whose `revpos` CouchDB 3.5.1 reports as
+/// `a.bin: 4, b.bin: 3`: an inline upload, a body edit with a stub, a
+/// standalone upload, and a re-upload of identical bytes.
+async fn attachment_history(db: &Database) {
+    let hello = serde_json::json!({"content_type": "application/octet-stream", "data": "aGVsbG8="});
+    let stub = serde_json::json!({"stub": true});
+    let rev = |r: rouchdb::DocResult| r.rev.unwrap();
+    let r1 = rev(db
+        .put(
+            "d",
+            serde_json::json!({"v": 1, "_attachments": {"a.bin": hello}}),
+        )
+        .await
+        .unwrap());
+    let r2 = rev(db
+        .update(
+            "d",
+            &r1,
+            serde_json::json!({"v": 2, "_attachments": {"a.bin": stub}}),
+        )
+        .await
+        .unwrap());
+    let r3 = rev(db
+        .put_attachment(
+            "d",
+            "b.bin",
+            &r2,
+            b"xyz".to_vec(),
+            "application/octet-stream",
+        )
+        .await
+        .unwrap());
+    db.update(
+        "d",
+        &r3,
+        serde_json::json!({"v": 4, "_attachments": {"a.bin": hello, "b.bin": stub}}),
+    )
+    .await
+    .unwrap();
+}
+
+/// Item 4: attachment stubs (`revpos` included) are the same on CouchDB and
+/// on a local database after the same writes, and replication carries them
+/// unchanged in both directions. (`application/octet-stream` is stored
+/// uncompressed by CouchDB, so the digests are the same too.)
+#[tokio::test]
+#[ignore = "requires CouchDB"]
+async fn attachments_match_couchdb() {
+    let url = fresh_remote_db("att_revpos").await;
+    let remote = Database::http(&url);
+    let local = Database::memory("local");
+    attachment_history(&remote).await;
+    attachment_history(&local).await;
+    let couch = raw(&format!("{url}/d")).await["_attachments"].clone();
+    assert_eq!(couch["a.bin"]["revpos"], 4, "{couch}");
+    assert_eq!(couch["b.bin"]["revpos"], 3, "{couch}");
+    assert_eq!(
+        local.get("d").await.unwrap().to_json()["_attachments"],
+        couch
+    );
+    assert_eq!(
+        remote.get("d").await.unwrap().to_json()["_attachments"],
+        couch
+    );
+
+    // Pushed to CouchDB, pulled from it.
+    let pushed = fresh_remote_db("att_revpos_push").await;
+    assert!(
+        local
+            .replicate_to(&Database::http(&pushed))
+            .await
+            .unwrap()
+            .ok
+    );
+    assert_eq!(raw(&format!("{pushed}/d")).await["_attachments"], couch);
+    let pulled = Database::memory("pulled");
+    assert!(pulled.replicate_from(&remote).await.unwrap().ok);
+    assert_eq!(
+        pulled.get("d").await.unwrap().to_json()["_attachments"],
+        couch
+    );
+    let bytes = pulled.get_attachment("d", "b.bin").await.unwrap();
+    assert_eq!(bytes, b"xyz");
 }
 
 #[tokio::test]

@@ -86,6 +86,7 @@ async fn design_doc_crud_on_http() {
                 rouchdb::ViewDef {
                     map: "function(doc) { emit(doc.type, 1); }".into(),
                     reduce: Some("_count".into()),
+                    ..Default::default()
                 },
             );
             v
@@ -96,6 +97,7 @@ async fn design_doc_crud_on_http() {
         lists: std::collections::HashMap::new(),
         updates: std::collections::HashMap::new(),
         language: Some("javascript".into()),
+        ..Default::default()
     };
 
     let result = db.put_design(ddoc).await.unwrap();
@@ -183,7 +185,7 @@ async fn replication_since_override_http() {
         .unwrap()
         .rows
         .into_iter()
-        .map(|r| r.id)
+        .map(|r| r.key)
         .collect();
     assert_eq!(ids, expected);
 }
@@ -279,7 +281,11 @@ async fn all_docs_conflicts_http() {
         .iter()
         .map(|r| {
             let doc = r.doc.as_ref().unwrap();
-            (r.id.clone(), r.value.rev.clone(), doc["_conflicts"].clone())
+            (
+                r.key.clone(),
+                r.rev().unwrap().to_string(),
+                doc["_conflicts"].clone(),
+            )
         })
         .collect();
     assert_eq!(

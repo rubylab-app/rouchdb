@@ -2,10 +2,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 use uuid::Uuid;
 
-use rouchdb_core::adapter::Adapter;
+use rouchdb_core::adapter::{Adapter, ChangeNotice};
 use rouchdb_core::document::*;
 use rouchdb_core::error::{Result, RouchError};
 use rouchdb_core::merge::{
@@ -60,16 +60,25 @@ struct Inner {
     purge_seq: u64,
 }
 
+/// Change notices buffered per subscriber before it lags (and re-reads the
+/// changes feed).
+const NOTICE_CAPACITY: usize = 1024;
+
 /// In-memory adapter for RouchDB. All data is held in RAM.
+///
+/// Clones share the data and the change notifications
+/// ([`Adapter::subscribe`]).
 #[derive(Debug, Clone)]
 pub struct MemoryAdapter {
     inner: Arc<RwLock<Inner>>,
     rev_limit: u64,
+    notices: broadcast::Sender<ChangeNotice>,
 }
 
 impl MemoryAdapter {
     pub fn new(name: &str) -> Self {
         Self {
+            notices: broadcast::channel(NOTICE_CAPACITY).0,
             inner: Arc::new(RwLock::new(Inner {
                 name: name.to_string(),
                 docs: HashMap::new(),
@@ -90,6 +99,21 @@ impl MemoryAdapter {
     pub fn with_rev_limit(mut self, limit: u64) -> Self {
         self.rev_limit = limit;
         self
+    }
+
+    /// Announce the changes recorded after `since` to the subscribers. It
+    /// runs under the write lock, once the write is applied: a woken reader
+    /// waits for the lock and then sees the change.
+    fn announce(&self, inner: &Inner, since: u64) {
+        if self.notices.receiver_count() == 0 {
+            return;
+        }
+        for (seq, (doc_id, _)) in inner.changes.range(since + 1..) {
+            let _ = self.notices.send(ChangeNotice {
+                seq: Seq::Num(*seq),
+                doc_id: doc_id.clone(),
+            });
+        }
     }
 }
 
@@ -285,6 +309,7 @@ impl Adapter for MemoryAdapter {
         opts: BulkDocsOptions,
     ) -> Result<Vec<DocResult>> {
         let mut inner = self.inner.write().await;
+        let since = inner.update_seq;
         let mut results = Vec::with_capacity(docs.len());
 
         for doc in docs {
@@ -296,6 +321,7 @@ impl Adapter for MemoryAdapter {
             results.push(result);
         }
 
+        self.announce(&inner, since);
         Ok(results)
     }
 
@@ -347,11 +373,11 @@ impl Adapter for MemoryAdapter {
                 }
             }
 
-            if let Some(stored) = inner.docs.get(key.as_str()) {
-                let winner = match winning_rev(&stored.rev_tree) {
-                    Some(w) => w,
-                    None => continue,
-                };
+            let found = inner
+                .docs
+                .get(key.as_str())
+                .and_then(|stored| winning_rev(&stored.rev_tree).map(|w| (stored, w)));
+            if let Some((stored, winner)) = found {
                 let deleted = is_deleted(&stored.rev_tree);
 
                 // Skip deleted docs unless specific keys were requested
@@ -389,18 +415,18 @@ impl Adapter for MemoryAdapter {
                 };
 
                 rows.push(AllDocsRow {
-                    id: key.clone(),
-                    key: key.clone(),
-                    value: AllDocsRowValue {
-                        rev: winner.to_string(),
-                        deleted: if deleted { Some(true) } else { None },
-                    },
                     doc: doc_json,
+                    ..AllDocsRow::document(
+                        key.clone(),
+                        AllDocsRowValue {
+                            rev: winner.to_string(),
+                            deleted: deleted.then_some(true),
+                        },
+                    )
                 });
             } else if opts.keys.is_some() {
-                // For specific key lookups, include missing keys as errors
-                // (CouchDB returns {"key":"x","error":"not_found"})
-                // We skip these for now — they don't fit our row struct cleanly
+                // Every requested key gets a row (CouchDB).
+                rows.push(AllDocsRow::not_found(key.clone()));
             }
         }
 
@@ -638,32 +664,13 @@ impl Adapter for MemoryAdapter {
                         if let Some(atts) = stored.rev_attachments.get(&rev_str)
                             && !atts.is_empty()
                         {
-                            use base64::Engine;
-                            let mut att_map = serde_json::Map::new();
-                            for (name, meta) in atts {
-                                let mut m = serde_json::Map::new();
-                                m.insert(
-                                    "content_type".into(),
-                                    serde_json::Value::String(meta.content_type.clone()),
-                                );
-                                m.insert(
-                                    "digest".into(),
-                                    serde_json::Value::String(meta.digest.clone()),
-                                );
-                                m.insert("length".into(), serde_json::json!(meta.length));
-                                if let Some(bytes) = inner.attachments.get(&meta.digest) {
-                                    m.insert(
-                                        "data".into(),
-                                        serde_json::Value::String(
-                                            base64::engine::general_purpose::STANDARD.encode(bytes),
-                                        ),
-                                    );
-                                    m.insert("stub".into(), serde_json::Value::Bool(false));
-                                } else {
-                                    m.insert("stub".into(), serde_json::Value::Bool(true));
-                                }
-                                att_map.insert(name.clone(), serde_json::Value::Object(m));
-                            }
+                            let att_map = atts
+                                .iter()
+                                .map(|(name, meta)| {
+                                    let bytes = inner.attachments.get(&meta.digest);
+                                    (name.clone(), meta.to_json(bytes.map(Vec::as_slice)))
+                                })
+                                .collect();
                             obj.insert("_attachments".into(), serde_json::Value::Object(att_map));
                         }
 
@@ -735,16 +742,7 @@ impl Adapter for MemoryAdapter {
             .cloned()
             .unwrap_or_default();
         let mut attachments = parent_atts.clone();
-        attachments.insert(
-            att_id.to_string(),
-            AttachmentMeta {
-                content_type: content_type.to_string(),
-                digest: String::new(),
-                length: data.len() as u64,
-                stub: false,
-                data: Some(data),
-            },
-        );
+        attachments.insert(att_id.to_string(), AttachmentMeta::new(content_type, data));
 
         let doc = Document {
             id: doc_id.to_string(),
@@ -756,7 +754,10 @@ impl Adapter for MemoryAdapter {
         let tree = stored.rev_tree.clone();
         let plan = plan_new_edit(Some(&tree), doc, Some(&parent_atts), false, self.rev_limit)
             .map_err(attachment_edit_error)?;
-        Ok(apply_write(&mut inner, plan))
+        let since = inner.update_seq;
+        let result = apply_write(&mut inner, plan);
+        self.announce(&inner, since);
+        Ok(result)
     }
 
     async fn get_attachment(
@@ -836,7 +837,10 @@ impl Adapter for MemoryAdapter {
         let tree = stored.rev_tree.clone();
         let plan = plan_new_edit(Some(&tree), doc, Some(&parent_atts), false, self.rev_limit)
             .map_err(attachment_edit_error)?;
-        Ok(apply_write(&mut inner, plan))
+        let since = inner.update_seq;
+        let result = apply_write(&mut inner, plan);
+        self.announce(&inner, since);
+        Ok(result)
     }
 
     async fn get_local(&self, id: &str) -> Result<serde_json::Value> {
@@ -899,8 +903,13 @@ impl Adapter for MemoryAdapter {
         Ok(())
     }
 
+    fn subscribe(&self) -> Option<broadcast::Receiver<ChangeNotice>> {
+        Some(self.notices.subscribe())
+    }
+
     async fn purge(&self, req: HashMap<String, Vec<String>>) -> Result<PurgeResponse> {
         let mut inner = self.inner.write().await;
+        let since = inner.update_seq;
         let mut purged = HashMap::new();
         let mut bumped = false;
 
@@ -952,6 +961,7 @@ impl Adapter for MemoryAdapter {
         }
         inner.purge_seq += 1;
         collect_unreferenced_attachments(&mut inner);
+        self.announce(&inner, since);
 
         Ok(PurgeResponse {
             purge_seq: Some(inner.purge_seq),
@@ -983,10 +993,16 @@ fn process_doc_new_edits(
     rev_limit: u64,
 ) -> DocResult {
     if let Err(e) = doc.prepare_for_write() {
-        return error_result(&doc.id, "bad_request", &e.to_string());
+        // The bare reason, as CouchDB and replicated writes report it.
+        let reason = match e {
+            RouchError::BadRequest(reason) => reason,
+            other => other.to_string(),
+        };
+        return error_result(&doc.id, "bad_request", &reason);
     }
     if doc.id.is_empty() {
-        doc.id = Uuid::new_v4().to_string();
+        // 32 hex digits, like the ids CouchDB generates.
+        doc.id = Uuid::new_v4().simple().to_string();
     }
     if local_doc_id(&doc.id).is_some() {
         return match plan_local_write(doc) {
@@ -1239,7 +1255,7 @@ mod tests {
         opts.include_docs = true;
         let result = db.all_docs(opts).await.unwrap();
         assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0].value.rev, rev);
+        assert_eq!(result.rows[0].rev().unwrap(), rev);
         assert_eq!(
             result.rows[0].doc,
             Some(serde_json::json!({"_id": "doc1", "_rev": rev, "name": "Alice"}))
@@ -1283,6 +1299,49 @@ mod tests {
         let doc2_diff = diff.results.get("doc2").unwrap();
         assert_eq!(doc2_diff.missing, ["1-abc"]);
         assert!(doc2_diff.possible_ancestors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn subscribers_are_notified_after_each_committed_change() {
+        use rouchdb_core::adapter::ChangeNotice;
+        let db = MemoryAdapter::new("test");
+        let mut rx = db
+            .subscribe()
+            .expect("the memory adapter announces changes");
+        let doc = |id: &str| Document::from_json(serde_json::json!({"_id": id})).unwrap();
+        let results = db
+            .bulk_docs(vec![doc("a"), doc("b")], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        let notice = |seq: u64, id: &str| ChangeNotice {
+            seq: Seq::Num(seq),
+            doc_id: id.into(),
+        };
+        assert_eq!(rx.try_recv().unwrap(), notice(1, "a"));
+        assert_eq!(rx.try_recv().unwrap(), notice(2, "b"));
+        // Nothing for a failed write or a local document.
+        db.bulk_docs(vec![doc("a")], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        db.put_local("cp", serde_json::json!({})).await.unwrap();
+        assert!(rx.try_recv().is_err());
+        let rev = results[0].rev.clone().unwrap();
+        let r2 = db
+            .put_attachment("a", "x", &rev, b"x".to_vec(), "text/plain")
+            .await
+            .unwrap()
+            .rev
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap(), notice(3, "a"));
+        db.remove_attachment("a", "x", &r2).await.unwrap();
+        assert_eq!(rx.try_recv().unwrap(), notice(4, "a"));
+        // A clone of the adapter shares the notifications.
+        let mut other = db.clone().subscribe().unwrap();
+        db.bulk_docs(vec![doc("c")], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap(), notice(5, "c"));
+        assert_eq!(other.try_recv().unwrap(), notice(5, "c"));
     }
 
     #[tokio::test]
@@ -1431,7 +1490,7 @@ mod tests {
             ..AllDocsOptions::new()
         };
         let result = db.all_docs(opts).await.unwrap();
-        let ids: Vec<&str> = result.rows.iter().map(|r| r.id.as_str()).collect();
+        let ids: Vec<&str> = result.rows.iter().map(|r| r.key.as_str()).collect();
         assert_eq!(ids, ["b"]);
         assert_eq!(result.total_rows, 4);
     }

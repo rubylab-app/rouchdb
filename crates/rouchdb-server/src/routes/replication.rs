@@ -9,6 +9,7 @@ use rouchdb::BulkGetItem;
 use rouchdb_core::error::RouchError;
 
 use crate::error::AppError;
+use crate::extract::JsonBody;
 use crate::state::AppState;
 
 fn bad_request(reason: &str) -> AppError {
@@ -60,7 +61,7 @@ pub(crate) fn shape_doc(doc: &mut serde_json::Value, revs: bool, attachments: bo
 pub async fn revs_diff(
     State(state): State<AppState>,
     Path(db): Path<String>,
-    Json(body): Json<serde_json::Value>,
+    JsonBody(body): JsonBody<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     state.check_db(&db)?;
     let revs = parse_rev_map(body)?;
@@ -81,7 +82,7 @@ pub async fn bulk_get(
     State(state): State<AppState>,
     Path(db): Path<String>,
     Query(query): Query<BulkGetQuery>,
-    Json(body): Json<serde_json::Value>,
+    JsonBody(body): JsonBody<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     state.check_db(&db)?;
     let requested = body
@@ -144,7 +145,7 @@ pub async fn bulk_get(
 pub async fn purge(
     State(state): State<AppState>,
     Path(db): Path<String>,
-    Json(body): Json<serde_json::Value>,
+    JsonBody(body): JsonBody<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     state.check_db(&db)?;
     let req = parse_rev_map(body)?;

@@ -3,7 +3,9 @@
 /// Provides a `ChangesStream` that wraps the adapter's `changes()` method
 /// and supports:
 /// - One-shot mode: fetch changes since a sequence and return
-/// - Live/continuous mode: keep polling for new changes
+/// - Live/continuous mode: wait for new changes, woken by the adapter's
+///   change notifications ([`Adapter::subscribe`]) when it has them, and
+///   polling at `poll_interval` otherwise
 /// - Filtering by document IDs
 use std::future::Future;
 use std::pin::Pin;
@@ -41,12 +43,9 @@ pub enum ChangesEvent {
 }
 use rouchdb_core::error::Result;
 
-/// A notification that a change occurred, sent through the broadcast channel.
-#[derive(Debug, Clone)]
-pub struct ChangeNotification {
-    pub seq: Seq,
-    pub doc_id: String,
-}
+/// A notification that a change occurred, sent through the broadcast
+/// channel: the notice adapters send ([`Adapter::subscribe`]).
+pub type ChangeNotification = rouchdb_core::adapter::ChangeNotice;
 
 /// A sender for change notifications. Adapters use this to notify listeners
 /// when documents are written.
@@ -78,7 +77,21 @@ pub struct ChangeReceiver {
     rx: broadcast::Receiver<ChangeNotification>,
 }
 
+impl From<broadcast::Receiver<ChangeNotification>> for ChangeReceiver {
+    /// Wrap a subscription, such as the one [`Adapter::subscribe`] returns.
+    fn from(rx: broadcast::Receiver<ChangeNotification>) -> Self {
+        ChangeReceiver { rx }
+    }
+}
+
 impl ChangeReceiver {
+    /// Drop the notifications already queued (the caller is about to read
+    /// the changes feed, which covers them). A closed channel is left for
+    /// the next `recv` to report.
+    fn drain(&mut self) {
+        while let Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) = self.rx.try_recv() {}
+    }
+
     pub async fn recv(&mut self) -> Option<ChangeNotification> {
         loop {
             match self.rx.recv().await {
@@ -110,7 +123,9 @@ pub struct ChangesStreamOptions {
     pub style: ChangesStyle,
     /// A filter function applied post-fetch to each change event.
     pub filter: Option<ChangesFilter>,
-    /// Polling interval for live mode when no broadcast channel is available.
+    /// Polling interval for live mode when there is no change notification
+    /// channel (the adapter's [`Adapter::subscribe`] returns `None` and no
+    /// receiver was given), and retry base delay after a failed fetch.
     pub poll_interval: Duration,
     /// In live mode, end the stream (with `Complete`) after this long
     /// without new changes.
@@ -232,8 +247,10 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 /// A live changes stream that yields change events as they happen.
 ///
-/// In live mode, after fetching existing changes, it waits for
-/// notifications via a broadcast channel or polls at regular intervals.
+/// In live mode, after fetching existing changes, it waits for change
+/// notifications (the receiver given to [`LiveChangesStream::new`], else
+/// the adapter's [`Adapter::subscribe`]) or, without any, polls at
+/// `poll_interval`.
 /// A failed fetch is reported as [`ChangesEvent::Error`]; a live stream then
 /// retries with a growing delay, a one-shot stream ends.
 pub struct LiveChangesStream {
@@ -283,11 +300,20 @@ enum LiveStreamState {
 }
 
 impl LiveChangesStream {
+    /// A stream over `adapter`. In live mode it wakes up on `receiver`'s
+    /// notifications, or, when `receiver` is `None`, on the adapter's own
+    /// ([`Adapter::subscribe`], subscribed here, before anything is read, so
+    /// no change is missed); it polls when there are none.
     pub fn new(
         adapter: Arc<dyn Adapter>,
         receiver: Option<ChangeReceiver>,
         mut opts: ChangesStreamOptions,
     ) -> Self {
+        let receiver = match receiver {
+            Some(receiver) => Some(receiver),
+            None if opts.live => adapter.subscribe().map(ChangeReceiver::from),
+            None => None,
+        };
         let strip_docs = apply_selector(&mut opts);
         let last_seq = opts.since.clone();
         let next_heartbeat = opts
@@ -559,6 +585,8 @@ impl LiveChangesStream {
                             self.state = LiveStreamState::Done;
                             return false;
                         }
+                        // One fetch covers every notification queued so far.
+                        receiver.drain();
                         true
                     }
                     _ = sleep_until(wake) => false,
@@ -884,6 +912,103 @@ mod tests {
         assert_eq!(events[1].id, "d2");
     }
 
+    // -----------------------------------------------------------------------
+    // Adapter change notifications (F96), on a paused clock: a poll would
+    // advance it by `HOUR`, so staying below proves no change waited for one.
+    // -----------------------------------------------------------------------
+
+    const HOUR: Duration = Duration::from_secs(3600);
+
+    fn hourly_polls() -> ChangesStreamOptions {
+        ChangesStreamOptions {
+            live: true,
+            poll_interval: HOUR,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_feed_wakes_on_adapter_notifications() {
+        let db = Arc::new(MemoryAdapter::new("n"));
+        let start = Instant::now();
+        let (mut rx, handle) = live_changes(db.clone(), hourly_polls());
+        for id in ["a", "b", "c"] {
+            put_doc(db.as_ref(), id, serde_json::json!({})).await;
+            assert_eq!(rx.recv().await.unwrap().id, id);
+        }
+        assert!(start.elapsed() < HOUR, "waited {:?}", start.elapsed());
+        handle.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_feed_loses_no_change_under_concurrent_writes() {
+        let db = Arc::new(MemoryAdapter::new("n"));
+        let start = Instant::now();
+        let (mut rx, handle) = live_changes(db.clone(), hourly_polls());
+        let writers: Vec<_> = (0..8)
+            .map(|w| {
+                let db = db.clone();
+                tokio::spawn(async move {
+                    for i in 0..50 {
+                        put_doc(db.as_ref(), &format!("w{w}-{i}"), serde_json::json!({})).await;
+                        tokio::task::yield_now().await;
+                    }
+                })
+            })
+            .collect();
+        // A burst larger than the notification buffer: the subscriber lags
+        // and must still re-read everything.
+        let burst: Vec<Document> = (0..1500)
+            .map(|i| Document::from_json(serde_json::json!({"_id": format!("burst-{i}")})).unwrap())
+            .collect();
+        db.bulk_docs(burst, BulkDocsOptions::new()).await.unwrap();
+        let mut seen = std::collections::HashSet::new();
+        while seen.len() < 8 * 50 + 1500 {
+            let event = rx.recv().await.unwrap();
+            assert!(seen.insert(event.id.clone()), "{} twice", event.id);
+        }
+        for writer in writers {
+            writer.await.unwrap();
+        }
+        assert!(start.elapsed() < HOUR, "waited {:?}", start.elapsed());
+        handle.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_notifications_cost_one_fetch() {
+        let db = Flaky::notifying();
+        let (mut rx, handle) = live_changes(db.clone(), hourly_polls());
+        put_doc(&db.inner, "first", serde_json::json!({})).await;
+        assert_eq!(rx.recv().await.unwrap().id, "first");
+        let before = db.calls.load(Ordering::SeqCst);
+        // Written while the feed waits, without yielding to it: their 50
+        // notifications are queued when it wakes up.
+        for i in 0..50 {
+            put_doc(&db.inner, &format!("d{i}"), serde_json::json!({})).await;
+        }
+        for i in 0..50 {
+            assert_eq!(rx.recv().await.unwrap().id, format!("d{i}"));
+        }
+        let fetches = db.calls.load(Ordering::SeqCst) - before;
+        assert!(fetches <= 3, "{fetches} fetches for one burst");
+        handle.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_feed_polls_an_adapter_without_notifications() {
+        // `Flaky` does not forward `subscribe`: the feed falls back to polling.
+        let db = Flaky::new(false);
+        let start = Instant::now();
+        let (mut rx, handle) = live_changes(db.clone(), hourly_polls());
+        put_doc(&db.inner, "a", serde_json::json!({})).await;
+        assert_eq!(rx.recv().await.unwrap().id, "a");
+        tokio::task::yield_now().await;
+        put_doc(&db.inner, "b", serde_json::json!({})).await;
+        assert_eq!(rx.recv().await.unwrap().id, "b");
+        assert!(start.elapsed() >= HOUR, "waited {:?}", start.elapsed());
+        handle.cancel();
+    }
+
     #[tokio::test]
     async fn change_sender_subscribe() {
         let (sender, _rx) = ChangeSender::new(16);
@@ -911,6 +1036,8 @@ mod tests {
         calls: AtomicUsize,
         /// How long each `changes()` call takes, in milliseconds.
         latency_ms: std::sync::atomic::AtomicU64,
+        /// Forward the memory adapter's change notifications.
+        notify: bool,
     }
 
     impl Flaky {
@@ -920,7 +1047,15 @@ mod tests {
                 fail: AtomicBool::new(fail),
                 calls: AtomicUsize::new(0),
                 latency_ms: std::sync::atomic::AtomicU64::new(0),
+                notify: false,
             })
+        }
+
+        /// A healthy adapter that announces its changes.
+        fn notifying() -> Arc<Self> {
+            let mut flaky = Arc::try_unwrap(Self::new(false)).ok().unwrap();
+            flaky.notify = true;
+            Arc::new(flaky)
         }
     }
 
@@ -941,6 +1076,13 @@ mod tests {
         }
         async fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
             self.inner.all_docs(opts).await
+        }
+        fn subscribe(&self) -> Option<broadcast::Receiver<rouchdb_core::adapter::ChangeNotice>> {
+            if self.notify {
+                self.inner.subscribe()
+            } else {
+                None
+            }
         }
         async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
