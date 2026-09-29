@@ -43,6 +43,13 @@ async fn doc_ids_filter_in_get() {
 
     let resp = get(&app, "/db/_changes?filter=_doc_ids").await;
     assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "error": "bad_request",
+            "reason": "`doc_ids` filter parameter is not a list of doc ids.",
+        })
+    );
 
     let resp = post(
         &app,
@@ -83,6 +90,10 @@ async fn unsupported_filters_are_rejected_instead_of_ignored() {
     // replicate everything.
     let resp = get(&app, "/db/_changes?filter=app/by_type").await;
     assert_eq!(resp.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        resp.json(),
+        json!({"error": "not_found", "reason": "missing"})
+    );
     db.put(
         "_design/app",
         json!({"filters": {"by_type": "function(doc) { return true; }"}}),
@@ -97,23 +108,48 @@ async fn unsupported_filters_are_rejected_instead_of_ignored() {
         get(&app, "/db/_changes?filter=_view").await.status,
         StatusCode::BAD_REQUEST
     );
+    let resp = get(&app, "/db/_changes?filter=bogus").await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
     assert_eq!(
-        get(&app, "/db/_changes?filter=bogus").await.status,
-        StatusCode::BAD_REQUEST
+        resp.json(),
+        json!({
+            "error": "bad_request",
+            "reason": "`filter` must be of the form `designname/filtername`",
+        })
     );
+    let resp = get(&app, "/db/_changes?feed=bogus").await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
     assert_eq!(
-        get(&app, "/db/_changes?feed=bogus").await.status,
-        StatusCode::BAD_REQUEST
+        resp.json(),
+        json!({
+            "error": "bad_request",
+            "reason": "Supported `feed` types: normal, continuous, live, longpoll, eventsource",
+        })
     );
 }
 
 #[tokio::test]
 async fn post_accepts_a_numeric_since() {
-    let (_db, app) = seeded().await;
-    let resp = post(&app, "/db/_changes", json!({"since": 2})).await;
-    assert_eq!(ids(&resp.json()), ["c", "_design/x"]);
-    let resp = post(&app, "/db/_changes", json!({"since": "2"})).await;
-    assert_eq!(ids(&resp.json()), ["c", "_design/x"]);
+    let (db, app) = seeded().await;
+    let c_rev = db.get("c").await.unwrap().rev.unwrap().to_string();
+    let x_rev = db.get("_design/x").await.unwrap().rev.unwrap().to_string();
+    let expected = json!([
+        {"seq": 3, "id": "c", "changes": [{"rev": c_rev}]},
+        {"seq": 4, "id": "_design/x", "changes": [{"rev": x_rev}]},
+    ]);
+    for since in [json!(2), json!("2")] {
+        let body = post(&app, "/db/_changes", json!({ "since": since }))
+            .await
+            .json();
+        let rows: Vec<_> = body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| json!({"seq": r["seq"], "id": r["id"], "changes": r["changes"]}))
+            .collect();
+        assert_eq!(json!(rows), expected, "since {since}");
+        assert_eq!(body["last_seq"], 4, "since {since}");
+    }
 }
 
 // ─── longpoll ───────────────────────────────────────────────────────────────

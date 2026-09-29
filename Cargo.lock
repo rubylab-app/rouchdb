@@ -1715,6 +1715,7 @@ dependencies = [
  "reqwest",
  "rouchdb",
  "rouchdb-core",
+ "rouchdb-replication",
  "rust-embed",
  "serde",
  "serde_json",

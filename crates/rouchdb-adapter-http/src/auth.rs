@@ -170,6 +170,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn logout_deletes_the_server_session() {
+        let (url, requests) =
+            recording_stub_server(json_response("200 OK", r#"{"ok":true}"#)).await;
+        let auth = AuthClient::new(&format!("{url}/"));
+        assert_eq!(auth.server_url(), url);
+
+        auth.logout().await.unwrap();
+        assert_eq!(*requests.lock().unwrap(), vec!["DELETE /_session HTTP/1.1"]);
+    }
+
+    #[tokio::test]
     async fn sign_up_escapes_the_user_id() {
         let (url, requests) = recording_stub_server(json_response(
             "201 Created",

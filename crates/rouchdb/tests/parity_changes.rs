@@ -10,6 +10,24 @@ use std::time::Duration;
 
 use rouchdb::{ChangesEvent, ChangesFilter, ChangesOptions, ChangesStreamOptions, Database};
 
+/// Ids of the `Change` events a live stream delivers before its first
+/// `Paused`, i.e. everything it had to report about the existing docs.
+async fn ids_until_paused(rx: &mut tokio::sync::mpsc::Receiver<ChangesEvent>) -> Vec<String> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut ids = Vec::new();
+        loop {
+            match rx.recv().await {
+                Some(ChangesEvent::Change(ce)) => ids.push(ce.id),
+                Some(ChangesEvent::Paused) => return ids,
+                Some(_) => {}
+                None => panic!("stream ended before Paused (after {ids:?})"),
+            }
+        }
+    })
+    .await
+    .expect("the live stream never went idle")
+}
+
 // =========================================================================
 // ChangesFilter — custom filter closures
 // =========================================================================
@@ -97,15 +115,13 @@ async fn live_changes_filter_rejects_all() {
 
     let filter: ChangesFilter = Arc::new(|_| false); // reject all
 
-    let (mut rx, handle) = db.live_changes(ChangesStreamOptions {
+    let (mut rx, handle) = db.live_changes_events(ChangesStreamOptions {
         filter: Some(filter),
         poll_interval: Duration::from_millis(50),
         ..Default::default()
     });
 
-    // Should not receive any events
-    let result = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
-    assert!(result.is_err());
+    assert_eq!(ids_until_paused(&mut rx).await, Vec::<String>::new());
 
     handle.cancel();
 }
@@ -168,29 +184,9 @@ async fn live_changes_events_with_filter() {
         ..Default::default()
     });
 
-    let mut change_ids = Vec::new();
-    let timeout = tokio::time::sleep(Duration::from_secs(2));
-    tokio::pin!(timeout);
-
-    loop {
-        tokio::select! {
-            event = rx.recv() => {
-                match event {
-                    Some(ChangesEvent::Change(ce)) => {
-                        change_ids.push(ce.id.clone());
-                        if !change_ids.is_empty() {
-                            break;
-                        }
-                    }
-                    Some(_) => continue,
-                    None => break,
-                }
-            }
-            _ = &mut timeout => break,
-        }
-    }
-
-    assert_eq!(change_ids, vec!["keep"]);
+    // Every existing doc is reported before the first Paused: `skip`, written
+    // after `keep`, must not be among them.
+    assert_eq!(ids_until_paused(&mut rx).await, vec!["keep"]);
     handle.cancel();
 }
 
@@ -217,31 +213,7 @@ async fn live_changes_events_with_selector() {
         ..Default::default()
     });
 
-    let mut user_ids = Vec::new();
-    let timeout = tokio::time::sleep(Duration::from_secs(2));
-    tokio::pin!(timeout);
-
-    loop {
-        tokio::select! {
-            event = rx.recv() => {
-                match event {
-                    Some(ChangesEvent::Change(ce)) => {
-                        user_ids.push(ce.id.clone());
-                        if user_ids.len() >= 2 {
-                            break;
-                        }
-                    }
-                    Some(_) => continue,
-                    None => break,
-                }
-            }
-            _ = &mut timeout => break,
-        }
-    }
-
-    assert_eq!(user_ids.len(), 2);
-    assert!(user_ids.contains(&"alice".to_string()));
-    assert!(user_ids.contains(&"bob".to_string()));
+    assert_eq!(ids_until_paused(&mut rx).await, vec!["alice", "bob"]);
     handle.cancel();
 }
 
@@ -304,10 +276,8 @@ async fn changes_with_doc_ids_filter() {
         .await
         .unwrap();
 
-    assert_eq!(changes.results.len(), 2);
     let ids: Vec<&str> = changes.results.iter().map(|r| r.id.as_str()).collect();
-    assert!(ids.contains(&"a"));
-    assert!(ids.contains(&"c"));
+    assert_eq!(ids, vec!["a", "c"]);
 }
 
 // =========================================================================
@@ -344,7 +314,7 @@ async fn changes_since_sequence() {
     let all = db.changes(ChangesOptions::default()).await.unwrap();
     assert_eq!(all.results.len(), 3);
 
-    // Get changes since the second event
+    // Changes after the second event: exactly the third one.
     let since = all.results[1].seq.clone();
     let partial = db
         .changes(ChangesOptions {
@@ -354,7 +324,11 @@ async fn changes_since_sequence() {
         .await
         .unwrap();
 
-    assert!(partial.results.len() < all.results.len());
+    let entries = |r: &[rouchdb::ChangeEvent]| -> Vec<(String, rouchdb::Seq)> {
+        r.iter().map(|c| (c.id.clone(), c.seq.clone())).collect()
+    };
+    assert_eq!(entries(&partial.results), entries(&all.results[2..]));
+    assert_eq!(partial.results[0].id, "doc3");
 }
 
 // =========================================================================

@@ -27,7 +27,31 @@ async fn changes_since_sequence() {
         .await
         .unwrap();
 
-    assert!(partial.results.len() < 3);
+    // CouchDB (q=2) orders the feed by shard, not by write time: the exact
+    // expectation is whatever followed results[1] in the full feed.
+    let ids =
+        |r: &[rouchdb::ChangeEvent]| -> Vec<String> { r.iter().map(|c| c.id.clone()).collect() };
+    assert_eq!(ids(&partial.results), ids(&all.results[2..]));
+}
+
+#[tokio::test]
+#[ignore = "requires CouchDB"]
+async fn changes_with_doc_ids_lists_only_those_docs() {
+    let url = fresh_remote_db("ch_docids").await;
+    let db = Database::http(&url);
+    for id in ["doc1", "doc2", "doc3"] {
+        db.put(id, serde_json::json!({})).await.unwrap();
+    }
+
+    let filtered = db
+        .changes(ChangesOptions {
+            doc_ids: Some(vec!["doc2".into()]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let ids: Vec<&str> = filtered.results.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(ids, vec!["doc2"]);
 }
 
 #[tokio::test]
@@ -140,11 +164,19 @@ async fn changes_with_selector_filter() {
         .await
         .unwrap();
 
-    assert_eq!(changes.results.len(), 2);
-    for event in &changes.results {
-        let doc = event.doc.as_ref().unwrap();
-        assert_eq!(doc["type"], "user");
-    }
+    let mut got: Vec<(String, serde_json::Value)> = changes
+        .results
+        .iter()
+        .map(|e| (e.id.clone(), e.doc.as_ref().unwrap()["name"].clone()))
+        .collect();
+    got.sort_by(|a, b| a.0.cmp(&b.0)); // shard order
+    assert_eq!(
+        got,
+        vec![
+            ("user1".to_string(), serde_json::json!("Alice")),
+            ("user2".to_string(), serde_json::json!("Bob")),
+        ]
+    );
 }
 
 // =========================================================================

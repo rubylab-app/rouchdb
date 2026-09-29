@@ -1360,4 +1360,129 @@ mod tests {
         .unwrap_or(false);
         assert!(delivered, "change never delivered");
     }
+
+    #[test]
+    fn seq_after_orders_numeric_and_opaque_sequences() {
+        let num = Seq::Num;
+        assert!(seq_after(&num(5), &num(3)));
+        assert!(!seq_after(&num(3), &num(3)));
+        assert!(!seq_after(&num(2), &num(3)));
+
+        // Opaque CouchDB sequences compare by their numeric prefix only.
+        let s = |v: &str| Seq::Str(v.into());
+        assert!(seq_after(&s("5-g1AAAAB"), &s("3-g1AAAAA")));
+        assert!(!seq_after(&s("3-g1AAAAA"), &s("3-g1AAAAA")));
+        assert!(!seq_after(&s("3-g1AAAAA"), &s("5-g1AAAAB")));
+        assert!(seq_after(&s("12-g1AAAAB"), &s("9-g1AAAAA")));
+    }
+
+    /// `d` has two leaves under 1-aaa (2-ccc wins), `e` is a plain doc.
+    async fn conflicted_db() -> Arc<MemoryAdapter> {
+        let db = Arc::new(MemoryAdapter::new("test"));
+        for ids in [["bbb", "aaa"], ["ccc", "aaa"]] {
+            let doc = Document::from_json(serde_json::json!({
+                "_id": "d",
+                "_rev": format!("2-{}", ids[0]),
+                "_revisions": {"start": 2, "ids": ids},
+            }))
+            .unwrap();
+            db.bulk_docs(vec![doc], BulkDocsOptions::replication())
+                .await
+                .unwrap();
+        }
+        put_doc(db.as_ref(), "e", serde_json::json!({})).await;
+        db
+    }
+
+    fn doc_ids_conflicts_all_leaves() -> ChangesStreamOptions {
+        ChangesStreamOptions {
+            doc_ids: Some(vec!["d".into()]),
+            conflicts: true,
+            style: ChangesStyle::AllDocs,
+            poll_interval: Duration::from_millis(20),
+            ..Default::default()
+        }
+    }
+
+    /// (id, leaf revs, conflicts) of a change.
+    fn shape(c: &ChangeEvent) -> (String, Vec<String>, Option<Vec<String>>) {
+        let mut revs: Vec<String> = c.changes.iter().map(|r| r.rev.clone()).collect();
+        revs.sort();
+        (c.id.clone(), revs, c.conflicts.clone())
+    }
+
+    fn expected_shape() -> Vec<(String, Vec<String>, Option<Vec<String>>)> {
+        vec![(
+            "d".into(),
+            vec!["2-bbb".into(), "2-ccc".into()],
+            Some(vec!["2-bbb".into()]),
+        )]
+    }
+
+    #[tokio::test]
+    async fn one_shot_changes_pass_doc_ids_conflicts_and_style() {
+        let db = conflicted_db().await;
+        let changes = get_changes(db.as_ref(), doc_ids_conflicts_all_leaves())
+            .await
+            .unwrap();
+        assert_eq!(
+            changes.iter().map(shape).collect::<Vec<_>>(),
+            expected_shape()
+        );
+    }
+
+    #[tokio::test]
+    async fn live_changes_pass_doc_ids_conflicts_and_style() {
+        let db = conflicted_db().await;
+        let (mut rx, handle) = live_changes_events(db, doc_ids_conflicts_all_leaves());
+        let changes = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut changes = Vec::new();
+            loop {
+                match rx.recv().await {
+                    Some(ChangesEvent::Change(c)) => changes.push(shape(&c)),
+                    Some(ChangesEvent::Paused) | None => return changes,
+                    Some(_) => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        handle.cancel();
+        assert_eq!(changes, expected_shape());
+    }
+
+    #[tokio::test]
+    async fn cancelled_event_stream_completes_at_the_last_seq() {
+        let db = Arc::new(MemoryAdapter::new("test"));
+        for id in ["a", "b", "c"] {
+            put_doc(db.as_ref(), id, serde_json::json!({})).await;
+        }
+        let (mut rx, handle) = live_changes_events(
+            db,
+            ChangesStreamOptions {
+                poll_interval: Duration::from_millis(20),
+                ..Default::default()
+            },
+        );
+        let rest = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = rx.recv().await {
+                if matches!(event, ChangesEvent::Paused) {
+                    break;
+                }
+            }
+            handle.cancel();
+            let mut rest = Vec::new();
+            while let Some(event) = rx.recv().await {
+                rest.push(event);
+            }
+            rest
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(rest.last(), Some(ChangesEvent::Complete { last_seq }) if *last_seq == Seq::Num(3)),
+            "{:?}",
+            rest.iter().map(|e| format!("{e:?}")).collect::<Vec<_>>()
+        );
+    }
 }
