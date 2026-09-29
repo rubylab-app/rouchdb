@@ -1592,9 +1592,9 @@ dependencies = [
  "reqwest",
  "rouchdb-adapter-http",
  "rouchdb-adapter-memory",
- "rouchdb-adapter-redb",
+ "rouchdb-adapter-redb 0.5.0",
  "rouchdb-changes",
- "rouchdb-core",
+ "rouchdb-core 0.5.0",
  "rouchdb-query",
  "rouchdb-replication",
  "rouchdb-views",
@@ -1611,7 +1611,7 @@ dependencies = [
  "async-trait",
  "percent-encoding",
  "reqwest",
- "rouchdb-core",
+ "rouchdb-core 0.5.0",
  "serde",
  "serde_json",
  "tokio",
@@ -1623,7 +1623,24 @@ version = "0.5.0"
 dependencies = [
  "async-trait",
  "base64",
- "rouchdb-core",
+ "rouchdb-core 0.5.0",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "rouchdb-adapter-redb"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0992f66a69d7bdd101f761bd05ad5d2b928e2981a3b116f7aec190fafc7fdac9"
+dependencies = [
+ "async-trait",
+ "base64",
+ "md-5",
+ "redb",
+ "rouchdb-core 0.4.0",
+ "serde",
  "serde_json",
  "tokio",
  "uuid",
@@ -1636,7 +1653,7 @@ dependencies = [
  "async-trait",
  "base64",
  "redb",
- "rouchdb-core",
+ "rouchdb-core 0.5.0",
  "serde",
  "serde_json",
  "tempfile",
@@ -1650,7 +1667,7 @@ version = "0.5.0"
 dependencies = [
  "criterion",
  "rouchdb",
- "rouchdb-core",
+ "rouchdb-core 0.5.0",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1662,7 +1679,7 @@ version = "0.5.0"
 dependencies = [
  "async-trait",
  "rouchdb-adapter-memory",
- "rouchdb-core",
+ "rouchdb-core 0.5.0",
  "rouchdb-query",
  "serde_json",
  "tokio",
@@ -1677,13 +1694,41 @@ dependencies = [
  "base64",
  "clap",
  "predicates",
+ "redb",
  "reqwest",
  "rouchdb",
- "rouchdb-core",
+ "rouchdb-core 0.5.0",
  "serde_json",
  "tempfile",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "rouchdb-compat-tests"
+version = "0.5.0"
+dependencies = [
+ "redb",
+ "rouchdb-adapter-redb 0.4.0",
+ "rouchdb-adapter-redb 0.5.0",
+ "rouchdb-core 0.4.0",
+ "rouchdb-core 0.5.0",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "rouchdb-core"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b93664a831ff8358df548fa8b7c55c135aeb0ef2be6ea59710319410efededd0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -1706,7 +1751,7 @@ version = "0.5.0"
 dependencies = [
  "fancy-regex",
  "rouchdb-adapter-memory",
- "rouchdb-core",
+ "rouchdb-core 0.5.0",
  "serde",
  "serde_json",
  "tokio",
@@ -1719,7 +1764,7 @@ dependencies = [
  "async-trait",
  "md-5",
  "rouchdb-adapter-memory",
- "rouchdb-core",
+ "rouchdb-core 0.5.0",
  "rouchdb-query",
  "serde",
  "serde_json",
@@ -1740,7 +1785,7 @@ dependencies = [
  "mime_guess",
  "reqwest",
  "rouchdb",
- "rouchdb-core",
+ "rouchdb-core 0.5.0",
  "rouchdb-replication",
  "rust-embed",
  "serde",
@@ -1758,7 +1803,7 @@ name = "rouchdb-views"
 version = "0.5.0"
 dependencies = [
  "rouchdb-adapter-memory",
- "rouchdb-core",
+ "rouchdb-core 0.5.0",
  "rouchdb-query",
  "serde",
  "serde_json",

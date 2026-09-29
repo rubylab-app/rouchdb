@@ -13,6 +13,7 @@ members = [
     "crates/rouchdb-server",
     "crates/rouchdb-cli",
     "crates/rouchdb-bench",
+    "crates/rouchdb-compat-tests",
 ]
 
 [workspace.package]

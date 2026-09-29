@@ -1,0 +1,21 @@
+[package]
+name = "rouchdb-compat-tests"
+description = "Cross-version tests: files written by rouchdb 0.4 (from crates.io) read, refused and upgraded by this version"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# Test-only crate: never published, so it may depend on old releases.
+publish = false
+
+[dev-dependencies]
+# The released 0.4 crates, exactly as users have them.
+rouchdb04-core = { package = "rouchdb-core", version = "=0.4.0" }
+rouchdb04-redb = { package = "rouchdb-adapter-redb", version = "=0.4.0" }
+rouchdb-core = { path = "../rouchdb-core" }
+rouchdb-adapter-redb = { path = "../rouchdb-adapter-redb" }
+redb = "2.3"
+serde_json = "1.0.106"
+tempfile = "3.1.0"
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }

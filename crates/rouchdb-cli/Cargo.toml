@@ -26,6 +26,8 @@ tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
 assert_cmd = "2"
+# To write database files laid out as rouchdb 0.4 wrote them (tests/migrate.rs).
+redb = "2.3"
 predicates = "3"
 tempfile = "3.1.0"
 rouchdb = { path = "../rouchdb" }

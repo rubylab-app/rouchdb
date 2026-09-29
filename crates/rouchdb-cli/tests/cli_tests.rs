@@ -1655,7 +1655,8 @@ fn usage_errors_exit_2_with_empty_stdout() {
     let p = path_str(&path);
 
     let cases: Vec<(Vec<&str>, &str)> = vec![
-        (vec![], "Usage: rouchdb [OPTIONS] <COMMAND>"),
+        // `rouchdb.exe` on Windows.
+        (vec![], " [OPTIONS] <COMMAND>"),
         (
             vec!["frobnicate"],
             "error: unrecognized subcommand 'frobnicate'",

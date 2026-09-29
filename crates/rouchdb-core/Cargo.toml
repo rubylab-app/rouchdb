@@ -15,7 +15,7 @@ readme.workspace = true
 async-trait = "0.1.68"
 base64 = "0.22.1"
 md-5 = "0.10"
-serde = { version = "1.0.184", features = ["derive"] }
+serde = { version = "1.0.185", features = ["derive"] }
 serde_json = { version = "1.0.106", features = ["unbounded_depth"] }
 thiserror = "2"
 tokio = { version = "1.37", features = ["sync"] }

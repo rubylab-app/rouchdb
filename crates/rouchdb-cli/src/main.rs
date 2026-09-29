@@ -7,7 +7,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Parser, Subcommand};
 use rouchdb::{
     AllDocsOptions, BulkDocsOptions, ChangesOptions, Database, Document, FindOptions, GetOptions,
-    ReplicationOptions,
+    RedbAdapter, ReplicationOptions, RouchError, UpgradePolicy,
 };
 
 #[derive(Parser)]
@@ -162,6 +162,32 @@ enum Commands {
         target_name: Option<String>,
     },
 
+    /// Upgrade a database file written by rouchdb 0.4 or earlier
+    ///
+    /// Writes a verified backup of the file first (by default
+    /// `<path>.rouchdb-0.4.bak`, which rouchdb 0.4 can still open, or
+    /// `<path>.rouchdb-0.5-pre.bak` for a file of a 0.5 development build),
+    /// then converts the file in one atomic transaction and prints what it
+    /// found. Afterwards rouchdb 0.4 refuses to open the file. Needs about
+    /// three times the file size of free disk space (about twice with
+    /// `--no-backup`). The first `compact` after the upgrade deletes the
+    /// bodies of old revisions and attachment bytes only they reference: read
+    /// the report before compacting.
+    Migrate {
+        /// Path to the .redb file
+        path: String,
+        /// Write the backup here instead of next to the file (must not
+        /// exist)
+        #[arg(long, value_name = "PATH", conflicts_with = "no_backup")]
+        backup: Option<std::path::PathBuf>,
+        /// Upgrade in place without writing a backup
+        #[arg(long)]
+        no_backup: bool,
+        /// Only report what the upgrade would do; the file is only read
+        #[arg(long, conflicts_with_all = ["backup", "no_backup"])]
+        dry_run: bool,
+    },
+
     /// Compact the database
     Compact {
         /// Path to the .redb file
@@ -240,6 +266,19 @@ fn infer_db_name(path: &str) -> String {
         .to_string()
 }
 
+/// `s` as one POSIX shell word: unchanged if it only holds characters that
+/// need no quoting, else in single quotes.
+fn shell_quote(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"%+,-./:=@_".contains(&b));
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
 fn open_db(path: &str, name: Option<&str>) -> Database {
     let db_name = name
         .map(String::from)
@@ -248,6 +287,13 @@ fn open_db(path: &str, name: Option<&str>) -> Database {
         Ok(db) => db,
         Err(e) => {
             eprintln!("Error opening database: {}", e);
+            if matches!(e, RouchError::UpgradeRequired { .. }) {
+                eprintln!(
+                    "hint: `rouchdb migrate --dry-run {}` reports what the upgrade would \
+                     change, without modifying the file",
+                    shell_quote(path)
+                );
+            }
             process::exit(1);
         }
     }
@@ -493,11 +539,29 @@ fn print_json(value: &serde_json::Value, pretty: bool) {
     }
 }
 
-#[tokio::main]
-async fn main() {
+/// Stack of the threads that run commands. Documents and selectors may be
+/// nested up to `MAX_NESTING_DEPTH` levels, which parsing and matching walk
+/// recursively: more than the 1 MiB main thread of Windows (or tokio's
+/// 2 MiB workers) holds.
+const STACK_SIZE: usize = 64 * 1024 * 1024;
+
+fn main() {
     let cli = Cli::parse();
 
-    let result = run(cli).await;
+    let result = std::thread::Builder::new()
+        .name("rouchdb".into())
+        .stack_size(STACK_SIZE)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(STACK_SIZE)
+                .build()
+                .map_err(rouchdb::RouchError::from)?
+                .block_on(run(cli))
+        })
+        .expect("cannot start the main thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     if let Err(e) = result {
         eprintln!("Error: {}", redact_credentials(&e.to_string()));
         process::exit(1);
@@ -721,6 +785,24 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
                     errors.len()
                 )));
             }
+        }
+
+        Commands::Migrate {
+            path,
+            backup,
+            no_backup,
+            dry_run,
+        } => {
+            let report = if dry_run {
+                RedbAdapter::inspect_upgrade(&path)?
+            } else if no_backup {
+                RedbAdapter::upgrade(&path, UpgradePolicy::InPlaceNoBackup)?
+            } else {
+                RedbAdapter::upgrade(&path, UpgradePolicy::WithBackup(backup))?
+            };
+            // The report ends with the advice that fits it (dry run or not,
+            // backup or not, 0.4 or development-build file).
+            println!("{}", report);
         }
 
         Commands::Compact { path, db_name } => {

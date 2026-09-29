@@ -138,7 +138,14 @@ The foundation crate. Everything else depends on it.
 **Responsibility:** Command-line tool for inspecting and querying redb database files.
 
 **Key files:**
-- `src/main.rs` -- Clap-based CLI with subcommands: `info`, `get`, `all-docs`, `find`, `changes`, `dump`, `replicate`, `compact`.
+- `src/main.rs` -- Clap-based CLI with subcommands: `info`, `get`, `all-docs`, `find`, `changes`, `dump`, `replicate`, `migrate`, `compact`, `put`, `delete`, `post`, `import`.
+
+### `rouchdb-compat-tests` (not published)
+
+**Responsibility:** Cross-version tests. Depends on the released `rouchdb-core` and `rouchdb-adapter-redb` 0.4.0 from crates.io (renamed `rouchdb04-*`) next to the workspace crates, and checks that 0.4 files are refused and upgraded without loss by this version and that 0.4 refuses 0.5 files.
+
+**Key files:**
+- `tests/redb_0_4_to_0_5.rs`
 
 ## Adding an Adapter
 

@@ -9,6 +9,8 @@ RouchDB is the Rust equivalent of [PouchDB](https://pouchdb.com/) — it stores 
 [![CI](https://github.com/rubylab-app/rouchdb/actions/workflows/ci.yml/badge.svg)](https://github.com/rubylab-app/rouchdb/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+> **Upgrading from 0.4?** 0.5 does not open `.redb` files written by 0.4 until you upgrade them once, with `rouchdb migrate app.redb` (which writes a verified backup first; `--dry-run` only reads the file) or `Database::open_with` + `UpgradePolicy::WithBackup`, with about three times the file size of free disk space; afterwards 0.4 cannot open them. The first `compact()` after the upgrade deletes old revision bodies. Read the [migration guide](https://github.com/rubylab-app/rouchdb/blob/main/docs/book/src/upgrading/0.4-to-0.5.md#redb-files-upgrade-once-explicitly).
+
 ## Features
 
 - **Local-first** — works offline, syncs when connected
@@ -278,6 +280,7 @@ failure (including a `replicate` or `import` that only partly succeeded).
 ```bash
 rouchdb replicate mydb.redb http://admin:password@localhost:5984/mydb  # Sync
 rouchdb compact mydb.redb                                              # Compact
+rouchdb migrate mydb.redb                  # Upgrade a file written by rouchdb 0.4 (backup first)
 ```
 
 To keep the CouchDB password out of shell history and `ps`, `replicate` reads

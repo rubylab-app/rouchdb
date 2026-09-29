@@ -2,7 +2,7 @@ use std::process;
 use std::sync::Arc;
 
 use clap::Parser;
-use rouchdb::Database;
+use rouchdb::{Database, OpenOptions, RedbAdapter, RouchError, UpgradePolicy};
 use rouchdb_server::{AdminCredentials, parse_cors_origin};
 
 #[derive(Parser)]
@@ -67,6 +67,16 @@ struct Cli {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     session_timeout: u64,
+
+    /// Upgrade a database file written by rouchdb 0.4 or earlier before
+    /// serving it, after writing a verified backup to
+    /// `<path>.rouchdb-0.4.bak` (without this flag such a file is refused
+    /// and left untouched). Afterwards rouchdb 0.4 cannot open the file.
+    /// Needs about three times the file size of free disk space. (A file of
+    /// a 0.5 development build is always upgraded, after a backup to
+    /// `<path>.rouchdb-0.5-pre.bak`.)
+    #[arg(long)]
+    upgrade: bool,
 }
 
 fn infer_db_name(path: &str) -> String {
@@ -83,10 +93,28 @@ async fn main() {
 
     let db_name = cli.db_name.unwrap_or_else(|| infer_db_name(&cli.path));
 
-    let db = match Database::open(&cli.path, &db_name) {
-        Ok(db) => db,
+    let options = if cli.upgrade {
+        OpenOptions::new().upgrade(UpgradePolicy::WithBackup(None))
+    } else {
+        OpenOptions::new()
+    };
+    let db = match RedbAdapter::open_with(&cli.path, &db_name, options) {
+        Ok(adapter) => {
+            // The report ends with the advice that fits it (backup or not,
+            // 0.4 or development-build file).
+            if let Some(report) = adapter.upgrade_report() {
+                eprintln!("{report}");
+            }
+            Database::from_adapter(Arc::new(adapter))
+        }
         Err(e) => {
             eprintln!("Error opening database: {e}");
+            if matches!(e, RouchError::UpgradeRequired { .. }) {
+                eprintln!(
+                    "hint: or restart rouchdb-server with --upgrade, which writes the same \
+                     verified backup first"
+                );
+            }
             process::exit(1);
         }
     };

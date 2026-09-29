@@ -34,6 +34,12 @@ macro_rules! db_err {
     };
 }
 
+// After `db_err!`, which it uses.
+mod upgrade;
+pub use upgrade::{
+    DiscardedRevision, OpenOptions, REPORT_SAMPLE, StoredFormat, UpgradePolicy, UpgradeReport,
+};
+
 // ---------------------------------------------------------------------------
 // Table definitions for redb
 // ---------------------------------------------------------------------------
@@ -54,8 +60,10 @@ const LOCAL_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("local_do
 /// revision and document that references the same content)
 const ATTACHMENT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("attachments");
 
-/// Metadata table: key -> value
-const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
+/// Metadata table: key -> value (the metadata record, the security
+/// document). Files written by rouchdb <= 0.4 kept these in `metadata`,
+/// which is now the format guard (see the `upgrade` module).
+const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("rouchdb_meta");
 
 // ---------------------------------------------------------------------------
 // Serializable records
@@ -375,6 +383,7 @@ fn in_tree(tree: &RevTree, rev: &str) -> bool {
 pub struct RedbAdapter {
     inner: Arc<Inner>,
     rev_limit: u64,
+    upgrade_report: Option<Arc<UpgradeReport>>,
 }
 
 struct Inner {
@@ -394,57 +403,51 @@ const NOTICE_CAPACITY: usize = 1024;
 impl RedbAdapter {
     /// Open or create a database at the given path.
     ///
-    /// Databases written by older versions are upgraded in place: attachment
-    /// bytes stored per `(document, name)` are re-keyed by digest, and legacy
-    /// revision-tree records are rewritten on their next write. A database
-    /// written by a newer version (a schema this one does not know) is
-    /// refused rather than misread.
+    /// # Files written by rouchdb 0.4 or earlier
+    ///
+    /// The on-disk format changed in 0.5, and a file cannot be read by
+    /// both versions. `open` never converts a file written by rouchdb <= 0.4:
+    /// it returns [`RouchError::UpgradeRequired`] and leaves the file
+    /// untouched. Upgrade it once, keeping a backup, with the CLI
+    /// (`rouchdb migrate <path>`), with [`RedbAdapter::upgrade`], or by
+    /// opening it with [`RedbAdapter::open_with`] and
+    /// [`UpgradePolicy::WithBackup`]. After the upgrade rouchdb 0.4 refuses
+    /// the file (it fails to open it, with an error saying the file requires
+    /// rouchdb >= 0.5), and so it does files created by 0.5.
+    ///
+    /// Files written by unreleased 0.5 development builds (which 0.4 cannot
+    /// open either) are upgraded automatically, after a verified backup to
+    /// `<file>.rouchdb-0.5-pre.bak`. A file written by a newer rouchdb (an
+    /// unknown on-disk format) is refused rather than misread. Opening a file
+    /// that is already current writes nothing.
     pub fn open(path: impl AsRef<Path>, name: &str) -> Result<Self> {
-        let db = Database::create(path.as_ref())
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+        Self::open_with(path, name, OpenOptions::default())
+    }
 
-        // Initialize tables
-        {
-            let write_txn = db
-                .begin_write()
-                .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
-            // Opening tables in a write transaction creates them if they don't exist
-            create_tables(&write_txn)?;
-            {
-                let mut meta_table = db_err!(write_txn.open_table(META_TABLE))?;
-                let existing = match db_err!(meta_table.get(META_KEY))? {
-                    Some(guard) => Some(serde_json::from_slice::<MetaRecord>(guard.value())?),
-                    None => None,
-                };
-                match existing {
-                    None => write_meta(&mut meta_table, &MetaRecord::new())?,
-                    Some(meta) if meta.schema > SCHEMA_VERSION => {
-                        return Err(RouchError::DatabaseError(format!(
-                            "{}: on-disk schema version {} is newer than the {} this version \
-                             of rouchdb supports; open it with a newer rouchdb",
-                            path.as_ref().display(),
-                            meta.schema,
-                            SCHEMA_VERSION
-                        )));
-                    }
-                    Some(mut meta) if meta.schema < SCHEMA_VERSION => {
-                        if meta.schema < 1 {
-                            migrate_attachments_to_digest_keys(&write_txn)?;
-                        }
-                        if meta.schema < 2 {
-                            count_documents(&write_txn, &mut meta)?;
-                        }
-                        meta.schema = SCHEMA_VERSION;
-                        write_meta(&mut meta_table, &meta)?;
-                    }
-                    Some(_) => {}
-                }
-            }
-            write_txn
-                .commit()
-                .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
-        }
-
+    /// Open or create a database at the given path, choosing what happens to
+    /// a file written by rouchdb <= 0.4 ([`OpenOptions::upgrade`]):
+    ///
+    /// ```no_run
+    /// use rouchdb_adapter_redb::{OpenOptions, RedbAdapter, UpgradePolicy};
+    ///
+    /// // Upgrades a 0.4 file after writing a verified backup of it to
+    /// // `app.redb.rouchdb-0.4.bak`.
+    /// let db = RedbAdapter::open_with(
+    ///     "app.redb",
+    ///     "app",
+    ///     OpenOptions::new().upgrade(UpgradePolicy::WithBackup(None)),
+    /// )?;
+    /// if let Some(report) = db.upgrade_report() {
+    ///     eprintln!("{report}");
+    /// }
+    /// # Ok::<(), rouchdb_core::error::RouchError>(())
+    /// ```
+    ///
+    /// The upgrade is one atomic transaction: after an error the file is
+    /// exactly as it was. **Read [`RedbAdapter::upgrade`] about the first
+    /// compaction afterwards.**
+    pub fn open_with(path: impl AsRef<Path>, name: &str, options: OpenOptions) -> Result<Self> {
+        let (db, upgrade_report) = upgrade::open_database(path.as_ref(), &options)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 db,
@@ -453,7 +456,64 @@ impl RedbAdapter {
                 notices: broadcast::channel(NOTICE_CAPACITY).0,
             }),
             rev_limit: DEFAULT_REV_LIMIT,
+            upgrade_report: upgrade_report.map(Arc::new),
         })
+    }
+
+    /// Upgrade a file written by an older rouchdb to the current format,
+    /// without opening it as a database (what `rouchdb migrate` does). The
+    /// file must exist and no program may have it open. `policy` is
+    /// [`UpgradePolicy::WithBackup`] or [`UpgradePolicy::InPlaceNoBackup`];
+    /// a file that already is current is left alone.
+    ///
+    /// The upgrade, in one atomic transaction: re-keys attachment bytes by
+    /// digest, moves `_local/` documents that 0.4 stored as ordinary
+    /// documents to the local document store, lower-cases upper-case
+    /// revision ids, counts the documents, moves the metadata to its new
+    /// table and installs the format guard that makes rouchdb 0.4 refuse the
+    /// file. A record it cannot decode stops it with an error naming the
+    /// record (nothing is skipped, nothing is changed); so does a file it
+    /// cannot represent (a `_local/` document stored under two names, or one
+    /// named just `_local/`), before any backup is written.
+    ///
+    /// Lower-casing revision ids can merge two spellings of one revision
+    /// (`2-ABC…` and `2-abc…`) and can change which conflicting revision
+    /// wins: the report lists both
+    /// ([`UpgradeReport::case_duplicate_bodies_discarded`],
+    /// [`UpgradeReport::docs_with_changed_winner`]).
+    ///
+    /// # Disk space and memory
+    ///
+    /// The upgrade needs about twice the file size of free disk space (redb
+    /// copies every page it changes and commits in two phases), and the
+    /// backup about the file size again: about three times the file size
+    /// when backing up. Memory stays small whatever the file size: records
+    /// and attachments are processed one at a time, with a small page cache.
+    ///
+    /// # The first compaction after upgrading deletes old data
+    ///
+    /// rouchdb 0.4's `compact()` did nothing, so an upgraded file still holds
+    /// the bodies of every old revision. The first
+    /// [`compact`](Adapter::compact) deletes them, together with attachment
+    /// bytes that only old revisions reference (0.4 dropped the attachments
+    /// of a document whose body was updated without them, so such bytes are
+    /// often reachable only from an old revision). The report counts both;
+    /// keep the backup until you have checked it.
+    pub fn upgrade(path: impl AsRef<Path>, policy: UpgradePolicy) -> Result<UpgradeReport> {
+        upgrade::upgrade_file(path.as_ref(), &policy, false)
+    }
+
+    /// Report what [`RedbAdapter::upgrade`] would do to a file, without
+    /// changing it: the file is only read (read transactions), so not a
+    /// byte of it changes and no disk space is used. It fails where the
+    /// upgrade would, with the same error.
+    pub fn inspect_upgrade(path: impl AsRef<Path>) -> Result<UpgradeReport> {
+        upgrade::upgrade_file(path.as_ref(), &UpgradePolicy::Refuse, true)
+    }
+
+    /// What was done to the file when it was opened, if it was upgraded.
+    pub fn upgrade_report(&self) -> Option<&UpgradeReport> {
+        self.upgrade_report.as_deref()
     }
 
     /// Keep at most `limit` revisions per branch of a document's history
@@ -500,6 +560,11 @@ impl RedbAdapter {
 /// - 0: rouchdb <= 0.4 (attachment bytes keyed by `doc_id\0name`).
 /// - 1: attachment bytes keyed by digest (content-addressed, shared).
 /// - 2: document counts maintained in the metadata record.
+///
+/// Released files of schema 2 keep the metadata in `rouchdb_meta` and carry
+/// the format guard; files of schema 1 or 2 with the metadata still in
+/// `metadata` were written by unreleased 0.5 development builds (see the
+/// `upgrade` module).
 const SCHEMA_VERSION: u32 = 2;
 
 const META_KEY: &str = "meta";
@@ -540,45 +605,6 @@ fn create_tables(txn: &redb::WriteTransaction) -> Result<()> {
     db_err!(txn.open_table(LOCAL_TABLE))?;
     db_err!(txn.open_table(ATTACHMENT_TABLE))?;
     db_err!(txn.open_table(META_TABLE))?;
-    Ok(())
-}
-
-/// Schema 0 -> 1: attachment bytes were stored under `doc_id\0name` (so a
-/// later write of the same name overwrote the bytes older revisions point
-/// at). Re-key every entry by its digest, which is what revision metadata
-/// references.
-fn migrate_attachments_to_digest_keys(txn: &redb::WriteTransaction) -> Result<()> {
-    let mut table = db_err!(txn.open_table(ATTACHMENT_TABLE))?;
-    let mut legacy_keys = Vec::new();
-    for entry in db_err!(table.iter())? {
-        let (key, _) = db_err!(entry)?;
-        if key.value().contains('\0') {
-            legacy_keys.push(key.value().to_string());
-        }
-    }
-    for key in legacy_keys {
-        let bytes = db_err!(table.remove(key.as_str()))?.map(|g| g.value().to_vec());
-        if let Some(bytes) = bytes {
-            let digest = attachment_digest(&bytes);
-            let exists = db_err!(table.get(digest.as_str()))?.is_some();
-            if !exists {
-                db_err!(table.insert(digest.as_str(), bytes.as_slice()))?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Schema 1 -> 2: compute the document counts once.
-fn count_documents(txn: &redb::WriteTransaction, meta: &mut MetaRecord) -> Result<()> {
-    let table = db_err!(txn.open_table(DOC_TABLE))?;
-    meta.doc_count = 0;
-    meta.doc_del_count = 0;
-    for entry in db_err!(table.iter())? {
-        let (_, value) = db_err!(entry)?;
-        let (tree, _) = decode_doc_record(value.value())?;
-        meta.adjust_counts(None, Some(is_deleted(&tree)));
-    }
     Ok(())
 }
 
@@ -1612,6 +1638,8 @@ impl Inner {
         let write_txn = db_err!(self.db.begin_write())?;
 
         // Delete all tables in O(1) instead of draining entries one by one.
+        // The format guard is never deleted: a destroyed database is still
+        // a 0.5 file that older versions must not open.
         let _ = db_err!(write_txn.delete_table(DOC_TABLE))?;
         let _ = db_err!(write_txn.delete_table(REV_DATA_TABLE))?;
         let _ = db_err!(write_txn.delete_table(CHANGES_TABLE))?;
@@ -2145,6 +2173,8 @@ mod tests {
             assert!(txn.open_table(table).unwrap().is_empty().unwrap());
         }
         assert!(txn.open_table(CHANGES_TABLE).unwrap().is_empty().unwrap());
+        // The format guard survives: 0.4 still cannot open the file.
+        assert!(txn.open_table(upgrade::GUARD_TABLE).is_ok());
     }
 
     /// Re-sending a revision already stored with its body in replication
@@ -2486,6 +2516,30 @@ mod tests {
         txn.commit().unwrap();
     }
 
+    /// Turn a file into the layout of rouchdb <= 0.4: no format guard, and
+    /// `meta` as the record of an unguarded `metadata` table.
+    fn make_legacy(db: &RedbAdapter, meta: &[u8]) {
+        let txn = db.inner.db.begin_write().unwrap();
+        txn.delete_table(upgrade::GUARD_TABLE).unwrap();
+        txn.delete_table(META_TABLE).unwrap();
+        txn.open_table(upgrade::LEGACY_META_TABLE)
+            .unwrap()
+            .insert(META_KEY, meta)
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
+    fn open_upgrading(path: &Path) -> RedbAdapter {
+        let db = RedbAdapter::open_with(
+            path,
+            "legacy",
+            OpenOptions::new().upgrade(UpgradePolicy::InPlaceNoBackup),
+        )
+        .unwrap();
+        assert!(db.upgrade_report().unwrap().upgraded);
+        db
+    }
+
     fn raw_record(db: &RedbAdapter, id: &str) -> Vec<u8> {
         let txn = db.inner.db.begin_read().unwrap();
         let t = txn.open_table(DOC_TABLE).unwrap();
@@ -2528,16 +2582,10 @@ mod tests {
                 }
                 txn.commit().unwrap();
             }
-            let txn = db.inner.db.begin_write().unwrap();
-            {
-                let mut meta = txn.open_table(META_TABLE).unwrap();
-                meta.insert(META_KEY, &br#"{"update_seq":400,"db_uuid":"x"}"#[..])
-                    .unwrap();
-            }
-            txn.commit().unwrap();
+            make_legacy(&db, br#"{"update_seq":400,"db_uuid":"x"}"#);
         }
 
-        let db = RedbAdapter::open(&path, "legacy").unwrap();
+        let db = open_upgrading(&path);
         assert_eq!(db.info().await.unwrap().doc_count, 2);
         // Node status survives the legacy decoding: only the leaf has a body.
         let shallow = db
@@ -2830,15 +2878,13 @@ mod tests {
                 .unwrap();
                 let mut atts = txn.open_table(ATTACHMENT_TABLE).unwrap();
                 atts.insert("d\0a.txt", &b"legacy bytes"[..]).unwrap();
-                // A pre-0.5 metadata record (no schema field).
-                let mut meta = txn.open_table(META_TABLE).unwrap();
-                meta.insert(META_KEY, &br#"{"update_seq":1,"db_uuid":"x"}"#[..])
-                    .unwrap();
             }
             txn.commit().unwrap();
+            // A pre-0.5 metadata record (no schema field).
+            make_legacy(&db, br#"{"update_seq":1,"db_uuid":"x"}"#);
         }
 
-        let db = RedbAdapter::open(&path, "legacy").unwrap();
+        let db = open_upgrading(&path);
         let bytes = db
             .get_attachment("d", "a.txt", GetAttachmentOptions::default())
             .await
