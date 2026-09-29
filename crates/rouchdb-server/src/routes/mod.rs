@@ -224,3 +224,62 @@ pub fn build_routes(state: AppState) -> Router {
         )
         .with_state(state)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    fn failed(error: &str, reason: &str) -> rouchdb::DocResult {
+        rouchdb::DocResult {
+            ok: false,
+            id: "doc".into(),
+            rev: None,
+            error: Some(error.into()),
+            reason: Some(reason.into()),
+        }
+    }
+
+    /// A failed single-document write keeps CouchDB's status: a conflict is
+    /// a 409 (reached over HTTP when another writer creates the document
+    /// between an attachment upload's existence check and its write), any
+    /// other failure a 400 with the write's reason.
+    #[tokio::test]
+    async fn write_result_maps_failures_to_couchdb_errors() {
+        let ok = rouchdb::DocResult {
+            ok: true,
+            id: "doc".into(),
+            rev: Some("1-a".into()),
+            error: None,
+            reason: None,
+        };
+        assert!(write_result(ok).is_ok_and(|r| r.rev.as_deref() == Some("1-a")));
+
+        for (result, status, error, reason) in [
+            (
+                failed("conflict", "Document update conflict."),
+                StatusCode::CONFLICT,
+                "conflict",
+                "Document update conflict.",
+            ),
+            (
+                failed("bad_request", "Invalid rev format"),
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "Invalid rev format",
+            ),
+        ] {
+            let Err(err) = write_result(result) else {
+                panic!("a failed write must be an error");
+            };
+            let resp = err.into_response();
+            assert_eq!(resp.status(), status);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], error, "{body}");
+            assert_eq!(body["reason"], reason, "{body}");
+        }
+    }
+}

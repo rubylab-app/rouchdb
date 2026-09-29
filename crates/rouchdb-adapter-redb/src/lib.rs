@@ -2083,6 +2083,52 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// The security document round-trips, survives reopening the file, is
+    /// kept apart from local documents (`_local/_security` is an ordinary
+    /// one, as in CouchDB) and is reset by `destroy`.
+    #[tokio::test]
+    async fn security_document_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.redb");
+        let stored = |sec: SecurityDocument| serde_json::to_value(sec).unwrap();
+        let empty = stored(SecurityDocument::default());
+        let sec = SecurityDocument {
+            admins: SecurityGroup {
+                names: vec!["bob".into()],
+                roles: vec![],
+            },
+            members: SecurityGroup {
+                names: vec![],
+                roles: vec!["team".into()],
+            },
+            extra: serde_json::Map::from_iter([("x".into(), serde_json::json!(1))]),
+        };
+        let expected = stored(sec.clone());
+        {
+            let db = RedbAdapter::open(&path, "test").unwrap();
+            assert_eq!(stored(db.get_security().await.unwrap()), empty);
+            db.put_security(sec).await.unwrap();
+            assert_eq!(stored(db.get_security().await.unwrap()), expected);
+        }
+
+        let db = RedbAdapter::open(&path, "test").unwrap();
+        assert_eq!(stored(db.get_security().await.unwrap()), expected);
+        assert!(matches!(
+            db.get_local("_security").await,
+            Err(RouchError::NotFound(_))
+        ));
+        db.put_local(
+            "_security",
+            serde_json::json!({"admins": {"names": ["eve"]}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored(db.get_security().await.unwrap()), expected);
+
+        db.destroy().await.unwrap();
+        assert_eq!(stored(db.get_security().await.unwrap()), empty);
+    }
+
     #[tokio::test]
     async fn destroy_clears_all() {
         let (_dir, db) = temp_db();
@@ -2137,6 +2183,36 @@ mod tests {
             assert!(txn.open_table(table).unwrap().is_empty().unwrap());
         }
         assert!(txn.open_table(CHANGES_TABLE).unwrap().is_empty().unwrap());
+    }
+
+    /// Re-sending a revision already stored with its body in replication
+    /// mode is a no-op, as in CouchDB: the stored body stays, and there is
+    /// no new sequence or change.
+    #[tokio::test]
+    async fn replicated_known_revision_is_a_noop() {
+        let (_dir, db) = temp_db();
+        let rev: Revision = format!("1-{}", "a".repeat(32)).parse().unwrap();
+        for v in [1, 2] {
+            let doc = Document {
+                id: "d".into(),
+                rev: Some(rev.clone()),
+                deleted: false,
+                data: serde_json::json!({"v": v}),
+                attachments: HashMap::new(),
+            };
+            let results = db
+                .bulk_docs(vec![doc], BulkDocsOptions::replication())
+                .await
+                .unwrap();
+            assert!(results[0].ok, "{:?}", results[0]);
+        }
+
+        let doc = db.get("d", GetOptions::default()).await.unwrap();
+        assert_eq!(doc.data["v"], 1);
+        assert_eq!(db.info().await.unwrap().update_seq, Seq::Num(1));
+        let changes = db.changes(ChangesOptions::default()).await.unwrap();
+        assert_eq!(changes.results.len(), 1);
+        assert_eq!(changes.results[0].seq, Seq::Num(1));
     }
 
     #[tokio::test]

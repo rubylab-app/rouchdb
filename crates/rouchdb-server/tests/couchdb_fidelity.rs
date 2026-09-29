@@ -330,11 +330,45 @@ async fn invalid_revisions_are_bad_requests() {
     let db = Arc::new(Database::memory(DB));
     db.put("doc", json!({})).await.unwrap();
     let app = app_with(db, &config());
+    let text = [("content-type", "text/plain")];
+    let text_if_match = [("content-type", "text/plain"), ("if-match", "\"garbage\"")];
+    // The revision is checked before the document is looked up, so a
+    // missing document gets the same 400.
     for resp in [
         get(&app, "/db/doc?rev=garbage").await,
+        get(&app, "/db/missing?rev=garbage").await,
         get(&app, "/db/doc/att.txt?rev=garbage").await,
-        delete(&app, "/db/doc?rev=garbage").await,
+        get(&app, "/db/missing/att.txt?rev=garbage").await,
+        put(&app, "/db/doc?rev=garbage", json!({})).await,
+        put(&app, "/db/missing?rev=garbage", json!({})).await,
         put(&app, "/db/doc", json!({"_rev": "garbage"})).await,
+        delete(&app, "/db/doc?rev=garbage").await,
+        request(
+            &app,
+            Method::PUT,
+            "/db/doc/a.txt?rev=garbage",
+            &text,
+            Some("x"),
+        )
+        .await,
+        request(
+            &app,
+            Method::PUT,
+            "/db/missing/a.txt?rev=garbage",
+            &text,
+            Some("x"),
+        )
+        .await,
+        request(
+            &app,
+            Method::PUT,
+            "/db/missing/a.txt",
+            &text_if_match,
+            Some("x"),
+        )
+        .await,
+        delete(&app, "/db/doc/att.txt?rev=garbage").await,
+        delete(&app, "/db/missing/att.txt?rev=garbage").await,
     ] {
         assert_error(
             &resp,
@@ -350,6 +384,61 @@ async fn invalid_revisions_are_bad_requests() {
         "not_found",
         "missing",
     );
+}
+
+/// `GET /{db}/{docid}` passes its read options on (CouchDB answers
+/// `?attachments=true` as multipart unless asked for JSON; the members are
+/// the same).
+#[tokio::test]
+async fn document_read_options_are_honored() {
+    let db = Arc::new(Database::memory(DB));
+    let r1 = db.put("c", json!({"v": 1})).await.unwrap().rev.unwrap();
+    let r2 = db
+        .put_attachment("c", "a.txt", &r1, b"hi".to_vec(), "text/plain")
+        .await
+        .unwrap()
+        .rev
+        .unwrap();
+    let hash1 = r1.strip_prefix("1-").unwrap();
+    let loser = format!("2-{}", "0".repeat(32));
+    let conflict = rouchdb::Document::from_json(json!({
+        "_id": "c", "_rev": loser, "v": 0,
+        "_revisions": {"start": 2, "ids": ["0".repeat(32), hash1]},
+    }))
+    .unwrap();
+    let written = db
+        .bulk_docs(vec![conflict], rouchdb::BulkDocsOptions::replication())
+        .await
+        .unwrap();
+    assert!(written[0].ok, "{:?}", written[0]);
+    let app = app_with(db, &config());
+
+    let doc = get(&app, "/db/c?conflicts=true").await.json();
+    assert_eq!(doc["_rev"], r2.as_str());
+    assert_eq!(doc["_conflicts"], json!([loser]));
+
+    let doc = get(&app, "/db/c?revs_info=true").await.json();
+    assert_eq!(
+        doc["_revs_info"],
+        json!([
+            {"rev": r2, "status": "available"},
+            {"rev": r1, "status": "available"},
+        ])
+    );
+
+    // `latest` follows the requested revision's branch to its leaf.
+    let doc = get(&app, &format!("/db/c?rev={r1}")).await.json();
+    assert_eq!(doc["_rev"], r1.as_str());
+    let doc = get(&app, &format!("/db/c?rev={r1}&latest=true"))
+        .await
+        .json();
+    assert_eq!(doc["_rev"], r2.as_str());
+
+    let doc = get(&app, "/db/c").await.json();
+    assert_eq!(doc["_attachments"]["a.txt"]["stub"], true, "{doc}");
+    assert!(doc["_attachments"]["a.txt"].get("data").is_none(), "{doc}");
+    let doc = get(&app, "/db/c?attachments=true").await.json();
+    assert_eq!(doc["_attachments"]["a.txt"]["data"], "aGk=", "{doc}");
 }
 
 #[tokio::test]
@@ -770,6 +859,14 @@ async fn couchdb_differential() {
         },
         probe(Method::DELETE, "/nope/a.txt?rev=1-abc", None),
         probe(Method::DELETE, "/a1/none.txt?rev=1-abc", None),
+        probe(Method::GET, "/nope?rev=garbage", None),
+        probe(Method::PUT, "/nope?rev=garbage", Some(json!({}))),
+        Probe {
+            headers: vec![("content-type", "text/plain")],
+            body: Some(json!("x")),
+            ..probe(Method::PUT, "/nope/a.txt?rev=garbage", None)
+        },
+        probe(Method::DELETE, "/nope/a.txt?rev=garbage", None),
         probe(Method::GET, "/_all_docs?limit=abc", None),
         probe(Method::GET, "/_all_docs?skip=-1", None),
         probe(Method::GET, "/_all_docs?descending=abc", None),
