@@ -432,8 +432,14 @@ impl Query {
                 .all(|(path, _)| lookup(doc, path).is_some())
         });
 
-        // Sort (stable, so ties keep the input order)
+        // CouchDB serves a sort by walking an index on the sort fields (in
+        // one direction for all of them), backwards for a descending sort:
+        // ties come in index order, reversed when descending. The input is
+        // in index order (or _id order without one) and the sort is stable.
         if !self.sort.is_empty() {
+            if self.sort[0].1 == SortDirection::Desc {
+                matched.reverse();
+            }
             matched.sort_by(|a, b| {
                 for (path, direction) in &self.sort {
                     let va = lookup(a, path).unwrap_or(&Value::Null);
@@ -1708,6 +1714,32 @@ mod tests {
         assert!(sorted(json!({"f": {"$exists": false}}), json!(["f"])).is_empty());
         // Without a sort nothing is skipped.
         assert_eq!(select(&docs, all), ["a1", "a3", "mi"]);
+    }
+
+    #[test]
+    fn sort_ties_follow_the_input_order_reversed_when_descending() {
+        // CouchDB 3.5.1 walks the index backwards for a descending sort, so
+        // ties come in reverse index (here _id) order.
+        use serde_json::json;
+        let docs = [
+            json!({"_id": "a", "k": 1}),
+            json!({"_id": "b", "k": 2}),
+            json!({"_id": "c", "k": 1}),
+            json!({"_id": "d", "k": 2}),
+        ];
+        let sorted = |sort: Value| {
+            find_ids(
+                &docs,
+                FindOptions {
+                    selector: json!({"k": {"$gt": null}}),
+                    sort: Some(serde_json::from_value(sort).unwrap()),
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(sorted(json!(["k"])), ["a", "c", "b", "d"]);
+        assert_eq!(sorted(json!([{"k": "asc"}])), ["a", "c", "b", "d"]);
+        assert_eq!(sorted(json!([{"k": "desc"}])), ["d", "b", "c", "a"]);
     }
 
     #[test]

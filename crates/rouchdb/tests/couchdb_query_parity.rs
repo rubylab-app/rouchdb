@@ -697,9 +697,24 @@ fn indexed_queries() -> Vec<(Value, Value)> {
             json!({"selector": {"tags.0": {"$gt": null}}, "sort": ["tags.0"], "fields": ["_id", "tags"]}),
             json!([{"_id": "d8", "tags": ["db"]}, {"_id": "d2", "tags": ["js"]}, {"_id": "d9", "tags": ["js", "rust"]}, {"_id": "d1", "tags": ["rust", "db"]}, {"_id": "d10", "tags": ["rust"]}]),
         ),
-        // Ties in a descending sort are left out: CouchDB walks the index
-        // backwards (ties in reverse _id order), RouchDB keeps them in _id
-        // order.
+        // A descending sort walks the index backwards: ties come in reverse
+        // index order (the other index fields, then _id).
+        (
+            json!({"selector": {"tags.0": {"$gt": null}}, "sort": [{"tags.0": "desc"}], "fields": ["_id"]}),
+            json!([{"_id": "d10"}, {"_id": "d1"}, {"_id": "d9"}, {"_id": "d2"}, {"_id": "d8"}]),
+        ),
+        (
+            json!({"selector": {"tags.0": {"$gt": null}}, "sort": [{"tags.0": "desc"}], "skip": 1, "limit": 2, "fields": ["_id"]}),
+            json!([{"_id": "d1"}, {"_id": "d9"}]),
+        ),
+        (
+            json!({"selector": {"flag": {"$exists": true}, "s": {"$exists": true}}, "sort": [{"flag": "desc"}], "fields": ["_id"]}),
+            json!([{"_id": "d8"}, {"_id": "d11"}, {"_id": "d10"}, {"_id": "d7"}]),
+        ),
+        (
+            json!({"selector": {"flag": {"$exists": true}, "s": {"$exists": true}}, "sort": ["flag"], "fields": ["_id"]}),
+            json!([{"_id": "d7"}, {"_id": "d10"}, {"_id": "d11"}, {"_id": "d8"}]),
+        ),
         (
             json!({"selector": {"flag": {"$exists": true}, "s": {"$exists": true}}, "sort": ["flag", "s"], "fields": ["_id", "flag", "s"]}),
             json!([{"_id": "d7", "flag": false, "s": ""}, {"_id": "d10", "flag": false, "s": "ab"}, {"_id": "d11", "flag": true, "s": "a"}, {"_id": "d8", "flag": true, "s": "b"}]),
