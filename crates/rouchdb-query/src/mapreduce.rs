@@ -41,9 +41,9 @@ pub enum ReduceFn {
 /// Options for querying a view.
 #[derive(Debug, Clone, Default)]
 pub struct ViewQueryOptions {
-    /// Only return rows with this exact key: it is both bounds of the
-    /// range, and `start_key` or `end_key` replaces one (as when they follow
-    /// `key` in a CouchDB query string).
+    /// Only return rows with this exact key. With `start_key` or `end_key`
+    /// it is the other bound of the range (as when they follow `key` in a
+    /// CouchDB query string).
     pub key: Option<serde_json::Value>,
     /// Return rows matching any of these keys, in the given order. Several
     /// keys cannot be combined with `key`, `start_key` or `end_key`.
@@ -225,7 +225,7 @@ pub fn query_sorted(
             // even when descending (as in CouchDB).
             let mut groups = Vec::new();
             for key in keys {
-                let (lo, hi) = key_range(rows, key, opts);
+                let (lo, hi) = equal_range(rows, key);
                 if lo < hi {
                     groups.extend(group_reduce(&rows[lo..hi], reduce, opts.group_level)?);
                 }
@@ -277,7 +277,7 @@ pub fn query_sorted(
     let (page, first_position): (Vec<&EmittedRow>, usize) = if let Some(ref keys) = opts.keys {
         let mut positions: Vec<usize> = Vec::new();
         for key in keys {
-            let (lo, hi) = key_range(rows, key, opts);
+            let (lo, hi) = equal_range(rows, key);
             positions.extend(lo..hi);
         }
         if opts.descending {
@@ -381,16 +381,13 @@ fn reducer<'a>(
     Ok(reduce)
 }
 
-/// Index range `[lo, hi)` of the rows (sorted ascending) whose key equals
-/// `key`: empty when `inclusive_end` is off, as for CouchDB, which reads
-/// each key as the range from the key to itself.
-fn key_range(rows: &[EmittedRow], key: &Value, opts: &ViewQueryOptions) -> (usize, usize) {
-    let lo = lower_bound(rows, key);
-    if opts.inclusive_end {
-        (lo, upper_bound(rows, key))
-    } else {
-        (lo, lo)
-    }
+/// Index range `[lo, hi)` of the rows (sorted ascending) whose key equals `key`.
+///
+/// Unlike CouchDB, which reads a key as the range from the key to itself
+/// and so returns nothing for it with `inclusive_end=false`, a key always
+/// selects its rows: `ViewQueryOptions::default()` has `inclusive_end` off.
+fn equal_range(rows: &[EmittedRow], key: &Value) -> (usize, usize) {
+    (lower_bound(rows, key), upper_bound(rows, key))
 }
 
 /// First row whose key is not less than `key`.
@@ -403,11 +400,17 @@ fn upper_bound(rows: &[EmittedRow], key: &Value) -> usize {
     rows.partition_point(|r| collate(&r.key, key) != Ordering::Greater)
 }
 
-/// Index range `[lo, hi)`, in ascending order, selected by
-/// `start_key`/`end_key` (which swap roles when descending). `key` is both
-/// bounds, and `start_key` or `end_key` replaces its bound, as when they
-/// follow `key` in a CouchDB query string.
+/// Index range `[lo, hi)`, in ascending order, selected by `key` or by
+/// `start_key`/`end_key` (which swap roles when descending). With either of
+/// them, `key` is the other bound, as when they follow `key` in a CouchDB
+/// query string.
 fn range_bounds(rows: &[EmittedRow], opts: &ViewQueryOptions) -> (usize, usize) {
+    if let Some(ref key) = opts.key
+        && opts.start_key.is_none()
+        && opts.end_key.is_none()
+    {
+        return equal_range(rows, key);
+    }
     let start = opts.start_key.as_ref().or(opts.key.as_ref());
     let end = opts.end_key.as_ref().or(opts.key.as_ref());
     let (mut lo, mut hi) = (0, rows.len());

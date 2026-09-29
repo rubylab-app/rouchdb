@@ -515,6 +515,16 @@ async fn before_write_sees_attachment_edits_without_changing_them() {
         assert_eq!(seen[0].data, serde_json::json!({"v": 0}), "{kind}");
         assert_eq!(attachment_names(&seen[0]), ["b.bin"], "{kind}");
 
+        // A write on a stale revision shows that revision, then conflicts.
+        let err =
+            b.db.put_attachment("d", "c.txt", &r2, b"c".to_vec(), "text/plain")
+                .await
+                .unwrap_err();
+        assert!(matches!(err, RouchError::Conflict), "{kind}: {err:?}");
+        let seen = capture.take();
+        assert_eq!(seen[0].rev.as_ref().unwrap().to_string(), r2, "{kind}");
+        assert_eq!(attachment_names(&seen[0]), ["a.txt", "c.txt"], "{kind}");
+
         // A write on a document that cannot be read still goes through
         // before_write (with an empty body), then fails as without plugins.
         let err =

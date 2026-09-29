@@ -336,7 +336,10 @@ async fn key_is_both_bounds_and_start_or_end_key_replace_one() {
     assert_eq!(query("eng", None, Some("hr"), true).await, ["a", "c", "d"]);
     assert_eq!(query("eng", None, Some("hr"), false).await, ["a", "c"]);
     assert_eq!(query("eng", None, None, true).await, ["a", "c"]);
-    assert!(query("eng", None, None, false).await.is_empty());
+    // Alone, a key selects its rows whatever `inclusive_end` says (CouchDB
+    // returns none with inclusive_end=false; `ViewQueryOptions::default()`
+    // has it off).
+    assert_eq!(query("eng", None, None, false).await, ["a", "c"]);
     let opts = ViewQueryOptions {
         key: Some(json!("eng")),
         start_key: Some(json!("hr")),
@@ -353,8 +356,7 @@ async fn key_is_both_bounds_and_start_or_end_key_replace_one() {
         .await
         .unwrap();
     assert_eq!(ids(&result), ["a", "c", "d"]);
-    // Several keys exclude key and ranges, and each key is the range from
-    // itself to itself.
+    // Several keys exclude key and ranges.
     for opts in [
         ViewQueryOptions {
             key: Some(json!("eng")),
@@ -388,7 +390,7 @@ async fn key_is_both_bounds_and_start_or_end_key_replace_one() {
     let result = query_view(db.adapter(), &by_dept, None, opts)
         .await
         .unwrap();
-    assert!(result.rows.is_empty());
+    assert_eq!(ids(&result), ["d", "a", "c"]);
 }
 
 #[tokio::test]

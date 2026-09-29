@@ -447,7 +447,7 @@ pub struct ViewQueryOptions {
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `key` | `Option<serde_json::Value>` | `None` | Return only rows with this exact key (the start and end of the range; `start_key`/`end_key` replace one). |
+| `key` | `Option<serde_json::Value>` | `None` | Return only rows with this exact key (with `start_key` or `end_key`, the other bound of the range). |
 | `keys` | `Option<Vec<serde_json::Value>>` | `None` | Return only rows matching any of these keys, in the given order. Several keys exclude `key`, `start_key` and `end_key`. |
 | `start_key` | `Option<serde_json::Value>` | `None` | Start of key range (inclusive). A range no row can be in is a `BadRequest`. |
 | `end_key` | `Option<serde_json::Value>` | `None` | End of key range (inclusive by default). |

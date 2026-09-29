@@ -117,6 +117,8 @@ fn range_queries() -> Vec<AllDocsOptions> {
         (key("a"), None),
         (None, key("zzz")),
         (key("users"), key("users;")),
+        (key("users;"), None),
+        (None, key("users;")),
         (key("users2"), key("usersX:1")),
         (key("users:b"), None),
         (None, key("users:b")),

@@ -208,7 +208,7 @@ let result = query_view(
 ```
 
 `ViewQueryOptions` fields:
-- `key` -- return only rows with this exact key. It is both the start and the end of the range: `start_key` or `end_key` replaces one of them (as when `startkey` follows `key` in a CouchDB query string), and `inclusive_end: false` returns no rows.
+- `key` -- return only rows with this exact key. With `start_key` or `end_key` it is the other bound of the range (as when `startkey` follows `key` in a CouchDB query string).
 - `start_key` / `end_key` -- define a key range (inclusive by default). A range no row can be in (a start after the end, or before it when descending) is a `BadRequest`, as in CouchDB.
 - `inclusive_end` -- whether to include the end key.
 - `descending` -- reverse the sort order.
