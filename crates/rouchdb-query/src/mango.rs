@@ -522,6 +522,8 @@ impl CompiledSelector {
     /// without a field name) return `BadRequest`.
     pub fn new(selector: &serde_json::Value) -> Result<Self> {
         let root = match selector {
+            // `{}` as the whole selector matches every document.
+            Value::Object(map) if map.is_empty() => Node::always(),
             Value::Object(map) => compile_object(map, &[], false, false)?,
             other => {
                 return Err(bad_request(format!(
@@ -544,7 +546,8 @@ enum Node {
     And(Vec<Node>),
     Or(Vec<Node>),
     /// A condition on the value at `path` (an empty path is the value
-    /// itself, used inside `$elemMatch`, `$allMatch` and `$keyMapMatch`).
+    /// itself: the whole document inside a combinator, or the element or
+    /// key inside `$elemMatch`, `$allMatch` and `$keyMapMatch`).
     Field {
         path: Vec<String>,
         cond: Cond,
@@ -714,8 +717,9 @@ fn bad_arg(op: &str, arg: &Value) -> RouchError {
 ///
 /// `negate` is set under an odd number of `$not`/`$nor`, in which case the
 /// conditions are negated and combined with De Morgan's laws. `nested` is
-/// set inside `$elemMatch`/`$allMatch`/`$keyMapMatch`, where operators may
-/// apply to the value itself (an empty path).
+/// set inside a combinator's arguments and inside
+/// `$elemMatch`/`$allMatch`/`$keyMapMatch`, where operators may apply to the
+/// value itself (an empty path): the whole document, or the element.
 fn compile_object(
     map: &Map<String, Value>,
     path: &[String],
@@ -723,15 +727,10 @@ fn compile_object(
     nested: bool,
 ) -> Result<Node> {
     if map.is_empty() {
-        // `{}` as a whole selector matches everything; as the condition of
-        // a field it is an equality test against `{}`.
-        if path.is_empty() {
-            return Ok(if negate {
-                Node::never()
-            } else {
-                Node::always()
-            });
-        }
+        // Anywhere but as the whole selector (see `CompiledSelector::new`),
+        // `{}` is an equality test with `{}`, like a bare value: on a field,
+        // on the whole document inside a combinator (which no document
+        // passes), or on an element.
         return leaf(path, Cond::Eq(Value::Object(Map::new())), negate, nested);
     }
 
@@ -764,11 +763,12 @@ fn compile_entry(
             if args.is_empty() {
                 return Ok(Node::always());
             }
-            // $nor is the conjunction of the negated arguments.
+            // $nor is the conjunction of the negated arguments. Operators
+            // without a field in an argument apply to the value at hand.
             let arg_negate = if key == "$nor" { !negate } else { negate };
             let children = args
                 .iter()
-                .map(|arg| compile_argument(arg, path, arg_negate, nested))
+                .map(|arg| compile_argument(arg, path, arg_negate, true))
                 .collect::<Result<Vec<_>>>()?;
             let conjunction = (key != "$or") != negate;
             Ok(if conjunction {
@@ -828,14 +828,11 @@ fn leaf(path: &[String], cond: Cond, negate: bool, nested: bool) -> Result<Node>
 }
 
 /// Compile the selector argument of `$elemMatch`, `$allMatch` and
-/// `$keyMapMatch`, which is matched against each element (or key).
+/// `$keyMapMatch`, which is matched against each element (or key). It must
+/// be an object, as in CouchDB; `{}` matches the elements equal to `{}`.
 fn compile_nested(op: &str, arg: &Value) -> Result<Node> {
     match arg {
-        // An empty sub-selector matches no element (as in CouchDB).
-        Value::Object(map) if map.is_empty() => Ok(Node::never()),
         Value::Object(map) => compile_object(map, &[], false, true),
-        // A bare value in $elemMatch is an implicit $eq on each element.
-        _ if op == "$elemMatch" => compile_value(arg, &[], false, true),
         _ => Err(bad_arg(op, arg)),
     }
 }
@@ -1020,11 +1017,74 @@ mod tests {
             &d,
             &serde_json::json!({"scores": {"$elemMatch": {"$gt": 90}}})
         ));
-        // Bare scalar operand -> implicit $eq against each element.
-        assert!(matches_selector(
-            &d,
-            &serde_json::json!({"scores": {"$elemMatch": 85}})
-        ));
+        // A bare value is not a sub-selector: CouchDB 3.5.1 answers 400
+        // bad_arg (the argument of $allMatch/$keyMapMatch too).
+        for (op, arg) in [
+            ("$elemMatch", serde_json::json!(85)),
+            ("$elemMatch", serde_json::json!([85])),
+            ("$elemMatch", serde_json::json!(null)),
+            ("$allMatch", serde_json::json!(85)),
+            ("$keyMapMatch", serde_json::json!("k")),
+        ] {
+            let sel = serde_json::json!({"scores": {op: arg.clone()}});
+            let Err(RouchError::BadRequest(reason)) = CompiledSelector::new(&sel) else {
+                panic!("{sel} must be rejected");
+            };
+            assert_eq!(reason, format!("Bad argument for operator {op}: {arg}"));
+            assert!(!matches_selector(&d, &sel));
+        }
+    }
+
+    #[test]
+    fn empty_object_below_the_root_is_an_equality_test() {
+        // CouchDB 3.5.1: only the whole selector `{}` matches everything.
+        // Anywhere else `{}` is `{"$eq": {}}` on the value at hand (the
+        // whole document inside a combinator), and operators without a
+        // field inside a combinator apply to that value.
+        use serde_json::json;
+        let docs = [
+            json!({"_id": "a", "o": {}, "arr": [{}, 1]}),
+            json!({"_id": "b", "o": {"k": 1}, "arr": [2]}),
+            json!({"_id": "c", "arr": []}),
+        ];
+        for (sel, expected) in [
+            (json!({}), vec!["a", "b", "c"]),
+            (json!({"$and": [{}]}), vec![]),
+            (json!({"$or": [{}, {"o.k": 1}]}), vec!["b"]),
+            (json!({"$nor": [{}]}), vec!["a", "b", "c"]),
+            (json!({"$and": [{"$not": {}}]}), vec!["a", "b", "c"]),
+            (json!({"$not": {"$and": [{}]}}), vec!["a", "b", "c"]),
+            (json!({"o": {"$and": [{}]}}), vec!["a"]),
+            (json!({"o": {"$not": {}}}), vec!["b"]),
+            (json!({"o": {"$nor": [{}]}}), vec!["b"]),
+            (json!({"arr": {"$elemMatch": {}}}), vec!["a"]),
+            (json!({"arr": {"$elemMatch": {"$not": {}}}}), vec!["a", "b"]),
+            (json!({"arr": {"$allMatch": {}}}), vec![]),
+            (
+                json!({"arr": {"$elemMatch": {"$or": [{}, {"$eq": 2}]}}}),
+                vec!["a", "b"],
+            ),
+            (json!({"o": {"$keyMapMatch": {}}}), vec![]),
+            (json!({"$and": [{"$gt": 1}]}), vec!["a", "b", "c"]),
+            (json!({"$or": [{"$lt": 1}]}), vec![]),
+            (json!({"$and": [{"$type": "object"}]}), vec!["a", "b", "c"]),
+            (json!({"$nor": [{"$exists": true}]}), vec![]),
+        ] {
+            assert_eq!(select(&docs, sel.clone()), expected, "{sel}");
+        }
+        // A whole document equal to `{}` does pass.
+        assert!(matches_selector(&json!({}), &json!({"$and": [{}]})));
+        // Outside a combinator an operator still needs a field.
+        for sel in [
+            json!({"$not": {}}),
+            json!({"$not": {"$gt": 1}}),
+            json!({"$eq": {}}),
+        ] {
+            let Err(RouchError::BadRequest(reason)) = CompiledSelector::new(&sel) else {
+                panic!("{sel} must be rejected");
+            };
+            assert_eq!(reason, "One or more conditions is missing a field name.");
+        }
     }
 
     #[test]

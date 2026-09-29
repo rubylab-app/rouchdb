@@ -331,6 +331,55 @@ async fn partition_with_empty_name_is_the_colon_prefix() {
 }
 
 #[tokio::test]
+async fn partition_find_takes_any_selector_the_database_takes() {
+    for b in backends("partition") {
+        for id in ["users:a", "users:b", "orders:1", "users"] {
+            b.db.put(id, serde_json::json!({"o": {}})).await.unwrap();
+        }
+        let users = b.db.partition("users");
+        let find = |selector: serde_json::Value| {
+            users.find(FindOptions {
+                selector,
+                ..Default::default()
+            })
+        };
+        let ids = |r: rouchdb::FindResponse| -> Vec<String> {
+            r.docs
+                .iter()
+                .map(|d| d["_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // `{}` matches every document of the partition, as `{}` does in
+        // the database (nested in a combinator it would match none).
+        assert_eq!(
+            ids(find(serde_json::json!({})).await.unwrap()),
+            ["users:a", "users:b"],
+            "{}",
+            b.name
+        );
+        assert_eq!(
+            ids(find(serde_json::json!({"o": {}})).await.unwrap()),
+            ["users:a", "users:b"],
+            "{}",
+            b.name
+        );
+        // A selector the database rejects is rejected in a partition too,
+        // although it would be valid inside a combinator.
+        for selector in [
+            serde_json::json!({"$gt": 1}),
+            serde_json::json!({"$not": {}}),
+        ] {
+            let result = find(selector.clone()).await;
+            assert!(
+                matches!(result, Err(RouchError::BadRequest(_))),
+                "{}: {selector}: {result:?}",
+                b.name
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn partition_find_matches_the_prefix_literally() {
     for b in backends("partition") {
         for id in [

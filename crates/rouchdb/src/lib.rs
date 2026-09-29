@@ -1393,9 +1393,17 @@ impl Partition<'_> {
 
     /// Run a Mango find query scoped to this partition.
     pub async fn find(&self, mut opts: FindOptions) -> Result<FindResponse> {
+        // Validate the selector as a whole selector first: in a combinator
+        // some invalid ones (`{"$gt": 1}`) would be accepted.
+        CompiledSelector::new(&opts.selector)?;
         let escaped = regex_escape(&self.name);
         let partition_filter = serde_json::json!({"_id": {"$regex": format!("^{}:", escaped)}});
-        opts.selector = serde_json::json!({"$and": [opts.selector, partition_filter]});
+        opts.selector = match opts.selector {
+            // `{}` matches every document, but inside `$and` it would be an
+            // equality test with `{}` that no document passes.
+            serde_json::Value::Object(ref map) if map.is_empty() => partition_filter,
+            selector => serde_json::json!({"$and": [selector, partition_filter]}),
+        };
         self.db.find(opts).await
     }
 

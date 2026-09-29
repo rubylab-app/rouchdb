@@ -577,6 +577,47 @@ fn unindexed_queries() -> Vec<(Value, Value)> {
             json!({"selector": {"s": {"$regex": "^(?!a)"}}}),
             json!(["d7", "d8"]),
         ),
+        // Inside a combinator (or $not below a field), `{}` is an equality
+        // test with `{}` on the value at hand, the whole document included,
+        // and operators without a field apply to that value.
+        (json!({"selector": {"$and": [{}]}}), json!([])),
+        (json!({"selector": {"$and": [{}, {"x": 3}]}}), json!([])),
+        (
+            json!({"selector": {"$or": [{}, {"age": 20}]}}),
+            json!(["d2"]),
+        ),
+        (
+            json!({"selector": {"$nor": [{}, {"age": 20}]}}),
+            json!(["d1", "d10", "d11", "d4", "d7", "d8", "d9"]),
+        ),
+        (json!({"selector": {"obj": {"$and": [{}]}}}), json!(["d7"])),
+        (
+            json!({"selector": {"address": {"$or": [{}, {"city": "la"}]}}}),
+            json!(["d2", "d6"]),
+        ),
+        (
+            json!({"selector": {"address": {"$not": {}}}}),
+            json!(["d1", "d2"]),
+        ),
+        (
+            json!({"selector": {"items": {"$elemMatch": {"$or": [{}, {"subject": "bio"}]}}}}),
+            json!(["d2"]),
+        ),
+        // (CouchDB 3.5.1 matches nothing with a $nor inside $elemMatch or
+        // $allMatch, even {"$nor": [{"$eq": 1}]} on [3]; not emulated.)
+        (
+            json!({"selector": {"tags": {"$allMatch": {"$not": {}}}}}),
+            json!(["d1", "d10", "d2", "d8", "d9"]),
+        ),
+        (
+            json!({"selector": {"$and": [{"$gt": 1}]}, "fields": ["_id"]}),
+            json!([{"_id": "d1"}, {"_id": "d10"}, {"_id": "d11"}, {"_id": "d2"}, {"_id": "d3"}, {"_id": "d4"}, {"_id": "d5"}, {"_id": "d6"}, {"_id": "d7"}, {"_id": "d8"}, {"_id": "d9"}]),
+        ),
+        (json!({"selector": {"$or": [{"$lt": 1}]}}), json!([])),
+        (
+            json!({"selector": {"$not": {"$and": [{"$type": "object"}]}}}),
+            json!([]),
+        ),
     ]
 }
 
@@ -599,6 +640,11 @@ fn rejected_queries() -> Vec<Value> {
         json!({"selector": {"s": {"$gt": null}}, "sort": [{"s": "up"}]}),
         json!({"selector": {"s": {"$gt": null}}, "sort": [{"s": "asc", "f": "asc"}]}),
         json!({"selector": {"f": {"$not": 5}}}),
+        json!({"selector": {"$not": {}}}),
+        json!({"selector": {"$not": {"$gt": 1}}}),
+        json!({"selector": {"tags": {"$elemMatch": "js"}}}),
+        json!({"selector": {"scores": {"$elemMatch": 50}}}),
+        json!({"selector": {"tags": {"$elemMatch": ["js"]}}}),
     ]
 }
 
