@@ -261,7 +261,7 @@ pub struct ReplicationOptions {
   `bulk_get`. `Custom` filters after fetching changes.
 - `live` -- enable continuous replication mode.
 - `retry` -- automatically retry on transient errors in live mode.
-- `poll_interval` -- how often to poll for new changes in live mode.
+- `poll_interval` -- how often to poll for new changes in live mode, when the source cannot announce them (`Adapter::subscribe`).
 - `back_off_function` -- custom backoff for retries; receives retry count,
   returns delay duration.
 
@@ -335,7 +335,8 @@ continuous loop:
  │         │                                        │
  │    emit Paused                                   │
  │         │                                        │
- │    sleep(poll_interval)                          │
+ │    wait: source change notice, or               │
+ │    sleep(poll_interval) without notices         │
  │         │                                        │
  │    ┌────▼────┐                                   │
  │    │cancelled?│──yes──→ stop                     │
@@ -356,8 +357,13 @@ Key implementation details:
 - **Retry with backoff:** When `retry: true` and an error occurs, the loop
   sleeps for `back_off_function(retry_count)` before retrying. The retry
   counter resets after a successful cycle.
-- **Poll interval:** Between successful cycles where no changes were found,
-  the loop sleeps for `poll_interval` before checking again.
+- **Waiting for changes:** When the source announces its changes
+  (`Adapter::subscribe`, as the memory and redb adapters do), the loop
+  subscribes before the first pass and, once caught up (emitting `Paused`),
+  waits for the next notice: a local write is replicated immediately and a
+  change made during a pass triggers another pass. A source that cannot
+  announce changes (a remote CouchDB) is polled: between cycles the loop
+  sleeps for `poll_interval`.
 
 ## Event Streaming
 

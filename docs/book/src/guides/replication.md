@@ -127,7 +127,7 @@ let opts = ReplicationOptions {
 | `checkpoint` | `true` | Set to `false` to disable checkpoint saving. Each replication will start from the beginning (or `since`). |
 | `live` | `false` | Enable continuous replication that keeps running and picks up new changes. |
 | `retry` | `false` | Automatically retry on network or transient errors (live mode). |
-| `poll_interval` | 500ms | How frequently to poll for new changes in live mode. |
+| `poll_interval` | 500ms | How frequently to poll for new changes in live mode, for a source that cannot announce them (a remote CouchDB). A local source (memory, redb) wakes the replication up on each change instead. |
 | `back_off_function` | `None` | Custom backoff function for retries. Receives retry count, returns delay. |
 
 ## Filtered Replication
@@ -291,7 +291,7 @@ while let Ok(event) = rx.try_recv() {
 
 ## Live (Continuous) Replication
 
-Live replication keeps running in the background, continuously polling for new changes and replicating them. This is the equivalent of PouchDB's `{ live: true }` option.
+Live replication keeps running in the background, replicating new changes as they happen: a local source (memory, redb) announces each committed change, a remote one is polled every `poll_interval`. This is the equivalent of PouchDB's `{ live: true }` option.
 
 ```rust
 use rouchdb::{ReplicationOptions, ReplicationEvent};

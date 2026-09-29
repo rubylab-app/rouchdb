@@ -219,12 +219,13 @@ pub async fn build_index(adapter: &dyn Adapter, def: &IndexDefinition) -> Result
 
     let mut entries: Vec<(Vec<serde_json::Value>, String)> = Vec::new();
 
+    // A range query only returns document rows, whose key is the id.
     for row in &all.rows {
-        if is_design_doc(&row.id) {
+        if is_design_doc(&row.key) {
             continue;
         }
         if let Some(ref doc_json) = row.doc {
-            entries.push((index_key(def, doc_json), row.id.clone()));
+            entries.push((index_key(def, doc_json), row.key.clone()));
         }
     }
 
@@ -1786,15 +1787,15 @@ mod tests {
     }
 
     #[test]
-    fn known_divergence_object_key_order_is_not_significant() {
-        // KNOWN DIVERGENCE (deferred): CouchDB 3.5.1 compares objects in
-        // document key order, so {"b":1,"a":2} only equals {"b":1,"a":2}:
-        // `{"m": {"$eq": {"a": 2, "b": 1}}}` does not match that document
-        // (and view keys collate the same way). serde_json without the
-        // `preserve_order` feature sorts object keys, so RouchDB cannot see
-        // the order; enabling it would change every serde_json map in the
-        // dependency graph and the revision hashes. This test pins today's
-        // behavior so a change to it is deliberate.
+    fn accepted_divergence_object_key_order_is_not_significant() {
+        // ACCEPTED DIFFERENCE (book: "Differences from CouchDB"): CouchDB
+        // 3.5.1 compares objects in document key order, so {"b":1,"a":2}
+        // only equals {"b":1,"a":2}: `{"m": {"$eq": {"a": 2, "b": 1}}}` does
+        // not match that document (and view keys collate the same way).
+        // serde_json without the `preserve_order` feature sorts object keys,
+        // so RouchDB cannot see the order; enabling it would change every
+        // serde_json map in the dependency graph and the revision hashes.
+        // This test pins today's behavior so a change to it is deliberate.
         let d: Value = serde_json::from_str(r#"{"m": {"b": 1, "a": 2}}"#).unwrap();
         let sel: Value = serde_json::from_str(r#"{"m": {"$eq": {"a": 2, "b": 1}}}"#).unwrap();
         assert!(matches_selector(&d, &sel));

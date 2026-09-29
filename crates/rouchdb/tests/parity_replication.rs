@@ -17,7 +17,7 @@ async fn ids(db: &Database) -> Vec<String> {
         .unwrap()
         .rows
         .into_iter()
-        .map(|r| r.id)
+        .map(|r| r.key)
         .collect()
 }
 

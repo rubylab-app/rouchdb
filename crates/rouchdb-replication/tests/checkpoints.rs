@@ -27,7 +27,7 @@ async fn ids(db: &MemoryAdapter) -> Vec<String> {
         .unwrap()
         .rows
         .into_iter()
-        .map(|r| r.id)
+        .map(|r| r.key)
         .collect()
 }
 

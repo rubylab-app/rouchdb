@@ -32,6 +32,16 @@ rouchdb = { version = "0.4", default-features = false, features = ["native-tls"]
 
 With `default-features = false` and no TLS feature, only plain `http://` URLs work, and the build has no C code at all (rustls' default crypto provider, ring, compiles a small amount of bundled C and assembly). The same features exist on `rouchdb-adapter-http`. They are new after 0.4.0; version 0.4.0 always uses native-tls.
 
+### Exact numbers
+
+By default JSON numbers are `serde_json` numbers: integers that fit `i64`/`u64` are exact, anything else goes through `f64` (so `18446744073709551616` is stored as `1.8446744073709552e19` and `1.50` as `1.5`). The opt-in `arbitrary-precision` feature keeps every number exactly as written, through the memory and redb adapters, replication and the HTTP adapter (CouchDB itself keeps integers of any size exact and rounds decimals to doubles):
+
+```sh
+cargo add rouchdb --features arbitrary-precision
+```
+
+It enables serde_json's `arbitrary_precision` for the whole build, which also changes `serde_json::Number` for your own code (comparisons are textual: `1.0` and `1.00` are different numbers), and revision ids of documents with such numbers differ from those computed without the feature. See [Differences from CouchDB](../reference/differences.md#numbers).
+
 ## Minimal Setup
 
 If you only need local storage without replication or HTTP:

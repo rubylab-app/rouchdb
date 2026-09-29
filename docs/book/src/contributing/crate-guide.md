@@ -86,7 +86,7 @@ The foundation crate. Everything else depends on it.
 **Responsibility:** Streaming changes feed with one-shot and live/continuous modes.
 
 **Key files:**
-- `src/lib.rs` -- `ChangeSender`, `ChangeReceiver`, `ChangeNotification`, and `LiveChangesStream`. Uses Tokio broadcast channels for real-time change notification.
+- `src/lib.rs` -- `ChangeSender`, `ChangeReceiver`, `ChangeNotification` (= core's `ChangeNotice`), and `LiveChangesStream`, which waits on the adapter's change notifications (`Adapter::subscribe`, Tokio broadcast channels) and polls adapters without them.
 
 ### `rouchdb-replication`
 
@@ -111,7 +111,7 @@ The foundation crate. Everything else depends on it.
 **Responsibility:** Design documents and the persistent view engine.
 
 **Key files:**
-- `src/lib.rs` -- `DesignDocument` struct (with views, filters, validate_doc_update) and `ViewEngine` for persistent map/reduce indexes.
+- `src/design_doc.rs` -- the lossless `DesignDocument` struct (typed views, filters, validate_doc_update, plus `other_views` and `extra` for every other member); `src/engine.rs` -- `ViewEngine` for persistent map/reduce indexes.
 
 ### `rouchdb`
 

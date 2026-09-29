@@ -191,7 +191,7 @@ async fn persisted_indexes(
         if let Some(views) = doc.get("views").and_then(|v| v.as_object()) {
             for (name, view) in views {
                 if let Some(fields) = view_fields(view) {
-                    out.push((row.id.clone(), name.clone(), fields));
+                    out.push((row.key.clone(), name.clone(), fields));
                 }
             }
         }
