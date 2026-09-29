@@ -230,7 +230,7 @@ at it in a read transaction:
 | no tables (a new file) | creates, in one write transaction, the seven tables, a fresh `MetaRecord` (`update_seq` 0, new UUID, current `schema`) and the guard |
 | the guard (a 0.5 file) | writes nothing (unless a table is missing); a newer `schema` is refused |
 | an unguarded `"metadata"` without `schema` (rouchdb ≤ 0.4) | returns `RouchError::UpgradeRequired` and changes nothing, unless `OpenOptions::upgrade` allows the upgrade |
-| an unguarded `"metadata"` with `schema` 1 or 2 (unreleased 0.5 builds) | finishes the upgrade automatically |
+| an unguarded `"metadata"` with `schema` 1 or 2 (unreleased 0.5 builds) | upgrades it automatically, after a verified backup to `<file>.rouchdb-0.5-pre.bak` (unless the policy is `InPlaceNoBackup`) |
 | other tables only | refuses the file ("not a rouchdb database") |
 | a `"metadata"` table of another type | refuses the file, naming that type |
 
@@ -238,38 +238,71 @@ at it in a read transaction:
 
 `RedbAdapter::upgrade(path, policy)`, `rouchdb migrate <path>` and
 `open_with` with `UpgradePolicy::WithBackup` / `InPlaceNoBackup` run the
-upgrade; `RedbAdapter::inspect_upgrade` (`rouchdb migrate --dry-run`) runs it
-and rolls it back.
+upgrade in three steps. The file is opened with a 32 MiB page cache (redb's
+default is 1 GiB) and records and attachments are handled one at a time, so
+memory stays small whatever the file size; `open_with` then reopens the
+upgraded file with the default cache.
 
-**Backup** (`WithBackup`, default path `<file>.rouchdb-0.4.bak`). While the
-file is open (redb's file lock is held), every table is copied entry by
-entry from one read transaction into `<backup>.partial` with the same table
-types, committed, reopened and compared entry by entry (keys and values)
-with the source, synced, then renamed to the backup path and the directory
-synced. The backup path must not exist; on any error the partial copy is
-removed and the source, which is only read, is unchanged. The backup opens
-in 0.4 exactly like the original. A table rouchdb did not create makes the
-backup fail (copy the file yourself and upgrade without a backup).
-
-**Upgrade.** One write transaction with two-phase commit, so an error or a
-crash at any point leaves the file as it was:
+**1. Analysis (read only).** From one read transaction, the upgrade works
+out everything it will write, and the report:
 
 1. Read every entry of the old `"metadata"` table.
-2. Re-key attachment bytes from `"{doc_id}\0{name}"` to their digest.
-3. Move `_local/…` documents from `docs` to `local_docs`: the winning
-   revision's body, with `"_rev": "0-N"` (`N` = its generation); deleted
-   ones are dropped; their bodies and change entries are removed. A
-   collision with an existing local document stops the upgrade.
-4. Lower-case upper-case 32-digit hex revision ids in revision trees and body
-   keys. An id stored in both cases stops the upgrade.
+2. Compute the digest of every attachment stored under
+   `"{doc_id}\0{name}"` (reading one entry at a time).
+3. Plan the move of `_local/…` documents from `docs` to `local_docs`: the
+   winning revision's body, with `"_rev": "0-N"` (`N` = its generation);
+   deleted ones are dropped; their bodies and change entries are removed. A
+   collision with an existing local document, or a live document whose id is
+   exactly `_local/` (an empty local name 0.5 cannot address), stops the
+   upgrade.
+4. Plan the lower-casing of upper-case 32-digit hex revision ids in revision
+   trees and body keys. A revision stored under several spellings becomes one
+   node (the root-to-leaf paths are merged again); of several stored bodies,
+   an identical copy is dropped, and when they differ the body of the
+   spelling 0.4 ranked first is kept (leaf before inner revision, live leaf
+   before deleted, then the greater id in byte order: 0.4's winner order) and
+   each other body is listed in `UpgradeReport::case_duplicate_bodies_discarded`.
+   Documents whose winning revision differs once ids are lower case are
+   counted.
 5. Count live and deleted documents, and collect the report's facts
    (attachment references without bytes, old revision bodies, attachment
-   bytes only old revisions reference).
-6. Write the `MetaRecord` (and the security document, if any) to
-   `rouchdb_meta`, delete the old `"metadata"` table and create the guard.
+   bytes only old revisions reference), as the file will be after the
+   upgrade.
 
-A record that cannot be decoded stops the upgrade with an error naming it;
-nothing is skipped. `UpgradeReport` holds the counts.
+A record that cannot be decoded stops the upgrade here with an error naming
+it; nothing is skipped. `RedbAdapter::inspect_upgrade`
+(`rouchdb migrate --dry-run`) is this step alone: it never opens a write
+transaction, so the file is not modified (not even redb's free-page
+bookkeeping) and no disk space is used.
+
+**2. Backup** (`WithBackup`, default path `<file>.rouchdb-0.4.bak`, or
+`<file>.rouchdb-0.5-pre.bak` for a development-build file). While the file
+is open (redb's file lock is held), every table is copied entry by entry
+from one read transaction into `<backup>.partial` with the same table types,
+committed, reopened and compared entry by entry (keys and values) with the
+source, synced (the file is opened for writing, which Windows requires to
+flush it), then renamed to the backup path and the directory synced. The
+backup path must not exist; on any error before the rename the partial copy
+is removed and the source, which is only read, is unchanged. If only the
+directory sync fails, the backup is complete and the upgrade goes on with a
+warning in the report. The backup opens in 0.4 exactly like the original. A
+table rouchdb did not create makes the backup fail (copy the file yourself
+and upgrade without a backup). After a crash, a leftover `<backup>.partial`
+is not a backup (delete it); a `<backup>` is complete, as it is only renamed
+into place once verified.
+
+**3. Upgrade.** One write transaction with two-phase commit applies the
+plan, so an error or a crash at any point leaves the file as it was: re-key
+the attachment bytes, move the `_local/` documents, rewrite the revision
+trees and body keys, write the `MetaRecord` (and the security document, if
+any) to `rouchdb_meta`, delete the old `"metadata"` table and create the
+guard. If this step fails, the backup made for the attempt is removed (it
+would block a retry); if the commit itself fails, it is kept.
+
+**Disk space.** redb copies every page the transaction changes and keeps
+the old pages until the commit, so the upgrade needs about twice the file
+size of free space; the backup needs about the file size again (about three
+times in total).
 
 **The first `compact()` after the upgrade** deletes every non-leaf body 0.4
 kept (0.4's `compact` did nothing) and the attachment bytes only those bodies

@@ -1,6 +1,6 @@
 # Installation
 
-> **Upgrading from 0.4?** 0.5 does not open `.redb` files written by 0.4 until you upgrade them once, with `rouchdb migrate app.redb` (which writes a verified backup first) or `Database::open_with` + `UpgradePolicy::WithBackup`; afterwards 0.4 cannot open them, and the first `compact()` deletes old revision bodies. See [Migrating from 0.4 to 0.5](../upgrading/0.4-to-0.5.md#redb-files-upgrade-once-explicitly).
+> **Upgrading from 0.4?** 0.5 does not open `.redb` files written by 0.4 until you upgrade them once, with `rouchdb migrate app.redb` (which writes a verified backup first; `--dry-run` only reads the file) or `Database::open_with` + `UpgradePolicy::WithBackup`, with about three times the file size of free disk space; afterwards 0.4 cannot open them, and the first `compact()` deletes old revision bodies. See [Migrating from 0.4 to 0.5](../upgrading/0.4-to-0.5.md#redb-files-upgrade-once-explicitly).
 
 ## Full Package
 
