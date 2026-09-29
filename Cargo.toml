@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 # Minimum supported Rust version, checked in CI (`msrv` job). Edition 2024
 # let-chains need 1.88.

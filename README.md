@@ -32,7 +32,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rouchdb = "0.4"
+rouchdb = "0.5"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -82,11 +82,11 @@ async fn main() -> rouchdb::Result<()> {
 HTTPS to CouchDB uses [rustls](https://github.com/rustls/rustls) by default. To use the platform TLS stack instead (OpenSSL on Linux), or to trust the OS certificate store, pick a different TLS feature:
 
 ```toml
-rouchdb = { version = "0.4", default-features = false, features = ["native-tls"] }
+rouchdb = { version = "0.5", default-features = false, features = ["native-tls"] }
 # or: features = ["rustls-tls-native-roots"]
 ```
 
-With no TLS feature only plain `http://` CouchDB URLs work. These features are new after 0.4.0 (see the [changelog](CHANGELOG.md)); 0.4.0 itself always uses native-tls.
+With no TLS feature only plain `http://` CouchDB URLs work. These features are new in 0.5.0 (see the [changelog](CHANGELOG.md)); 0.4.x always uses native-tls.
 
 ## Querying
 

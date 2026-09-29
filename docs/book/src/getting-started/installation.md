@@ -6,7 +6,7 @@ Add RouchDB to your project with all features:
 
 ```toml
 [dependencies]
-rouchdb = "0.4"
+rouchdb = "0.5"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -27,10 +27,10 @@ HTTPS connections to CouchDB (`Database::http("https://...")`) use [rustls](http
 
 ```toml
 [dependencies]
-rouchdb = { version = "0.4", default-features = false, features = ["native-tls"] }
+rouchdb = { version = "0.5", default-features = false, features = ["native-tls"] }
 ```
 
-With `default-features = false` and no TLS feature, only plain `http://` URLs work, and the build has no C code at all (rustls' default crypto provider, ring, compiles a small amount of bundled C and assembly). The same features exist on `rouchdb-adapter-http`. They are new after 0.4.0; version 0.4.0 always uses native-tls.
+With `default-features = false` and no TLS feature, only plain `http://` URLs work, and the build has no C code at all (rustls' default crypto provider, ring, compiles a small amount of bundled C and assembly). The same features exist on `rouchdb-adapter-http`. These features are new in 0.5.0 (see the [changelog](https://github.com/rubylab-app/rouchdb/blob/main/CHANGELOG.md)); 0.4.x always uses native-tls.
 
 ### Exact numbers
 
@@ -48,8 +48,8 @@ If you only need local storage without replication or HTTP:
 
 ```toml
 [dependencies]
-rouchdb-core = "0.4"
-rouchdb-adapter-redb = "0.4"
+rouchdb-core = "0.5"
+rouchdb-adapter-redb = "0.5"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```

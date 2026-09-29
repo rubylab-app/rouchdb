@@ -8,6 +8,10 @@
 - [Quickstart](./getting-started/quickstart.md)
 - [Core Concepts](./getting-started/concepts.md)
 
+# Upgrading
+
+- [Migrating from 0.4 to 0.5](./upgrading/0.4-to-0.5.md)
+
 # Guides
 
 - [CRUD Operations](./guides/crud.md)

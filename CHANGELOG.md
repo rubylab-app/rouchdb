@@ -6,22 +6,221 @@ This project follows [Semantic Versioning](https://semver.org/). Since we are pr
 
 ---
 
-## [Unreleased]
+## [0.5.0] - 2026-09-29
+
+CouchDB-fidelity release. Two audits (a bug audit of every crate and a test-quality audit with mutation testing) drove fixes that were each checked against **CouchDB 3.5.1** as the reference. Many of them change observable behavior: single-document writes return errors, several option and result types changed shape, the server is locked down by default, Mango and views follow CouchDB's semantics, and redb files are upgraded in place. **Read the [migration guide](docs/book/src/upgrading/0.4-to-0.5.md) before upgrading.**
+
+Thanks to **@stn (Akira Ishino)** for the first external contribution (#7).
+
+### Breaking changes
+
+#### API
+
+- **`Database::put`, `update`, `remove`, `post` and `put_design` return `Err` on failure** (`Err(RouchError::Conflict)`, `NotFound`, `BadRequest`, …) instead of `Ok(DocResult { ok: false, .. })`, as `docs/book/src/reference/error-handling.md` always described. `bulk_docs` still returns one result per document. (#12, #18)
+- **`update` with a `_rev` on a document that does not exist is `Err(Conflict)`** (was a `not_found` failure), on every adapter. **`remove` of a missing or already-deleted document is `Err(NotFound)`** (CouchDB `DELETE`). (#18)
+- **`get` with a malformed `rev` is `Err(InvalidRev)`** on every adapter (was `NotFound` locally and `BadRequest` over HTTP). Any CouchDB 400 "Invalid rev format" maps to `InvalidRev`. (#18)
+- **`BulkDocsOptions::default()` and `AllDocsOptions::default()` equal `new()`.** `BulkDocsOptions::default()` used to mean replication mode (`new_edits: false`) and `AllDocsOptions::default()` an exclusive `end_key`. Ask for replication explicitly with `BulkDocsOptions::replication()`. (#21)
+- **`AllDocsRow` has optional `id` / `value` and a new `error`**, and `all_docs` with `keys` returns one row per requested key, in request order, on every adapter and in the server: unknown ids give a `{"key": …, "error": "not_found"}` row (they used to be skipped locally and dropped over HTTP) and deleted documents a row with `value.deleted: true` (and `"doc": null` with `include_docs`). `skip`/`limit` count error rows. Read the id with `row.key` (or `row.id.as_deref()`) and the revision with `row.rev()`. (#21)
+- **`DesignDocument` is lossless**: any design document CouchDB accepts reads and writes back unchanged. New members `other_views` (`lib`, Mango views) and `extra` (`options`, `autoupdate`, `rewrites`, custom fields), `ViewDef::extra`; `filters`, `shows`, `lists` and `updates` hold `serde_json::Value`s. Struct literals need the new fields or `..Default::default()`. (#21)
+- **`put_design` writes exactly the struct it is given** and no longer merges members of the stored revision into it. Start from `get_design` to edit a design document; removing a member from the struct now removes it from the document. (#21)
+- **`AttachmentMeta` gains `revpos`, `encoding` and `encoded_length`.** Struct literals need the new fields, `AttachmentMeta::new` or `..Default::default()`. (#21)
+- **`ServerConfig` has new fields** `cors_origins`, `admin`, `max_request_size` and `session_timeout`. Struct literals need `..Default::default()`. (#11, #15)
+- **The default `Adapter::put_security` returns `Err(BadRequest)`** instead of reporting success and dropping the document. Custom adapters that store security documents must implement it; all bundled adapters do. (#12)
+- **`before_write` plugins run on `put_attachment` / `remove_attachment`** (they may accept or reject the revision the attachment write creates, but their modifications are not stored; dropping the document is `Forbidden`). (#22)
+- **`ViewQueryOptions::new()` sets `reduce: true`** (CouchDB's default). Passing a reduce function now reduces unless you set `reduce: false`. (#14)
+- **`SortField` deserialization is strict**: only a field name or a single `{"field": "asc" | "desc"}` is accepted (`{}`, multi-key maps and other directions are rejected). New `SortField::try_field_and_direction`; `field_and_direction()` no longer panics. (#14)
+- **`rouchdb_core::collation::to_indexable_string` has a new output format** whose byte order matches `collate`. Rebuild anything you persisted with it. (#14)
+- **`rouchdb_core::merge::latest_rev` is removed** (it was unused). Use `merge::latest_leaf`. (#20)
+- **`ChangeEvent` serializes `deleted` only when it is `true`** (CouchDB omits it). (#15)
+- **`rouchdb_changes::ChangeNotification` is an alias of `rouchdb_core::adapter::ChangeNotice`** (same fields). (#21)
+
+#### Documents and storage
+
+- **redb files are upgraded the first time a 0.5 build opens them**, even for a read-only use such as `rouchdb info`, and **0.4 may no longer read their attachments afterwards**. Back up the `.redb` file before opening it with 0.5 if you may need 0.4 again. See [Upgrading redb files](#upgrading-redb-files). (#12, #18)
+- **Writes are validated like CouchDB** (`new_edits` mode): unknown `_`-prefixed members, non-object bodies, reserved `_` ids and wrongly typed `_id`, `_rev`, `_deleted` or `_attachments` are `BadRequest`. Read-only metadata (`_conflicts`, `_revs_info`, `_revisions`) is dropped, so writing back a `get()` result is safe. Local adapters report an invalid document's bare reason in `bulk_docs` results (no `bad request: ` prefix), like the HTTP adapter and CouchDB. (#12, #22)
+- **Generated ids** (`Database::post`, local `bulk_docs` without `_id`, server `POST /{db}`) are 32 lower-case hex digits (still UUID v4) instead of hyphenated UUIDs; over HTTP a document without an id is sent without `_id`, so CouchDB generates it. (#22)
+- **`_local/` ids are local documents** on every adapter: `put`, `update`, `remove`, `bulk_docs` and `get` with a `_local/…` id use `0-N` revisions without MVCC, the documents are not listed by `all_docs`, not in the changes feed and not replicated. Replicated `_local/` documents are ignored, as in CouchDB. (#18)
+- **Documents may be nested up to `MAX_NESTING_DEPTH` (1000) levels** (re-exported by `rouchdb`) on every input path: the adapters, the server and the CLI. Deeper writes are `BadRequest`; `HttpAdapter::bulk_docs` rejects a deeper document on its own instead of sending it. Documents up to that depth, which broke every read path above serde_json's 128 levels, are now readable on all adapters and replicate. (#18, #22)
+- **Revision stemming follows CouchDB.** `stem` cuts every root-to-leaf path (it used to stop at the first branch point); stemmed revisions are unreadable (`NotFound`) and `revs_diff` reports them missing. The limit is configurable with `MemoryAdapter::with_rev_limit` / `RedbAdapter::with_rev_limit` (`DEFAULT_REV_LIMIT` = 1000, `0` = unlimited). (#12, #18)
+- **Deleting a document drops its attachments**, and an explicit `_attachments` map is exact: stubs keep an attachment, omitted entries are removed (an *empty* map still inherits from the parent). (#12)
+- **Attachment stubs are matched by name** and the stored metadata wins; `{"stub": true}` without a digest is accepted; a stub whose name has no stored attachment (including a "renamed" stub) is `missing_stub`. Stubs (`Document::to_json`, `get`, `bulk_get`) now include `revpos`, which follows CouchDB's rules through writes and replication both ways; attachments stored by 0.4 read back with `revpos` 0. (#12, #18, #21)
+- **Re-creating a deleted document extends its tombstone** (`3-…` after `1-…`/`2-…` deleted), as CouchDB does. Re-sending an old edit of a deleted document is a `Conflict` (it used to return the existing revision and rewrite it). (#7, #12, #18)
+- **Revision ids are normalized to lower-case hex**; ids containing NUL are rejected; malformed replicated `_revisions` are `doc_validation` errors per document. (#18)
+- **`get` of an unknown, compacted or body-less revision is `NotFound("missing")`**; local adapters reject `open_revs` with `BadRequest` instead of silently returning the winner. (#12)
+- **Purge follows CouchDB**: only leaves are purged, older revisions are never resurrected, `purge_seq` is tracked, and ids with nothing purged are reported with `[]`. (#12)
+- **`destroy` leaves a usable, empty database** on every adapter (documents, local documents/checkpoints, attachments, security and Mango indexes are gone). The HTTP adapter re-creates the remote database on its next use, and destroying an already-deleted remote database is `Ok`. (#14, #18)
+- **`changes` with `limit: Some(0)` returns no change** (was one). (#18)
+- **`revs_diff`** lists `missing` sorted by generation then id, and `possible_ancestors` once each, in winner order. (#18)
+
+#### Mango (`find`, selector `changes`, replication selector filters)
+
+- **CouchDB semantics for missing fields**: a document without the field only matches `{"$exists": false}`; `$ne`, `$nin`, `$not` and `$nor` no longer match it (PouchDB differs here). (#14)
+- **Nested object selectors are paths** (`{"a": {"b": 1}}` is `{"a.b": 1}`), `$and`/`$or`/`$nor`/`$not` inside a field apply to that field, `$in`/`$nin` look inside arrays, and `items.0.name` / `a\.b` paths work. (#14)
+- **`find` never returns design documents.** (#14)
+- **`fields` returns only the requested fields** (no implicit `_id`), and nested paths keep their structure (`address.city` → `{"address": {"city": …}}`). (#14)
+- **Invalid selectors, operators, regexes and sort fields are `Err(BadRequest)`** with CouchDB's reasons (`Invalid operator: $foo`, `Bad argument for operator $not: 5`, …) instead of an empty result. A `null` or missing selector is an error too, and so is `$elemMatch` with a non-object argument. (#14, #15, #22)
+- **Empty selectors and combinators**: a selector that is only `{"$and": []}` / `{"$or": []}` / `{"$nor": []}` returns nothing; nested empty combinators are true; `{}` below the top level is an equality test with `{}` (`{"$and": [{}]}` matches nothing); operators without a field inside `$and`/`$or`/`$nor` apply to the whole document. `$all` uses exact equality, `$not` needs an object, and a sorted `find` skips documents that lack a sort field. (#15, #22)
+- **Descending sort ties come in reverse index order**, as in CouchDB. (#22)
+- **`$regex` is PCRE-like** (lookaround and backreferences via `fancy-regex`); a pattern that exhausts the backtracking limit does not match. (#15)
+
+#### Views and collation
+
+- **Reduce**: `_sum` and `_stats` keep integers (`90`, not `90.0`) and sum arrays element-wise and objects per field. `_sum` over values it cannot add returns CouchDB's `{"error": "builtin_reduce_error", …, "caused_by": <value>}` object as the row's value (a 200 over the server); `_stats` over other values is `Err(BadRequest)`. Custom reduce functions receive `[key, doc_id]` keys, and all values of a group are reduced in one call (`rereduce` is always `false`). (#14, #22)
+- **Query options**: several `keys` with a reduce need `group: true` without `group_level`; a single key behaves like `key`; `include_docs` with a reduce is an error; `include_docs` now fills `ViewRow.doc` (including linked `{"_id": …}` docs). A key range that cannot match (`start_key` after `end_key` without `descending`), several `keys` together with `key`/`start_key`/`end_key`, and `group`/`group_level` without a reduce are `BadRequest`; `start_key`/`end_key` are honored next to `key`; `group` + `keys` keeps the keys' order when descending. (#14, #15, #22)
+- **Results**: `total_rows` counts the whole view and `offset` is the position of the first returned row; design documents are not mapped. (#14)
+- **Collation**: `-0.0 == 0`, integers and floats compare exactly (no precision loss above 2⁵³), and strings compare by UTF-16 code units, exactly like PouchDB (this only differs from 0.4 for characters above U+FFFF against U+E000..U+FFFF). CouchDB's ICU order and object key order are not emulated (see "Differences from CouchDB" in the book). (#14, #21)
+
+#### Replication and the HTTP adapter
+
+- **`Database::http` / `HttpAdapter::new` create a missing remote database on first use** (PouchDB's default). Set `HttpAdapterOptions::skip_setup` to keep failing with `NotFound`. (#13)
+- **Replications with an HTTP peer get a new replication id** (it now includes the server uuid), so the first run after upgrading re-reads the changes feed once. `revs_diff` means no document is transferred again; the old `_local` checkpoints are left unused. Local↔local ids are unchanged. (#13)
+- **Denied documents** (`forbidden` / `unauthorized` from a validation function) are reported in `errors` (so `ok` is `false`) and the checkpoint moves past them instead of stalling forever. (#13)
+- **`ReplicationFilter::Custom` closures no longer use checkpoints**: each run rescans from `since` (documents already on the target are not re-sent). (#13)
+- **`before_write` plugins act as `validate_doc_update` for replicated documents**: they run per document, their modifications are ignored, and a rejection is reported as denied without blocking the batch. `after_write` also sees attachment writes and documents replicated to CouchDB. (#13)
+- **Live feeds and live replication from memory and redb react to writes immediately** instead of polling (`poll_interval` then only applies to HTTP sources and retry delays), and live replication from them emits `Paused` as soon as it is caught up. (#21)
+- **Mango on `Database::http` runs on the server**: `find`, `create_index`, `get_indexes`, `delete_index` and `explain` use `_find`/`_index`/`_explain`, so results follow CouchDB and indexes are real CouchDB indexes. (#14)
+- **HTTP errors are mapped from the status and `{error, reason}`**: 400/413/415 → `BadRequest`, 412 `file_exists` → `DatabaseExists`, 401 → `Unauthorized`. (#13)
+- **HTTP requests time out**: 30 s to connect and 60 s of inactivity by default (`HttpAdapterOptions`). (#13)
+
+#### Server (`rouchdb-server`)
+
+- **CORS is off by default** and **optional admin authentication** is available; see [Security](#security). (#11)
+- **`DELETE /{db}` really deletes the database**: every database route answers 404 until `PUT /{db}` re-creates it. (#15)
+- **Status codes and error bodies follow CouchDB**: errors are always JSON with CouchDB's names and reasons (`Document update conflict.`, `Database does not exist.`, `missing` / `deleted`, `Invalid rev format`, `illegal_docid`, `doc_validation`, `query_parse_error`, Mango error names); a wrong-shape JSON body is 400 (was 422) and malformed JSON is CouchDB's "invalid UTF-8 JSON"; `DELETE` without a rev and `PUT` with a `_rev` the document does not have are 409; design-document conflicts are 409 (were 201 with `"ok": false`); 405 carries a sorted `Allow`. (#11, #15, #22)
+- **Anonymous `POST`/`PUT`/`DELETE` on `/` and `/_active_tasks` are 405** (`Only GET,HEAD allowed`); non-GET requests on `/_utils` need credentials. (#22)
+- **`POST /{db}/_all_docs` with `keys`** answers exactly like CouchDB: one row per key including `not_found` rows (also for non-string keys, which used to be dropped), `"offset": null`, and `"doc": null` for deleted documents. (#21)
+- **`GET /{db}/_design/{ddoc}` serves the stored document as is**, with the same options and headers as any document (`rev`, `revs`, `conflicts`, `attachments`, `ETag`/`If-None-Match`). (#21)
+- **`_bulk_docs` rejects the whole request** on an invalid document (nothing is written); with `new_edits: false` it returns only failures (`[]` normally). (#15)
+- **`_find` returns at most 25 documents unless `limit` is set**, and bookmarks are real (an invalid one is 400 `invalid_bookmark`). (#11)
+- **`POST /{db}/_index` writes a `_design/<ddoc>` document** (`language: "query"`, as CouchDB): it appears in `_all_docs` and `_changes`, replicates, and the response `id` is the design-document id (was the index name). (#11)
+- **`_all_docs` query keys must be JSON-encoded** (`?key="b"`; `?key=b` is 400). (#11)
+- **`_changes` rejects unknown feeds and unsupported filters** (400/404) instead of ignoring them. (#11)
+- **`POST /{db}/_compact` requires `Content-Type: application/json`** (415 otherwise). (#15)
+- **The request body limit is 64 MiB** (was axum's implicit 2 MB), with a JSON 413. (#11)
+- **`/_uuids` and `POST /{db}` generate 32 lower-case hex digits** (were hyphenated). (#15, #22)
+
+#### CLI (`rouchdb-cli`)
+
+- Read-only commands (`info`, `get`, `all-docs`, `find`, `changes`, `dump`, `compact`, `delete`, a redb `replicate` source) fail with exit 1 on a missing file instead of creating it. (#11)
+- `replicate` exits 1 when `ok` is `false`, and its output gains `errors` (passwords masked) and `last_seq`. (#11)
+- `dump` inlines attachments as base64 and `import` restores them. `dump` still exports winning revisions only and names conflicted documents on stderr; use `replicate` to copy conflicts and history. (#11)
+
+#### Build
+
+- **HTTPS uses rustls by default instead of native-tls/OpenSSL.** `rouchdb` and `rouchdb-adapter-http` expose the TLS backend as features: `rustls-tls` (default, bundled Mozilla roots), `rustls-tls-native-roots` (rustls with the OS certificate store) and `native-tls` (the 0.4 behavior: OpenSSL on Linux). Building no longer needs OpenSSL headers on Linux. If your CouchDB certificate is signed by a private CA in the OS trust store, enable `rustls-tls-native-roots` or `native-tls`:
+  ```toml
+  rouchdb = { version = "0.5", default-features = false, features = ["native-tls"] }
+  ```
+  (#10)
+- **The minimum supported Rust version is declared: 1.88** (`rust-version`) and checked in CI. (#10)
+
+### Added
+
+- **The server is a replication peer**: `POST _revs_diff`, `POST _bulk_get` (with `revs` and `attachments`), `GET/PUT/DELETE _local/{id}`, `POST _purge` and `?open_revs=all|[…]` (JSON form). Replication to and from a memory- or redb-backed server works both ways and resumes from checkpoints. (#11)
+- **Server `_changes` feeds**: `feed=longpoll|continuous|live|eventsource`, `heartbeat`, inactivity `timeout`, `pending`, and the `_doc_ids`, `_selector` and `_design` filters. (#11, #15)
+- **Server HTTP semantics**: `ETag` / `If-None-Match` (304) / `If-Match`, `Location` headers, attachment `ETag` / `Accept-Ranges: none` / `Content-Security-Policy: sandbox`, attachment names containing `/`, and attachment GET honoring `?rev`. Mango indexes persist as design documents and are restored at startup (`restore_indexes`). (#11, #15)
+- **Server options**: `--cors-origin` / `ROUCHDB_CORS_ORIGINS`, `--admin` / `ROUCHDB_ADMIN`, `--max-request-size`, `--session-timeout`; `ServerConfig::{cors_origins, admin, max_request_size, session_timeout}`, `AdminCredentials`, `parse_cors_origin`, `DEFAULT_MAX_REQUEST_SIZE`, `DEFAULT_SESSION_TIMEOUT`, `Auth::with_timeout`. (#11, #15)
+- **CLI**: `ROUCHDB_USER` / `ROUCHDB_PASSWORD` supply credentials for http(s) URLs without userinfo. (#11)
+- **HTTP adapter**: `HttpAdapterOptions` (`skip_setup`, `connect_timeout`, `read_timeout`), `HttpAdapter::with_options`, `DEFAULT_CONNECT_TIMEOUT`, `DEFAULT_READ_TIMEOUT`, `HttpAdapter::request_json`. (#13, #14)
+- **`Adapter::id()`** (default method: the database name; the HTTP adapter returns the server uuid plus the database name), used to derive replication ids. (#13)
+- **`Adapter::subscribe()`** (default method returning `None`, so custom adapters compile unchanged and keep being polled): the memory and redb adapters announce committed changes (`ChangeNotice { seq, doc_id }`) to live changes feeds and live replication. (#21)
+- **Opt-in `arbitrary-precision` feature** on `rouchdb` for exact JSON numbers (enables serde_json's `arbitrary_precision` for the whole build; revision ids of documents with such numbers differ from those computed without it). (#21)
+- **Live changes**: `ChangesEvent::Paused` / `Active` / `Error` are now emitted (catch-up, resume, failed fetch with retry and backoff), heartbeats and the inactivity `timeout` work, and `LiveChangesStream::next_event()` / `last_seq()` are new. (#13)
+- **Views**: `ViewEngine::query` with `StaleOption` (`False`, `Ok`, `UpdateAfter`); `ViewEngine` rebuilds after purges or a recreated database, and `register_map` invalidates an existing view. (#14)
+- **Query API**: `CompiledSelector`, `find_in_docs`, `BuiltIndex::apply_changes`, `query_emitted`, `query_sorted`, `sort_emitted`, `attach_docs`. (#14)
+- **Core API**: the `rouchdb_core::write` module (storage-independent edit rules shared by the memory and redb adapters), `Document::prepare_for_write`, `rev_tree::path_from_revisions`, `rouchdb_core::json` (`MAX_NESTING_DEPTH`, `from_slice`, `from_input`, `value_depth`, `text_depth`, `check_document_depth`), `merge::{merge_and_stem, stem_revs, revs_diff_one}`, `write::{local_doc_id, plan_local_write, local_document, LocalWrite}`, `Revision::normalized`, `document::normalize_rev_hash`, `PlannedWrite::stemmed`. (#12, #18, #22)
+- **Type helpers**: `AllDocsRow::{rev, is_deleted, is_error}` and the `AllDocsRow::{document, not_found}` constructors; `DesignDocument::new`, `with_view`, `with_filter`, `ViewDef::new`, `with_reduce` and `Default` for both; `AttachmentMeta::new` and `to_json`. (#21)
+- **redb**: purge, persistent security documents, and `with_rev_limit`. (#12, #18)
+- **Docs**: a "Differences from CouchDB" book page (object key order, local `all_docs` `offset`, numbers, attachment digests) and a [0.4 → 0.5 migration guide](docs/book/src/upgrading/0.4-to-0.5.md). (#21)
+
+### Fixed
+
+**Storage (core, memory, redb)**
+- Re-creating a deleted document with the same body as its first revision was a silent no-op: it returned `ok: true` but the document stayed deleted. Thanks @stn. (#7)
+- redb stored the revision tree as nested records that could not be read back for long histories; it is now a flat list, deep legacy records load, and decode errors are reported instead of the document looking missing. (#12)
+- redb dropped attachments on body-only updates and ignored inline attachments from `bulk_docs` and replication; `bulk_get` now returns attachment data. (#12)
+- redb compaction and purge of `a` deleted the bodies of `a\0b`. (#18)
+- Merging a replicated revision could overwrite an existing revision in place, drop ancestors of a path that starts earlier, or skip overlapping roots. (#12)
+- Merging a path that bridges two roots of a stemmed (multi-root) tree kept both copies of the joined branch, so revisions (and the winner) were listed twice and the tree depended on merge order; this could happen when replicating from sources with different `revs_limit`s. Roots are now sorted by `(pos, hash)`, as in CouchDB. (#25)
+- Edits could not extend a losing branch, so conflicts could not be resolved by updating or deleting the loser. (#12)
+- The changes feed and `include_docs` reported whether the *edit* was a deletion instead of whether the *winner* is deleted, which also confused `ViewEngine` and live changes. (#12)
+- Stemmed revisions stayed readable; memory `revs_diff` returned duplicate `possible_ancestors`; non-string `_revisions.ids` were dropped and invented revisions. (#18)
+- The revision hash now covers the final attachment set (hashes of documents without attachments are unchanged). (#12)
+- redb ignored `latest`, `attachments`, `revs_info` and `conflicts` in `get`; `revs_info` listed other branches with wrong statuses; `revs` (`_revisions`) is implemented on both local adapters. (#12)
+- redb `all_docs` with `keys` lost request order and duplicates, and `descending` did not reverse the keys. (#12)
+- redb `compact` kept every revision body; it now drops non-leaf bodies and unreferenced attachment bytes. The memory adapter stored attachment bytes before the write was accepted and never freed them. (#12)
+- `remove_attachment` of a missing attachment wrote a new revision; it is now `NotFound`. (#12)
+- redb work blocked the async runtime; it now runs on `spawn_blocking`. (#12)
+- `Document::from_json` rejected the `{content_type, data}` inline attachment form clients send and CouchDB's inline form without `length`. (#12)
+
+**Replication, changes and HTTP**
+- `docs_written` was always 0 when replicating to CouchDB, and an indexed `find` on a remote database failed to decode `_all_docs` (`offset: null`). (#9)
+- Losing branches did not replicate (the changes feed was read without `style=all_docs`), and attachment bytes pulled from CouchDB were missing. (#13)
+- Attachments pushed to CouchDB arrived with `revpos: 0`. (#21)
+- `replicate_to_with_events` deadlocked past 64 events. (#13)
+- Checkpoints could skip documents after a `_bulk_get` item error, stall forever on a denied document, fail on a read-only source, or not advance past filtered or already-synced batches; checkpoint write errors are now reported. (#13)
+- Live replication ignored `since` and rescanned on every poll; selector filters did not see `_id`, `_rev` and `_deleted`. (#13)
+- The live changes feed dropped polls when the heartbeat was shorter than the poll interval, reported a wrong `last_seq`, ignored `limit` with a filter, and kept running after the receiver was dropped. (#13)
+- `AuthClient::login` failed against CouchDB (`POST /_session` has no `userCtx`); `sign_up` did not percent-encode the user id. (#13)
+- `changes(conflicts)` and `all_docs(update_seq)` were ignored over HTTP. (#13)
+- The CLI's `replicate` to CouchDB failed because the target database was not created. (#13)
+
+**Query and views**
+- `$mod` could panic (`i64::MIN % -1`) and accepted a zero or non-integer divisor; `SortField::field_and_direction` could panic; `put_design` panicked when a plugin dropped the document. (#14)
+- Mango indexes were rebuilt under a write lock on every `find`; they are now updated incrementally from the changes feed, and an indexed query narrows candidates by binary search. (#14)
+- `Partition::all_docs` returned documents outside the partition with `descending` or out-of-range keys, missed ids after `p:\u{10FFFF}`, and applied `inclusive_end` to the partition's own bound; it now lists exactly the partition and applies `inclusive_end` only to the caller's end key. (#14, #22)
+- `changes` with a selector counted `limit` before filtering. (#14)
+- `put_design` / `get_design` dropped design-document members `DesignDocument` did not model (`views.lib`, Mango index views, `options`, custom fields); the struct is now lossless. (#14, #21)
+
+**Server and CLI**
+- Creating a document through an attachment `PUT` produced a `2-` revision (CouchDB: `1-`). (#15)
+- `PUT`/`DELETE /{db}/{doc}/{att}` with a malformed `?rev` or `If-Match` answered 404/409 when the document was missing; it is now 400 `Invalid rev format` before the lookup, as in CouchDB. (#26)
+- `_changes.pending` was always 0, and 404 reasons were the document id instead of `missing` / `deleted`. (#15)
+- Axum rejections (bad JSON, bad query parameters, missing `Content-Type`, 404/405) returned non-JSON bodies. (#11)
+- The server and the CLI rejected JSON bodies, selectors and `import` files nested deeper than serde_json's 128 levels. (#22)
+- `import` of 20 000 documents took 97 s; it now writes in batches of 500 and takes 0.7 s (release build). (#11)
+- A broken pipe (`rouchdb … | head`) panicked with exit 101. (#11)
+
+### Security
+
+- **Server CORS is disabled by default.** Browser apps on another origin must be allowed with `--cors-origin` / `ROUCHDB_CORS_ORIGINS` (repeatable). Credentials are allowed only for listed origins; `*` allows any origin without credentials. (#11)
+- **Optional admin authentication**: with `--admin user:password` / `ROUCHDB_ADMIN`, every endpoint except `/`, `/_session`, `/_uuids` and `/_utils` requires HTTP Basic auth or a `_session` cookie (random token, `HttpOnly`, `SameSite=Strict`). The server warns at startup when it listens on a non-loopback address without authentication. (#11)
+- **Wrong Basic credentials are rejected with 401 on every route**, including `/`, `/_uuids`, `/_session` and `/_utils` (they used to be accepted on public routes). (#15)
+- **Session cookies follow CouchDB**: only the first `AuthSession` cookie counts, a malformed one is a 400 on every route (even with valid Basic credentials), and tokens have CouchDB's shape. (#22)
+- **Session cookies expire after 10 minutes without use** (was 1 hour), carry `Max-Age`, and are refreshed on cookie-authenticated requests. (#15)
+- **Request bodies are limited** (64 MiB by default, `--max-request-size`). (#11)
+- **The CLI redacts `user:password@`** from every error it prints. (#11)
+- Not covered yet: per-database `_security` members/admins are not enforced, and there is no Host-header (DNS rebinding) check, so run the server with `--admin` whenever other local software could reach it.
 
 ### Changed
 
-- **HTTPS uses rustls by default instead of native-tls/OpenSSL.** `rouchdb` and `rouchdb-adapter-http` now expose the TLS backend as Cargo features: `rustls-tls` (default, bundled Mozilla roots), `rustls-tls-native-roots` (rustls with the OS certificate store) and `native-tls` (the previous behavior: OpenSSL on Linux). Building no longer needs OpenSSL headers on Linux. If you connect to a CouchDB whose certificate is signed by a private CA installed in the OS trust store, enable `rustls-tls-native-roots` or `native-tls`:
-  ```toml
-  rouchdb = { version = "…", default-features = false, features = ["native-tls"] }
-  ```
-- **The minimum supported Rust version is now declared: 1.88** (`rust-version`) and checked in CI. Development and CI use the toolchain pinned in `rust-toolchain.toml`.
+- redb keeps document counts in its metadata, answers `all_docs` with range scans and early `skip`/`limit`, and iterates `changes` lazily. (#12)
+- `rouchdb-changes` and `rouchdb-views` now depend on `rouchdb-query`, so `rouchdb-query` is published before them. (#13, #14)
+- `rouchdb-query` uses `fancy-regex` instead of `regex`. (#15)
+- `rouchdb-core` owns the `md-5` dependency (moved from the adapters). (#12)
+- async-trait 0.1.92 (fixes `clippy::double_must_use` on Rust 1.99). (#19)
 
-### Internal
+### CI and tooling
 
-- CI runs the `#[ignore]`d CouchDB integration suite against a `couchdb:3` service container, checks the MSRV and the TLS feature combinations, builds the benchmarks, and runs a non-blocking clippy on stable/beta.
-- New `rouchdb-bench` crate with criterion benchmarks (`cargo bench -p rouchdb-bench`); a manual `Benchmarks` workflow runs them on GitHub.
-- Tests: tautological assertions replaced by real ones, inline-attachment tests use documents captured from CouchDB 3.5, and the memory↔redb replication tests run in the default suite.
-- Docs: installation snippets show `0.4`, and CI fails if README/book snippets drift from the workspace version.
+- The toolchain is pinned in `rust-toolchain.toml`; CI checks the MSRV, the TLS feature combinations and minimal dependency versions, and runs non-blocking clippy on stable and beta. (#10, #16)
+- The CouchDB integration suite (`#[ignore = "requires CouchDB"]`) runs in CI against `couchdb:3.5.1`, in parallel, with RAII-cleaned `rouchdb_test_*` databases and a leftover-database check; blocked tests use `#[ignore = "blocked on …"]` plus a `blocked_on_` name and run as a non-blocking xfail step; a lint rejects bare `#[ignore]`. The two tests blocked at the start of the cycle are fixed and unblocked. (#10, #16, #22)
+- New `rouchdb-bench` crate with criterion benchmarks, smoke-run in CI; a manual `Benchmarks` workflow runs them. (#10, #16)
+- A cross-adapter conformance suite (`crates/rouchdb/tests/adapter_conformance.rs`) runs every storage scenario against memory and redb (with reopen). (#12, #18, #20, #21)
+- Differential tests against CouchDB 3.5.1 for the server, Mango and views (the CouchDB parity tables re-check every divergence fix), and exact-oracle rewrites of the replication, HTTP, server, CLI, core, facade and query tests, measured with cargo-mutants. (#15, #17, #20, #22)
+- Property-based tests (proptest) for the revision tree: merge order independence, idempotence, winner/conflicts against a brute-force oracle, stemming, `merge_and_stem`, `remove_leaves`, and the revision/document codecs. (#25)
+- Tests that kill residual mutants in security documents, replicated writes, server write results, rev-format checks and document read options. (#26)
+- CI runs the test suite with the `arbitrary-precision` feature. (#21)
+- Coverage (cargo-llvm-cov), `cargo mutants --in-diff` on PRs and a nightly flaky-test workflow (non-blocking). The README examples compile as doctests. (#16)
+- The "Mutants in the diff" job runs the whole suite per mutant against a CouchDB 3.5.1 service (so mutants caught by the CouchDB-backed tests are no longer reported as missed), reports survivors as notices with a job summary instead of failing, and stops within a 75-minute budget with partial results. (#24)
+- CI fails if README/book install snippets drift from the workspace version. (#10)
+
+### Upgrading redb files
+
+- **Opening a file written by rouchdb ≤ 0.4 with any 0.5 build runs a one-time upgrade** in `RedbAdapter::open`, even for read-only uses such as `rouchdb info` or `rouchdb get`: attachment bytes are re-keyed by digest and document counts are computed (tracked by a `schema` field in the metadata record). Revision trees stay in the old nested format until each document is next written, then are rewritten flat; both formats are readable.
+- **Downgrade is not supported.** After the first 0.5 open, 0.4 may no longer read the file's attachments (digest-keyed), and once a 0.5 build has written a document, 0.4 cannot read its (flat) revision record. **Back up the `.redb` file before opening it with 0.5** if you may need to go back. (#12)
+- Files written by a newer rouchdb (higher `schema`) are refused with a clear error and left untouched. (#18)
+- Attachments stored by 0.4 read back with `revpos` 0. (#21)
+- Bodies of stemmed revisions left by older versions are ignored and removed by the next `compact()`. Bodies deeper than 1000 levels written by older versions (unreadable before) give a clear error. Revisions stored in upper-case hex through `new_edits: false` stay as stored but can no longer be addressed by id (CouchDB and PouchDB never produce them). (#18)
 
 ---
 

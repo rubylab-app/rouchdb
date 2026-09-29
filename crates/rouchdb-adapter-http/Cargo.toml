@@ -21,7 +21,7 @@ rustls-tls-native-roots = ["reqwest/rustls-tls-native-roots"]
 native-tls = ["reqwest/native-tls"]
 
 [dependencies]
-rouchdb-core = { path = "../rouchdb-core", version = "0.4.0" }
+rouchdb-core = { path = "../rouchdb-core", version = "0.5.0" }
 async-trait = "0.1.68"
 percent-encoding = "2.3"
 reqwest = { version = "0.12.17", default-features = false, features = [
