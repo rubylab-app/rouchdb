@@ -95,15 +95,19 @@ With no TLS feature only plain `http://` CouchDB URLs work. These features are n
 ```rust
 use rouchdb::{Database, FindOptions};
 
-let result = db.find(FindOptions {
-    selector: serde_json::json!({
-        "age": {"$gte": 21},
-        "city": {"$in": ["NYC", "LA"]}
-    }),
-    sort: Some(vec![rouchdb::SortField::Simple("age".into())]),
-    limit: Some(10),
-    ..Default::default()
-}).await?;
+async fn adults_in_nyc_or_la(db: &Database) -> rouchdb::Result<()> {
+    let result = db.find(FindOptions {
+        selector: serde_json::json!({
+            "age": {"$gte": 21},
+            "city": {"$in": ["NYC", "LA"]}
+        }),
+        sort: Some(vec![rouchdb::SortField::Simple("age".into())]),
+        limit: Some(10),
+        ..Default::default()
+    }).await?;
+    println!("{} matches", result.docs.len());
+    Ok(())
+}
 ```
 
 ### Map/Reduce
@@ -111,15 +115,19 @@ let result = db.find(FindOptions {
 ```rust
 use rouchdb::{Database, query_view, ReduceFn, ViewQueryOptions};
 
-let result = query_view(
-    db.adapter(),
-    &|doc| {
-        let city = doc.get("city").cloned().unwrap_or_default();
-        vec![(city, serde_json::json!(1))]
-    },
-    Some(&ReduceFn::Count),
-    ViewQueryOptions { reduce: true, group: true, ..ViewQueryOptions::new() },
-).await?;
+async fn count_by_city(db: &Database) -> rouchdb::Result<()> {
+    let result = query_view(
+        db.adapter(),
+        &|doc| {
+            let city = doc.get("city").cloned().unwrap_or_default();
+            vec![(city, serde_json::json!(1))]
+        },
+        Some(&ReduceFn::Count),
+        ViewQueryOptions { reduce: true, group: true, ..ViewQueryOptions::new() },
+    ).await?;
+    println!("{} cities", result.rows.len());
+    Ok(())
+}
 ```
 
 ## Replication
@@ -127,39 +135,46 @@ let result = query_view(
 Sync with CouchDB or between any two databases:
 
 ```rust
-let local = Database::open("local.redb", "mydb")?;
-let remote = Database::http("http://admin:password@localhost:5984/mydb");
+use rouchdb::Database;
 
-// One-way
-local.replicate_to(&remote).await?;
-local.replicate_from(&remote).await?;
+async fn sync_with_couchdb() -> rouchdb::Result<()> {
+    let local = Database::open("local.redb", "mydb")?;
+    let remote = Database::http("http://admin:password@localhost:5984/mydb");
 
-// Bidirectional
-local.sync(&remote).await?;
+    // One-way
+    local.replicate_to(&remote).await?;
+    local.replicate_from(&remote).await?;
+
+    // Bidirectional
+    local.sync(&remote).await?;
+    Ok(())
+}
 ```
 
 ### Live Replication
 
 ```rust
 use std::time::Duration;
-use rouchdb::{ReplicationOptions, ReplicationEvent};
+use rouchdb::{Database, ReplicationEvent, ReplicationOptions};
 
-let (mut rx, handle) = local.replicate_to_live(&remote, ReplicationOptions {
-    poll_interval: Duration::from_secs(5),
-    retry: true,
-    ..Default::default()
-});
+async fn live_push(local: &Database, remote: &Database) {
+    let (mut rx, handle) = local.replicate_to_live(remote, ReplicationOptions {
+        poll_interval: Duration::from_secs(5),
+        retry: true,
+        ..Default::default()
+    });
 
-while let Some(event) = rx.recv().await {
-    match event {
-        ReplicationEvent::Change { docs_read, .. } => println!("synced {docs_read} docs"),
-        ReplicationEvent::Paused => println!("up to date"),
-        ReplicationEvent::Error(msg) => eprintln!("error: {msg}"),
-        _ => {}
+    while let Some(event) = rx.recv().await {
+        match event {
+            ReplicationEvent::Change { docs_read, .. } => println!("synced {docs_read} docs"),
+            ReplicationEvent::Paused => println!("up to date"),
+            ReplicationEvent::Error(msg) => eprintln!("error: {msg}"),
+            _ => {}
+        }
     }
-}
 
-handle.cancel();
+    handle.cancel();
+}
 ```
 
 ## Storage Backends
@@ -194,7 +209,7 @@ The server exposes 25+ CouchDB-compatible REST endpoints — documents, queries,
 
 Options:
 
-```
+```text
 rouchdb-server <path.redb> [OPTIONS]
 
 Options:
@@ -204,6 +219,7 @@ Options:
       --admin <USER:PASSWORD>      Require admin credentials [env: ROUCHDB_ADMIN]
       --cors-origin <ORIGIN>       Allow CORS from this origin (repeatable) [env: ROUCHDB_CORS_ORIGINS]
       --max-request-size <BYTES>   Largest accepted request body [default: 67108864]
+      --session-timeout <SECONDS>  Idle lifetime of a _session cookie [default: 600]
 ```
 
 Security defaults: the server binds to `127.0.0.1`, **CORS is disabled** (so
@@ -212,7 +228,9 @@ database) and **authentication is off**. To require credentials, set
 `ROUCHDB_ADMIN=user:password` (or `--admin`); clients then authenticate with
 HTTP Basic auth (`http://user:password@host:5984/db`) or a `_session` cookie
 (Fauxton login), and only `/`, `/_session`, `/_uuids` and `/_utils` stay
-public. To let a browser app on another origin talk to the server, allow its
+public (wrong Basic credentials are rejected even there, as in CouchDB). As in
+CouchDB, a session cookie expires after 10 minutes without use
+(`--session-timeout`). To let a browser app on another origin talk to the server, allow its
 origin explicitly, e.g. `--cors-origin http://localhost:3000` (credentials are
 allowed for listed origins; `*` allows any origin without credentials). The
 server warns at startup when it listens on a non-loopback address without

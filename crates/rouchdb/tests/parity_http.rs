@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{
     AllDocsOptions, ChangesOptions, ChangesStreamOptions, Database, FindOptions, IndexDefinition,
     ReplicationOptions, SortField,
@@ -17,7 +17,7 @@ use std::time::Duration;
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn explain_on_http_without_index() {
     let url = fresh_remote_db("explain").await;
     let db = Database::http(&url);
@@ -35,12 +35,10 @@ async fn explain_on_http_without_index() {
 
     // Should fall back to _all_docs since no Mango index
     assert_eq!(explanation.index.name, "_all_docs");
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn explain_on_http_with_index() {
     let url = fresh_remote_db("explain_idx").await;
     let db = Database::http(&url);
@@ -66,8 +64,6 @@ async fn explain_on_http_with_index() {
 
     assert_eq!(explanation.index.name, "idx-age");
     assert_eq!(explanation.index.index_type, "json");
-
-    delete_remote_db(&url).await;
 }
 
 // =========================================================================
@@ -75,7 +71,7 @@ async fn explain_on_http_with_index() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn design_doc_crud_on_http() {
     let url = fresh_remote_db("ddoc").await;
     let db = Database::http(&url);
@@ -116,8 +112,6 @@ async fn design_doc_crud_on_http() {
 
     // Should be gone
     assert!(db.get_design("myapp").await.is_err());
-
-    delete_remote_db(&url).await;
 }
 
 // =========================================================================
@@ -125,7 +119,7 @@ async fn design_doc_crud_on_http() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn security_document_round_trips_on_http() {
     let url = fresh_remote_db("security").await;
     let db = Database::http(&url);
@@ -139,8 +133,6 @@ async fn security_document_round_trips_on_http() {
         .unwrap();
     let stored = db.get_security().await.unwrap();
     assert_eq!(serde_json::to_value(&stored).unwrap(), wanted);
-
-    delete_remote_db(&url).await;
 }
 
 // =========================================================================
@@ -148,7 +140,7 @@ async fn security_document_round_trips_on_http() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replication_since_override_http() {
     let url = fresh_remote_db("repl_since").await;
     let remote = Database::http(&url);
@@ -194,8 +186,6 @@ async fn replication_since_override_http() {
         .map(|r| r.id)
         .collect();
     assert_eq!(ids, expected);
-
-    delete_remote_db(&url).await;
 }
 
 // =========================================================================
@@ -203,7 +193,7 @@ async fn replication_since_override_http() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn replication_no_checkpoint_http() {
     let url = fresh_remote_db("repl_nockpt").await;
     let remote = Database::http(&url);
@@ -246,8 +236,6 @@ async fn replication_no_checkpoint_http() {
             "{cp:?}"
         );
     }
-
-    delete_remote_db(&url).await;
 }
 
 // =========================================================================
@@ -255,7 +243,7 @@ async fn replication_no_checkpoint_http() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn all_docs_conflicts_http() {
     let url = fresh_remote_db("alldocs_conflicts").await;
     let db = Database::http(&url);
@@ -309,8 +297,6 @@ async fn all_docs_conflicts_http() {
             ),
         ]
     );
-
-    delete_remote_db(&url).await;
 }
 
 // =========================================================================
@@ -318,7 +304,7 @@ async fn all_docs_conflicts_http() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn live_changes_events_http() {
     let url = fresh_remote_db("ch_events").await;
     let db = Database::http(&url);
@@ -354,7 +340,6 @@ async fn live_changes_events_http() {
 
     assert!(got_change);
     handle.cancel();
-    delete_remote_db(&url).await;
 }
 
 // =========================================================================
@@ -362,7 +347,7 @@ async fn live_changes_events_http() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn mango_find_with_index_http() {
     let url = fresh_remote_db("mango_idx").await;
     let db = Database::http(&url);
@@ -405,6 +390,4 @@ async fn mango_find_with_index_http() {
         .unwrap();
 
     assert_eq!(result.docs.len(), 2);
-
-    delete_remote_db(&url).await;
 }

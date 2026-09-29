@@ -1,26 +1,19 @@
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use rouchdb_core::error::RouchError;
 
+use super::set_location;
 use crate::error::AppError;
 use crate::state::AppState;
 
 #[derive(Deserialize, Default)]
 pub struct LocalQuery {
     pub rev: Option<String>,
-}
-
-fn validate_db(db: &str, state: &AppState) -> Result<(), AppError> {
-    if db != state.db_name {
-        return Err(AppError(RouchError::NotFound(format!(
-            "Database does not exist: {db}"
-        ))));
-    }
-    Ok(())
 }
 
 fn missing() -> AppError {
@@ -39,7 +32,7 @@ pub async fn get_local(
     State(state): State<AppState>,
     Path((db, id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     let stored = match state.db.adapter().get_local(&id).await {
         Ok(doc) => doc,
         Err(RouchError::NotFound(_)) => return Err(missing()),
@@ -70,9 +63,10 @@ pub async fn put_local(
     State(state): State<AppState>,
     Path((db, id)): Path<(String, String)>,
     Query(query): Query<LocalQuery>,
+    headers: HeaderMap,
     body: Bytes,
-) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    validate_db(&db, &state)?;
+) -> Result<Response, AppError> {
+    state.check_db(&db)?;
     let mut obj = super::json_object_body(&body)?;
 
     let body_rev = obj
@@ -92,14 +86,18 @@ pub async fn put_local(
         .put_local(&id, serde_json::Value::Object(obj))
         .await?;
 
-    Ok((
+    let local_id = format!("_local/{id}");
+    let mut resp = (
         StatusCode::CREATED,
         Json(serde_json::json!({
             "ok": true,
-            "id": format!("_local/{id}"),
+            "id": local_id,
             "rev": rev,
         })),
-    ))
+    )
+        .into_response();
+    set_location(&mut resp, &headers, &[&db, &local_id]);
+    Ok(resp)
 }
 
 /// DELETE /{db}/_local/{id} — remove a local document.
@@ -107,7 +105,7 @@ pub async fn delete_local(
     State(state): State<AppState>,
     Path((db, id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     match state.db.adapter().remove_local(&id).await {
         Ok(()) => Ok(Json(serde_json::json!({
             "ok": true,

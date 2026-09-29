@@ -11,15 +11,6 @@ use rouchdb_core::error::RouchError;
 use crate::error::AppError;
 use crate::state::AppState;
 
-fn validate_db(db: &str, state: &AppState) -> Result<(), AppError> {
-    if db != state.db_name {
-        return Err(AppError(rouchdb_core::error::RouchError::NotFound(
-            format!("Database does not exist: {db}"),
-        )));
-    }
-    Ok(())
-}
-
 /// CouchDB's `_find` limit when the request does not set one.
 const DEFAULT_FIND_LIMIT: u64 = 25;
 
@@ -43,7 +34,12 @@ pub async fn find(
     Path(db): Path<String>,
     Json(mut body): Json<serde_json::Value>,
 ) -> Result<Response, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
+    if body.get("selector").is_none() {
+        return Err(AppError(RouchError::BadRequest(
+            "Missing required key: selector".into(),
+        )));
+    }
 
     let offset = match body.as_object_mut().and_then(|o| o.remove("bookmark")) {
         None | Some(serde_json::Value::Null) => None,
@@ -61,8 +57,15 @@ pub async fn find(
             }
         },
     };
-    let mut opts: FindOptions = serde_json::from_value(body)
-        .map_err(|e| AppError(RouchError::BadRequest(format!("invalid query: {e}"))))?;
+    let mut opts: FindOptions = serde_json::from_value(body).map_err(|e| {
+        // Keep CouchDB's own reason (e.g. `Invalid sort field: ...`) as is.
+        let reason = e.to_string();
+        if reason.starts_with("Invalid sort field: ") {
+            AppError(RouchError::BadRequest(reason))
+        } else {
+            AppError(RouchError::BadRequest(format!("invalid query: {reason}")))
+        }
+    })?;
 
     // A bookmark resumes after the results already returned; `skip` applies
     // on top of it, as in CouchDB.
@@ -214,17 +217,6 @@ pub async fn restore_indexes(db: &Database) -> rouchdb::Result<usize> {
     Ok(created)
 }
 
-/// Turn a failed single-document write into the matching error.
-fn check_write(result: rouchdb::DocResult) -> Result<(), AppError> {
-    if result.ok {
-        return Ok(());
-    }
-    Err(AppError(match result.error.as_deref() {
-        Some("conflict") => RouchError::Conflict,
-        _ => RouchError::BadRequest(result.reason.unwrap_or_else(|| "write failed".into())),
-    }))
-}
-
 /// Keep only the user fields of a document read back for an update.
 fn body_of(doc: &rouchdb::Document) -> serde_json::Map<String, serde_json::Value> {
     let mut obj = match doc.to_json() {
@@ -260,14 +252,15 @@ async fn persist_index(
             }
             views[name] = view;
             let rev = doc.rev.map(|r| r.to_string()).unwrap_or_default();
-            check_write(
-                db.update(ddoc_id, &rev, serde_json::Value::Object(body))
-                    .await?,
-            )
+            // `update` / `put` / `remove` report a failed write as an error.
+            db.update(ddoc_id, &rev, serde_json::Value::Object(body))
+                .await?;
+            Ok(())
         }
         Err(RouchError::NotFound(_)) => {
             let body = serde_json::json!({ "language": "query", "views": { name: view } });
-            check_write(db.put(ddoc_id, body).await?)
+            db.put(ddoc_id, body).await?;
+            Ok(())
         }
         Err(e) => Err(AppError(e)),
     }
@@ -282,7 +275,7 @@ pub async fn create_index(
     Path(db): Path<String>,
     Json(body): Json<CreateIndexBody>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     let fields = body.index.fields;
     if fields.is_empty() || !fields.iter().all(valid_field) {
@@ -331,7 +324,7 @@ pub async fn get_indexes(
     State(state): State<AppState>,
     Path(db): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     // Always include the special _all_docs index
     let mut all_indexes = vec![serde_json::json!({
@@ -379,7 +372,7 @@ pub async fn delete_index(
     State(state): State<AppState>,
     Path((db, ddoc, itype, name)): Path<(String, String, String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     if itype != "json" {
         return Err(missing());
     }
@@ -399,14 +392,12 @@ pub async fn delete_index(
     views.remove(&name);
 
     if views.is_empty() {
-        check_write(state.db.remove(&ddoc_id, &rev).await?)?;
+        state.db.remove(&ddoc_id, &rev).await?;
     } else {
-        check_write(
-            state
-                .db
-                .update(&ddoc_id, &rev, serde_json::Value::Object(body))
-                .await?,
-        )?;
+        state
+            .db
+            .update(&ddoc_id, &rev, serde_json::Value::Object(body))
+            .await?;
     }
     // The in-memory index may be missing (e.g. never rebuilt); that is fine.
     let _ = state.db.delete_index(&name).await;
@@ -424,7 +415,7 @@ pub async fn bulk_delete_indexes(
     Path(db): Path<String>,
     Json(body): Json<BulkDeleteIndexBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     let mut success = Vec::new();
     let mut fail = Vec::new();
@@ -472,7 +463,7 @@ pub async fn explain(
     Path(db): Path<String>,
     Json(opts): Json<FindOptions>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     let response = state.db.explain(opts).await;
     Ok(Json(serde_json::to_value(&response).unwrap()))
 }

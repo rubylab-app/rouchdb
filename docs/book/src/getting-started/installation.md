@@ -154,12 +154,18 @@ Options:
       --admin <USER:PASSWORD>      Require admin credentials [env: ROUCHDB_ADMIN]
       --cors-origin <ORIGIN>       Allow CORS from this origin (repeatable) [env: ROUCHDB_CORS_ORIGINS]
       --max-request-size <BYTES>   Largest accepted request body [default: 67108864]
+      --session-timeout <SECONDS>  Idle lifetime of a _session cookie [default: 600]
 ```
 
 By default the server listens on `127.0.0.1` with CORS disabled and no
 authentication. Set `ROUCHDB_ADMIN=user:password` to require credentials
-(HTTP Basic auth or a `_session` cookie), and allow browser apps on other
+(HTTP Basic auth or a `_session` cookie, which expires after
+`--session-timeout` seconds without use), and allow browser apps on other
 origins explicitly with `--cors-origin`.
+
+The server serves a single database. `DELETE /{db}` destroys its data and the
+database answers 404 until `PUT /{db}` creates it again (a restart also brings
+it back, empty).
 
 ## Async Runtime
 

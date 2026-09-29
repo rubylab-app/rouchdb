@@ -16,6 +16,34 @@ use serde::{Deserialize, Serialize};
 use rouchdb_core::adapter::Adapter;
 use rouchdb_core::document::*;
 use rouchdb_core::error::{Result, RouchError};
+use rouchdb_core::json::MAX_NESTING_DEPTH;
+
+/// Containers a CouchDB response wraps around a document (a `_bulk_get`
+/// result: object, `results`, result, `docs`, entry), with some margin.
+const RESPONSE_ENVELOPE_DEPTH: usize = 8;
+
+/// Decode a JSON response body. Documents in it may be nested as deep as
+/// rouchdb stores them ([`MAX_NESTING_DEPTH`]); serde_json alone stops at
+/// 128 levels, which made deep CouchDB documents unreadable.
+pub(crate) fn decode_response<T>(bytes: &[u8]) -> Result<T>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+{
+    rouchdb_core::json::from_slice(bytes, MAX_NESTING_DEPTH + RESPONSE_ENVELOPE_DEPTH)
+        .map_err(|e| RouchError::DatabaseError(e.to_string()))
+}
+
+/// Read and decode a JSON response body (see [`decode_response`]).
+async fn read_json<T>(resp: reqwest::Response) -> Result<T>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+{
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+    decode_response(&bytes)
+}
 
 // ---------------------------------------------------------------------------
 // CouchDB JSON response shapes
@@ -193,8 +221,10 @@ pub struct HttpAdapter {
     client: Client,
     base_url: String,
     skip_setup: bool,
-    /// Set once the remote database is known to exist.
-    setup: tokio::sync::OnceCell<()>,
+    /// Set once the remote database is known to exist; replaced by a fresh
+    /// cell when the database is destroyed, so it is created again on the
+    /// next use.
+    setup: std::sync::Mutex<std::sync::Arc<tokio::sync::OnceCell<()>>>,
 }
 
 impl HttpAdapter {
@@ -224,7 +254,7 @@ impl HttpAdapter {
             client,
             base_url,
             skip_setup: false,
-            setup: tokio::sync::OnceCell::new(),
+            setup: Default::default(),
         }
     }
 
@@ -242,7 +272,12 @@ impl HttpAdapter {
         if self.skip_setup {
             return Ok(());
         }
-        self.setup
+        let setup = self
+            .setup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        setup
             .get_or_try_init(|| async {
                 let resp = self
                     .client
@@ -296,6 +331,13 @@ pub(crate) async fn check_response(response: reqwest::Response) -> Result<reqwes
             .unwrap_or_else(|| default.to_string())
     };
     Err(match status.as_u16() {
+        // A malformed revision, as the local adapters report it.
+        400 if couch
+            .as_ref()
+            .is_some_and(|e| e.reason == "Invalid rev format") =>
+        {
+            RouchError::InvalidRev(reason(&body))
+        }
         400 | 413 | 415 => RouchError::BadRequest(reason(&body)),
         401 => RouchError::Unauthorized,
         403 => RouchError::Forbidden(reason("access denied")),
@@ -338,10 +380,7 @@ impl Adapter for HttpAdapter {
             .await
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
         let resp = self.check_error(resp).await?;
-        let info: CouchDbInfo = resp
-            .json()
-            .await
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+        let info: CouchDbInfo = read_json(resp).await?;
 
         Ok(DbInfo {
             db_name: info.db_name,
@@ -383,7 +422,7 @@ impl Adapter for HttpAdapter {
         let mut params = Vec::new();
 
         if let Some(ref rev) = opts.rev {
-            params.push(format!("rev={}", rev));
+            params.push(format!("rev={}", urlencoded(rev)));
         }
         if opts.conflicts {
             params.push("conflicts=true".into());
@@ -423,10 +462,7 @@ impl Adapter for HttpAdapter {
             .await
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
         let resp = self.check_error(resp).await?;
-        let json: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+        let json: serde_json::Value = read_json(resp).await?;
 
         if opts.open_revs.is_some() {
             return winning_open_rev(json, id);
@@ -456,10 +492,7 @@ impl Adapter for HttpAdapter {
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
         let resp = self.check_error(resp).await?;
 
-        let results: Vec<CouchDbBulkDocsResult> = resp
-            .json()
-            .await
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+        let results: Vec<CouchDbBulkDocsResult> = read_json(resp).await?;
 
         Ok(results
             .into_iter()
@@ -525,10 +558,7 @@ impl Adapter for HttpAdapter {
         }
         .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
         let resp = self.check_error(resp).await?;
-        let result: CouchDbAllDocsResponse = resp
-            .json()
-            .await
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+        let result: CouchDbAllDocsResponse = read_json(resp).await?;
 
         Ok(AllDocsResponse {
             total_rows: result.total_rows,
@@ -609,10 +639,7 @@ impl Adapter for HttpAdapter {
         };
 
         let resp = self.check_error(resp).await?;
-        let result: CouchDbChangesResponse = resp
-            .json()
-            .await
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+        let result: CouchDbChangesResponse = read_json(resp).await?;
 
         Ok(ChangesResponse {
             last_seq: parse_seq(&result.last_seq),
@@ -657,10 +684,7 @@ impl Adapter for HttpAdapter {
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
         let resp = self.check_error(resp).await?;
 
-        let results: HashMap<String, RevsDiffResult> = resp
-            .json()
-            .await
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+        let results: HashMap<String, RevsDiffResult> = read_json(resp).await?;
 
         Ok(RevsDiffResponse { results })
     }
@@ -692,10 +716,7 @@ impl Adapter for HttpAdapter {
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
         let resp = self.check_error(resp).await?;
 
-        let result: CouchDbBulkGetResponse = resp
-            .json()
-            .await
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+        let result: CouchDbBulkGetResponse = read_json(resp).await?;
 
         Ok(BulkGetResponse {
             results: result
@@ -746,10 +767,7 @@ impl Adapter for HttpAdapter {
             .await
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
         let resp = self.check_error(resp).await?;
-        let result: CouchDbPutResponse = resp
-            .json()
-            .await
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+        let result: CouchDbPutResponse = read_json(resp).await?;
 
         Ok(DocResult {
             ok: result.ok.unwrap_or(true),
@@ -807,10 +825,7 @@ impl Adapter for HttpAdapter {
             .await
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
         let resp = self.check_error(resp).await?;
-        let result: CouchDbPutResponse = resp
-            .json()
-            .await
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+        let result: CouchDbPutResponse = read_json(resp).await?;
 
         Ok(DocResult {
             ok: result.ok.unwrap_or(true),
@@ -831,10 +846,7 @@ impl Adapter for HttpAdapter {
             .await
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
         let resp = self.check_error(resp).await?;
-        let json: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+        let json: serde_json::Value = read_json(resp).await?;
         Ok(json)
     }
 
@@ -885,6 +897,9 @@ impl Adapter for HttpAdapter {
         Ok(())
     }
 
+    /// Delete the remote database. Like PouchDB, a database that does not
+    /// exist is not an error, and (unless `skip_setup` is set) the next
+    /// operation creates it again, empty, as the local adapters behave.
     async fn destroy(&self) -> Result<()> {
         let resp = self
             .client
@@ -892,7 +907,13 @@ impl Adapter for HttpAdapter {
             .send()
             .await
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
-        self.check_error(resp).await?;
+        if resp.status() != reqwest::StatusCode::NOT_FOUND {
+            self.check_error(resp).await?;
+        }
+        *self
+            .setup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Default::default();
         Ok(())
     }
 
@@ -906,10 +927,7 @@ impl Adapter for HttpAdapter {
             .await
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
         let resp = self.check_error(resp).await?;
-        let result: PurgeResponse = resp
-            .json()
-            .await
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+        let result: PurgeResponse = read_json(resp).await?;
         Ok(result)
     }
 
@@ -922,10 +940,7 @@ impl Adapter for HttpAdapter {
             .await
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
         let resp = self.check_error(resp).await?;
-        let doc: SecurityDocument = resp
-            .json()
-            .await
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+        let doc: SecurityDocument = read_json(resp).await?;
         Ok(doc)
     }
 
@@ -1870,7 +1885,7 @@ mod tests {
             .put_local("cp", serde_json::json!({"_rev": "x", "last_seq": 6}))
             .await;
         assert!(
-            matches!(bad, Err(RouchError::BadRequest(ref r)) if r == "Invalid rev format"),
+            matches!(bad, Err(RouchError::InvalidRev(ref r)) if r == "Invalid rev format"),
             "{bad:?}"
         );
 
@@ -1887,19 +1902,25 @@ mod tests {
                 "404 Object Not Found",
                 r#"{"error":"not_found","reason":"Database does not exist."}"#.into(),
             ),
+            (
+                "401 Unauthorized",
+                r#"{"error":"unauthorized","reason":"You are not a server admin."}"#.into(),
+            ),
         ])
         .await;
         let db = adapter_at(&url);
 
         db.destroy().await.unwrap();
-        assert!(matches!(db.destroy().await, Err(RouchError::NotFound(_))));
+        // A database that is already gone counts as destroyed.
+        db.destroy().await.unwrap();
+        assert!(matches!(db.destroy().await, Err(RouchError::Unauthorized)));
         let lines: Vec<_> = requests
             .lock()
             .unwrap()
             .iter()
             .map(Captured::line)
             .collect();
-        assert_eq!(lines, vec!["DELETE /db", "DELETE /db"]);
+        assert_eq!(lines, vec!["DELETE /db", "DELETE /db", "DELETE /db"]);
     }
 
     #[tokio::test]
@@ -1966,11 +1987,21 @@ mod tests {
     async fn http_errors_map_to_rouch_errors() {
         let err = error_for(
             "400 Bad Request",
+            r#"{"error":"bad_request","reason":"Document must be a JSON object"}"#,
+        )
+        .await;
+        assert!(
+            matches!(err, RouchError::BadRequest(ref r) if r == "Document must be a JSON object"),
+            "{err:?}"
+        );
+        // A malformed revision is reported like the local adapters do.
+        let err = error_for(
+            "400 Bad Request",
             r#"{"error":"bad_request","reason":"Invalid rev format"}"#,
         )
         .await;
         assert!(
-            matches!(err, RouchError::BadRequest(ref r) if r == "Invalid rev format"),
+            matches!(err, RouchError::InvalidRev(ref r) if r == "Invalid rev format"),
             "{err:?}"
         );
 

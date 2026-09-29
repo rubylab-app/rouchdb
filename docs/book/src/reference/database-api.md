@@ -45,7 +45,7 @@ These methods correspond to CouchDB's core document API. See the [Core Types Ref
 | `post` | `async fn post(&self, data: serde_json::Value)` | `Result<DocResult>` | Create a new document with an auto-generated UUID v4 as the ID. Equivalent to PouchDB's `db.post()`. |
 | `put` | `async fn put(&self, id: &str, data: serde_json::Value)` | `Result<DocResult>` | Create a new document. If a document with the same `_id` already exists and has no previous revision, this creates it; otherwise it may conflict. |
 | `update` | `async fn update(&self, id: &str, rev: &str, data: serde_json::Value)` | `Result<DocResult>` | Update an existing document. You must provide the current `_rev` string. Returns `RouchError::Conflict` if the rev does not match. |
-| `remove` | `async fn remove(&self, id: &str, rev: &str)` | `Result<DocResult>` | Delete a document by marking it as deleted. Requires the current `_rev`. The document remains in the database as a deletion tombstone. |
+| `remove` | `async fn remove(&self, id: &str, rev: &str)` | `Result<DocResult>` | Delete a document by marking it as deleted. Requires the current `_rev`. The document remains in the database as a deletion tombstone. Like CouchDB's `DELETE`, a missing or already deleted document is `RouchError::NotFound`. |
 | `bulk_docs` | `async fn bulk_docs(&self, docs: Vec<Document>, opts: BulkDocsOptions)` | `Result<Vec<DocResult>>` | Write multiple documents atomically. See [`BulkDocsOptions`](core-types.md) for user mode vs. replication mode. |
 | `all_docs` | `async fn all_docs(&self, opts: AllDocsOptions)` | `Result<AllDocsResponse>` | Query all documents, optionally filtered by key range. Supports pagination, descending order, and including full document bodies. |
 | `changes` | `async fn changes(&self, opts: ChangesOptions)` | `Result<ChangesResponse>` | Get the list of changes since a given sequence. Used for change tracking, live feeds, and replication. |
@@ -252,7 +252,7 @@ println!("Index: {} ({})", explanation.index.name, explanation.index.index_type)
 
 | Method | Signature | Return Type | Description |
 |--------|-----------|-------------|-------------|
-| `put_design` | `async fn put_design(&self, ddoc: DesignDocument)` | `Result<DocResult>` | Create or update a design document. |
+| `put_design` | `async fn put_design(&self, ddoc: DesignDocument)` | `Result<DocResult>` | Create or update a design document. Like `put`, a failed write (e.g. `RouchError::Conflict`) is an error. |
 | `get_design` | `async fn get_design(&self, name: &str)` | `Result<DesignDocument>` | Retrieve a design document by short name (without `_design/` prefix). |
 | `delete_design` | `async fn delete_design(&self, name: &str, rev: &str)` | `Result<DocResult>` | Delete a design document. |
 | `view_cleanup` | `async fn view_cleanup(&self)` | `Result<()>` | Remove unused view indexes. |
@@ -308,7 +308,7 @@ See the [Plugins](../guides/plugins.md) guide for details.
 | `close` | `async fn close(&self)` | `Result<()>` | Close the database connection. No-op for HTTP adapter. |
 | `compact` | `async fn compact(&self)` | `Result<()>` | Compact the database: removes old revisions and cleans up unreferenced attachment data. |
 | `purge` | `async fn purge(&self, id: &str, revs: Vec<String>)` | `Result<PurgeResponse>` | Permanently remove specific revisions of a document. Unlike `remove()`, purged revisions do not replicate. |
-| `destroy` | `async fn destroy(&self)` | `Result<()>` | Destroy the database and all its data. This is irreversible. |
+| `destroy` | `async fn destroy(&self)` | `Result<()>` | Destroy the database and all its data (local documents, attachments, security and Mango indexes included). This is irreversible. The handle stays usable as a new, empty database; an http database is re-created on its next use. |
 
 ---
 

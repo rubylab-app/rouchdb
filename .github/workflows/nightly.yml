@@ -1,0 +1,83 @@
+name: Nightly
+
+# Flaky-test detection: the unit suite and the CouchDB suite run several
+# times in a row, so a test that fails once in N runs shows up here before
+# it breaks somebody's PR, and the unit suite also runs on macOS.
+# Informational: check the job summaries in the Actions tab.
+on:
+  schedule:
+    - cron: "43 3 * * *" # 03:43 UTC
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Runs of each suite"
+        required: false
+        default: "5"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUNS: ${{ inputs.runs || '5' }}
+
+jobs:
+  unit:
+    name: Unit tests, repeated (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build tests
+        run: cargo test --workspace --locked --no-run
+
+      - name: Run the unit tests repeatedly
+        run: bash scripts/repeat-tests.sh "$RUNS" cargo test --workspace --locked --no-fail-fast
+
+  couchdb:
+    name: CouchDB tests, repeated
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      couchdb:
+        image: couchdb:3.5.1
+        ports:
+          - 15984:5984
+        env:
+          COUCHDB_USER: admin
+          COUCHDB_PASSWORD: password
+        options: >-
+          --health-cmd "curl -fs http://localhost:5984/_up"
+          --health-interval 3s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      COUCHDB_URL: http://admin:password@localhost:15984
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build tests
+        run: cargo test --workspace --tests --locked --no-run
+
+      - name: Disable CouchDB account lockout
+        run: |
+          curl -fsS --retry 30 --retry-delay 2 --retry-all-errors "$COUCHDB_URL/_up"
+          curl -fsS -X PUT "$COUCHDB_URL/_node/_local/_config/chttpd_auth_lockout/mode" -d '"off"'
+
+      - name: Run the CouchDB tests repeatedly
+        run: bash scripts/repeat-tests.sh "$RUNS" bash scripts/test-couchdb.sh --locked

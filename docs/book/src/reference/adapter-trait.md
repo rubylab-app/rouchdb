@@ -107,7 +107,8 @@ pub trait Adapter: Send + Sync {
 **Behavior contract:**
 
 - With default `GetOptions`: returns the winning revision of the document. Returns `RouchError::NotFound` if the document does not exist or the winning revision is a deletion.
-- With `opts.rev = Some(rev)`: returns the specific revision, even if it is not the winner. Returns `NotFound` if that revision does not exist.
+- With `opts.rev = Some(rev)`: returns the specific revision, even if it is not the winner. Returns `NotFound` if that revision does not exist (including revisions stemmed by the revision limit or compacted away) and `InvalidRev` if `rev` is malformed. A 32-digit hex revision id is case-insensitive (CouchDB stores it in lower case).
+- An id starting with `_local/` reads the local document of that name (as CouchDB does).
 - With `opts.conflicts = true`: the returned document includes information about conflicting leaf revisions.
 - With `opts.open_revs = Some(OpenRevs::All)`: returns all leaf revisions of the document.
 - With `opts.revs = true`: includes full revision history in the response.
@@ -269,7 +270,7 @@ This is why local documents are excluded from replication -- each side maintains
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `compact` | `async fn compact(&self) -> Result<()>` | Remove old (non-leaf) revisions and clean up unreferenced attachment data. |
-| `destroy` | `async fn destroy(&self) -> Result<()>` | Destroy the database and all its data. After calling this, the adapter should not be used. |
+| `destroy` | `async fn destroy(&self) -> Result<()>` | Destroy the database and all its data (local documents and security included). The adapter stays usable and behaves as a new, empty database (the http adapter re-creates the remote database on its next use). |
 | `close` | `async fn close(&self) -> Result<()>` | Release resources (default: no-op). |
 | `purge` | `async fn purge(&self, req: HashMap<String, Vec<String>>) -> Result<PurgeResponse>` | Permanently remove specific revisions. Purged revisions do not replicate. Default returns an error. |
 | `get_security` | `async fn get_security(&self) -> Result<SecurityDocument>` | Get the database security document (default: empty document). |

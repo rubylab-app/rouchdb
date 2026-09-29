@@ -1,14 +1,17 @@
+use std::collections::HashMap;
+
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
-use rouchdb::{GetAttachmentOptions, GetOptions};
+use rouchdb::{AttachmentMeta, BulkDocsOptions, Document, GetAttachmentOptions, GetOptions};
 use rouchdb_core::error::RouchError;
 
-use super::document::resolve_rev;
-use crate::error::AppError;
+use super::document::{check_rev_format, get_or_not_found, resolve_rev};
+use super::set_location;
+use crate::error::{AppError, couch_error};
 use crate::state::AppState;
 
 #[derive(Deserialize, Default)]
@@ -16,13 +19,26 @@ pub struct AttachmentQuery {
     pub rev: Option<String>,
 }
 
-fn validate_db(db: &str, state: &AppState) -> Result<(), AppError> {
-    if db != state.db_name {
-        return Err(AppError(rouchdb_core::error::RouchError::NotFound(
-            format!("Database does not exist: {db}"),
-        )));
-    }
-    Ok(())
+/// Whether `rev` is not in the document's revision tree (or the document
+/// does not exist at all).
+async fn rev_is_unknown(state: &AppState, docid: &str, rev: &str) -> bool {
+    let request = HashMap::from([(docid.to_string(), vec![rev.to_string()])]);
+    state
+        .db
+        .adapter()
+        .revs_diff(request)
+        .await
+        .is_ok_and(|diff| {
+            diff.results
+                .get(docid)
+                .is_some_and(|result| result.missing.iter().any(|r| r == rev))
+        })
+}
+
+/// CouchDB's answer to an attachment write on a revision that does not exist
+/// (whether or not the document does): a 409 with a `not_found` error.
+fn missing_rev() -> Response {
+    couch_error(StatusCode::CONFLICT, "not_found", "missing_rev")
 }
 
 /// GET /{db}/{docid}/{attname}?rev=... — download an attachment.
@@ -33,21 +49,17 @@ pub async fn get_attachment(
     Path((db, docid, attname)): Path<(String, String, String)>,
     Query(query): Query<AttachmentQuery>,
 ) -> Result<Response, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
+    check_rev_format(query.rev.as_deref())?;
 
     // Resolve the revision once (the requested one, or the winner) and read
     // both the metadata and the bytes from that same revision, so the
     // content type always matches the data served.
-    let doc = state
-        .db
-        .get_with_opts(
-            &docid,
-            GetOptions {
-                rev: query.rev,
-                ..Default::default()
-            },
-        )
-        .await?;
+    let opts = GetOptions {
+        rev: query.rev,
+        ..Default::default()
+    };
+    let doc = get_or_not_found(&state, &docid, opts).await?;
     let meta = doc.attachments.get(&attname).ok_or_else(|| {
         AppError(RouchError::NotFound(
             "Document is missing attachment".to_string(),
@@ -74,7 +86,23 @@ pub async fn get_attachment(
                 .to_string()
         });
 
-    Ok((StatusCode::OK, [("content-type", content_type)], data).into_response())
+    // As in CouchDB: the ETag is the digest, byte ranges are not served, and
+    // the content is sandboxed so an HTML attachment cannot run scripts on
+    // the database's origin.
+    let mut resp = (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data).into_response();
+    let headers = resp.headers_mut();
+    let digest = meta.digest.strip_prefix("md5-").unwrap_or(&meta.digest);
+    if !digest.is_empty()
+        && let Ok(etag) = HeaderValue::from_str(&format!("\"{digest}\""))
+    {
+        headers.insert(header::ETAG, etag);
+    }
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("none"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox"),
+    );
+    Ok(resp)
 }
 
 /// PUT /{db}/{docid}/{attname}?rev=... — upload an attachment.
@@ -87,45 +115,71 @@ pub async fn put_attachment(
     Query(query): Query<AttachmentQuery>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<(StatusCode, axum::Json<serde_json::Value>), AppError> {
-    validate_db(&db, &state)?;
+) -> Result<Response, AppError> {
+    state.check_db(&db)?;
 
     let content_type = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream");
 
-    let rev = match resolve_rev(query.rev, None, &headers)? {
-        Some(rev) => rev,
-        None => match state.db.get(&docid).await {
-            Ok(_) => return Err(AppError(RouchError::Conflict)),
-            Err(RouchError::NotFound(_)) => {
-                // The adapters attach to an existing revision, so create an
-                // empty document first (the result is a 2- revision where
-                // CouchDB would produce 1-).
-                let created = state.db.put(&docid, serde_json::json!({})).await?;
-                match created.rev {
-                    Some(rev) if created.ok => rev,
-                    _ => return Err(AppError(RouchError::Conflict)),
+    let result = match resolve_rev(query.rev, None, &headers)? {
+        Some(rev) => {
+            let result = state
+                .db
+                .put_attachment(&docid, &attname, &rev, body.to_vec(), content_type)
+                .await;
+            match result {
+                Err(RouchError::NotFound(_) | RouchError::Conflict)
+                    if rev_is_unknown(&state, &docid, &rev).await =>
+                {
+                    return Ok(missing_rev());
                 }
+                other => other?,
             }
-            Err(e) => return Err(AppError(e)),
-        },
+        }
+        None => {
+            // Without a revision the document must not exist yet: create it
+            // with the attachment in a single first revision, as CouchDB does.
+            match state.db.get(&docid).await {
+                Ok(_) => return Err(AppError(RouchError::Conflict)),
+                Err(RouchError::NotFound(_)) => {}
+                Err(e) => return Err(AppError(e)),
+            }
+            let attachment = AttachmentMeta {
+                content_type: content_type.to_string(),
+                digest: String::new(),
+                length: body.len() as u64,
+                stub: false,
+                data: Some(body.to_vec()),
+            };
+            let doc = Document {
+                id: docid.clone(),
+                rev: None,
+                deleted: false,
+                data: serde_json::json!({}),
+                attachments: HashMap::from([(attname.clone(), attachment)]),
+            };
+            let mut results = state
+                .db
+                .bulk_docs(vec![doc], BulkDocsOptions::new())
+                .await?;
+            let result = results.pop().ok_or(AppError(RouchError::Conflict))?;
+            super::write_result(result)?
+        }
     };
 
-    let result = state
-        .db
-        .put_attachment(&docid, &attname, &rev, body.to_vec(), content_type)
-        .await?;
-
-    Ok((
+    let mut resp = (
         StatusCode::CREATED,
         axum::Json(serde_json::json!({
             "ok": result.ok,
             "id": result.id,
             "rev": result.rev,
         })),
-    ))
+    )
+        .into_response();
+    set_location(&mut resp, &headers, &[&db, &docid, &attname]);
+    Ok(resp)
 }
 
 /// DELETE /{db}/{docid}/{attname}?rev=... — delete an attachment.
@@ -134,17 +188,30 @@ pub async fn delete_attachment(
     Path((db, docid, attname)): Path<(String, String, String)>,
     Query(query): Query<AttachmentQuery>,
     headers: HeaderMap,
-) -> Result<axum::Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+) -> Result<Response, AppError> {
+    state.check_db(&db)?;
 
     // Without any revision CouchDB reports a conflict.
     let rev = resolve_rev(query.rev, None, &headers)?.ok_or(AppError(RouchError::Conflict))?;
 
-    let result = state.db.remove_attachment(&docid, &attname, &rev).await?;
+    let result = match state.db.remove_attachment(&docid, &attname, &rev).await {
+        Err(RouchError::NotFound(_) | RouchError::Conflict)
+            if rev_is_unknown(&state, &docid, &rev).await =>
+        {
+            return Ok(missing_rev());
+        }
+        Err(RouchError::NotFound(_)) => {
+            return Err(AppError(RouchError::NotFound(
+                "Document is missing attachment".into(),
+            )));
+        }
+        other => other?,
+    };
 
     Ok(axum::Json(serde_json::json!({
         "ok": result.ok,
         "id": result.id,
         "rev": result.rev,
-    })))
+    }))
+    .into_response())
 }

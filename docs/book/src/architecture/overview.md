@@ -131,7 +131,7 @@ Mango selectors (`$eq`, `$gt`, `$in`, `$regex`, etc.) and map/reduce view
 support. Evaluates selectors against `serde_json::Value` documents using
 CouchDB collation order.
 
-Dependencies: `rouchdb-core`, `regex`, `serde`, `serde_json`.
+Dependencies: `rouchdb-core`, `fancy-regex`, `serde`, `serde_json`.
 
 ### 8. `rouchdb-views`
 

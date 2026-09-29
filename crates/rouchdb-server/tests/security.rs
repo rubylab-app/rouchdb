@@ -273,7 +273,9 @@ fn session_cookie(resp: &Resp) -> String {
     let set_cookie = cookies[0].to_str().unwrap();
     let token = set_cookie
         .strip_prefix("AuthSession=")
-        .and_then(|rest| rest.strip_suffix("; Version=1; Path=/; HttpOnly; SameSite=Strict"))
+        .and_then(|rest| {
+            rest.strip_suffix("; Version=1; Max-Age=600; Path=/; HttpOnly; SameSite=Strict")
+        })
         .unwrap_or_else(|| panic!("unexpected Set-Cookie: {set_cookie}"));
     assert!(
         !token.is_empty() && !token.contains([';', ' ', ',']),
@@ -386,25 +388,27 @@ async fn session_login_accepts_forms_and_rejects_other_content_types() {
     assert_eq!(resp.header("set-cookie"), None);
 }
 
-// Q-SRV-4: sessions expire after an hour without use. The clock is tokio's,
-// paused and advanced by hand.
+// Q-SRV-4: sessions expire after CouchDB's default ten minutes without use.
+// The clock is tokio's, paused and advanced by hand.
+
+const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[tokio::test(start_paused = true)]
-async fn session_survives_59_idle_minutes() {
+async fn session_survives_just_under_the_idle_timeout() {
     let app = app_with(Arc::new(Database::memory(DB)), &with_admin());
     let cookie = session_cookie(&login(&app).await);
 
-    tokio::time::advance(Duration::from_secs(59 * 60)).await;
+    tokio::time::advance(IDLE_TIMEOUT - Duration::from_secs(1)).await;
     let resp = get_with(&app, "/db", &[("cookie", &cookie)]).await;
     assert_eq!(resp.status, StatusCode::OK);
 }
 
 #[tokio::test(start_paused = true)]
-async fn session_expires_after_60_idle_minutes() {
+async fn session_expires_after_the_idle_timeout() {
     let app = app_with(Arc::new(Database::memory(DB)), &with_admin());
     let cookie = session_cookie(&login(&app).await);
 
-    tokio::time::advance(Duration::from_secs(60 * 60)).await;
+    tokio::time::advance(IDLE_TIMEOUT).await;
     let resp = get_with(&app, "/db", &[("cookie", &cookie)]).await;
     assert_eq!(resp.status, StatusCode::UNAUTHORIZED);
     assert_eq!(resp.json(), anonymous());
@@ -425,29 +429,39 @@ async fn session_activity_resets_the_idle_timer() {
     let cookie = session_cookie(&login(&app).await);
 
     for _ in 0..2 {
-        tokio::time::advance(Duration::from_secs(50 * 60)).await;
+        tokio::time::advance(Duration::from_secs(8 * 60)).await;
         let resp = get_with(&app, "/db", &[("cookie", &cookie)]).await;
         assert_eq!(resp.status, StatusCode::OK);
     }
-    // 100 minutes after the login, 50 after the last use: still valid;
-    // an hour after the last use it is gone.
-    tokio::time::advance(Duration::from_secs(60 * 60)).await;
+    // 16 minutes after the login, 8 after the last use: still valid; ten
+    // minutes after the last use it is gone.
+    tokio::time::advance(IDLE_TIMEOUT).await;
     let resp = get_with(&app, "/db", &[("cookie", &cookie)]).await;
     assert_eq!(resp.status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test(start_paused = true)]
-async fn new_login_keeps_other_live_sessions() {
-    let app = app_with(Arc::new(Database::memory(DB)), &with_admin());
-    let first = session_cookie(&login(&app).await);
+async fn configured_idle_timeout_applies_on_the_paused_clock() {
+    let config = ServerConfig {
+        session_timeout: Duration::from_secs(90),
+        ..with_admin()
+    };
+    let app = app_with(Arc::new(Database::memory(DB)), &config);
+    let resp = login(&app).await;
+    let set_cookie = resp.header("set-cookie").unwrap().to_string();
+    assert!(set_cookie.contains("; Max-Age=90;"), "{set_cookie}");
+    let cookie = set_cookie.split(';').next().unwrap().to_string();
 
-    tokio::time::advance(Duration::from_secs(30 * 60)).await;
-    let second = session_cookie(&login(&app).await);
-
-    for cookie in [&first, &second] {
-        let resp = get_with(&app, "/db", &[("cookie", cookie)]).await;
-        assert_eq!(resp.status, StatusCode::OK, "{cookie}");
-    }
+    tokio::time::advance(Duration::from_secs(89)).await;
+    assert_eq!(
+        get_with(&app, "/db", &[("cookie", &cookie)]).await.status,
+        StatusCode::OK
+    );
+    tokio::time::advance(Duration::from_secs(90)).await;
+    assert_eq!(
+        get_with(&app, "/db", &[("cookie", &cookie)]).await.status,
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[tokio::test]

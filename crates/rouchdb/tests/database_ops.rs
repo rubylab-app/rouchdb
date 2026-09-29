@@ -2,11 +2,11 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::Database;
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn database_info_http() {
     let url = fresh_remote_db("db_info").await;
     let db = Database::http(&url);
@@ -19,12 +19,10 @@ async fn database_info_http() {
 
     let info = db.info().await.unwrap();
     assert_eq!(info.doc_count, 2);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn database_compact_http() {
     let url = fresh_remote_db("db_compact").await;
     let db = Database::http(&url);
@@ -41,21 +39,19 @@ async fn database_compact_http() {
             .ok
     );
 
+    // CouchDB compacts in the background; the reads below do not depend
+    // on when it finishes, so there is nothing to wait for.
     db.compact().await.unwrap();
-
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let doc = db.get("doc1").await.unwrap();
     assert_eq!(doc.data["v"], 3);
 
     let info = db.info().await.unwrap();
     assert_eq!(info.doc_count, 1);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn database_destroy_http() {
     let url = fresh_remote_db("db_destroy").await;
     let db = Database::http(&url);
@@ -64,12 +60,19 @@ async fn database_destroy_http() {
 
     db.destroy().await.unwrap();
 
-    let result = db.info().await;
-    assert!(result.is_err());
+    // Like the local adapters, the handle then behaves as a new, empty
+    // database: it is re-created on its next use.
+    let info = db.info().await.unwrap();
+    assert_eq!(info.doc_count, 0);
+    assert!(matches!(
+        db.get("doc1").await,
+        Err(rouchdb::RouchError::NotFound(_))
+    ));
+    db.destroy().await.unwrap();
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn cross_adapter_fidelity_memory_couchdb_redb() {
     let url = fresh_remote_db("fidelity").await;
     let memory = Database::memory("mem");
@@ -111,6 +114,4 @@ async fn cross_adapter_fidelity_memory_couchdb_redb() {
     assert_eq!(remote_doc.data["array"], redb_doc.data["array"]);
     assert_eq!(mem_doc.data["nested"], remote_doc.data["nested"]);
     assert_eq!(remote_doc.data["nested"], redb_doc.data["nested"]);
-
-    delete_remote_db(&url).await;
 }

@@ -39,6 +39,7 @@ fn unauthorized(reason: &str) -> Value {
 
 const BAD_CREDENTIALS: &str = "Name or password is incorrect.";
 const NOT_AUTHORIZED_DB: &str = "You are not authorized to access this db.";
+const NOT_SERVER_ADMIN: &str = "You are not a server admin.";
 
 async fn request(
     app: &Router,
@@ -261,8 +262,6 @@ enum Effect {
     Reads,
     /// Writes: with valid credentials the snapshot must change.
     Writes,
-    /// Only the rejection is checked (`DELETE /db` is being reworked).
-    RejectionOnly,
 }
 
 struct Row {
@@ -270,10 +269,9 @@ struct Row {
     uri: String,
     body: Option<(&'static str, Vec<u8>)>,
     effect: Effect,
-    /// Database-level routes use CouchDB's "not authorized to access this
-    /// db" reason for anonymous requests; server-level ones differ (CouchDB
-    /// says "You are not a server admin."), so only the error name is
-    /// checked for them.
+    /// Database-level routes answer anonymous requests with CouchDB's "not
+    /// authorized to access this db" reason, server-level ones with "You are
+    /// not a server admin.".
     db_level: bool,
 }
 
@@ -312,7 +310,7 @@ fn rows(fx: &Fixture) -> Vec<Row> {
         row(M::HEAD, "/db", Reads),
         row(M::PUT, "/db", Reads),
         json_row(M::POST, "/db", json!({"_id": "posted"}), Writes),
-        row(M::DELETE, "/db", RejectionOnly),
+        row(M::DELETE, "/db", Writes),
         // _all_docs, _bulk_docs, _changes.
         row(M::GET, "/db/_all_docs?include_docs=true", Reads),
         json_row(M::POST, "/db/_all_docs", json!({"keys": ["a"]}), Reads),
@@ -479,15 +477,14 @@ async fn every_route_rejects_missing_or_wrong_credentials_without_side_effects()
                     (None, true) => {
                         assert_eq!(resp.json(), unauthorized(NOT_AUTHORIZED_DB), "{ctx}")
                     }
-                    (None, false) => assert_eq!(resp.json()["error"], "unauthorized", "{ctx}"),
+                    (None, false) => {
+                        assert_eq!(resp.json(), unauthorized(NOT_SERVER_ADMIN), "{ctx}")
+                    }
                 }
             }
             assert_eq!(snapshot(&fx).await, before, "{ctx} changed the database");
         }
 
-        if row.effect == Effect::RejectionOnly {
-            continue;
-        }
         // Positive control through the session cookie, surrounded by other
         // cookies.
         let cookie = format!("other=x; AuthSession={}; theme=dark", fx.token);
@@ -508,7 +505,6 @@ async fn every_route_rejects_missing_or_wrong_credentials_without_side_effects()
         match row.effect {
             Effect::Reads => assert_eq!(after, before, "{what} must not write"),
             Effect::Writes => assert_ne!(after, before, "{what} did not write"),
-            Effect::RejectionOnly => unreachable!(),
         }
     }
 }

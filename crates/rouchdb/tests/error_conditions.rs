@@ -2,23 +2,21 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{Database, RouchError};
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn error_get_nonexistent_doc() {
     let url = fresh_remote_db("err_noexist").await;
     let db = Database::http(&url);
 
     let result = db.get("does_not_exist").await;
     assert!(matches!(result, Err(RouchError::NotFound(_))));
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn error_update_wrong_rev() {
     let url = fresh_remote_db("err_wrongrev").await;
     let db = Database::http(&url);
@@ -32,12 +30,10 @@ async fn error_update_wrong_rev() {
     assert!(matches!(result, Err(RouchError::Conflict)), "{result:?}");
     // The stored document is left untouched.
     assert_eq!(db.get("doc1").await.unwrap().data["v"], 1);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn error_delete_wrong_rev() {
     let url = fresh_remote_db("err_delrev").await;
     let db = Database::http(&url);
@@ -49,12 +45,10 @@ async fn error_delete_wrong_rev() {
     assert!(matches!(result, Err(RouchError::Conflict)), "{result:?}");
     // The stored document is left untouched.
     assert_eq!(db.get("doc1").await.unwrap().data["v"], 1);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn error_put_existing_without_rev() {
     let url = fresh_remote_db("err_dup").await;
     let db = Database::http(&url);
@@ -66,12 +60,10 @@ async fn error_put_existing_without_rev() {
     assert!(matches!(result, Err(RouchError::Conflict)), "{result:?}");
     // The stored document is left untouched.
     assert_eq!(db.get("doc1").await.unwrap().data["v"], 1);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn error_get_deleted_doc() {
     let url = fresh_remote_db("err_deleted").await;
     let db = Database::http(&url);
@@ -81,6 +73,4 @@ async fn error_get_deleted_doc() {
 
     let result = db.get("doc1").await;
     assert!(matches!(result, Err(RouchError::NotFound(_))));
-
-    delete_remote_db(&url).await;
 }

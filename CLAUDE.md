@@ -24,7 +24,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 # Integration tests (require CouchDB at localhost:15984)
 docker compose up -d
-bash scripts/test-couchdb.sh              # all #[ignore]d tests, skips "blocked on Fxx"
+bash scripts/test-couchdb.sh              # every "requires CouchDB" test, in parallel
+bash scripts/test-blocked.sh              # xfail: the "blocked on Fxx" tests must still fail
 cargo test -p rouchdb --test replication replicate_memory_to_couchdb -- --ignored
 
 # Benchmarks (criterion, crates/rouchdb-bench)
@@ -118,8 +119,8 @@ Clap-based CLI. Read commands: `info`, `get`, `all-docs`, `find`, `changes`, `du
 - Workspace-level `version` in root `Cargo.toml` — all crate versions must stay in sync
 - Internal dependency versions must match workspace version (e.g., `rouchdb-core = { path = "../rouchdb-core", version = "0.4.0" }`)
 - All async via Tokio; tests use `#[tokio::test]`
-- Integration tests are `#[ignore]` — they need CouchDB at `http://admin:password@localhost:15984` (override with `COUCHDB_URL` env var)
-- A test that exposes a known unfixed bug is marked `#[ignore = "blocked on Fxx"]` rather than weakened; `scripts/test-couchdb.sh` and CI skip those
+- CouchDB integration tests are `#[ignore = "requires CouchDB"]` — they need CouchDB at `http://admin:password@localhost:15984` (override with `COUCHDB_URL` env var). Create their databases with `common::fresh_remote_db` (an RAII guard that deletes it on drop, names start with `rouchdb_test_`) and take host/credentials from `common::couchdb()`; never log in as the admin with a wrong password (CouchDB locks the account)
+- A test that exposes a known unfixed bug is marked `#[ignore = "blocked on Fxx"]` and named `blocked_on_fxx_*` rather than weakened; `scripts/test-couchdb.sh` skips those by name and `scripts/test-blocked.sh` checks they still fail
 - `Database::memory("test")` is the go-to for fast unit testing
 - `tempfile::tempdir()` for RedbAdapter tests
 - Edition 2024 requires collapsible if-let chains (no nested `if let` inside `if`)
@@ -134,4 +135,4 @@ All 9 library crates must be published to crates.io in dependency order: core �
 
 ## CI
 
-GitHub Actions (`.github/workflows/ci.yml`), all on the toolchain pinned in `rust-toolchain.toml` unless noted: fmt + clippy `-D warnings` + TLS feature checks, `cargo test --workspace`, the `#[ignore]`d suite against a `couchdb:3` service container, `cargo bench --no-run`, an MSRV (1.88) check, and a non-blocking clippy run on stable/beta. `bench.yml` runs the benchmarks on demand (workflow_dispatch). Docs deploy via `docs.yml` (mdBook → GitHub Pages).
+GitHub Actions (`.github/workflows/ci.yml`), all on the toolchain pinned in `rust-toolchain.toml` unless noted, every job with a `timeout-minutes`: fmt + a check that every `#[ignore]` says `"requires CouchDB"` or `"blocked on Fxx"` + clippy `-D warnings` + TLS feature checks, `cargo test --workspace --no-fail-fast` (README examples are doctests of the `rouchdb` crate), the CouchDB suite against a pinned `couchdb:3.5.1` service (plus the non-blocking xfail check and a leftover-database check), `cargo bench --no-run` plus a one-iteration smoke run, an MSRV (1.88) check, and a non-blocking clippy run on stable/beta. `minimal-versions.yml` checks the declared dependency lower bounds with `-Z direct-minimal-versions` (manifest changes + weekly). Non-blocking quality workflows: `coverage.yml` (cargo-llvm-cov on push to main), `mutants.yml` (`cargo mutants --in-diff` on PRs), `nightly.yml` (suites repeated 5x with `scripts/repeat-tests.sh`, Linux + macOS). `bench.yml` runs the benchmarks on demand (workflow_dispatch). Docs deploy via `docs.yml` (mdBook → GitHub Pages).
