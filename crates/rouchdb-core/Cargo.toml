@@ -18,6 +18,7 @@ md-5 = "0.10"
 serde = { version = "1.0.184", features = ["derive"] }
 serde_json = { version = "1.0.106", features = ["unbounded_depth"] }
 thiserror = "2"
+tokio = { version = "1.37", features = ["sync"] }
 
 [dev-dependencies]
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }

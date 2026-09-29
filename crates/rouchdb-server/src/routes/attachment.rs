@@ -146,13 +146,7 @@ pub async fn put_attachment(
                 Err(RouchError::NotFound(_)) => {}
                 Err(e) => return Err(AppError(e)),
             }
-            let attachment = AttachmentMeta {
-                content_type: content_type.to_string(),
-                digest: String::new(),
-                length: body.len() as u64,
-                stub: false,
-                data: Some(body.to_vec()),
-            };
+            let attachment = AttachmentMeta::new(content_type, body.to_vec());
             let doc = Document {
                 id: docid.clone(),
                 rev: None,

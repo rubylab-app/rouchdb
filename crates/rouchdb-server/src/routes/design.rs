@@ -5,9 +5,8 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
-use super::document::{doc_not_found, etag_header, resolve_rev};
+use super::document::{GetDocQuery, etag_header, get_doc, resolve_rev};
 use super::set_location;
-use rouchdb_core::error::RouchError;
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -17,21 +16,15 @@ pub struct DesignDeleteQuery {
     pub rev: Option<String>,
 }
 
-/// GET /{db}/_design/{ddoc} — get a design document.
+/// GET /{db}/_design/{ddoc} — get a design document, like any document
+/// (every member, and the same query options and headers).
 pub async fn get_design(
-    State(state): State<AppState>,
+    state: State<AppState>,
     Path((db, ddoc)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    state.check_db(&db)?;
-
-    let design = match state.db.get_design(&ddoc).await {
-        Ok(design) => design,
-        Err(RouchError::NotFound(_)) => {
-            return Err(doc_not_found(&state, &format!("_design/{ddoc}")).await);
-        }
-        Err(e) => return Err(AppError(e)),
-    };
-    Ok(Json(design.to_json()))
+    query: Query<GetDocQuery>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    get_doc(state, Path((db, format!("_design/{ddoc}"))), query, headers).await
 }
 
 /// PUT /{db}/_design/{ddoc} — create or update a design document.
@@ -45,8 +38,8 @@ pub async fn put_design(
     state.check_db(&db)?;
     let mut obj = super::json_object_body(&body)?;
 
-    // Parse the body as a design document, injecting _id and the revision
-    // from `?rev`, `_rev` or `If-Match`.
+    // Parse the body as a design document (which keeps every member),
+    // injecting _id and the revision from `?rev`, `_rev` or `If-Match`.
     let body_rev = obj.get("_rev").and_then(|v| v.as_str()).map(String::from);
     if let Some(rev) = resolve_rev(query.rev, body_rev, &headers)? {
         obj.insert("_rev".to_string(), serde_json::Value::String(rev));

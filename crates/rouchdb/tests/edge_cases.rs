@@ -515,7 +515,7 @@ async fn replication_selector_filter_only_matching() {
     assert_eq!(result.docs_written, 1);
     let all = target.all_docs(AllDocsOptions::new()).await.unwrap();
     assert_eq!(row_ids(&all), ["user1"]);
-    assert_eq!(all.rows[0].value.rev, user.rev.unwrap());
+    assert_eq!(all.rows[0].rev().unwrap(), user.rev.unwrap());
     assert!(matches!(
         target.get("inv1").await,
         Err(RouchError::NotFound(_))
@@ -595,6 +595,7 @@ fn empty_design(id: &str) -> DesignDocument {
         lists: HashMap::new(),
         updates: HashMap::new(),
         language: None,
+        ..Default::default()
     }
 }
 
@@ -625,8 +626,9 @@ async fn design_doc_update_requires_rev() {
     }
 }
 
-/// What `put_design` removes through the struct stays removed: only fields
-/// the struct cannot represent are carried over from the replaced revision.
+/// `put_design` writes exactly the struct: what is removed from it stays
+/// removed, everything else (`lib`, Mango index views, view options, custom
+/// fields) round-trips through `get_design`.
 #[tokio::test]
 async fn put_design_update_drops_what_the_struct_removes() {
     let js = "function(doc) { emit(doc._id, 1); }";
@@ -642,7 +644,8 @@ async fn put_design_update_drops_what_the_struct_removes() {
                         "lib": {"util": "exports.x = 1"}
                     },
                     "validate_doc_update": "function(newDoc) {}",
-                    "custom": "kept"
+                    "custom": "kept",
+                    "gone": {"removed": "through extra"}
                 }),
             )
             .await
@@ -655,11 +658,13 @@ async fn put_design_update_drops_what_the_struct_removes() {
         // Mango index view as a JavaScript view.
         ddoc.views.get_mut("counted").unwrap().reduce = None;
         ddoc.validate_doc_update = None;
+        assert!(ddoc.extra.remove("gone").is_some(), "{}", b.name);
         ddoc.views.insert(
             "by_type".into(),
             rouchdb::ViewDef {
                 map: js.into(),
                 reduce: None,
+                ..Default::default()
             },
         );
         let r2 = db.put_design(ddoc).await.unwrap().rev.unwrap();
@@ -690,13 +695,15 @@ async fn put_design_update_drops_what_the_struct_removes() {
             b.name
         );
         assert_eq!(stored["custom"], "kept", "{}", b.name);
+        assert!(stored.get("gone").is_none(), "{}: {stored}", b.name);
     }
 }
 
-/// `put_design` carries over what `DesignDocument` does not model from the
-/// revision it replaces, which is not always the winning one.
+/// `put_design` writes exactly the given document on top of the revision it
+/// names, which is not always the winning one; nothing is carried over from
+/// that revision.
 #[tokio::test]
-async fn put_design_keeps_fields_of_the_revision_it_replaces() {
+async fn put_design_writes_the_struct_on_the_revision_it_names() {
     for b in backends("test") {
         let db = &b.db;
         let views = serde_json::json!({"v": {"map": "function(doc) { emit(doc._id, 1); }"}});
@@ -720,6 +727,7 @@ async fn put_design_keeps_fields_of_the_revision_it_replaces() {
                 "_revisions": {"start": 2, "ids": [hash, h1]},
                 "views": views,
                 "custom": custom,
+                "only_in": custom,
             }))
             .unwrap();
             let results = db
@@ -730,10 +738,11 @@ async fn put_design_keeps_fields_of_the_revision_it_replaces() {
             revs.push(format!("2-{hash}"));
         }
         let (loser, winner) = (&revs[0], &revs[1]);
-        let current = db.get_design("app").await.unwrap();
+        let mut current = db.get_design("app").await.unwrap();
         assert_eq!(current.rev.as_ref(), Some(winner), "{}", b.name);
+        current.extra.remove("only_in");
 
-        // Update the losing branch.
+        // Update the losing branch with the winner's (edited) content.
         let result = db
             .put_design(DesignDocument {
                 rev: Some(loser.clone()),
@@ -747,13 +756,21 @@ async fn put_design_keeps_fields_of_the_revision_it_replaces() {
                 "_design/app",
                 GetOptions {
                     rev: result.rev.clone(),
+                    revs: true,
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
-        assert_eq!(written.data["custom"], "loser", "{}", b.name);
+        assert_eq!(written.data["custom"], "winner", "{}", b.name);
+        assert!(written.data.get("only_in").is_none(), "{}", b.name);
         assert_eq!(written.data["views"], views, "{}", b.name);
+        assert_eq!(
+            written.data["_revisions"]["ids"][1],
+            loser.split_once('-').unwrap().1,
+            "{}",
+            b.name
+        );
     }
 }
 

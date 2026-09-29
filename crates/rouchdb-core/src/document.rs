@@ -97,15 +97,88 @@ impl PartialOrd for Revision {
 // AttachmentMeta
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// An attachment of a document revision, as CouchDB describes it in
+/// `_attachments`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AttachmentMeta {
     pub content_type: String,
+    /// Generation of the revision that uploaded the attachment's data
+    /// (CouchDB's `revpos`): a write that sends the data (inline, or with
+    /// `put_attachment`) sets it to the new revision's generation, even for
+    /// bytes identical to the stored ones; stubs and inherited attachments
+    /// keep it, and replicated revisions keep the revpos they carry.
+    /// `0` when unknown (stored before 0.5, or received without one).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub revpos: u64,
     pub digest: String,
     pub length: u64,
     #[serde(default)]
     pub stub: bool,
+    /// How the source stores the bytes (CouchDB reports `"gzip"` for
+    /// compressed attachments with `att_encoding_info=true`). Only kept
+    /// from stubs: rouchdb always stores and serves decoded bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    /// Size of the encoded bytes at the source (see `encoding`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoded_length: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Vec<u8>>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+impl AttachmentMeta {
+    /// An attachment with inline bytes, as written by `put_attachment` or
+    /// an inline `_attachments` member (digest and length computed; the
+    /// write sets `revpos`).
+    pub fn new(content_type: impl Into<String>, data: Vec<u8>) -> Self {
+        Self {
+            content_type: content_type.into(),
+            digest: attachment_digest(&data),
+            length: data.len() as u64,
+            data: Some(data),
+            ..Self::default()
+        }
+    }
+
+    /// The attachment as a CouchDB `_attachments` member: inline with the
+    /// base64 `data` when bytes are given, a stub otherwise. `revpos` is
+    /// written when known, `encoding`/`encoded_length` on stubs only (the
+    /// inline bytes are always decoded).
+    pub fn to_json(&self, data: Option<&[u8]>) -> serde_json::Value {
+        use base64::Engine;
+        let mut m = serde_json::Map::new();
+        m.insert("content_type".into(), self.content_type.clone().into());
+        if self.revpos > 0 {
+            m.insert("revpos".into(), self.revpos.into());
+        }
+        m.insert("digest".into(), self.digest.clone().into());
+        m.insert("length".into(), self.length.into());
+        match data {
+            Some(bytes) => {
+                m.insert("stub".into(), false.into());
+                m.insert(
+                    "data".into(),
+                    base64::engine::general_purpose::STANDARD
+                        .encode(bytes)
+                        .into(),
+                );
+            }
+            None => {
+                m.insert("stub".into(), true.into());
+                if let Some(encoding) = &self.encoding {
+                    m.insert("encoding".into(), encoding.clone().into());
+                }
+                if let Some(len) = self.encoded_length {
+                    m.insert("encoded_length".into(), len.into());
+                }
+            }
+        }
+        serde_json::Value::Object(m)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +191,9 @@ pub struct Document {
     pub id: String,
     pub rev: Option<Revision>,
     pub deleted: bool,
+    /// The body. Its objects keep their keys sorted, not in document order
+    /// (`serde_json` without `preserve_order`; see the book's "Differences
+    /// from CouchDB" page).
     pub data: serde_json::Value,
     pub attachments: HashMap<String, AttachmentMeta>,
 }
@@ -266,24 +342,11 @@ impl Document {
         }
 
         if !self.attachments.is_empty() {
-            use base64::Engine;
-            let mut att_map = serde_json::Map::new();
-            for (name, att) in &self.attachments {
-                if let Ok(serde_json::Value::Object(mut m)) = serde_json::to_value(att) {
-                    // Inline attachment bytes must be emitted as a CouchDB
-                    // base64 string, not serde's default numeric byte array.
-                    if let Some(bytes) = &att.data {
-                        m.insert(
-                            "data".into(),
-                            serde_json::Value::String(
-                                base64::engine::general_purpose::STANDARD.encode(bytes),
-                            ),
-                        );
-                        m.insert("stub".into(), serde_json::Value::Bool(false));
-                    }
-                    att_map.insert(name.clone(), serde_json::Value::Object(m));
-                }
-            }
+            let att_map = self
+                .attachments
+                .iter()
+                .map(|(name, att)| (name.clone(), att.to_json(att.data.as_deref())))
+                .collect();
             obj.insert("_attachments".into(), serde_json::Value::Object(att_map));
         }
 
@@ -352,6 +415,7 @@ fn parse_attachment(name: &str, meta: &serde_json::Value) -> Result<AttachmentMe
         Some(_) => return Err(invalid("content_type must be a string")),
     };
 
+    let revpos = obj.get("revpos").and_then(|v| v.as_u64()).unwrap_or(0);
     if let Some(data) = obj.get("data") {
         use base64::Engine;
         let encoded = data
@@ -361,11 +425,8 @@ fn parse_attachment(name: &str, meta: &serde_json::Value) -> Result<AttachmentMe
             .decode(encoded)
             .map_err(|_| invalid("data is not valid base64"))?;
         return Ok(AttachmentMeta {
-            content_type,
-            digest: attachment_digest(&bytes),
-            length: bytes.len() as u64,
-            stub: false,
-            data: Some(bytes),
+            revpos,
+            ..AttachmentMeta::new(content_type, bytes)
         });
     }
 
@@ -376,23 +437,24 @@ fn parse_attachment(name: &str, meta: &serde_json::Value) -> Result<AttachmentMe
     // A stub refers to the parent revision's attachment of the same name
     // (CouchDB matches stubs by name), so its digest is optional.
     let is_stub = obj.get("stub").and_then(|v| v.as_bool()).unwrap_or(false);
-    match obj.get("digest").and_then(|v| v.as_str()) {
-        Some(digest) => Ok(AttachmentMeta {
-            content_type,
-            digest: digest.to_string(),
-            length: obj.get("length").and_then(|v| v.as_u64()).unwrap_or(0),
-            stub: true,
-            data: None,
-        }),
-        None if is_stub => Ok(AttachmentMeta {
-            content_type,
-            digest: String::new(),
-            length: obj.get("length").and_then(|v| v.as_u64()).unwrap_or(0),
-            stub: true,
-            data: None,
-        }),
-        None => Err(invalid("neither data nor a stub")),
-    }
+    let digest = match obj.get("digest").and_then(|v| v.as_str()) {
+        Some(digest) => digest.to_string(),
+        None if is_stub => String::new(),
+        None => return Err(invalid("neither data nor a stub")),
+    };
+    Ok(AttachmentMeta {
+        content_type,
+        revpos,
+        digest,
+        length: obj.get("length").and_then(|v| v.as_u64()).unwrap_or(0),
+        stub: true,
+        encoding: obj
+            .get("encoding")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        encoded_length: obj.get("encoded_length").and_then(|v| v.as_u64()),
+        data: None,
+    })
 }
 
 /// CouchDB attachment digest: `md5-` followed by the base64 MD5 of the bytes.
@@ -413,6 +475,11 @@ pub fn attachment_digest(data: &[u8]) -> String {
 /// make different edits from the same parent (including attachment-only
 /// edits) never produce the same revision id. Documents without attachments
 /// hash exactly as before attachments were included.
+///
+/// The body is hashed as `serde_json` serializes it: object keys sorted
+/// (the document's key order is not kept) and, with the
+/// `arbitrary-precision` feature, numbers as written. Revision ids are
+/// opaque and differ from CouchDB's for the same edit.
 pub fn generate_rev_hash(
     doc_data: &serde_json::Value,
     deleted: bool,
@@ -506,7 +573,12 @@ pub struct DocResult {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Options of [`Adapter::bulk_docs`](crate::adapter::Adapter::bulk_docs).
+///
+/// `BulkDocsOptions::default()` is the same as [`BulkDocsOptions::new`]
+/// (normal writes); replication mode must be asked for explicitly with
+/// [`BulkDocsOptions::replication`].
+#[derive(Debug, Clone)]
 pub struct BulkDocsOptions {
     /// When false (replication), accept revisions as-is.
     /// When true (default), generate new revisions and check conflicts.
@@ -514,16 +586,28 @@ pub struct BulkDocsOptions {
 }
 
 impl BulkDocsOptions {
+    /// Normal writes (`new_edits: true`).
     pub fn new() -> Self {
         Self { new_edits: true }
     }
 
+    /// Replication writes (`new_edits: false`).
     pub fn replication() -> Self {
         Self { new_edits: false }
     }
 }
 
-#[derive(Debug, Clone, Default)]
+impl Default for BulkDocsOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Options of [`Adapter::all_docs`](crate::adapter::Adapter::all_docs).
+///
+/// `AllDocsOptions::default()` is the same as [`AllDocsOptions::new`]: every
+/// document, with an inclusive `end_key` (as in CouchDB).
+#[derive(Debug, Clone)]
 pub struct AllDocsOptions {
     pub start_key: Option<String>,
     pub end_key: Option<String>,
@@ -533,6 +617,7 @@ pub struct AllDocsOptions {
     pub descending: bool,
     pub skip: u64,
     pub limit: Option<u64>,
+    /// Include the `end_key` row itself (default `true`).
     pub inclusive_end: bool,
     /// Include `_conflicts` for each document (requires `include_docs`).
     pub conflicts: bool,
@@ -543,25 +628,109 @@ pub struct AllDocsOptions {
 impl AllDocsOptions {
     pub fn new() -> Self {
         Self {
+            start_key: None,
+            end_key: None,
+            key: None,
+            keys: None,
+            include_docs: false,
+            descending: false,
+            skip: 0,
+            limit: None,
             inclusive_end: true,
-            ..Default::default()
+            conflicts: false,
+            update_seq: false,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AllDocsRow {
-    pub id: String,
-    pub key: String,
-    pub value: AllDocsRowValue,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub doc: Option<serde_json::Value>,
+impl Default for AllDocsOptions {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A row of an `_all_docs` response.
+///
+/// A range or `key` query only returns rows for live documents: `id` (equal
+/// to `key`) and `value` are set, and `doc` too with `include_docs`.
+///
+/// A `keys` query returns exactly one row per requested key, in request
+/// order (so `rows[i]` answers `keys[i]`), as CouchDB and PouchDB do:
+///
+/// - a live document: as above;
+/// - a deleted document: `value.deleted == Some(true)` and never a `doc`
+///   (CouchDB sends `"doc": null` under `include_docs`);
+/// - an unknown id: only `key` and `error: Some("not_found")` (see
+///   [`AllDocsRow::not_found`]).
+///
+/// The row is a struct with optional members rather than an enum so that it
+/// maps one-to-one onto the CouchDB/PouchDB JSON row and `row.key` is there
+/// for every kind of row; [`AllDocsRow::rev`], [`AllDocsRow::is_deleted`]
+/// and [`AllDocsRow::is_error`] cover the usual checks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AllDocsRow {
+    /// The document id (`None` for an error row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The requested key; for a document row, its id.
+    pub key: String,
+    /// The winning revision (`None` for an error row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<AllDocsRowValue>,
+    /// The document body, with `include_docs`, for a live document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<serde_json::Value>,
+    /// Why there is no document for `key` (`"not_found"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl AllDocsRow {
+    /// The row of a live or deleted document.
+    pub fn document(id: impl Into<String>, value: AllDocsRowValue) -> Self {
+        let id = id.into();
+        Self {
+            key: id.clone(),
+            id: Some(id),
+            value: Some(value),
+            doc: None,
+            error: None,
+        }
+    }
+
+    /// The row of a requested key that names no document:
+    /// `{"key": key, "error": "not_found"}`.
+    pub fn not_found(key: impl Into<String>) -> Self {
+        Self {
+            id: None,
+            key: key.into(),
+            value: None,
+            doc: None,
+            error: Some("not_found".into()),
+        }
+    }
+
+    /// The winning revision, unless this is an error row.
+    pub fn rev(&self) -> Option<&str> {
+        self.value.as_ref().map(|v| v.rev.as_str())
+    }
+
+    /// Whether the row is a deleted document (only in `keys` queries).
+    pub fn is_deleted(&self) -> bool {
+        self.value.as_ref().and_then(|v| v.deleted) == Some(true)
+    }
+
+    /// Whether the row is an error row (a key with no document).
+    pub fn is_error(&self) -> bool {
+        self.error.is_some()
+    }
+}
+
+/// The `value` of an [`AllDocsRow`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AllDocsRowValue {
     pub rev: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted: Option<bool>,
 }
 
@@ -571,8 +740,12 @@ pub struct AllDocsResponse {
     /// The memory and redb adapters report the `skip` that was applied, as
     /// PouchDB's local adapters do. CouchDB (and so the http adapter)
     /// reports the number of rows before the first returned one, including
-    /// those before `start_key`, which needs a counted index the local
-    /// stores do not keep.
+    /// those before `start_key` (`startkey="c"&skip=1` over `a`..`e` gives
+    /// 3 there, 1 here), which needs a counted index the
+    /// local stores do not keep. For a `keys` query CouchDB sends `null`,
+    /// read as 0 by the http adapter (the local adapters still report
+    /// `skip`, and the server sends `null`). An accepted difference, see the
+    /// book's "Differences from CouchDB" page.
     pub offset: u64,
     pub rows: Vec<AllDocsRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -903,6 +1076,7 @@ mod tests {
                 length: 3,
                 stub: false,
                 data: Some(b"hi!".to_vec()),
+                ..Default::default()
             },
         );
         let doc = Document {
@@ -916,6 +1090,67 @@ mod tests {
         // CouchDB requires inline data as a base64 string, not a byte array.
         assert_eq!(json["_attachments"]["hi.txt"]["data"], "aGkh");
         assert_eq!(json["_attachments"]["hi.txt"]["stub"], false);
+    }
+
+    #[test]
+    fn attachment_revpos_and_encoding_round_trip() {
+        // A stub as CouchDB 3.5.1 lists it (`GET /db/e?att_encoding_info=true`).
+        let stub = serde_json::json!({"content_type": "text/plain", "revpos": 1,
+            "digest": "md5-Ew9RIaBldynHDFVo1PvkrA==", "length": 2400, "stub": true,
+            "encoding": "gzip", "encoded_length": 52});
+        let doc = Document::from_json(serde_json::json!({
+            "_id": "e", "_rev": "1-3b5073b1b7a6ec2abcd4b0d8e005da08",
+            "_attachments": {"big.txt": stub}
+        }))
+        .unwrap();
+        let meta = &doc.attachments["big.txt"];
+        assert_eq!(meta.revpos, 1);
+        assert_eq!(meta.encoding.as_deref(), Some("gzip"));
+        assert_eq!(meta.encoded_length, Some(52));
+        assert_eq!(doc.to_json()["_attachments"]["big.txt"], stub);
+
+        // Inline data is decoded bytes: its revpos is kept, an encoding is
+        // not (CouchDB ignores it too).
+        let doc = Document::from_json(serde_json::json!({
+            "_id": "d",
+            "_attachments": {"hi.txt": {"content_type": "text/plain", "revpos": 3,
+                "digest": "md5-O9yO4zjoapsrEQwYrCDNZw==", "data": "aGkh", "encoding": "gzip"}}
+        }))
+        .unwrap();
+        let meta = &doc.attachments["hi.txt"];
+        assert_eq!((meta.revpos, meta.encoding.as_deref()), (3, None));
+        // (The digest is recomputed from the bytes: CouchDB's is the MD5 of
+        // the gzip-compressed bytes it stores for text types.)
+        assert_eq!(
+            doc.to_json()["_attachments"]["hi.txt"],
+            serde_json::json!({"content_type": "text/plain", "revpos": 3,
+                "digest": attachment_digest(b"hi!"), "length": 3, "stub": false,
+                "data": "aGkh"})
+        );
+
+        // Without a revpos (unknown), none is written.
+        let doc = Document::from_json(serde_json::json!({
+            "_id": "d", "_attachments": {"x": {"stub": true, "digest": "md5-x", "length": 1}}
+        }))
+        .unwrap();
+        assert_eq!(doc.attachments["x"].revpos, 0);
+        assert!(doc.to_json()["_attachments"]["x"].get("revpos").is_none());
+        assert_eq!(
+            AttachmentMeta::new("text/plain", b"hi!".to_vec()).digest,
+            attachment_digest(b"hi!")
+        );
+        // The serde form omits an unknown revpos too.
+        let meta = |revpos| AttachmentMeta {
+            revpos,
+            ..AttachmentMeta::default()
+        };
+        assert!(
+            serde_json::to_value(meta(0))
+                .unwrap()
+                .get("revpos")
+                .is_none()
+        );
+        assert_eq!(serde_json::to_value(meta(3)).unwrap()["revpos"], 3);
     }
 
     #[test]
@@ -958,6 +1193,66 @@ mod tests {
     }
 
     #[test]
+    fn all_docs_rows_match_couchdb_json() {
+        // The three kinds of rows of a CouchDB 3.5.1 `keys` reply.
+        let live: AllDocsRow = serde_json::from_value(
+            serde_json::json!({"id": "a", "key": "a", "value": {"rev": "1-x"}}),
+        )
+        .unwrap();
+        let gone: AllDocsRow = serde_json::from_value(serde_json::json!(
+            {"id": "b", "key": "b", "value": {"rev": "2-y", "deleted": true}, "doc": null}
+        ))
+        .unwrap();
+        let missing: AllDocsRow =
+            serde_json::from_value(serde_json::json!({"key": "zz", "error": "not_found"})).unwrap();
+        assert_eq!(
+            (live.rev(), live.is_deleted(), live.is_error()),
+            (Some("1-x"), false, false)
+        );
+        assert_eq!(
+            (gone.rev(), gone.is_deleted(), gone.is_error()),
+            (Some("2-y"), true, false)
+        );
+        assert_eq!(
+            (missing.rev(), missing.is_deleted(), missing.is_error()),
+            (None, false, true)
+        );
+        assert_eq!(missing, AllDocsRow::not_found("zz"));
+        assert_eq!(
+            live,
+            AllDocsRow::document(
+                "a",
+                AllDocsRowValue {
+                    rev: "1-x".into(),
+                    deleted: None
+                }
+            )
+        );
+        // Serialized back without the members a row does not have.
+        assert_eq!(
+            serde_json::to_value(&missing).unwrap(),
+            serde_json::json!({"key": "zz", "error": "not_found"})
+        );
+        assert_eq!(
+            serde_json::to_value(&gone).unwrap(),
+            serde_json::json!({"id": "b", "key": "b", "value": {"rev": "2-y", "deleted": true}})
+        );
+    }
+
+    #[test]
+    fn option_defaults_match_new() {
+        // F23: `Default` must not silently switch to replication mode or to
+        // an exclusive end key; it is the same as `new()`.
+        assert!(BulkDocsOptions::default().new_edits);
+        let all_docs = AllDocsOptions::default();
+        assert!(all_docs.inclusive_end);
+        assert_eq!(
+            format!("{:?}", all_docs),
+            format!("{:?}", AllDocsOptions::new())
+        );
+    }
+
+    #[test]
     fn to_json_deleted_document() {
         let doc = Document {
             id: "doc1".into(),
@@ -983,6 +1278,7 @@ mod tests {
                 length: 100,
                 stub: true,
                 data: None,
+                ..Default::default()
             },
         );
         let doc = Document {
@@ -1210,6 +1506,7 @@ mod tests {
             length: 3,
             stub: true,
             data: None,
+            ..Default::default()
         }
     }
 
@@ -1247,6 +1544,25 @@ mod tests {
         assert_ne!(
             live,
             generate_rev_hash(&empty, false, None, &HashMap::new())
+        );
+    }
+
+    #[test]
+    fn accepted_divergence_rev_hash_ignores_key_order() {
+        // serde_json keeps object keys sorted, so the same members in
+        // another order are the same body and the same revision (CouchDB
+        // hashes the document as written). Accepted difference (book:
+        // "Differences from CouchDB").
+        let ab: serde_json::Value = serde_json::from_str(r#"{"a":1,"b":{"y":2,"x":1}}"#).unwrap();
+        let ba: serde_json::Value = serde_json::from_str(r#"{"b":{"x":1,"y":2},"a":1}"#).unwrap();
+        let none = HashMap::new();
+        assert_eq!(
+            generate_rev_hash(&ab, false, None, &none),
+            generate_rev_hash(&ba, false, None, &none)
+        );
+        assert_eq!(
+            serde_json::to_string(&ba).unwrap(),
+            r#"{"a":1,"b":{"x":1,"y":2}}"#
         );
     }
 

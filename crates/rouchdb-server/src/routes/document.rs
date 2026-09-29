@@ -89,8 +89,8 @@ pub(crate) async fn doc_not_found(state: &AppState, docid: &str) -> AppError {
         })
         .await
         .ok()
-        .and_then(|response| response.rows.into_iter().find(|row| row.id == docid))
-        .is_some_and(|row| row.value.deleted == Some(true));
+        .and_then(|response| response.rows.into_iter().next())
+        .is_some_and(|row| row.is_deleted());
     let reason = if deleted { "deleted" } else { "missing" };
     AppError(RouchError::NotFound(reason.into()))
 }
