@@ -555,6 +555,28 @@ fn unindexed_queries() -> Vec<(Value, Value)> {
             json!({"selector": {"age": {"$gte": null}}, "skip": 100}),
             json!([]),
         ),
+        // Empty combinators match nothing; $all compares exactly (an
+        // integral float is not the integer); regex lookaround works.
+        (json!({"selector": {"$and": []}}), json!([])),
+        (json!({"selector": {"$nor": []}}), json!([])),
+        // ...but next to another condition an empty $and is dropped.
+        (
+            json!({"selector": {"x": {"$gt": 0}, "$and": []}}),
+            json!(["d1", "d2"]),
+        ),
+        (
+            json!({"selector": {"scores": {"$all": [50]}}}),
+            json!(["d1"]),
+        ),
+        (json!({"selector": {"scores": {"$all": [50.0]}}}), json!([])),
+        (
+            json!({"selector": {"s": {"$regex": "^a(?=b)"}}}),
+            json!(["d10", "d9"]),
+        ),
+        (
+            json!({"selector": {"s": {"$regex": "^(?!a)"}}}),
+            json!(["d7", "d8"]),
+        ),
     ]
 }
 
@@ -576,6 +598,7 @@ fn rejected_queries() -> Vec<Value> {
         json!({"selector": {"s": {"$beginsWith": 1}}}),
         json!({"selector": {"s": {"$gt": null}}, "sort": [{"s": "up"}]}),
         json!({"selector": {"s": {"$gt": null}}, "sort": [{"s": "asc", "f": "asc"}]}),
+        json!({"selector": {"f": {"$not": 5}}}),
     ]
 }
 
@@ -1162,6 +1185,7 @@ fn view_queries() -> Vec<(&'static str, Value)> {
         ("by_dept", json!({"include_docs": true})),
         ("by_dept", json!({"keys": ["hr", "eng"]})),
         ("by_dept", json!({"keys": ["hr", "eng"], "group_level": 0})),
+        ("by_dept", json!({"keys": ["hr", "eng"], "group_level": 1})),
     ]
 }
 

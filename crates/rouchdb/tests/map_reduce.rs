@@ -294,9 +294,9 @@ async fn keys_with_non_adjacent_duplicates_repeat_their_rows() {
 #[tokio::test]
 async fn multi_key_reduce_without_grouping_is_rejected() {
     // CouchDB: "Multi-key fetches for reduce views must use `group=true`",
-    // also with group_level=0.
+    // whatever group_level says.
     let db = by_dept_db().await;
-    for group_level in [None, Some(0)] {
+    for group_level in [None, Some(0), Some(1)] {
         let opts = ViewQueryOptions {
             keys: keys(&["hr", "eng"]),
             group_level,

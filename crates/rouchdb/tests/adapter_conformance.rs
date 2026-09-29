@@ -139,7 +139,8 @@ fn row_ids(r: &AllDocsResponse) -> Vec<String> {
 }
 
 /// The change events as JSON, so a scenario can compare them exactly
-/// (seq, id, revisions, deleted flag, doc and conflicts).
+/// (seq, id, revisions, deleted flag, doc and conflicts). Like CouchDB,
+/// `deleted` only appears when it is true.
 fn changes_json(ch: &ChangesResponse) -> serde_json::Value {
     serde_json::to_value(&ch.results).unwrap()
 }
@@ -458,7 +459,7 @@ async fn long_history_survives_reopen(mut fx: Fx) {
     let ch = db.changes(ChangesOptions::default()).await.unwrap();
     assert_eq!(
         changes_json(&ch),
-        serde_json::json!([{"seq": 201, "id": "d", "changes": [{"rev": next}], "deleted": false}])
+        serde_json::json!([{"seq": 201, "id": "d", "changes": [{"rev": next}]}])
     );
 }
 
@@ -1121,7 +1122,7 @@ async fn replicated_duplicate_is_noop(fx: Fx) {
     let ch = db.changes(ChangesOptions::default()).await.unwrap();
     assert_eq!(
         changes_json(&ch),
-        serde_json::json!([{"seq": 1, "id": "d", "changes": [{"rev": format!("1-{}", h)}], "deleted": false}])
+        serde_json::json!([{"seq": 1, "id": "d", "changes": [{"rev": format!("1-{}", h)}]}])
     );
 }
 
@@ -1437,7 +1438,7 @@ async fn purge_conflict_loser(mut fx: Fx) {
     let ch = db.changes(ChangesOptions::default()).await.unwrap();
     assert_eq!(
         changes_json(&ch),
-        serde_json::json!([{"seq": before + 1, "id": "d", "changes": [{"rev": winner}], "deleted": false}])
+        serde_json::json!([{"seq": before + 1, "id": "d", "changes": [{"rev": winner}]}])
     );
 }
 
@@ -1644,7 +1645,7 @@ async fn live_leaf_beats_deeper_tombstone(mut fx: Fx) {
     let ch = db.changes(ChangesOptions::default()).await.unwrap();
     assert_eq!(
         changes_json(&ch),
-        serde_json::json!([{"seq": 2, "id": "d", "changes": [{"rev": live}], "deleted": false}])
+        serde_json::json!([{"seq": 2, "id": "d", "changes": [{"rev": live}]}])
     );
     let all_leaves = db
         .changes(ChangesOptions {
@@ -1895,9 +1896,9 @@ async fn changes_options(mut fx: Fx) {
     assert_eq!(
         changes_json(&all),
         serde_json::json!([
-            {"seq": 3, "id": "c", "changes": [{"rev": rc}], "deleted": false},
-            {"seq": 4, "id": "a", "changes": [{"rev": ra2}], "deleted": false},
-            {"seq": 7, "id": "k", "changes": [{"rev": winner}], "deleted": false},
+            {"seq": 3, "id": "c", "changes": [{"rev": rc}]},
+            {"seq": 4, "id": "a", "changes": [{"rev": ra2}]},
+            {"seq": 7, "id": "k", "changes": [{"rev": winner}]},
             {"seq": 8, "id": "b", "changes": [{"rev": rb2}], "deleted": true},
         ])
     );
