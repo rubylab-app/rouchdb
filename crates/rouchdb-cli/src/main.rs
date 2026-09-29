@@ -552,8 +552,7 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
                     limit,
                     skip,
                     descending,
-                    inclusive_end: true,
-                    ..Default::default()
+                    ..AllDocsOptions::new()
                 })
                 .await?;
             print_json(&serde_json::to_value(&response).unwrap(), cli.pretty);

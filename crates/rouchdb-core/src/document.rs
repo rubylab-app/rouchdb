@@ -506,7 +506,12 @@ pub struct DocResult {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Options of [`Adapter::bulk_docs`](crate::adapter::Adapter::bulk_docs).
+///
+/// `BulkDocsOptions::default()` is the same as [`BulkDocsOptions::new`]
+/// (normal writes); replication mode must be asked for explicitly with
+/// [`BulkDocsOptions::replication`].
+#[derive(Debug, Clone)]
 pub struct BulkDocsOptions {
     /// When false (replication), accept revisions as-is.
     /// When true (default), generate new revisions and check conflicts.
@@ -514,16 +519,28 @@ pub struct BulkDocsOptions {
 }
 
 impl BulkDocsOptions {
+    /// Normal writes (`new_edits: true`).
     pub fn new() -> Self {
         Self { new_edits: true }
     }
 
+    /// Replication writes (`new_edits: false`).
     pub fn replication() -> Self {
         Self { new_edits: false }
     }
 }
 
-#[derive(Debug, Clone, Default)]
+impl Default for BulkDocsOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Options of [`Adapter::all_docs`](crate::adapter::Adapter::all_docs).
+///
+/// `AllDocsOptions::default()` is the same as [`AllDocsOptions::new`]: every
+/// document, with an inclusive `end_key` (as in CouchDB).
+#[derive(Debug, Clone)]
 pub struct AllDocsOptions {
     pub start_key: Option<String>,
     pub end_key: Option<String>,
@@ -533,6 +550,7 @@ pub struct AllDocsOptions {
     pub descending: bool,
     pub skip: u64,
     pub limit: Option<u64>,
+    /// Include the `end_key` row itself (default `true`).
     pub inclusive_end: bool,
     /// Include `_conflicts` for each document (requires `include_docs`).
     pub conflicts: bool,
@@ -543,9 +561,24 @@ pub struct AllDocsOptions {
 impl AllDocsOptions {
     pub fn new() -> Self {
         Self {
+            start_key: None,
+            end_key: None,
+            key: None,
+            keys: None,
+            include_docs: false,
+            descending: false,
+            skip: 0,
+            limit: None,
             inclusive_end: true,
-            ..Default::default()
+            conflicts: false,
+            update_seq: false,
         }
+    }
+}
+
+impl Default for AllDocsOptions {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -955,6 +988,19 @@ mod tests {
 
         let repl = BulkDocsOptions::replication();
         assert!(!repl.new_edits);
+    }
+
+    #[test]
+    fn option_defaults_match_new() {
+        // F23: `Default` must not silently switch to replication mode or to
+        // an exclusive end key; it is the same as `new()`.
+        assert!(BulkDocsOptions::default().new_edits);
+        let all_docs = AllDocsOptions::default();
+        assert!(all_docs.inclusive_end);
+        assert_eq!(
+            format!("{:?}", all_docs),
+            format!("{:?}", AllDocsOptions::new())
+        );
     }
 
     #[test]

@@ -304,9 +304,9 @@ pub struct BulkDocsOptions {
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `new_edits` | `bool` | `true` (via `BulkDocsOptions::new()`) | When `true`, the adapter generates new revisions and checks for conflicts. When `false` (replication mode), revisions are accepted as-is and merged into the revision tree. |
+| `new_edits` | `bool` | `true` | When `true`, the adapter generates new revisions and checks for conflicts. When `false` (replication mode), revisions are accepted as-is and merged into the revision tree. |
 
-**Note:** The `Default` trait implementation sets `new_edits` to `false`. Use `BulkDocsOptions::new()` for user-mode writes (which sets `new_edits: true`) and `BulkDocsOptions::replication()` for replication-mode writes (which sets `new_edits: false`).
+`BulkDocsOptions::default()` is the same as `BulkDocsOptions::new()` (user-mode writes, `new_edits: true`); replication mode must be requested explicitly with `BulkDocsOptions::replication()`. (Before 0.5, `Default` meant replication mode.)
 
 | Constructor | `new_edits` Value | Use Case |
 |-------------|-------------------|----------|
@@ -345,11 +345,11 @@ pub struct AllDocsOptions {
 | `descending` | `bool` | `false` | Return rows in descending key order. |
 | `skip` | `u64` | `0` | Number of rows to skip before returning results. |
 | `limit` | `Option<u64>` | `None` | Maximum number of rows to return. |
-| `inclusive_end` | `bool` | `true` (via `AllDocsOptions::new()`) | Whether the `end_key` is included in the range. |
+| `inclusive_end` | `bool` | `true` | Whether the `end_key` is included in the range. |
 | `conflicts` | `bool` | `false` | Include `_conflicts` for each document (requires `include_docs`). |
 | `update_seq` | `bool` | `false` | Include the current `update_seq` in the response. |
 
-**Note:** Use `AllDocsOptions::new()` instead of `Default::default()` to get `inclusive_end: true`, which matches CouchDB's default behavior.
+`AllDocsOptions::default()` is the same as `AllDocsOptions::new()`: `inclusive_end: true`, like CouchDB. (Before 0.5, `Default` set `inclusive_end: false`.)
 
 ---
 
