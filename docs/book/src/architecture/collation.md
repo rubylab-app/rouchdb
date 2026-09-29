@@ -74,7 +74,8 @@ Compared key-by-key in map order. For each key pair, the key strings are
 compared; if equal, the values are compared recursively. If all shared
 key-value pairs are equal, the object with fewer keys sorts first. CouchDB uses
 the document's key order; `serde_json` keeps keys sorted, so RouchDB compares
-them in sorted order.
+them in sorted order (an accepted difference, see
+[Differences from CouchDB](../reference/differences.md#object-key-order)).
 
 ```
 {}           < {"a": 1}

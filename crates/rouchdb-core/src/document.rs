@@ -191,6 +191,9 @@ pub struct Document {
     pub id: String,
     pub rev: Option<Revision>,
     pub deleted: bool,
+    /// The body. Its objects keep their keys sorted, not in document order
+    /// (`serde_json` without `preserve_order`; see the book's "Differences
+    /// from CouchDB" page).
     pub data: serde_json::Value,
     pub attachments: HashMap<String, AttachmentMeta>,
 }
@@ -472,6 +475,11 @@ pub fn attachment_digest(data: &[u8]) -> String {
 /// make different edits from the same parent (including attachment-only
 /// edits) never produce the same revision id. Documents without attachments
 /// hash exactly as before attachments were included.
+///
+/// The body is hashed as `serde_json` serializes it: object keys sorted
+/// (the document's key order is not kept) and, with the
+/// `arbitrary-precision` feature, numbers as written. Revision ids are
+/// opaque and differ from CouchDB's for the same edit.
 pub fn generate_rev_hash(
     doc_data: &serde_json::Value,
     deleted: bool,
@@ -732,8 +740,12 @@ pub struct AllDocsResponse {
     /// The memory and redb adapters report the `skip` that was applied, as
     /// PouchDB's local adapters do. CouchDB (and so the http adapter)
     /// reports the number of rows before the first returned one, including
-    /// those before `start_key`, which needs a counted index the local
-    /// stores do not keep.
+    /// those before `start_key` (`startkey="c"&skip=1` over `a`..`e` gives
+    /// 3 there, 1 here), which needs a counted index the
+    /// local stores do not keep. For a `keys` query CouchDB sends `null`,
+    /// read as 0 by the http adapter (the local adapters still report
+    /// `skip`, and the server sends `null`). An accepted difference, see the
+    /// book's "Differences from CouchDB" page.
     pub offset: u64,
     pub rows: Vec<AllDocsRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1532,6 +1544,25 @@ mod tests {
         assert_ne!(
             live,
             generate_rev_hash(&empty, false, None, &HashMap::new())
+        );
+    }
+
+    #[test]
+    fn accepted_divergence_rev_hash_ignores_key_order() {
+        // serde_json keeps object keys sorted, so the same members in
+        // another order are the same body and the same revision (CouchDB
+        // hashes the document as written). Accepted difference (book:
+        // "Differences from CouchDB").
+        let ab: serde_json::Value = serde_json::from_str(r#"{"a":1,"b":{"y":2,"x":1}}"#).unwrap();
+        let ba: serde_json::Value = serde_json::from_str(r#"{"b":{"x":1,"y":2},"a":1}"#).unwrap();
+        let none = HashMap::new();
+        assert_eq!(
+            generate_rev_hash(&ab, false, None, &none),
+            generate_rev_hash(&ba, false, None, &none)
+        );
+        assert_eq!(
+            serde_json::to_string(&ba).unwrap(),
+            r#"{"a":1,"b":{"x":1,"y":2}}"#
         );
     }
 

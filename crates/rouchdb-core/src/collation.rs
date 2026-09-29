@@ -37,6 +37,12 @@ fn type_rank(v: &Value) -> u8 {
 /// Strings compare by UTF-16 code units, like PouchDB (JavaScript). CouchDB
 /// itself uses ICU collation for strings (e.g. `"apple" < "Banana"`), which
 /// is not implemented here.
+///
+/// Objects compare key by key in *sorted* key order: `serde_json` (without
+/// its `preserve_order` feature) does not keep the document's key order,
+/// which CouchDB uses (`{"b":1} < {"b":2,"a":1}` in CouchDB, the other way
+/// round here). This is an accepted difference, see the book's
+/// "Differences from CouchDB" page.
 pub fn collate(a: &Value, b: &Value) -> Ordering {
     let rank_a = type_rank(a);
     let rank_b = type_rank(b);
@@ -372,6 +378,18 @@ mod tests {
         assert_eq!(collate(&json!([]), &json!([1])), Ordering::Less);
         assert_eq!(collate(&json!([1]), &json!([2])), Ordering::Less);
         assert_eq!(collate(&json!([1]), &json!([1, 2])), Ordering::Less);
+    }
+
+    #[test]
+    fn accepted_divergence_objects_collate_in_sorted_key_order() {
+        // CouchDB 3.5.1 sorts the view keys {"b":2,"a":1} and {"b":1} as
+        // [{"b":1}, {"b":2,"a":1}] (document key order). serde_json keeps
+        // keys sorted, so here {"a":1,"b":2} < {"b":1}. Accepted difference
+        // (book: "Differences from CouchDB"); a change must be deliberate.
+        let a: Value = serde_json::from_str(r#"{"b":2,"a":1}"#).unwrap();
+        let b: Value = serde_json::from_str(r#"{"b":1}"#).unwrap();
+        assert_eq!(collate(&a, &b), Ordering::Less);
+        assert_eq!(a.as_object().unwrap().keys().next().unwrap(), "a");
     }
 
     #[test]

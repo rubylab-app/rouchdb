@@ -27,6 +27,7 @@
 - [Adapter Trait](./reference/adapter-trait.md)
 - [Core Types](./reference/core-types.md)
 - [Error Handling](./reference/error-handling.md)
+- [Differences from CouchDB](./reference/differences.md)
 
 # Architecture
 

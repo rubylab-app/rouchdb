@@ -1345,6 +1345,38 @@ async fn all_docs_keys_order(fx: Fx) {
 
 conformance!(f30: all_docs_keys_order);
 
+/// Accepted difference (book: "Differences from CouchDB"): the local
+/// adapters report the `skip` as `offset`, like PouchDB's, where CouchDB
+/// reports the global position of the first row (see
+/// `offset_is_the_global_position_on_couchdb` in `all_docs.rs`).
+async fn accepted_divergence_all_docs_offset_is_the_skip(fx: Fx) {
+    let db = fx.db();
+    for id in ["a", "b", "c", "d", "e"] {
+        write(db, serde_json::json!({"_id": id})).await;
+    }
+    let from_c = db
+        .all_docs(AllDocsOptions {
+            start_key: Some("c".into()),
+            skip: 1,
+            ..AllDocsOptions::new()
+        })
+        .await
+        .unwrap();
+    assert_eq!(row_ids(&from_c), ["d", "e"]);
+    assert_eq!((from_c.total_rows, from_c.offset), (5, 1));
+    let keys = db
+        .all_docs(AllDocsOptions {
+            keys: Some(vec!["a".into(), "b".into()]),
+            skip: 1,
+            ..AllDocsOptions::new()
+        })
+        .await
+        .unwrap();
+    assert_eq!((row_ids(&keys), keys.offset), (vec!["b".to_string()], 1));
+}
+
+conformance!(accepted_divergence: accepted_divergence_all_docs_offset_is_the_skip);
+
 // === section: f68 ===
 
 /// F68: document counts stay exact through every kind of write (they are

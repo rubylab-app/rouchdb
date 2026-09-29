@@ -503,7 +503,7 @@ pub struct AllDocsResponse {
 | Field | Type | Description |
 |-------|------|-------------|
 | `total_rows` | `u64` | Total number of non-deleted documents in the database. |
-| `offset` | `u64` | Number of rows skipped. |
+| `offset` | `u64` | Local adapters: the `skip` applied (like PouchDB). CouchDB / HTTP adapter: the global position of the first row (`0` for `keys` queries, where CouchDB sends `null`). See [Differences from CouchDB](./differences.md#all_docs-offset-of-the-local-adapters). |
 | `rows` | `Vec<AllDocsRow>` | The result rows. |
 | `update_seq` | `Option<Seq>` | The current update sequence, present when `update_seq: true` was requested. |
 
@@ -636,7 +636,7 @@ pub struct ViewResult {
 | Field | Type | Description |
 |-------|------|-------------|
 | `total_rows` | `u64` | Total number of rows emitted by the map function (before skip/limit). |
-| `offset` | `u64` | Number of rows skipped. |
+| `offset` | `u64` | Local adapters: the `skip` applied (like PouchDB). CouchDB / HTTP adapter: the global position of the first row (`0` for `keys` queries, where CouchDB sends `null`). See [Differences from CouchDB](./differences.md#all_docs-offset-of-the-local-adapters). |
 | `rows` | `Vec<ViewRow>` | The result rows. |
 
 ### ViewRow

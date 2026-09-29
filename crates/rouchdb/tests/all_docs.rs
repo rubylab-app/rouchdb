@@ -196,6 +196,39 @@ async fn all_docs_conflicts_and_update_seq() {
     assert!(plain.update_seq.is_none());
 }
 
+/// CouchDB's `offset` is the global position of the first returned row;
+/// the local adapters report the `skip` instead (an accepted difference,
+/// pinned by `accepted_divergence_all_docs_offset_is_the_skip` in
+/// `adapter_conformance.rs`). For `keys`, CouchDB sends null (read as 0).
+#[tokio::test]
+#[ignore = "requires CouchDB"]
+async fn offset_is_the_global_position_on_couchdb() {
+    let url = fresh_remote_db("ad_offset").await;
+    let db = Database::http(&url);
+    for id in ["a", "b", "c", "d", "e"] {
+        db.put(id, serde_json::json!({})).await.unwrap();
+    }
+    let from_c = db
+        .all_docs(AllDocsOptions {
+            start_key: Some("c".into()),
+            skip: 1,
+            ..AllDocsOptions::new()
+        })
+        .await
+        .unwrap();
+    assert_eq!(ids(&from_c), ["d", "e"]);
+    assert_eq!((from_c.total_rows, from_c.offset), (5, 3));
+    let keys = db
+        .all_docs(AllDocsOptions {
+            keys: Some(vec!["a".into(), "b".into()]),
+            skip: 1,
+            ..AllDocsOptions::new()
+        })
+        .await
+        .unwrap();
+    assert_eq!((ids(&keys), keys.offset), (vec!["b"], 0));
+}
+
 /// Item 3 (F30): the rows of a `keys` query are the same on CouchDB, the
 /// memory and the redb adapter: one per requested key, in order, with
 /// deleted docs (`value.deleted`, no doc) and `not_found` error rows, and

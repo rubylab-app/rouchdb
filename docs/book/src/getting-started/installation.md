@@ -40,7 +40,7 @@ By default JSON numbers are `serde_json` numbers: integers that fit `i64`/`u64` 
 cargo add rouchdb --features arbitrary-precision
 ```
 
-It enables serde_json's `arbitrary_precision` for the whole build, which also changes `serde_json::Number` for your own code (comparisons are textual: `1.0` and `1.00` are different numbers), and revision ids of documents with such numbers differ from those computed without the feature.
+It enables serde_json's `arbitrary_precision` for the whole build, which also changes `serde_json::Number` for your own code (comparisons are textual: `1.0` and `1.00` are different numbers), and revision ids of documents with such numbers differ from those computed without the feature. See [Differences from CouchDB](../reference/differences.md#numbers).
 
 ## Minimal Setup
 
