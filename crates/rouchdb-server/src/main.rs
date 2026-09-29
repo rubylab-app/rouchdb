@@ -72,6 +72,9 @@ struct Cli {
     /// serving it, after writing a verified backup to
     /// `<path>.rouchdb-0.4.bak` (without this flag such a file is refused
     /// and left untouched). Afterwards rouchdb 0.4 cannot open the file.
+    /// Needs about three times the file size of free disk space. (A file of
+    /// a 0.5 development build is always upgraded, after a backup to
+    /// `<path>.rouchdb-0.5-pre.bak`.)
     #[arg(long)]
     upgrade: bool,
 }
@@ -97,12 +100,10 @@ async fn main() {
     };
     let db = match RedbAdapter::open_with(&cli.path, &db_name, options) {
         Ok(adapter) => {
+            // The report ends with the advice that fits it (backup or not,
+            // 0.4 or development-build file).
             if let Some(report) = adapter.upgrade_report() {
                 eprintln!("{report}");
-                eprintln!(
-                    "note: the first compaction deletes the old revision bodies and \
-                     attachment bytes counted above; keep the backup until you have checked them"
-                );
             }
             Database::from_adapter(Arc::new(adapter))
         }
@@ -110,9 +111,8 @@ async fn main() {
             eprintln!("Error opening database: {e}");
             if matches!(e, RouchError::UpgradeRequired { .. }) {
                 eprintln!(
-                    "hint: upgrade it once with `rouchdb migrate {}` or start the server with \
-                     --upgrade (both write a verified backup first)",
-                    cli.path
+                    "hint: or restart rouchdb-server with --upgrade, which writes the same \
+                     verified backup first"
                 );
             }
             process::exit(1);

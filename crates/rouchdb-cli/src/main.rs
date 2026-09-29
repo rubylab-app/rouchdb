@@ -7,16 +7,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Parser, Subcommand};
 use rouchdb::{
     AllDocsOptions, BulkDocsOptions, ChangesOptions, Database, Document, FindOptions, GetOptions,
-    RedbAdapter, ReplicationOptions, RouchError, StoredFormat, UpgradePolicy,
+    RedbAdapter, ReplicationOptions, RouchError, UpgradePolicy,
 };
-
-/// Printed after an upgrade (and a dry run).
-const COMPACT_WARNING: &str = "\
-WARNING: rouchdb 0.4 never compacted. The first `compact` after this upgrade
-permanently deletes the bodies of old (non-leaf) revisions and attachment bytes
-that only old revisions reference (counted above). Keep the backup until you
-have checked that you do not need them. After the upgrade rouchdb 0.4 can no
-longer open this file; the backup still opens in 0.4.";
 
 #[derive(Parser)]
 #[command(name = "rouchdb", about = "Inspect and query RouchDB redb databases")]
@@ -173,22 +165,25 @@ enum Commands {
     /// Upgrade a database file written by rouchdb 0.4 or earlier
     ///
     /// Writes a verified backup of the file first (by default
-    /// `<path>.rouchdb-0.4.bak`, which rouchdb 0.4 can still open), then
-    /// converts the file in one atomic transaction and prints what it found.
-    /// Afterwards rouchdb 0.4 refuses to open the file. The first `compact`
-    /// after the upgrade deletes the bodies of old revisions and attachment
-    /// bytes only they reference: read the report before compacting.
+    /// `<path>.rouchdb-0.4.bak`, which rouchdb 0.4 can still open, or
+    /// `<path>.rouchdb-0.5-pre.bak` for a file of a 0.5 development build),
+    /// then converts the file in one atomic transaction and prints what it
+    /// found. Afterwards rouchdb 0.4 refuses to open the file. Needs about
+    /// three times the file size of free disk space (about twice with
+    /// `--no-backup`). The first `compact` after the upgrade deletes the
+    /// bodies of old revisions and attachment bytes only they reference: read
+    /// the report before compacting.
     Migrate {
         /// Path to the .redb file
         path: String,
-        /// Write the backup here instead of `<path>.rouchdb-0.4.bak` (must
-        /// not exist)
+        /// Write the backup here instead of next to the file (must not
+        /// exist)
         #[arg(long, value_name = "PATH", conflicts_with = "no_backup")]
         backup: Option<std::path::PathBuf>,
         /// Upgrade in place without writing a backup
         #[arg(long)]
         no_backup: bool,
-        /// Only report what the upgrade would do; change nothing
+        /// Only report what the upgrade would do; the file is only read
         #[arg(long, conflicts_with_all = ["backup", "no_backup"])]
         dry_run: bool,
     },
@@ -271,6 +266,19 @@ fn infer_db_name(path: &str) -> String {
         .to_string()
 }
 
+/// `s` as one POSIX shell word: unchanged if it only holds characters that
+/// need no quoting, else in single quotes.
+fn shell_quote(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"%+,-./:=@_".contains(&b));
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
 fn open_db(path: &str, name: Option<&str>) -> Database {
     let db_name = name
         .map(String::from)
@@ -281,9 +289,9 @@ fn open_db(path: &str, name: Option<&str>) -> Database {
             eprintln!("Error opening database: {}", e);
             if matches!(e, RouchError::UpgradeRequired { .. }) {
                 eprintln!(
-                    "hint: upgrade it once with `rouchdb migrate {}` (a verified backup is \
-                     written to {}.rouchdb-0.4.bak first; `--dry-run` only reports)",
-                    path, path
+                    "hint: `rouchdb migrate --dry-run {}` reports what the upgrade would \
+                     change, without modifying the file",
+                    shell_quote(path)
                 );
             }
             process::exit(1);
@@ -774,11 +782,9 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
             } else {
                 RedbAdapter::upgrade(&path, UpgradePolicy::WithBackup(backup))?
             };
+            // The report ends with the advice that fits it (dry run or not,
+            // backup or not, 0.4 or development-build file).
             println!("{}", report);
-            if report.from != StoredFormat::Current {
-                println!();
-                println!("{}", COMPACT_WARNING);
-            }
         }
 
         Commands::Compact { path, db_name } => {

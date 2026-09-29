@@ -58,15 +58,24 @@ fn legacy_file_is_refused_with_a_hint_then_migrated() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("rouchdb 0.4 or earlier"))
-        .stderr(predicate::str::contains(format!("rouchdb migrate {p}")));
+        .stderr(predicate::str::contains("rouchdb migrate "))
+        .stderr(predicate::str::contains("RedbAdapter::upgrade"))
+        .stderr(predicate::str::contains("rouchdb migrate --dry-run "));
 
+    let raw = std::fs::read(&path).unwrap();
     rouchdb()
         .args(["migrate", "--dry-run", p])
         .assert()
         .success()
-        .stdout(predicate::str::contains("not modified (dry run)"))
-        .stdout(predicate::str::contains("documents: 1 live, 0 deleted"));
+        .stdout(predicate::str::contains("not modified (dry run"))
+        .stdout(predicate::str::contains("documents: 1 live, 0 deleted"))
+        .stdout(predicate::str::contains("three times the file size"))
+        .stdout(predicate::str::contains("will permanently delete"));
     assert!(!backup.exists());
+    assert!(
+        std::fs::read(&path).unwrap() == raw,
+        "the dry run modified the file"
+    );
 
     rouchdb()
         .args(["migrate", p])
@@ -78,7 +87,8 @@ fn legacy_file_is_refused_with_a_hint_then_migrated() {
             backup.display()
         )))
         .stdout(predicate::str::contains("WARNING"))
-        .stdout(predicate::str::contains("first `compact`"));
+        .stdout(predicate::str::contains("first compact()"))
+        .stdout(predicate::str::contains("still opens in rouchdb 0.4"));
     assert!(backup.exists());
 
     rouchdb()
@@ -127,7 +137,9 @@ fn migrate_refuses_an_existing_backup_and_supports_no_backup() {
         .assert()
         .success()
         .stdout(predicate::str::contains("status: upgraded"))
-        .stdout(predicate::str::contains("backup:").not());
+        .stdout(predicate::str::contains("backup:").not())
+        .stdout(predicate::str::contains("No backup was written"))
+        .stdout(predicate::str::contains("Keep the backup").not());
     assert!(!dir.path().join("old.redb.rouchdb-0.4.bak").exists());
 
     rouchdb()
