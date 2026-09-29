@@ -577,6 +577,47 @@ fn unindexed_queries() -> Vec<(Value, Value)> {
             json!({"selector": {"s": {"$regex": "^(?!a)"}}}),
             json!(["d7", "d8"]),
         ),
+        // Inside a combinator (or $not below a field), `{}` is an equality
+        // test with `{}` on the value at hand, the whole document included,
+        // and operators without a field apply to that value.
+        (json!({"selector": {"$and": [{}]}}), json!([])),
+        (json!({"selector": {"$and": [{}, {"x": 3}]}}), json!([])),
+        (
+            json!({"selector": {"$or": [{}, {"age": 20}]}}),
+            json!(["d2"]),
+        ),
+        (
+            json!({"selector": {"$nor": [{}, {"age": 20}]}}),
+            json!(["d1", "d10", "d11", "d4", "d7", "d8", "d9"]),
+        ),
+        (json!({"selector": {"obj": {"$and": [{}]}}}), json!(["d7"])),
+        (
+            json!({"selector": {"address": {"$or": [{}, {"city": "la"}]}}}),
+            json!(["d2", "d6"]),
+        ),
+        (
+            json!({"selector": {"address": {"$not": {}}}}),
+            json!(["d1", "d2"]),
+        ),
+        (
+            json!({"selector": {"items": {"$elemMatch": {"$or": [{}, {"subject": "bio"}]}}}}),
+            json!(["d2"]),
+        ),
+        // (CouchDB 3.5.1 matches nothing with a $nor inside $elemMatch or
+        // $allMatch, even {"$nor": [{"$eq": 1}]} on [3]; not emulated.)
+        (
+            json!({"selector": {"tags": {"$allMatch": {"$not": {}}}}}),
+            json!(["d1", "d10", "d2", "d8", "d9"]),
+        ),
+        (
+            json!({"selector": {"$and": [{"$gt": 1}]}, "fields": ["_id"]}),
+            json!([{"_id": "d1"}, {"_id": "d10"}, {"_id": "d11"}, {"_id": "d2"}, {"_id": "d3"}, {"_id": "d4"}, {"_id": "d5"}, {"_id": "d6"}, {"_id": "d7"}, {"_id": "d8"}, {"_id": "d9"}]),
+        ),
+        (json!({"selector": {"$or": [{"$lt": 1}]}}), json!([])),
+        (
+            json!({"selector": {"$not": {"$and": [{"$type": "object"}]}}}),
+            json!([]),
+        ),
     ]
 }
 
@@ -599,6 +640,11 @@ fn rejected_queries() -> Vec<Value> {
         json!({"selector": {"s": {"$gt": null}}, "sort": [{"s": "up"}]}),
         json!({"selector": {"s": {"$gt": null}}, "sort": [{"s": "asc", "f": "asc"}]}),
         json!({"selector": {"f": {"$not": 5}}}),
+        json!({"selector": {"$not": {}}}),
+        json!({"selector": {"$not": {"$gt": 1}}}),
+        json!({"selector": {"tags": {"$elemMatch": "js"}}}),
+        json!({"selector": {"scores": {"$elemMatch": 50}}}),
+        json!({"selector": {"tags": {"$elemMatch": ["js"]}}}),
     ]
 }
 
@@ -697,9 +743,24 @@ fn indexed_queries() -> Vec<(Value, Value)> {
             json!({"selector": {"tags.0": {"$gt": null}}, "sort": ["tags.0"], "fields": ["_id", "tags"]}),
             json!([{"_id": "d8", "tags": ["db"]}, {"_id": "d2", "tags": ["js"]}, {"_id": "d9", "tags": ["js", "rust"]}, {"_id": "d1", "tags": ["rust", "db"]}, {"_id": "d10", "tags": ["rust"]}]),
         ),
-        // Ties in a descending sort are left out: CouchDB walks the index
-        // backwards (ties in reverse _id order), RouchDB keeps them in _id
-        // order.
+        // A descending sort walks the index backwards: ties come in reverse
+        // index order (the other index fields, then _id).
+        (
+            json!({"selector": {"tags.0": {"$gt": null}}, "sort": [{"tags.0": "desc"}], "fields": ["_id"]}),
+            json!([{"_id": "d10"}, {"_id": "d1"}, {"_id": "d9"}, {"_id": "d2"}, {"_id": "d8"}]),
+        ),
+        (
+            json!({"selector": {"tags.0": {"$gt": null}}, "sort": [{"tags.0": "desc"}], "skip": 1, "limit": 2, "fields": ["_id"]}),
+            json!([{"_id": "d1"}, {"_id": "d9"}]),
+        ),
+        (
+            json!({"selector": {"flag": {"$exists": true}, "s": {"$exists": true}}, "sort": [{"flag": "desc"}], "fields": ["_id"]}),
+            json!([{"_id": "d8"}, {"_id": "d11"}, {"_id": "d10"}, {"_id": "d7"}]),
+        ),
+        (
+            json!({"selector": {"flag": {"$exists": true}, "s": {"$exists": true}}, "sort": ["flag"], "fields": ["_id"]}),
+            json!([{"_id": "d7"}, {"_id": "d10"}, {"_id": "d11"}, {"_id": "d8"}]),
+        ),
         (
             json!({"selector": {"flag": {"$exists": true}, "s": {"$exists": true}}, "sort": ["flag", "s"], "fields": ["_id", "flag", "s"]}),
             json!([{"_id": "d7", "flag": false, "s": ""}, {"_id": "d10", "flag": false, "s": "ab"}, {"_id": "d11", "flag": true, "s": "a"}, {"_id": "d8", "flag": true, "s": "b"}]),
@@ -917,6 +978,9 @@ fn view_design_docs() -> Vec<Value> {
         json!({"_id": "_design/ragged", "views": {
             "ragged": {"map": "function(doc){ if (doc.rag !== undefined) emit(doc._id, doc.rag); }", "reduce": "_sum"}
         }}),
+        json!({"_id": "_design/strings", "views": {
+            "strs": {"map": "function(doc){ if (doc.dept) emit(doc._id, doc.dept); }", "reduce": "_sum"}
+        }}),
     ]
 }
 
@@ -1054,6 +1118,11 @@ fn local_view(view: &str) -> (&'static str, MapFn, Option<ReduceFn>) {
         "mixed_stats" => ("parity", map_if("v", "k", "v"), Some(ReduceFn::Stats)),
         "mixed_count" => ("parity", map_if("v", "k", "v"), Some(ReduceFn::Count)),
         "ragged" => ("ragged", map_if("rag", "_id", "rag"), Some(ReduceFn::Sum)),
+        "strs" => (
+            "strings",
+            map_if("dept", "_id", "dept"),
+            Some(ReduceFn::Sum),
+        ),
         other => panic!("unknown view {other}"),
     }
 }
@@ -1181,7 +1250,80 @@ fn view_queries() -> Vec<(&'static str, Value)> {
         ("linked_rev", json!({"include_docs": true})),
         // F105: custom reduce receives [key, id] pairs
         ("custom", json!({"group_level": 1})),
+        // group + keys keeps the order of the keys, even descending
+        (
+            "by_dept",
+            json!({"group": true, "keys": ["hr", "eng", "sales"], "descending": true}),
+        ),
+        (
+            "by_dept",
+            json!({"group": true, "keys": ["sales", "zzz", "eng"], "descending": true}),
+        ),
+        // With a startkey (after it in the query string) key is the end.
+        // (Not here: CouchDB returns no rows for a key with
+        // inclusive_end=false, rouchdb returns the key's rows.)
+        (
+            "by_dept",
+            json!({"reduce": false, "key": "hr", "startkey": "eng"}),
+        ),
+        (
+            "by_dept",
+            json!({"reduce": false, "keys": ["hr"], "startkey": "eng"}),
+        ),
+        (
+            "by_dept",
+            json!({"reduce": false, "startkey": "hr", "endkey": "hr", "inclusive_end": false}),
+        ),
+        (
+            "by_dept",
+            json!({"reduce": false, "startkey": "eng", "endkey": "eng", "descending": true}),
+        ),
+        // _sum of values it cannot add: the reduced value is the error
+        ("strs", json!({})),
+        ("strs", json!({"startkey": "b", "endkey": "c"})),
+        ("strs", json!({"group": true})),
+        ("strs", json!({"group_level": 1})),
+        // Grouping a map view with group_level 0 (or group=false) is fine
+        ("linked", json!({"group_level": 0})),
+        ("linked", json!({"group": false})),
         // Rejected by CouchDB with a 400
+        ("by_dept", json!({"startkey": "z", "endkey": "a"})),
+        (
+            "by_dept",
+            json!({"reduce": false, "startkey": "z", "endkey": "a"}),
+        ),
+        (
+            "by_dept",
+            json!({"reduce": false, "startkey": "a", "endkey": "z", "descending": true}),
+        ),
+        (
+            "by_dept",
+            json!({"group": true, "startkey": "z", "endkey": "a"}),
+        ),
+        (
+            "by_dept",
+            json!({"reduce": false, "key": "eng", "startkey": "hr"}),
+        ),
+        (
+            "by_dept",
+            json!({"reduce": false, "keys": ["hr"], "startkey": "z"}),
+        ),
+        (
+            "by_dept",
+            json!({"reduce": false, "keys": ["hr", "eng"], "key": "z"}),
+        ),
+        (
+            "by_dept",
+            json!({"reduce": false, "keys": ["hr", "eng"], "startkey": "a"}),
+        ),
+        (
+            "by_dept",
+            json!({"group": true, "keys": ["hr", "eng"], "endkey": "z"}),
+        ),
+        ("linked", json!({"group": true})),
+        ("linked", json!({"group_level": 1})),
+        ("by_dept", json!({"reduce": false, "group": true})),
+        ("by_dept", json!({"reduce": false, "group_level": 2})),
         ("by_dept", json!({"include_docs": true})),
         ("by_dept", json!({"keys": ["hr", "eng"]})),
         ("by_dept", json!({"keys": ["hr", "eng"], "group_level": 0})),

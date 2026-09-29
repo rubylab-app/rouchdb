@@ -48,6 +48,12 @@ async fn document_crud() {
     let resp = post(&app, "/db", json!({"a": 1})).await;
     assert_eq!(resp.status, StatusCode::CREATED);
     let id = resp.json()["id"].as_str().unwrap().to_string();
+    // Like CouchDB's generated ids: 32 lowercase hex digits.
+    assert_eq!(id.len(), 32, "{id}");
+    assert!(
+        id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "{id}"
+    );
     let rev = rev_with_prefix(&resp, "1-");
     assert_eq!(resp.json(), json!({"ok": true, "id": id, "rev": rev}));
     assert_eq!(

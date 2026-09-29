@@ -15,6 +15,7 @@ use rouchdb_core::document::{ChangeEvent, ChangesOptions, ChangesResponse, Chang
 use rouchdb_core::error::RouchError;
 
 use crate::error::AppError;
+use crate::extract::JsonBody;
 use crate::state::AppState;
 
 /// CouchDB's default `timeout` for longpoll and continuous feeds.
@@ -488,7 +489,7 @@ pub async fn post_changes(
     State(state): State<AppState>,
     Path(db): Path<String>,
     Query(query): Query<ChangesQuery>,
-    Json(body): Json<serde_json::Value>,
+    JsonBody(body): JsonBody<serde_json::Value>,
 ) -> Result<Response, AppError> {
     state.check_db(&db)?;
     let req = parse_request(&state, query, Some(&body)).await?;

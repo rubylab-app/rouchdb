@@ -3,6 +3,7 @@ use axum::extract::{Path, Query, State};
 use serde::Deserialize;
 
 use crate::error::AppError;
+use crate::extract::JsonBody;
 use crate::state::AppState;
 
 #[derive(Deserialize, Default)]
@@ -53,7 +54,7 @@ pub async fn get_view(
 pub async fn post_view(
     State(state): State<AppState>,
     Path((db, ddoc, view)): Path<(String, String, String)>,
-    Json(_body): Json<serde_json::Value>,
+    JsonBody(_body): JsonBody<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     state.check_db(&db)?;
 

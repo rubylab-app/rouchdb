@@ -4,6 +4,7 @@ use axum::extract::{Path, State};
 use rouchdb::SecurityDocument;
 
 use crate::error::AppError;
+use crate::extract::JsonBody;
 use crate::state::AppState;
 use rouchdb_core::error::RouchError;
 
@@ -22,7 +23,7 @@ pub async fn get_security(
 pub async fn put_security(
     State(state): State<AppState>,
     Path(db): Path<String>,
-    Json(raw): Json<serde_json::Value>,
+    JsonBody(raw): JsonBody<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     state.check_db(&db)?;
 

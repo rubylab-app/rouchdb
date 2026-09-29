@@ -76,3 +76,50 @@ async fn attachment_binary_data() {
     let binary_data: Vec<u8> = (0..=255).collect();
     roundtrip(&db, "bytes.bin", &binary_data, "application/octet-stream").await;
 }
+
+/// Attach `data` to document `d` (created if needed) and return the digest
+/// the database reports for it.
+async fn stored_digest(db: &Database, name: &str, data: &[u8], content_type: &str) -> String {
+    let rev = match db.get("d").await {
+        Ok(doc) => doc.rev.unwrap().to_string(),
+        Err(_) => db
+            .put("d", serde_json::json!({}))
+            .await
+            .unwrap()
+            .rev
+            .unwrap(),
+    };
+    db.put_attachment("d", name, &rev, data.to_vec(), content_type)
+        .await
+        .unwrap();
+    db.get("d").await.unwrap().attachments[name].digest.clone()
+}
+
+/// Attachment digests are `md5-<base64>` of the stored bytes, as in
+/// CouchDB 3.5.1: for the same bytes of a type CouchDB stores as is, the
+/// local adapters and CouchDB agree. CouchDB gzips compressible types
+/// (text/*, application/json, ...) before storing and digests the gzip
+/// bytes; rouchdb stores those raw, so their digests differ.
+#[tokio::test]
+#[ignore = "requires CouchDB"]
+async fn digests_match_couchdb_for_bytes_stored_as_is() {
+    let url = fresh_remote_db("attach_digest").await;
+    let remote = Database::http(&url);
+    let local = Database::memory("digests");
+    let data = b"hello hello hello hello hello hello hello hello";
+    // md5 of the bytes, base64-encoded.
+    let raw = "md5-7uNimBaMipk1DrT0kixOKA==";
+    for (name, content_type) in [
+        ("a.bin", "application/octet-stream"),
+        ("a.png", "image/png"),
+    ] {
+        for db in [&remote, &local] {
+            let digest = stored_digest(db, name, data, content_type).await;
+            assert_eq!(digest, raw, "{content_type}");
+        }
+    }
+    let couch_text = stored_digest(&remote, "a.txt", data, "text/plain").await;
+    assert_ne!(couch_text, raw, "CouchDB digests the gzip-encoded body");
+    let local_text = stored_digest(&local, "a.txt", data, "text/plain").await;
+    assert_eq!(local_text, raw);
+}

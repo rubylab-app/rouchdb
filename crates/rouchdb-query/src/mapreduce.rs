@@ -41,11 +41,16 @@ pub enum ReduceFn {
 /// Options for querying a view.
 #[derive(Debug, Clone, Default)]
 pub struct ViewQueryOptions {
-    /// Only return rows with this exact key.
+    /// Only return rows with this exact key. With `start_key` or `end_key`
+    /// it is the other bound of the range (as when they follow `key` in a
+    /// CouchDB query string).
     pub key: Option<serde_json::Value>,
-    /// Return rows matching any of these keys, in the given order.
+    /// Return rows matching any of these keys, in the given order. Several
+    /// keys cannot be combined with `key`, `start_key` or `end_key`.
     pub keys: Option<Vec<serde_json::Value>>,
-    /// Start of key range (inclusive).
+    /// Start of key range (inclusive). A range no row can be in (a start
+    /// after the end, or before it when descending) is a `BadRequest`, as
+    /// in CouchDB.
     pub start_key: Option<serde_json::Value>,
     /// End of key range (inclusive by default).
     pub end_key: Option<serde_json::Value>,
@@ -64,7 +69,8 @@ pub struct ViewQueryOptions {
     /// Whether to run the reduce function, if one is given. `new()` turns
     /// it on, like CouchDB's default.
     pub reduce: bool,
-    /// Group by key (requires reduce).
+    /// Group by key. Grouping (this, or a `group_level` above 0) without a
+    /// reduce is a `BadRequest`, as in CouchDB.
     pub group: bool,
     /// Group to this many array elements of the key.
     pub group_level: Option<u64>,
@@ -216,16 +222,14 @@ pub fn query_sorted(
 
     if let Some(reduce) = reduce {
         let groups = if let Some(ref keys) = opts.keys {
-            // One reduced row per requested key.
+            // One reduced row per requested key, in the order of the keys
+            // even when descending (as in CouchDB).
             let mut groups = Vec::new();
             for key in keys {
                 let (lo, hi) = equal_range(rows, key);
                 if lo < hi {
                     groups.extend(group_reduce(&rows[lo..hi], reduce, opts.group_level)?);
                 }
-            }
-            if opts.descending {
-                groups.reverse();
             }
             groups
         } else {
@@ -319,12 +323,46 @@ pub fn query_sorted(
 }
 
 /// The reduce function to run for these options, if any, after checking
-/// the option combinations CouchDB rejects.
+/// the option combinations CouchDB rejects (with a `query_parse_error`).
 fn reducer<'a>(
     reduce_fn: Option<&'a ReduceFn>,
     opts: &ViewQueryOptions,
 ) -> Result<Option<&'a ReduceFn>> {
+    let parse_error = |reason: &str| Err(RouchError::BadRequest(reason.into()));
+    if opts.keys.as_ref().is_some_and(|keys| keys.len() != 1)
+        && (opts.key.is_some() || opts.start_key.is_some() || opts.end_key.is_some())
+    {
+        return parse_error("`keys` is incompatible with `key`, `start_key` and `end_key`");
+    }
+    // A single key is `key`, which is both bounds unless replaced.
+    let key = match opts.keys.as_deref() {
+        Some([key]) => Some(key),
+        _ => opts.key.as_ref(),
+    };
+    let start = opts.start_key.as_ref().or(key);
+    let end = opts.end_key.as_ref().or(key);
+    if let (Some(start), Some(end)) = (start, end) {
+        match (opts.descending, collate(start, end)) {
+            (false, Ordering::Greater) => {
+                return parse_error(
+                    "No rows can match your key range, reverse your start_key and end_key \
+                     or set descending=true",
+                );
+            }
+            (true, Ordering::Less) => {
+                return parse_error(
+                    "No rows can match your key range, reverse your start_key and end_key \
+                     or set descending=false",
+                );
+            }
+            _ => {}
+        }
+    }
     let reduce = reduce_fn.filter(|_| opts.reduce);
+    let grouped = opts.group_level.map(|l| l > 0).unwrap_or(opts.group);
+    if reduce.is_none() && grouped {
+        return parse_error("Invalid use of grouping on a map view.");
+    }
     if reduce.is_some() {
         if opts.include_docs {
             return Err(RouchError::BadRequest(
@@ -345,6 +383,10 @@ fn reducer<'a>(
 }
 
 /// Index range `[lo, hi)` of the rows (sorted ascending) whose key equals `key`.
+///
+/// Unlike CouchDB, which reads a key as the range from the key to itself
+/// and so returns nothing for it with `inclusive_end=false`, a key always
+/// selects its rows: `ViewQueryOptions::default()` has `inclusive_end` off.
 fn equal_range(rows: &[EmittedRow], key: &Value) -> (usize, usize) {
     (lower_bound(rows, key), upper_bound(rows, key))
 }
@@ -360,17 +402,24 @@ fn upper_bound(rows: &[EmittedRow], key: &Value) -> usize {
 }
 
 /// Index range `[lo, hi)`, in ascending order, selected by `key` or by
-/// `start_key`/`end_key` (which are swapped roles when descending).
+/// `start_key`/`end_key` (which swap roles when descending). With either of
+/// them, `key` is the other bound, as when they follow `key` in a CouchDB
+/// query string.
 fn range_bounds(rows: &[EmittedRow], opts: &ViewQueryOptions) -> (usize, usize) {
-    if let Some(ref key) = opts.key {
+    if let Some(ref key) = opts.key
+        && opts.start_key.is_none()
+        && opts.end_key.is_none()
+    {
         return equal_range(rows, key);
     }
+    let start = opts.start_key.as_ref().or(opts.key.as_ref());
+    let end = opts.end_key.as_ref().or(opts.key.as_ref());
     let (mut lo, mut hi) = (0, rows.len());
     if opts.descending {
-        if let Some(ref start) = opts.start_key {
+        if let Some(start) = start {
             hi = upper_bound(rows, start);
         }
-        if let Some(ref end) = opts.end_key {
+        if let Some(end) = end {
             lo = if opts.inclusive_end {
                 lower_bound(rows, end)
             } else {
@@ -378,10 +427,10 @@ fn range_bounds(rows: &[EmittedRow], opts: &ViewQueryOptions) -> (usize, usize) 
             };
         }
     } else {
-        if let Some(ref start) = opts.start_key {
+        if let Some(start) = start {
             lo = lower_bound(rows, start);
         }
-        if let Some(ref end) = opts.end_key {
+        if let Some(end) = end {
             hi = if opts.inclusive_end {
                 upper_bound(rows, end)
             } else {
@@ -517,7 +566,7 @@ fn group_key(key: &serde_json::Value, group_level: Option<u64>) -> serde_json::V
 fn apply_reduce(reduce: &ReduceFn, rows: &[EmittedRow]) -> Result<Value> {
     let values = || rows.iter().map(|r| &r.value);
     match reduce {
-        ReduceFn::Sum => builtin_sum(values()),
+        ReduceFn::Sum => Ok(builtin_sum(&values().collect::<Vec<_>>())),
         ReduceFn::Count => Ok(serde_json::json!(rows.len())),
         ReduceFn::Stats => builtin_stats(values()),
         ReduceFn::Custom(f) => {
@@ -615,13 +664,11 @@ impl Num {
     }
 }
 
-fn sum_error() -> RouchError {
-    RouchError::BadRequest(
-        "builtin_reduce_error: the _sum function requires that map values be numbers, \
-         arrays of numbers, or objects (not mixed with other data structures)"
-            .into(),
-    )
-}
+/// CouchDB's reason for a `_sum` of values it cannot add.
+const SUM_ERROR: &str = "The _sum function requires that map values be numbers, arrays of \
+     numbers, or objects. Objects cannot be mixed with other data structures. Objects can be \
+     arbitrarily nested, provided that the values for all fields are themselves numbers, \
+     arrays of numbers, or objects.";
 
 /// Partial `_sum`: a number, an array of numbers, or an object of sums.
 enum Sum {
@@ -631,27 +678,30 @@ enum Sum {
 }
 
 impl Sum {
-    fn from_json(value: &Value) -> Result<Sum> {
+    /// `None` for a value `_sum` cannot add.
+    fn from_json(value: &Value) -> Option<Sum> {
         match value {
-            Value::Number(_) => Ok(Sum::Num(Num::from_json(value).ok_or_else(sum_error)?)),
-            Value::Array(items) => Ok(Sum::Array(numbers(items)?)),
+            Value::Number(_) => Num::from_json(value).map(Sum::Num),
+            Value::Array(items) => numbers(items).map(Sum::Array),
             Value::Object(map) => map
                 .iter()
-                .map(|(k, v)| Ok((k.clone(), Sum::from_json(v)?)))
-                .collect::<Result<_>>()
+                .map(|(k, v)| Some((k.clone(), Sum::from_json(v)?)))
+                .collect::<Option<_>>()
                 .map(Sum::Object),
-            _ => Err(sum_error()),
+            _ => None,
         }
     }
 
-    fn add(self, other: Sum) -> Result<Sum> {
+    /// `None` when the two cannot be added (an object and a number or an
+    /// array).
+    fn add(self, other: Sum) -> Option<Sum> {
         match (self, other) {
-            (Sum::Num(a), Sum::Num(b)) => Ok(Sum::Num(a.add(b))),
+            (Sum::Num(a), Sum::Num(b)) => Some(Sum::Num(a.add(b))),
             // A number is added to the first element of an array.
             (Sum::Num(a), Sum::Array(b)) | (Sum::Array(b), Sum::Num(a)) => {
-                Ok(Sum::Array(add_arrays(vec![a], b)))
+                Some(Sum::Array(add_arrays(vec![a], b)))
             }
-            (Sum::Array(a), Sum::Array(b)) => Ok(Sum::Array(add_arrays(a, b))),
+            (Sum::Array(a), Sum::Array(b)) => Some(Sum::Array(add_arrays(a, b))),
             (Sum::Object(mut a), Sum::Object(b)) => {
                 for (k, v) in b {
                     let sum = match a.remove(&k) {
@@ -660,9 +710,9 @@ impl Sum {
                     };
                     a.insert(k, sum);
                 }
-                Ok(Sum::Object(a))
+                Some(Sum::Object(a))
             }
-            _ => Err(sum_error()),
+            _ => None,
         }
     }
 
@@ -677,11 +727,8 @@ impl Sum {
     }
 }
 
-fn numbers(items: &[Value]) -> Result<Vec<Num>> {
-    items
-        .iter()
-        .map(|v| Num::from_json(v).ok_or_else(sum_error))
-        .collect()
+fn numbers(items: &[Value]) -> Option<Vec<Num>> {
+    items.iter().map(Num::from_json).collect()
 }
 
 /// Element-wise sum; the shorter array is padded with zeros.
@@ -695,17 +742,44 @@ fn add_arrays(mut a: Vec<Num>, b: Vec<Num>) -> Vec<Num> {
     a
 }
 
-/// CouchDB's `_sum`: integers stay integers, arrays of numbers are summed
-/// element-wise, objects field by field; anything else is an error.
-fn builtin_sum<'a>(mut values: impl Iterator<Item = &'a Value>) -> Result<Value> {
-    let Some(first) = values.next() else {
-        return Ok(serde_json::json!(0));
-    };
-    let mut sum = Sum::from_json(first)?;
+/// Add `values` in order (`None` if there are none); `Err` holds the first
+/// value that could not be added.
+fn sum_in_order<'a>(
+    values: impl Iterator<Item = &'a Value>,
+) -> std::result::Result<Option<Sum>, &'a Value> {
+    let mut sum: Option<Sum> = None;
     for value in values {
-        sum = sum.add(Sum::from_json(value)?)?;
+        let next = Sum::from_json(value).ok_or(value)?;
+        sum = Some(match sum {
+            None => next,
+            Some(acc) => acc.add(next).ok_or(value)?,
+        });
     }
-    Ok(sum.to_json())
+    Ok(sum)
+}
+
+/// CouchDB's `_sum`: integers stay integers, arrays of numbers are summed
+/// element-wise, objects field by field.
+///
+/// Values it cannot add make the reduced value CouchDB's error object
+/// (`{"error": "builtin_reduce_error", "reason": ..., "caused_by": value}`),
+/// which CouchDB returns as the value of the row (with a 200), not as a
+/// query error. CouchDB adds the rows of an index node last to first, so
+/// `caused_by` is the first value that fails going backwards.
+fn builtin_sum(values: &[&Value]) -> Value {
+    match sum_in_order(values.iter().copied()) {
+        Ok(sum) => sum.map_or(serde_json::json!(0), |sum| sum.to_json()),
+        Err(_) => {
+            let culprit = sum_in_order(values.iter().rev().copied())
+                .err()
+                .unwrap_or(values[values.len() - 1]);
+            serde_json::json!({
+                "error": "builtin_reduce_error",
+                "reason": SUM_ERROR,
+                "caused_by": culprit,
+            })
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1192,7 +1266,8 @@ mod tests {
     #[tokio::test]
     async fn builtin_sum_and_stats_follow_couchdb() {
         // F54: integers stay integers, arrays and objects are summed
-        // element-wise, and non-numeric values are an error.
+        // element-wise; non-numeric values make the value of the reduced
+        // row an error (a query error for _stats).
         let db = setup_db().await;
         let run = |map: fn(&serde_json::Value) -> Vec<(serde_json::Value, serde_json::Value)>,
                    reduce: ReduceFn| {
@@ -1228,14 +1303,13 @@ mod tests {
             r.rows[0].value,
             serde_json::json!({"a": 90, "n": {"x": 1.5}})
         );
-        assert!(
-            run(
-                |d| vec![(serde_json::Value::Null, d["name"].clone())],
-                ReduceFn::Sum
-            )
-            .await
-            .is_err()
-        );
+        let r = run(
+            |d| vec![(serde_json::Value::Null, d["name"].clone())],
+            ReduceFn::Sum,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.rows[0].value["error"], "builtin_reduce_error");
 
         let r = run(
             |d| vec![(serde_json::Value::Null, d["age"].clone())],
@@ -1405,13 +1479,12 @@ mod tests {
             ..ViewQueryOptions::new()
         });
         assert_eq!(with_key.unwrap(), [(Value::Null, json!(1))]);
-        // Without the reduce any `keys` list is fine.
+        // Without the reduce any `keys` list is fine (but not grouping).
         let map = query_emitted(
             rows.clone(),
             Some(&ReduceFn::Count),
             &ViewQueryOptions {
                 keys: two(),
-                group_level: Some(1),
                 reduce: false,
                 ..ViewQueryOptions::new()
             },

@@ -621,7 +621,7 @@ async fn security_document_roundtrip_and_overwrite() {
 // =========================================================================
 
 #[tokio::test]
-async fn post_generates_uuid_v4_ids() {
+async fn post_generates_uuid_v4_ids_as_32_hex_digits() {
     for b in backends("test") {
         let db = &b.db;
         let mut ids = Vec::new();
@@ -631,6 +631,8 @@ async fn post_generates_uuid_v4_ids() {
             let uuid = uuid::Uuid::parse_str(&r.id)
                 .unwrap_or_else(|e| panic!("{}: {} is not a UUID: {e}", b.name, r.id));
             assert_eq!(uuid.get_version_num(), 4, "{}: {}", b.name, r.id);
+            // Like CouchDB's generated ids: no hyphens.
+            assert_eq!(r.id, uuid.simple().to_string(), "{}", b.name);
             assert!(!ids.contains(&r.id), "{}: duplicate id {}", b.name, r.id);
             assert_eq!(db.get(&r.id).await.unwrap().data["i"], i);
             ids.push(r.id);
