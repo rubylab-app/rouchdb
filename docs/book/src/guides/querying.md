@@ -56,7 +56,7 @@ let opts = FindOptions {
 
 - `selector` -- the query (see operators below).
 - `fields` -- field projection; only these fields are returned (list `_id` explicitly if you need it). Nested paths such as `address.city` keep their structure.
-- `sort` -- sort by one or more fields, ascending (`"asc"`) or descending (`"desc"`).
+- `sort` -- sort by one or more fields, ascending (`"asc"`) or descending (`"desc"`). As in CouchDB (which sorts through an index on those fields), documents that lack a sort field are left out of sorted results; unlike CouchDB, no index is required.
 - `limit` -- maximum number of results.
 - `skip` -- number of results to skip (for pagination).
 
@@ -95,11 +95,14 @@ Supported type names: `"null"`, `"boolean"`, `"number"`, `"string"`, `"array"`, 
 |----------|-------------|---------|
 | `$regex` | Matches a regular expression | `{"name": {"$regex": "^Ali"}}` |
 
+Patterns use PCRE-like syntax (via `fancy-regex`), including lookaround and
+backreferences, as CouchDB does.
+
 ### Array Operators
 
 | Operator | Description | Example |
 |----------|-------------|---------|
-| `$all` | Array contains all listed elements | `{"tags": {"$all": ["rust", "db"]}}` |
+| `$all` | Array contains all listed elements (exact equality: `50.0` is not `50`) | `{"tags": {"$all": ["rust", "db"]}}` |
 | `$size` | Array has exactly N elements | `{"tags": {"$size": 3}}` |
 | `$elemMatch` | At least one element matches sub-selector | See below |
 
@@ -128,8 +131,13 @@ let selector = json!({
 |----------|-------------|---------|
 | `$and` | All sub-selectors must match | `{"$and": [{"age": {"$gte": 18}}, {"active": true}]}` |
 | `$or` | At least one sub-selector must match | `{"$or": [{"city": "NYC"}, {"city": "LA"}]}` |
-| `$not` | Negate a selector | `{"$not": {"status": "archived"}}` |
+| `$not` | Negate a selector (the argument must be an object) | `{"$not": {"status": "archived"}}` |
 | `$nor` | None of the sub-selectors match | `{"$nor": [{"status": "banned"}, {"age": {"$lt": 13}}]}` |
+
+An empty `$and`, `$or` or `$nor` is always true, so `{"age": 22, "$or": []}`
+is `{"age": 22}`; but, as in CouchDB, a query whose selector is nothing but an
+empty combinator (`{"$and": []}`, `{"$nor": []}`, `{"f": {"$or": []}}`)
+returns no documents.
 
 Note: multiple fields in the same selector object are an implicit `$and`:
 
@@ -209,6 +217,7 @@ let result = query_view(
 - `reduce` -- whether to run the reduce function (on by default with `new()`, as in CouchDB).
 - `group` -- group reduced results by key.
 - `group_level` -- for array keys, group by the first N elements.
+- `keys` -- return the rows of these keys, in this order. With a reduce, more than one key requires `group: true` without `group_level` (CouchDB's rule); a single key behaves like `key`.
 
 ### Built-In Reduce Functions
 

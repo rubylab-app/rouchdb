@@ -14,7 +14,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use regex::Regex;
+use fancy_regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
@@ -281,13 +281,14 @@ impl<'de> Deserialize<'de> for SortField {
             ),
             other => {
                 return Err(serde::de::Error::custom(format!(
-                    "invalid sort field: {other}"
+                    "Invalid sort field: {other}"
                 )));
             }
         };
-        sort_field
-            .try_field_and_direction()
-            .map_err(serde::de::Error::custom)?;
+        // Report the bare reason, without `RouchError`'s "bad request: ".
+        if let Err(RouchError::BadRequest(reason)) = sort_field.try_field_and_direction() {
+            return Err(serde::de::Error::custom(reason));
+        }
         Ok(sort_field)
     }
 }
@@ -318,7 +319,10 @@ impl SortField {
     /// The field and its direction, or `BadRequest` if the sort field is not
     /// a single field with an `"asc"` or `"desc"` direction.
     pub fn try_field_and_direction(&self) -> Result<(&str, SortDirection)> {
-        let invalid = || RouchError::BadRequest(format!("invalid sort field: {self:?}"));
+        let invalid = || {
+            let json = serde_json::to_string(self).unwrap_or_default();
+            RouchError::BadRequest(format!("Invalid sort field: {json}"))
+        };
         match self {
             SortField::Simple(f) => Ok((f.as_str(), SortDirection::Asc)),
             SortField::WithDirection(map) => {
@@ -382,6 +386,9 @@ where
 struct Query {
     selector: CompiledSelector,
     sort: Vec<(Vec<String>, SortDirection)>,
+    /// The selector is nothing but an empty combinator (see
+    /// [`is_empty_combinator`]): CouchDB does not run the query at all.
+    no_op: bool,
 }
 
 impl Query {
@@ -392,13 +399,20 @@ impl Query {
             let (field, direction) = sf.try_field_and_direction()?;
             sort.push((parse_field(field)?, direction));
         }
-        Ok(Query { selector, sort })
+        Ok(Query {
+            selector,
+            sort,
+            no_op: is_empty_combinator(&opts.selector),
+        })
     }
 
     fn run<I>(&self, docs: I, opts: &FindOptions) -> FindResponse
     where
         I: IntoIterator<Item = serde_json::Value>,
     {
+        if self.no_op {
+            return FindResponse { docs: Vec::new() };
+        }
         let mut matched: Vec<Value> = docs
             .into_iter()
             .filter(|doc| {
@@ -408,6 +422,15 @@ impl Query {
                     && self.selector.matches(doc)
             })
             .collect();
+
+        // CouchDB sorts with an index on the sort fields, which only holds
+        // the documents that have all of them: a document missing a sort
+        // field is never part of a sorted result.
+        matched.retain(|doc| {
+            self.sort
+                .iter()
+                .all(|(path, _)| lookup(doc, path).is_some())
+        });
 
         // Sort (stable, so ties keep the input order)
         if !self.sort.is_empty() {
@@ -443,6 +466,31 @@ impl Query {
     }
 }
 
+/// Whether a `_find` selector normalizes to a bare empty `$and` / `$or`, such
+/// as `{"$and": []}`, `{"$nor": []}`, `{"f": {"$or": []}}` or
+/// `{"$not": {"$and": []}}`.
+///
+/// CouchDB returns no documents for such a query (its cursor turns it into an
+/// empty index range), although an empty combinator is otherwise always true:
+/// `{"f": 1, "$or": []}` is `{"f": 1}`, and the `_changes` selector filter
+/// passes every change for `{"$and": []}`. Field names over a combinator
+/// vanish in CouchDB's normalization, and negations keep it empty.
+fn is_empty_combinator(selector: &Value) -> bool {
+    let Value::Object(map) = selector else {
+        return false;
+    };
+    let mut entries = map.iter();
+    let (Some((key, arg)), None) = (entries.next(), entries.next()) else {
+        return false;
+    };
+    match key.as_str() {
+        "$and" | "$or" | "$nor" => arg.as_array().is_some_and(Vec::is_empty),
+        "$not" => is_empty_combinator(arg),
+        op if op.starts_with('$') => false,
+        _field => is_empty_combinator(arg),
+    }
+}
+
 /// Check if a document matches a Mango selector.
 ///
 /// An invalid selector matches nothing; use [`CompiledSelector::new`] to
@@ -469,7 +517,11 @@ impl CompiledSelector {
     pub fn new(selector: &serde_json::Value) -> Result<Self> {
         let root = match selector {
             Value::Object(map) => compile_object(map, &[], false, false)?,
-            other => return Err(bad_request(format!("selector must be an object: {other}"))),
+            other => {
+                return Err(bad_request(format!(
+                    "Selector must be a JSON object, not: {other}"
+                )));
+            }
         };
         Ok(CompiledSelector { root })
     }
@@ -548,7 +600,11 @@ impl Cond {
             Cond::Nin(args) => !in_matches(args, value),
             Cond::Exists(should_exist) => *should_exist,
             Cond::Type(name) => json_type_name(value) == name,
-            Cond::Regex(re) => value.as_str().is_some_and(|s| re.is_match(s)),
+            // A pattern that exceeds the backtracking limit does not match,
+            // as in CouchDB (which catches `re:run` errors).
+            Cond::Regex(re) => value
+                .as_str()
+                .is_some_and(|s| re.is_match(s).unwrap_or(false)),
             Cond::BeginsWith(prefix) => value.as_str().is_some_and(|s| s.starts_with(prefix)),
             Cond::Size(n) => value.as_array().is_some_and(|a| a.len() as u64 == *n),
             Cond::Mod(divisor, remainder) => {
@@ -561,10 +617,13 @@ impl Cond {
             }
             Cond::All(args) => match value {
                 Value::Array(items) => {
-                    // {"$all": [[1, 2]]} also matches the array [1, 2] itself.
-                    let is_args = args.len() == 1 && args[0].is_array() && eq(&args[0], value);
-                    let has_args =
-                        !args.is_empty() && args.iter().all(|a| items.iter().any(|i| eq(i, a)));
+                    // Like CouchDB, membership is exact term equality
+                    // (`lists:member`): 50.0 is not an element of [50].
+                    let has_args = !args.is_empty() && args.iter().all(|a| items.contains(a));
+                    // {"$all": [[1, 2]]} also matches the array [1, 2]
+                    // itself, compared with Erlang's `==` (50.0 == 50).
+                    let is_args =
+                        matches!(args.as_slice(), [arg @ Value::Array(_)] if value_eq(arg, value));
                     has_args || is_args
                 }
                 _ => false,
@@ -580,6 +639,28 @@ impl Cond {
                 .is_some_and(|o| o.keys().any(|k| node.matches(&Value::String(k.clone())))),
             Cond::Not(cond) => !cond.matches(value),
         }
+    }
+}
+
+/// Erlang's `==` on JSON terms: numbers are equal when their values are
+/// (`50 == 50.0`), everything else must be identical.
+fn value_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => match (x.as_i64(), y.as_i64()) {
+            (Some(x), Some(y)) => x == y,
+            _ if x.is_u64() && y.is_u64() => x.as_u64() == y.as_u64(),
+            _ => x.as_f64() == y.as_f64(),
+        },
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| value_eq(x, y))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y)
+                    .all(|((kx, vx), (ky, vy))| kx == ky && value_eq(vx, vy))
+        }
+        _ => a == b,
     }
 }
 
@@ -620,7 +701,7 @@ fn bad_request(reason: String) -> RouchError {
 }
 
 fn bad_arg(op: &str, arg: &Value) -> RouchError {
-    bad_request(format!("bad argument for operator {op}: {arg}"))
+    bad_request(format!("Bad argument for operator {op}: {arg}"))
 }
 
 /// Compile the conditions of a selector object that apply at `path`.
@@ -671,6 +752,12 @@ fn compile_entry(
     match key {
         "$and" | "$or" | "$nor" => {
             let args = value.as_array().ok_or_else(|| bad_arg(key, value))?;
+            // CouchDB treats an empty combinator as always true, whatever it
+            // is and however it is negated (see `find` for the one exception:
+            // a query that is nothing but an empty combinator).
+            if args.is_empty() {
+                return Ok(Node::always());
+            }
             // $nor is the conjunction of the negated arguments.
             let arg_negate = if key == "$nor" { !negate } else { negate };
             let children = args
@@ -684,7 +771,10 @@ fn compile_entry(
                 Node::Or(children)
             })
         }
-        "$not" => compile_argument(value, path, !negate, nested),
+        "$not" => match value {
+            Value::Object(map) => compile_object(map, path, !negate, nested),
+            _ => Err(bad_arg(key, value)),
+        },
         op if op.starts_with('$') => leaf(path, compile_operator(op, value)?, negate, nested),
         field => {
             let mut sub_path = path.to_vec();
@@ -721,7 +811,7 @@ fn compile_value(value: &Value, path: &[String], negate: bool, nested: bool) -> 
 fn leaf(path: &[String], cond: Cond, negate: bool, nested: bool) -> Result<Node> {
     if path.is_empty() && !nested {
         return Err(bad_request(
-            "one or more conditions is missing a field name".into(),
+            "One or more conditions is missing a field name.".into(),
         ));
     }
     let cond = if negate { cond.negate() } else { cond };
@@ -766,8 +856,9 @@ fn compile_operator(op: &str, arg: &Value) -> Result<Cond> {
         "$beginsWith" => Cond::BeginsWith(string_arg()?),
         "$regex" => {
             let pattern = string_arg()?;
-            let re = Regex::new(&pattern)
-                .map_err(|e| bad_request(format!("invalid $regex {pattern:?}: {e}")))?;
+            // fancy-regex, like CouchDB's PCRE, supports lookaround and
+            // backreferences.
+            let re = Regex::new(&pattern).map_err(|_| bad_arg(op, arg))?;
             Cond::Regex(re)
         }
         "$size" => Cond::Size(arg.as_u64().ok_or_else(|| bad_arg(op, arg))?),
@@ -781,7 +872,7 @@ fn compile_operator(op: &str, arg: &Value) -> Result<Cond> {
         "$elemMatch" => Cond::ElemMatch(Box::new(compile_nested(op, arg)?)),
         "$allMatch" => Cond::AllMatch(Box::new(compile_nested(op, arg)?)),
         "$keyMapMatch" => Cond::KeyMapMatch(Box::new(compile_nested(op, arg)?)),
-        _ => return Err(bad_request(format!("invalid operator: {op}"))),
+        _ => return Err(bad_request(format!("Invalid operator: {op}"))),
     })
 }
 
@@ -809,7 +900,7 @@ fn split_field(field: &str) -> Vec<String> {
 fn parse_field(field: &str) -> Result<Vec<String>> {
     let parts = split_field(field);
     if parts.iter().any(String::is_empty) {
-        return Err(bad_request(format!("invalid field name: {field}")));
+        return Err(bad_request(format!("Invalid field name: {field}")));
     }
     Ok(parts)
 }
@@ -1450,7 +1541,6 @@ mod tests {
         // F102: invalid regexes (and other malformed selectors) are errors,
         // not silent non-matches.
         for sel in [
-            serde_json::json!({"s": {"$regex": "(?=a)"}}),
             serde_json::json!({"s": {"$regex": "[a"}}),
             serde_json::json!({"s": {"$foo": 1}}),
             serde_json::json!({"s": {"$in": 1}}),
@@ -1465,6 +1555,249 @@ mod tests {
             );
             assert!(!matches_selector(&serde_json::json!({"s": "a"}), &sel));
         }
+    }
+
+    /// Ids returned by `find_in_docs`, in order.
+    fn find_ids(docs: &[Value], opts: FindOptions) -> Vec<String> {
+        find_in_docs(docs.to_vec(), &opts)
+            .unwrap()
+            .docs
+            .iter()
+            .map(|d| d["_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn select(docs: &[Value], selector: Value) -> Vec<String> {
+        find_ids(
+            docs,
+            FindOptions {
+                selector,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn empty_combinators_are_true_but_a_bare_one_finds_nothing() {
+        // CouchDB 3.5.1: an empty $and / $or / $nor is always true
+        // (`mango_selector:match`), but a _find whose selector normalizes to
+        // nothing else returns no documents (`mango_cursor:maybe_noop_range`).
+        use serde_json::json;
+        let docs = [json!({"_id": "a", "f": 1}), json!({"_id": "mi", "g": 1})];
+        for sel in [
+            json!({"$and": []}),
+            json!({"$nor": []}),
+            json!({"$or": []}),
+            json!({"f": {"$and": []}}),
+            json!({"f": {"$or": []}}),
+            json!({"f": {"$nor": []}}),
+            json!({"f": {"g": {"$and": []}}}),
+            json!({"$not": {"$or": []}}),
+            json!({"$not": {"$and": []}}),
+            json!({"$not": {"$nor": []}}),
+            json!({"f": {"$not": {"$and": []}}}),
+        ] {
+            assert!(select(&docs, sel.clone()).is_empty(), "{sel}");
+        }
+        for (sel, expected) in [
+            (json!({"f": {"$exists": true}, "$or": []}), vec!["a"]),
+            (json!({"f": {"$exists": true}, "$and": []}), vec!["a"]),
+            (json!({"f": {"$and": [], "$gt": 0}}), vec!["a"]),
+            (json!({"$and": [{"f": 1}, {"$nor": []}]}), vec!["a"]),
+            (json!({"$or": [{"$and": []}, {"f": 1}]}), vec!["a", "mi"]),
+            (json!({"$and": [{"$and": []}]}), vec!["a", "mi"]),
+            // Operators are not field names: the combinator stays nested.
+            (json!({"f": {"$not": {"$exists": false}}}), vec!["a"]),
+        ] {
+            assert_eq!(select(&docs, sel.clone()), expected, "{sel}");
+        }
+        // An operator's argument is not a selector of its own.
+        let arrays = [json!({"_id": "x", "f": [1]}), json!({"_id": "y", "f": []})];
+        assert_eq!(
+            select(&arrays, json!({"f": {"$elemMatch": {"$and": []}}})),
+            ["x"]
+        );
+        assert_eq!(
+            select(&arrays, json!({"f": {"$allMatch": {"$or": []}}})),
+            ["x"]
+        );
+        // Matching alone (the `_changes` selector filter) has no exception.
+        for sel in [json!({"$and": []}), json!({"$or": []}), json!({"$nor": []})] {
+            assert!(matches_selector(&docs[1], &sel), "{sel}");
+        }
+    }
+
+    #[test]
+    fn all_uses_exact_membership() {
+        // CouchDB 3.5.1: `$all` checks membership with `lists:member` (exact
+        // terms, 50.0 =/= 50) and the whole-array form with `==` (50.0 == 50).
+        use serde_json::json;
+        let docs = [
+            json!({"_id": "a1", "sc": [50, 60]}),
+            json!({"_id": "a2", "sc": [50]}),
+            json!({"_id": "a3", "sc": 50}),
+            json!({"_id": "a4", "sc": [50.0]}),
+            json!({"_id": "a5", "sc": [50.0, 60]}),
+        ];
+        for (sel, expected) in [
+            (json!({"sc": {"$all": [50.0]}}), vec!["a4", "a5"]),
+            (json!({"sc": {"$all": [50]}}), vec!["a1", "a2"]),
+            (json!({"sc": {"$all": [50, 60]}}), vec!["a1"]),
+            (json!({"sc": {"$all": [[50]]}}), vec!["a2", "a4"]),
+            (json!({"sc": {"$all": [[50.0]]}}), vec!["a2", "a4"]),
+            (json!({"sc": {"$all": [[50.0, 60]]}}), vec!["a1", "a5"]),
+            (json!({"sc": {"$all": []}}), vec![]),
+        ] {
+            assert_eq!(select(&docs, sel.clone()), expected, "{sel}");
+        }
+        assert!(value_eq(&json!({"a": [1]}), &json!({"a": [1.0]})));
+        assert!(!value_eq(&json!({"a": 1}), &json!({"b": 1})));
+        assert!(!value_eq(&json!([1, 2]), &json!([1])));
+        assert!(!value_eq(&json!(1), &json!("1")));
+        assert!(value_eq(&json!(u64::MAX), &json!(u64::MAX)));
+        // Integers compare exactly, beyond f64 precision.
+        assert!(!value_eq(&json!(i64::MIN), &json!(i64::MIN + 1)));
+        assert!(value_eq(&json!(i64::MIN), &json!(i64::MIN)));
+        assert!(!value_eq(&json!(u64::MAX), &json!(u64::MAX - 1)));
+    }
+
+    #[test]
+    fn not_needs_an_object_argument() {
+        // CouchDB 3.5.1: 400 bad_arg "Bad argument for operator $not: 5".
+        use serde_json::json;
+        for (sel, arg) in [
+            (json!({"f": {"$not": 5}}), "5"),
+            (json!({"$not": 5}), "5"),
+            (json!({"f": {"$not": [5]}}), "[5]"),
+            (json!({"f": {"$not": null}}), "null"),
+            (json!({"f": {"$elemMatch": {"$not": 5}}}), "5"),
+        ] {
+            let Err(RouchError::BadRequest(reason)) = CompiledSelector::new(&sel) else {
+                panic!("{sel} must be rejected");
+            };
+            assert_eq!(reason, format!("Bad argument for operator $not: {arg}"));
+        }
+    }
+
+    #[test]
+    fn sorted_find_skips_documents_without_the_sort_fields() {
+        // CouchDB 3.5.1 serves a sort from an index on the sort fields, which
+        // holds no document missing one of them.
+        use serde_json::json;
+        let docs = [
+            json!({"_id": "a1", "f": 1, "g": {"h": 1}}),
+            json!({"_id": "a3", "f": null}),
+            json!({"_id": "mi", "g": 1}),
+        ];
+        let sorted = |selector: Value, sort: Value| {
+            find_ids(
+                &docs,
+                FindOptions {
+                    selector,
+                    sort: Some(serde_json::from_value(sort).unwrap()),
+                    ..Default::default()
+                },
+            )
+        };
+        let all = json!({"_id": {"$gt": null}});
+        assert_eq!(sorted(all.clone(), json!(["f"])), ["a3", "a1"]);
+        assert_eq!(sorted(all.clone(), json!([{"f": "desc"}])), ["a1", "a3"]);
+        assert_eq!(sorted(all.clone(), json!(["g.h"])), ["a1"]);
+        assert_eq!(sorted(all.clone(), json!(["f", "g"])), ["a1"]);
+        assert_eq!(sorted(all.clone(), json!(["_id"])), ["a1", "a3", "mi"]);
+        assert!(sorted(json!({"f": {"$exists": false}}), json!(["f"])).is_empty());
+        // Without a sort nothing is skipped.
+        assert_eq!(select(&docs, all), ["a1", "a3", "mi"]);
+    }
+
+    #[test]
+    fn regex_supports_lookaround_and_backreferences_like_pcre() {
+        // CouchDB 3.5.1 (PCRE) accepts these; `(?=a)` matches "ab".
+        use serde_json::json;
+        let d = json!({"s": "ab", "t": "aa"});
+        for (sel, expected) in [
+            (json!({"s": {"$regex": "(?=a)"}}), true),
+            (json!({"s": {"$regex": "^a(?!c)"}}), true),
+            (json!({"s": {"$regex": "^a(?!b)"}}), false),
+            (json!({"s": {"$regex": "(?<=a)b"}}), true),
+            (json!({"s": {"$regex": "(a)\\1"}}), false),
+            (json!({"t": {"$regex": "(a)\\1"}}), true),
+            (json!({"s": {"$regex": "(?>a|ab)c|ab"}}), true),
+        ] {
+            assert!(CompiledSelector::new(&sel).is_ok(), "{sel}");
+            assert_eq!(matches_selector(&d, &sel), expected, "{sel}");
+        }
+        // Still rejected when the pattern is malformed.
+        let Err(RouchError::BadRequest(reason)) =
+            CompiledSelector::new(&json!({"s": {"$regex": "[a"}}))
+        else {
+            panic!("invalid regex must be rejected");
+        };
+        assert_eq!(reason, r#"Bad argument for operator $regex: "[a""#);
+        // A pattern that exhausts the backtracking limit matches nothing
+        // instead of failing the query (CouchDB catches `re:run` errors).
+        let evil = json!({"s": {"$regex": "^(a+)+\\1$"}});
+        let long = json!({"s": format!("{}b", "a".repeat(64))});
+        assert!(!matches_selector(&long, &evil));
+    }
+
+    #[test]
+    fn error_reasons_are_couchdb_texts() {
+        // The server maps these CouchDB reasons back to CouchDB's error
+        // names (invalid_operator, invalid_selector, ...).
+        use serde_json::json;
+        for (sel, reason) in [
+            (json!({"a": {"$foo": 1}}), "Invalid operator: $foo"),
+            (json!({"a": {"$in": 1}}), "Bad argument for operator $in: 1"),
+            (
+                json!({"$gt": 1}),
+                "One or more conditions is missing a field name.",
+            ),
+            (json!({"a..b": 1}), "Invalid field name: a..b"),
+            (json!(5), "Selector must be a JSON object, not: 5"),
+        ] {
+            match CompiledSelector::new(&sel) {
+                Err(RouchError::BadRequest(r)) => assert_eq!(r, reason, "{sel}"),
+                other => panic!("{sel}: {other:?}"),
+            }
+        }
+        let err = serde_json::from_value::<SortField>(json!({"a": "up"})).unwrap_err();
+        assert_eq!(err.to_string(), r#"Invalid sort field: {"a":"up"}"#);
+        let err = serde_json::from_value::<SortField>(json!(5)).unwrap_err();
+        assert_eq!(err.to_string(), "Invalid sort field: 5");
+    }
+
+    #[test]
+    fn key_map_match_tests_object_keys() {
+        use serde_json::json;
+        let d = json!({"m": {"b": 1, "c": 2}, "a": [1]});
+        assert!(matches_selector(
+            &d,
+            &json!({"m": {"$keyMapMatch": {"$eq": "c"}}})
+        ));
+        assert!(!matches_selector(
+            &d,
+            &json!({"m": {"$keyMapMatch": {"$eq": "z"}}})
+        ));
+        assert!(!matches_selector(
+            &d,
+            &json!({"a": {"$keyMapMatch": {"$eq": "0"}}})
+        ));
+    }
+
+    #[test]
+    fn known_divergence_object_key_order_is_not_significant() {
+        // KNOWN DIVERGENCE (deferred): CouchDB 3.5.1 compares objects in
+        // document key order, so {"b":1,"a":2} only equals {"b":1,"a":2}:
+        // `{"m": {"$eq": {"a": 2, "b": 1}}}` does not match that document
+        // (and view keys collate the same way). serde_json without the
+        // `preserve_order` feature sorts object keys, so RouchDB cannot see
+        // the order; enabling it would change every serde_json map in the
+        // dependency graph and the revision hashes. This test pins today's
+        // behavior so a change to it is deliberate.
+        let d: Value = serde_json::from_str(r#"{"m": {"b": 1, "a": 2}}"#).unwrap();
+        let sel: Value = serde_json::from_str(r#"{"m": {"$eq": {"a": 2, "b": 1}}}"#).unwrap();
+        assert!(matches_selector(&d, &sel));
     }
 
     #[test]

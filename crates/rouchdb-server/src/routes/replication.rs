@@ -11,15 +11,6 @@ use rouchdb_core::error::RouchError;
 use crate::error::AppError;
 use crate::state::AppState;
 
-fn validate_db(db: &str, state: &AppState) -> Result<(), AppError> {
-    if db != state.db_name {
-        return Err(AppError(RouchError::NotFound(format!(
-            "Database does not exist: {db}"
-        ))));
-    }
-    Ok(())
-}
-
 fn bad_request(reason: &str) -> AppError {
     AppError(RouchError::BadRequest(reason.to_string()))
 }
@@ -71,7 +62,7 @@ pub async fn revs_diff(
     Path(db): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     let revs = parse_rev_map(body)?;
     let diff = state.db.adapter().revs_diff(revs).await?;
     Ok(Json(serde_json::to_value(&diff).unwrap()))
@@ -92,7 +83,7 @@ pub async fn bulk_get(
     Query(query): Query<BulkGetQuery>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     let requested = body
         .get("docs")
         .and_then(|d| d.as_array())
@@ -155,7 +146,7 @@ pub async fn purge(
     Path(db): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     let req = parse_rev_map(body)?;
     let ids: Vec<String> = req.keys().cloned().collect();
     let mut response = state.db.adapter().purge(req).await?;

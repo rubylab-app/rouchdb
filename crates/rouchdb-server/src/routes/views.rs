@@ -25,15 +25,6 @@ pub struct ViewQuery {
     pub update: Option<String>,
 }
 
-fn validate_db(db: &str, state: &AppState) -> Result<(), AppError> {
-    if db != state.db_name {
-        return Err(AppError(rouchdb_core::error::RouchError::NotFound(
-            format!("Database does not exist: {db}"),
-        )));
-    }
-    Ok(())
-}
-
 /// GET /{db}/_design/{ddoc}/_view/{view} — query a view.
 ///
 /// RouchDB views use Rust closures, not JavaScript. Design document views
@@ -43,7 +34,7 @@ pub async fn get_view(
     Path((db, ddoc, view)): Path<(String, String, String)>,
     Query(_query): Query<ViewQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     let design = state.db.get_design(&ddoc).await?;
     if !design.views.contains_key(&view) {
@@ -64,7 +55,7 @@ pub async fn post_view(
     Path((db, ddoc, view)): Path<(String, String, String)>,
     Json(_body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     let design = state.db.get_design(&ddoc).await?;
     if !design.views.contains_key(&view) {
@@ -84,7 +75,7 @@ pub async fn get_design_info(
     State(state): State<AppState>,
     Path((db, ddoc)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
 
     // Verify the design doc exists
     let design = state.db.get_design(&ddoc).await?;

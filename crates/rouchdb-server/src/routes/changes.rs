@@ -61,15 +61,6 @@ struct ChangesRequest {
     heartbeat: Option<Duration>,
 }
 
-fn validate_db(db: &str, state: &AppState) -> Result<(), AppError> {
-    if db != state.db_name {
-        return Err(AppError(rouchdb_core::error::RouchError::NotFound(
-            format!("Database does not exist: {db}"),
-        )));
-    }
-    Ok(())
-}
-
 fn bad_request(reason: &str) -> AppError {
     AppError(RouchError::BadRequest(reason.to_string()))
 }
@@ -268,12 +259,45 @@ async fn fetch(
     Ok(response)
 }
 
-fn normal_body(results: &[ChangeEvent], last_seq: &Seq) -> serde_json::Value {
+fn normal_body(results: &[ChangeEvent], last_seq: &Seq, pending: u64) -> serde_json::Value {
     serde_json::json!({
         "results": results,
         "last_seq": last_seq,
-        "pending": 0,
+        "pending": pending,
     })
+}
+
+/// CouchDB's `pending`: how many changes remain after the ones returned when
+/// `limit` cut the feed short (counted without filters, in the direction of
+/// the feed); 0 when the feed was not limited.
+async fn pending(state: &AppState, opts: &ChangesOptions, batch: &ChangesResponse) -> u64 {
+    let Some(limit) = opts.limit else {
+        return 0;
+    };
+    if (batch.results.len() as u64) < limit {
+        return 0;
+    }
+    let last = batch
+        .results
+        .last()
+        .map_or(&batch.last_seq, |change| &change.seq);
+    let remaining = ChangesOptions {
+        since: if opts.descending {
+            Seq::zero()
+        } else {
+            last.clone()
+        },
+        ..Default::default()
+    };
+    match state.db.changes(remaining).await {
+        Ok(rest) if opts.descending => rest
+            .results
+            .iter()
+            .filter(|change| change.seq.as_num() < last.as_num())
+            .count() as u64,
+        Ok(rest) => rest.results.len() as u64,
+        Err(_) => 0,
+    }
 }
 
 async fn changes_response(state: AppState, req: ChangesRequest) -> Result<Response, AppError> {
@@ -284,7 +308,8 @@ async fn changes_response(state: AppState, req: ChangesRequest) -> Result<Respon
 
     let longpoll_ready = req.feed == Feed::Longpoll && !first.results.is_empty();
     if req.feed == Feed::Normal || longpoll_ready {
-        return Ok(Json(normal_body(&first.results, &first.last_seq)).into_response());
+        let pending = pending(&state, &req.opts, &first).await;
+        return Ok(Json(normal_body(&first.results, &first.last_seq, pending)).into_response());
     }
 
     let content_type = if req.feed == Feed::EventSource {
@@ -341,7 +366,10 @@ async fn run_feed(
         req.opts.since = batch.last_seq.clone();
         if feed == Feed::Longpoll {
             if !batch.results.is_empty() {
-                let body = normal_body(&batch.results, &batch.last_seq);
+                let mut opts = req.opts.clone();
+                opts.limit = remaining;
+                let pending = pending(&state, &opts, &batch).await;
+                let body = normal_body(&batch.results, &batch.last_seq, pending);
                 let _ = tx.send(Bytes::from(body.to_string())).await;
                 return;
             }
@@ -394,7 +422,7 @@ async fn run_feed(
                 }
                 _ = expire => {
                     if feed == Feed::Longpoll {
-                        let body = normal_body(&[], &req.opts.since);
+                        let body = normal_body(&[], &req.opts.since, 0);
                         let _ = tx.send(Bytes::from(body.to_string())).await;
                         return;
                     }
@@ -405,6 +433,15 @@ async fn run_feed(
         }
 
         writes.borrow_and_update();
+        // A deleted database ends the feed.
+        if !state.db_exists() {
+            if feed == Feed::Longpoll {
+                let body = normal_body(&[], &req.opts.since, 0);
+                let _ = tx.send(Bytes::from(body.to_string())).await;
+                return;
+            }
+            break;
+        }
         let mut opts = req.opts.clone();
         opts.limit = remaining;
         batch = match fetch(&state, &opts, req.design_only).await {
@@ -441,7 +478,7 @@ pub async fn get_changes(
     Path(db): Path<String>,
     Query(query): Query<ChangesQuery>,
 ) -> Result<Response, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     let req = parse_request(&state, query, None).await?;
     changes_response(state, req).await
 }
@@ -453,7 +490,7 @@ pub async fn post_changes(
     Query(query): Query<ChangesQuery>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, AppError> {
-    validate_db(&db, &state)?;
+    state.check_db(&db)?;
     let req = parse_request(&state, query, Some(&body)).await?;
     changes_response(state, req).await
 }

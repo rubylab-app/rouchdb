@@ -6,7 +6,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
-use crate::auth::{AuthOutcome, SESSION_COOKIE, unauthorized};
+use crate::auth::{AuthOutcome, unauthorized};
 use crate::state::AppState;
 
 const CLEAR_COOKIE: &str = "AuthSession=; Version=1; Path=/; HttpOnly; SameSite=Strict; Max-Age=0";
@@ -86,8 +86,7 @@ pub async fn post_session(
     match (field("name"), field("password")) {
         (Some(name), Some(password)) if auth.check_password(name, password) => {
             let token = auth.create_session();
-            let cookie =
-                format!("{SESSION_COOKIE}={token}; Version=1; Path=/; HttpOnly; SameSite=Strict");
+            let cookie = auth.session_cookie(&token);
             (
                 StatusCode::OK,
                 [(header::SET_COOKIE, cookie)],

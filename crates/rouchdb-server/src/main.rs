@@ -57,6 +57,16 @@ struct Cli {
     /// batches, attachments)
     #[arg(long, value_name = "BYTES", default_value_t = rouchdb_server::DEFAULT_MAX_REQUEST_SIZE)]
     max_request_size: usize,
+
+    /// Seconds a `_session` cookie stays valid without being used (CouchDB's
+    /// `[chttpd_auth] timeout`); also the cookie's `Max-Age`
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = rouchdb_server::DEFAULT_SESSION_TIMEOUT.as_secs(),
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    session_timeout: u64,
 }
 
 fn infer_db_name(path: &str) -> String {
@@ -88,6 +98,7 @@ async fn main() {
         cors_origins: cli.cors_origins,
         admin: cli.admin,
         max_request_size: cli.max_request_size,
+        session_timeout: std::time::Duration::from_secs(cli.session_timeout),
     };
 
     if let Err(e) = rouchdb_server::start_server(Arc::new(db), config).await {
