@@ -57,66 +57,75 @@ pub fn merge_and_stem(
 /// incoming path (in which case the incoming path becomes the new root and
 /// keeps its older ancestors). When `dont_expand` is set (used while
 /// re-merging stemmed paths), only roots starting at the same revision merge.
+///
+/// Unlike pouchdb-merge, the path first absorbs every root that starts
+/// inside it and only then merges into the roots holding its own root, so a
+/// path that bridges two roots joins them instead of leaving a copy of its
+/// revisions under both (which made the tree depend on the merge order and
+/// listed a leaf, even the winner, twice among the conflicts). Roots are
+/// kept sorted by position, then hash, like CouchDB.
 fn do_merge(tree: &RevTree, new_path: &RevPath, dont_expand: bool) -> (RevTree, MergeResult) {
     if tree.is_empty() {
         return (vec![new_path.clone()], MergeResult::NewLeaf);
     }
 
-    let mut restree: RevTree = Vec::with_capacity(tree.len() + 1);
     let mut conflicts: Option<MergeResult> = None;
     let mut merged = false;
-    // The incoming path absorbs existing roots that start below its root, so
-    // later roots are compared against the grown path.
     let mut path = new_path.clone();
 
+    // Roots that start below the path's root and lie on it are grafted into
+    // the path, which keeps their older ancestors.
+    let mut restree: RevTree = Vec::with_capacity(tree.len() + 1);
     for branch in tree {
-        if branch.pos == path.pos && branch.tree.hash == path.tree.hash {
-            // Same root: merge the two trees node by node.
-            let mut branch = branch.clone();
-            let res = merge_nodes(&mut branch.tree, &path.tree);
-            conflicts = conflicts.or(res);
-            restree.push(branch);
-            merged = true;
-        } else if !dont_expand && branch.pos < path.pos {
-            // The incoming path starts deeper: find its root inside the branch.
-            let mut branch = branch.clone();
-            if let Some(target) =
-                find_at_depth_mut(&mut branch.tree, path.pos - branch.pos, &path.tree.hash)
-            {
-                let res = merge_nodes(target, &path.tree);
+        if !dont_expand && branch.pos > path.pos {
+            let diff = branch.pos - path.pos;
+            if let Some(target) = find_at_depth_mut(&mut path.tree, diff, &branch.tree.hash) {
+                // Classify from the incoming side: what does the path add
+                // below the branch root?
+                let mut probe = branch.tree.clone();
+                let res = merge_nodes(&mut probe, target);
+                merge_nodes(target, &branch.tree);
                 conflicts = conflicts.or(res);
                 merged = true;
+                continue;
             }
-            restree.push(branch);
-        } else if !dont_expand && branch.pos > path.pos {
-            // The existing branch starts deeper: graft it into the incoming
-            // path, which becomes the root and keeps its older ancestors.
-            let diff = branch.pos - path.pos;
-            match find_at_depth_mut(&mut path.tree, diff, &branch.tree.hash) {
-                Some(target) => {
-                    // Classify from the incoming side: what does the path add
-                    // below the branch root?
-                    let mut probe = branch.tree.clone();
-                    let res = merge_nodes(&mut probe, target);
-                    merge_nodes(target, &branch.tree);
-                    conflicts = conflicts.or(res);
-                    restree.push(path.clone());
-                    merged = true;
-                }
-                None => restree.push(branch.clone()),
-            }
+        }
+        restree.push(branch.clone());
+    }
+
+    // The grown path then merges into every root holding its root revision,
+    // or becomes a root of its own.
+    let mut placed = false;
+    for branch in restree.iter_mut() {
+        let target = if branch.pos == path.pos && branch.tree.hash == path.tree.hash {
+            // Same root: merge the two trees node by node.
+            Some(&mut branch.tree)
+        } else if !dont_expand && branch.pos < path.pos {
+            // The path starts deeper: find its root inside the branch.
+            find_at_depth_mut(&mut branch.tree, path.pos - branch.pos, &path.tree.hash)
         } else {
-            restree.push(branch.clone());
+            None
+        };
+        if let Some(target) = target {
+            let res = merge_nodes(target, &path.tree);
+            conflicts = conflicts.or(res);
+            placed = true;
         }
     }
 
-    if !merged {
-        // No overlap with any root: a disjoint new root, i.e. a new branch.
+    if !placed {
         restree.push(path);
-        conflicts = Some(MergeResult::NewBranch);
+        if !merged {
+            // No overlap with any root: a disjoint new root, i.e. a new branch.
+            conflicts = Some(MergeResult::NewBranch);
+        }
     }
 
-    restree.sort_by_key(|p| p.pos);
+    restree.sort_by(|a, b| {
+        a.pos
+            .cmp(&b.pos)
+            .then_with(|| a.tree.hash.cmp(&b.tree.hash))
+    });
 
     (restree, conflicts.unwrap_or(MergeResult::InternalNode))
 }
@@ -946,6 +955,44 @@ mod tests {
         assert_eq!(result, MergeResult::NewLeaf);
         assert_eq!(dump(&merged), "1-a[2-b[3-c[4-d]]]");
         assert!(collect_conflicts(&merged).is_empty());
+    }
+
+    #[test]
+    fn merge_bridging_two_roots_joins_them() {
+        // Regression found by the rev tree property tests. The tree has
+        // [1-a -> 2-b -> 3-c] and a stray [3-d -> 4-e] (4-e replicated with a
+        // short _revisions). 4-f then arrives with [f, d, b]: it starts inside
+        // the first root and reaches into the second. It used to be merged
+        // into the first root AND grafted onto the second, keeping 3-d and
+        // 4-f in both roots: 4-f was the winner and its own conflict, and the
+        // tree depended on the merge order.
+        let first = RevPath {
+            pos: 1,
+            tree: node("a", vec![node("b", vec![leaf("c")])]),
+        };
+        let tree = vec![first.clone(), path(4, &["e", "d"])];
+        let (merged, result) = merge_tree(&tree, &path(4, &["f", "d", "b"]), 1000);
+        assert_eq!(result, MergeResult::NewBranch);
+        assert_eq!(dump(&merged), "1-a[2-b[3-c,3-d(m)[4-e,4-f]]]");
+        assert_eq!(winning_rev(&merged).unwrap().to_string(), "4-f");
+        assert_eq!(revs(&collect_conflicts(&merged)), ["4-e", "3-c"]);
+
+        // Merging the same paths in the other order builds the same tree.
+        let (other, _) = merge_tree(&vec![first], &path(4, &["f", "d", "b"]), 1000);
+        let (other, _) = merge_tree(&other, &path(4, &["e", "d"]), 1000);
+        assert_eq!(dump(&other), dump(&merged));
+    }
+
+    #[test]
+    fn roots_are_sorted_by_position_then_hash() {
+        // Disjoint roots at the same generation come out in the same order
+        // whatever order they were merged in (CouchDB sorts them too).
+        let x = path(2, &["x"]);
+        let y = path(2, &["y"]);
+        let (xy, _) = merge_tree(&merge_tree(&Vec::new(), &x, 1000).0, &y, 1000);
+        let (yx, _) = merge_tree(&merge_tree(&Vec::new(), &y, 1000).0, &x, 1000);
+        assert_eq!(dump(&xy), "2-x | 2-y");
+        assert_eq!(dump(&yx), dump(&xy));
     }
 
     #[test]
