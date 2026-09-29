@@ -7,8 +7,16 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Parser, Subcommand};
 use rouchdb::{
     AllDocsOptions, BulkDocsOptions, ChangesOptions, Database, Document, FindOptions, GetOptions,
-    ReplicationOptions,
+    RedbAdapter, ReplicationOptions, RouchError, StoredFormat, UpgradePolicy,
 };
+
+/// Printed after an upgrade (and a dry run).
+const COMPACT_WARNING: &str = "\
+WARNING: rouchdb 0.4 never compacted. The first `compact` after this upgrade
+permanently deletes the bodies of old (non-leaf) revisions and attachment bytes
+that only old revisions reference (counted above). Keep the backup until you
+have checked that you do not need them. After the upgrade rouchdb 0.4 can no
+longer open this file; the backup still opens in 0.4.";
 
 #[derive(Parser)]
 #[command(name = "rouchdb", about = "Inspect and query RouchDB redb databases")]
@@ -162,6 +170,29 @@ enum Commands {
         target_name: Option<String>,
     },
 
+    /// Upgrade a database file written by rouchdb 0.4 or earlier
+    ///
+    /// Writes a verified backup of the file first (by default
+    /// `<path>.rouchdb-0.4.bak`, which rouchdb 0.4 can still open), then
+    /// converts the file in one atomic transaction and prints what it found.
+    /// Afterwards rouchdb 0.4 refuses to open the file. The first `compact`
+    /// after the upgrade deletes the bodies of old revisions and attachment
+    /// bytes only they reference: read the report before compacting.
+    Migrate {
+        /// Path to the .redb file
+        path: String,
+        /// Write the backup here instead of `<path>.rouchdb-0.4.bak` (must
+        /// not exist)
+        #[arg(long, value_name = "PATH", conflicts_with = "no_backup")]
+        backup: Option<std::path::PathBuf>,
+        /// Upgrade in place without writing a backup
+        #[arg(long)]
+        no_backup: bool,
+        /// Only report what the upgrade would do; change nothing
+        #[arg(long, conflicts_with_all = ["backup", "no_backup"])]
+        dry_run: bool,
+    },
+
     /// Compact the database
     Compact {
         /// Path to the .redb file
@@ -248,6 +279,13 @@ fn open_db(path: &str, name: Option<&str>) -> Database {
         Ok(db) => db,
         Err(e) => {
             eprintln!("Error opening database: {}", e);
+            if matches!(e, RouchError::UpgradeRequired { .. }) {
+                eprintln!(
+                    "hint: upgrade it once with `rouchdb migrate {}` (a verified backup is \
+                     written to {}.rouchdb-0.4.bak first; `--dry-run` only reports)",
+                    path, path
+                );
+            }
             process::exit(1);
         }
     }
@@ -720,6 +758,26 @@ async fn run(cli: Cli) -> rouchdb::Result<()> {
                     "replication incomplete: {} error(s), see \"errors\" in the output",
                     errors.len()
                 )));
+            }
+        }
+
+        Commands::Migrate {
+            path,
+            backup,
+            no_backup,
+            dry_run,
+        } => {
+            let report = if dry_run {
+                RedbAdapter::inspect_upgrade(&path)?
+            } else if no_backup {
+                RedbAdapter::upgrade(&path, UpgradePolicy::InPlaceNoBackup)?
+            } else {
+                RedbAdapter::upgrade(&path, UpgradePolicy::WithBackup(backup))?
+            };
+            println!("{}", report);
+            if report.from != StoredFormat::Current {
+                println!();
+                println!("{}", COMPACT_WARNING);
             }
         }
 
