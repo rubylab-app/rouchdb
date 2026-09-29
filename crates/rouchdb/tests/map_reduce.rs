@@ -2,11 +2,11 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{Database, ReduceFn, ViewQueryOptions, query_view};
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn view_basic_map() {
     let url = fresh_remote_db("view_map").await;
     let remote = Database::http(&url);
@@ -49,12 +49,10 @@ async fn view_basic_map() {
     assert_eq!(results.rows[0].key, "Alice");
     assert_eq!(results.rows[0].value, 30);
     assert_eq!(results.rows[1].key, "Bob");
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn view_reduce_sum_and_count() {
     let url = fresh_remote_db("view_reduce").await;
     let remote = Database::http(&url);
@@ -128,12 +126,10 @@ async fn view_reduce_sum_and_count() {
     assert_eq!(eng.value, 220.0);
     let sales = results.rows.iter().find(|r| r.key == "sales").unwrap();
     assert_eq!(sales.value, 90.0);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn view_key_range() {
     let url = fresh_remote_db("view_range").await;
     let remote = Database::http(&url);
@@ -166,6 +162,4 @@ async fn view_key_range() {
     .unwrap();
 
     assert_eq!(results.rows.len(), 5); // 3, 4, 5, 6, 7
-
-    delete_remote_db(&url).await;
 }

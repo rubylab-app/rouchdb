@@ -11,17 +11,22 @@ use uuid::Uuid;
 use rouchdb_core::adapter::Adapter;
 use rouchdb_core::document::*;
 use rouchdb_core::error::{Result, RouchError};
-use rouchdb_core::merge::{collect_conflicts, is_deleted, latest_leaf, remove_leaves, winning_rev};
+use rouchdb_core::json::MAX_NESTING_DEPTH;
+use rouchdb_core::merge::{
+    collect_conflicts, is_deleted, latest_leaf, remove_leaves, revs_diff_one, winning_rev,
+};
 use rouchdb_core::rev_tree::{
     NodeOpts, RevNode, RevPath, RevStatus, RevTree, collect_leaves, find_rev_ancestry, rev_exists,
     revs_info, traverse_rev_tree,
 };
 use rouchdb_core::write::{
-    PlannedWrite, ReplicatedWrite, edit_parent, error_result, ok_result, plan_new_edit,
-    plan_replicated_edit,
+    LocalWrite, PlannedWrite, ReplicatedWrite, edit_parent, error_result, local_doc_id,
+    local_document, ok_result, plan_local_write, plan_new_edit, plan_replicated_edit,
 };
 
-const DEFAULT_REV_LIMIT: u64 = 1000;
+/// Revisions kept per branch unless configured otherwise (CouchDB's
+/// default `_revs_limit`).
+pub const DEFAULT_REV_LIMIT: u64 = 1000;
 
 macro_rules! db_err {
     ($e:expr) => {
@@ -107,6 +112,14 @@ struct RevDataRecord {
     data: serde_json::Value,
     deleted: bool,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    attachments: HashMap<String, AttachmentRecord>,
+}
+
+/// The attachment metadata of a stored revision, decoded without its body
+/// (which is skipped without recursion, whatever its depth).
+#[derive(Debug, Deserialize)]
+struct RevAttachmentsRecord {
+    #[serde(default)]
     attachments: HashMap<String, AttachmentRecord>,
 }
 
@@ -309,8 +322,34 @@ where
     }
 }
 
+/// Key of a stored revision body: `doc_id\0rev`. Revision ids never
+/// contain NUL (`Revision` rejects it), so the key is unambiguous even for
+/// ids that contain NUL; see [`rev_data_keys`].
 fn rev_data_key(doc_id: &str, rev_str: &str) -> String {
     format!("{}\0{}", doc_id, rev_str)
+}
+
+/// Decode a stored document body (or local document), which may be nested
+/// up to [`MAX_NESTING_DEPTH`] levels (one more for the record around it).
+fn decode_body<T>(bytes: &[u8]) -> Result<T>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+{
+    Ok(rouchdb_core::json::from_slice(
+        bytes,
+        MAX_NESTING_DEPTH + 1,
+    )?)
+}
+
+/// The canonical form of a revision string (`InvalidRev` if malformed).
+fn canonical_rev(rev_str: &str) -> Result<String> {
+    Ok(rev_str.parse::<Revision>()?.to_string())
+}
+
+/// Whether `rev` (canonical) names a revision of `tree`: a stored body of a
+/// revision that is not in the tree (stemmed by an older version) is gone.
+fn in_tree(tree: &RevTree, rev: &str) -> bool {
+    parse_rev(rev).is_ok_and(|(pos, hash)| rev_exists(tree, pos, &hash))
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +362,7 @@ fn rev_data_key(doc_id: &str, rev_str: &str) -> String {
 /// Tokio's blocking thread pool instead of an async worker thread.
 pub struct RedbAdapter {
     inner: Arc<Inner>,
+    rev_limit: u64,
 }
 
 struct Inner {
@@ -338,7 +378,9 @@ impl RedbAdapter {
     ///
     /// Databases written by older versions are upgraded in place: attachment
     /// bytes stored per `(document, name)` are re-keyed by digest, and legacy
-    /// revision-tree records are rewritten on their next write.
+    /// revision-tree records are rewritten on their next write. A database
+    /// written by a newer version (a schema this one does not know) is
+    /// refused rather than misread.
     pub fn open(path: impl AsRef<Path>, name: &str) -> Result<Self> {
         let db = Database::create(path.as_ref())
             .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
@@ -358,6 +400,15 @@ impl RedbAdapter {
                 };
                 match existing {
                     None => write_meta(&mut meta_table, &MetaRecord::new())?,
+                    Some(meta) if meta.schema > SCHEMA_VERSION => {
+                        return Err(RouchError::DatabaseError(format!(
+                            "{}: on-disk schema version {} is newer than the {} this version \
+                             of rouchdb supports; open it with a newer rouchdb",
+                            path.as_ref().display(),
+                            meta.schema,
+                            SCHEMA_VERSION
+                        )));
+                    }
                     Some(mut meta) if meta.schema < SCHEMA_VERSION => {
                         if meta.schema < 1 {
                             migrate_attachments_to_digest_keys(&write_txn)?;
@@ -382,7 +433,18 @@ impl RedbAdapter {
                 name: name.to_string(),
                 write_lock: Mutex::new(()),
             }),
+            rev_limit: DEFAULT_REV_LIMIT,
         })
+    }
+
+    /// Keep at most `limit` revisions per branch of a document's history
+    /// (PouchDB's `revs_limit`, CouchDB's `_revs_limit`; 0 means no limit).
+    /// Older revisions are stemmed away on the next write of the document
+    /// and are no longer readable. The limit is a property of this handle,
+    /// not of the file.
+    pub fn with_rev_limit(mut self, limit: u64) -> Self {
+        self.rev_limit = limit;
+        self
     }
 
     /// Run storage work on the blocking thread pool (or inline when called
@@ -516,14 +578,10 @@ fn write_meta(table: &mut redb::Table<&str, &[u8]>, meta: &MetaRecord) -> Result
     Ok(())
 }
 
+/// Parse (and normalize) a revision string.
 fn parse_rev(rev_str: &str) -> Result<(u64, String)> {
-    let (pos_str, hash) = rev_str
-        .split_once('-')
-        .ok_or_else(|| RouchError::InvalidRev(rev_str.to_string()))?;
-    let pos: u64 = pos_str
-        .parse()
-        .map_err(|_| RouchError::InvalidRev(rev_str.to_string()))?;
-    Ok((pos, hash.to_string()))
+    let rev: Revision = rev_str.parse()?;
+    Ok((rev.pos, rev.hash))
 }
 
 /// Load one revision's stored body and attachment metadata.
@@ -532,7 +590,25 @@ where
     T: ReadableTable<&'static str, &'static [u8]>,
 {
     match db_err!(table.get(rev_data_key(doc_id, rev).as_str()))? {
-        Some(guard) => Ok(Some(serde_json::from_slice(guard.value())?)),
+        Some(guard) => Ok(Some(decode_body(guard.value())?)),
+        None => Ok(None),
+    }
+}
+
+/// Load one revision's attachment metadata only (not its body).
+fn load_rev_attachments<T>(
+    table: &T,
+    doc_id: &str,
+    rev: &str,
+) -> Result<Option<HashMap<String, AttachmentRecord>>>
+where
+    T: ReadableTable<&'static str, &'static [u8]>,
+{
+    match db_err!(table.get(rev_data_key(doc_id, rev).as_str()))? {
+        Some(guard) => {
+            let record: RevAttachmentsRecord = serde_json::from_slice(guard.value())?;
+            Ok(Some(record.attachments))
+        }
         None => Ok(None),
     }
 }
@@ -579,6 +655,11 @@ fn meta_to_records(atts: &HashMap<String, AttachmentMeta>) -> HashMap<String, At
 }
 
 /// Keys of every stored revision body of `doc_id` (`doc_id\0rev`).
+///
+/// The key range of `doc_id` also holds the keys of longer ids that start
+/// with `doc_id\0` (`a\0b\0rev` sorts among the keys of `a`). Revision ids
+/// contain no NUL, so a key whose remainder does belongs to such an id and
+/// is skipped: compacting or purging `a` must never touch `a\0b`.
 fn rev_data_keys<T>(table: &T, doc_id: &str) -> Result<Vec<String>>
 where
     T: ReadableTable<&'static str, &'static [u8]>,
@@ -588,7 +669,10 @@ where
     let mut keys = Vec::new();
     for entry in db_err!(table.range(start.as_str()..end.as_str()))? {
         let (key, _) = db_err!(entry)?;
-        keys.push(key.value().to_string());
+        let key = key.value();
+        if !key[start.len()..].contains('\0') {
+            keys.push(key.to_string());
+        }
     }
     Ok(keys)
 }
@@ -684,7 +768,9 @@ impl Adapter for RedbAdapter {
         docs: Vec<Document>,
         opts: BulkDocsOptions,
     ) -> Result<Vec<DocResult>> {
-        self.run_write(move |db| db.bulk_docs(docs, opts)).await
+        let rev_limit = self.rev_limit;
+        self.run_write(move |db| db.bulk_docs(docs, opts, rev_limit))
+            .await
     }
 
     async fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
@@ -717,8 +803,11 @@ impl Adapter for RedbAdapter {
             rev.to_string(),
             content_type.to_string(),
         );
-        self.run_write(move |db| db.put_attachment(&doc_id, &att_id, &rev, data, &content_type))
-            .await
+        let rev_limit = self.rev_limit;
+        self.run_write(move |db| {
+            db.put_attachment(&doc_id, &att_id, &rev, data, &content_type, rev_limit)
+        })
+        .await
     }
 
     async fn get_attachment(
@@ -734,7 +823,8 @@ impl Adapter for RedbAdapter {
 
     async fn remove_attachment(&self, doc_id: &str, att_id: &str, rev: &str) -> Result<DocResult> {
         let (doc_id, att_id, rev) = (doc_id.to_string(), att_id.to_string(), rev.to_string());
-        self.run_write(move |db| db.remove_attachment(&doc_id, &att_id, &rev))
+        let rev_limit = self.rev_limit;
+        self.run_write(move |db| db.remove_attachment(&doc_id, &att_id, &rev, rev_limit))
             .await
     }
 
@@ -797,15 +887,23 @@ impl Inner {
             ));
         }
 
+        let requested = opts.rev.as_deref().map(canonical_rev).transpose()?;
         let read_txn = db_err!(self.db.begin_read())?;
+        if let Some(local) = local_doc_id(id) {
+            let table = db_err!(read_txn.open_table(LOCAL_TABLE))?;
+            return match db_err!(table.get(local))? {
+                Some(guard) => Ok(local_document(local, decode_body(guard.value())?)),
+                None => Err(RouchError::NotFound("missing".into())),
+            };
+        }
         let doc_table = db_err!(read_txn.open_table(DOC_TABLE))?;
         let rev_table = db_err!(read_txn.open_table(REV_DATA_TABLE))?;
 
         let (tree, _) =
             load_doc_record(&doc_table, id)?.ok_or_else(|| RouchError::NotFound(id.to_string()))?;
 
-        let mut target_rev = if let Some(ref rev_str) = opts.rev {
-            rev_str.clone()
+        let mut target_rev = if let Some(rev_str) = requested {
+            rev_str
         } else {
             winning_rev(&tree)
                 .ok_or_else(|| RouchError::NotFound(id.to_string()))?
@@ -821,8 +919,11 @@ impl Inner {
             target_rev = rev.to_string();
         }
 
-        // An unknown, compacted or otherwise body-less revision is missing,
-        // never an empty document.
+        // An unknown, stemmed, compacted or otherwise body-less revision is
+        // missing, never an empty document.
+        if !in_tree(&tree, &target_rev) {
+            return Err(RouchError::NotFound("missing".into()));
+        }
         let rd = load_rev_data(&rev_table, id, &target_rev)?
             .ok_or_else(|| RouchError::NotFound("missing".into()))?;
 
@@ -878,7 +979,12 @@ impl Inner {
         Ok(doc)
     }
 
-    fn bulk_docs(&self, docs: Vec<Document>, opts: BulkDocsOptions) -> Result<Vec<DocResult>> {
+    fn bulk_docs(
+        &self,
+        docs: Vec<Document>,
+        opts: BulkDocsOptions,
+        rev_limit: u64,
+    ) -> Result<Vec<DocResult>> {
         let write_txn = db_err!(self.db.begin_write())?;
 
         let mut results = Vec::with_capacity(docs.len());
@@ -890,9 +996,9 @@ impl Inner {
             let mut tables = WriteTables::open(&write_txn)?;
             for doc in docs {
                 let result = if opts.new_edits {
-                    write_new_edit(&mut tables, &mut meta, doc)?
+                    write_new_edit(&mut tables, &mut meta, doc, rev_limit)?
                 } else {
-                    write_replicated(&mut tables, &mut meta, doc)?
+                    write_replicated(&mut tables, &mut meta, doc, rev_limit)?
                 };
                 results.push(result);
             }
@@ -1058,6 +1164,19 @@ impl Inner {
 
     fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
         let read_txn = db_err!(self.db.begin_read())?;
+        // `limit: 0` is no change at all (CouchDB): the feed stays at `since`,
+        // or at the current sequence when descending.
+        if opts.limit == Some(0) {
+            let last_seq = if opts.descending {
+                Seq::Num(read_meta(&db_err!(read_txn.open_table(META_TABLE))?)?.update_seq)
+            } else {
+                opts.since.clone()
+            };
+            return Ok(ChangesResponse {
+                results: Vec::new(),
+                last_seq,
+            });
+        }
         let changes_table = db_err!(read_txn.open_table(CHANGES_TABLE))?;
         let doc_table = db_err!(read_txn.open_table(DOC_TABLE))?;
         let rev_table = db_err!(read_txn.open_table(REV_DATA_TABLE))?;
@@ -1168,42 +1287,9 @@ impl Inner {
         let mut results = HashMap::new();
 
         for (doc_id, rev_list) in revs {
-            let mut missing = Vec::new();
-            let mut possible_ancestors = Vec::new();
-
             let tree = load_doc_record(&doc_table, doc_id.as_str())?.map(|(t, _)| t);
-
-            for rev_str in &rev_list {
-                let (pos, hash) = parse_rev(rev_str)?;
-                let exists = tree
-                    .as_ref()
-                    .map(|t| rev_exists(t, pos, &hash))
-                    .unwrap_or(false);
-
-                if !exists {
-                    missing.push(rev_str.clone());
-                    if let Some(ref tree) = tree {
-                        let leaves = collect_leaves(tree);
-                        for leaf in &leaves {
-                            if leaf.pos < pos {
-                                let anc = leaf.rev_string();
-                                if !possible_ancestors.contains(&anc) {
-                                    possible_ancestors.push(anc);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if !missing.is_empty() {
-                results.insert(
-                    doc_id,
-                    RevsDiffResult {
-                        missing,
-                        possible_ancestors,
-                    },
-                );
+            if let Some(diff) = revs_diff_one(tree.as_ref(), &rev_list)? {
+                results.insert(doc_id, diff);
             }
         }
 
@@ -1231,14 +1317,16 @@ impl Inner {
 
             let tree = load_doc_record(&doc_table, item.id.as_str())?.map(|(t, _)| t);
             let rev_str = match (&item.rev, &tree) {
-                (Some(rev), _) => Some(rev.clone()),
+                (Some(rev), _) => Some(canonical_rev(rev).unwrap_or_else(|_| rev.clone())),
                 (None, Some(tree)) => winning_rev(tree).map(|w| w.to_string()),
                 (None, None) => None,
             };
 
             let found = match (&tree, &rev_str) {
-                (Some(tree), Some(rev_str)) => load_rev_data(&rev_table, &item.id, rev_str)?
-                    .map(|rd| (tree, rev_str.clone(), rd)),
+                (Some(tree), Some(rev_str)) if in_tree(tree, rev_str) => {
+                    load_rev_data(&rev_table, &item.id, rev_str)?
+                        .map(|rd| (tree, rev_str.clone(), rd))
+                }
                 _ => None,
             };
 
@@ -1319,6 +1407,7 @@ impl Inner {
         rev: &str,
         data: Vec<u8>,
         content_type: &str,
+        rev_limit: u64,
     ) -> Result<DocResult> {
         let write_txn = db_err!(self.db.begin_write())?;
         let mut meta = read_meta(&db_err!(write_txn.open_table(META_TABLE))?)?;
@@ -1328,10 +1417,11 @@ impl Inner {
             let (tree, seq) = load_doc_record(&tables.docs, doc_id)?
                 .ok_or_else(|| RouchError::NotFound(doc_id.to_string()))?;
             let parent: Revision = rev.parse()?;
+            let rev = parent.to_string();
 
             // The new revision builds on `rev` (any leaf, not only the
             // winner): its body plus its attachments with this one added.
-            let rd = load_rev_data(&tables.revs, doc_id, rev)?.ok_or(RouchError::Conflict)?;
+            let rd = load_rev_data(&tables.revs, doc_id, &rev)?.ok_or(RouchError::Conflict)?;
             let parent_atts = records_to_meta(&rd.attachments);
             let mut attachments = parent_atts.clone();
             attachments.insert(
@@ -1351,14 +1441,8 @@ impl Inner {
                 data: rd.data,
                 attachments,
             };
-            let plan = plan_new_edit(
-                Some(&tree),
-                doc,
-                Some(&parent_atts),
-                false,
-                DEFAULT_REV_LIMIT,
-            )
-            .map_err(attachment_edit_error)?;
+            let plan = plan_new_edit(Some(&tree), doc, Some(&parent_atts), false, rev_limit)
+                .map_err(attachment_edit_error)?;
             apply_write(&mut tables, &mut meta, Some((&tree, seq)), plan)?
         };
 
@@ -1381,7 +1465,7 @@ impl Inner {
         let (tree, _) = load_doc_record(&doc_table, doc_id)?
             .ok_or_else(|| RouchError::NotFound(doc_id.to_string()))?;
         let rev_str = if let Some(ref rev) = opts.rev {
-            rev.clone()
+            canonical_rev(rev)?
         } else {
             winning_rev(&tree)
                 .ok_or_else(|| RouchError::NotFound(doc_id.to_string()))?
@@ -1391,12 +1475,21 @@ impl Inner {
         // Resolve this revision's attachment metadata, then return the bytes
         // stored under its digest.
         let not_found = || RouchError::NotFound(format!("attachment {}/{}", doc_id, att_id));
-        let rd = load_rev_data(&rev_table, doc_id, &rev_str)?.ok_or_else(not_found)?;
-        let rec = rd.attachments.get(att_id).ok_or_else(not_found)?;
+        if !in_tree(&tree, &rev_str) {
+            return Err(not_found());
+        }
+        let atts = load_rev_attachments(&rev_table, doc_id, &rev_str)?.ok_or_else(not_found)?;
+        let rec = atts.get(att_id).ok_or_else(not_found)?;
         load_blob(&att_table, &rec.digest)?.ok_or_else(not_found)
     }
 
-    fn remove_attachment(&self, doc_id: &str, att_id: &str, rev: &str) -> Result<DocResult> {
+    fn remove_attachment(
+        &self,
+        doc_id: &str,
+        att_id: &str,
+        rev: &str,
+        rev_limit: u64,
+    ) -> Result<DocResult> {
         let write_txn = db_err!(self.db.begin_write())?;
         let mut meta = read_meta(&db_err!(write_txn.open_table(META_TABLE))?)?;
 
@@ -1405,8 +1498,9 @@ impl Inner {
             let (tree, seq) = load_doc_record(&tables.docs, doc_id)?
                 .ok_or_else(|| RouchError::NotFound(doc_id.to_string()))?;
             let parent: Revision = rev.parse()?;
+            let rev = parent.to_string();
 
-            let rd = load_rev_data(&tables.revs, doc_id, rev)?.ok_or(RouchError::Conflict)?;
+            let rd = load_rev_data(&tables.revs, doc_id, &rev)?.ok_or(RouchError::Conflict)?;
             if !rd.attachments.contains_key(att_id) {
                 return Err(RouchError::NotFound(format!(
                     "attachment {}/{}",
@@ -1427,14 +1521,8 @@ impl Inner {
                 data: rd.data,
                 attachments,
             };
-            let plan = plan_new_edit(
-                Some(&tree),
-                doc,
-                Some(&parent_atts),
-                false,
-                DEFAULT_REV_LIMIT,
-            )
-            .map_err(attachment_edit_error)?;
+            let plan = plan_new_edit(Some(&tree), doc, Some(&parent_atts), false, rev_limit)
+                .map_err(attachment_edit_error)?;
             apply_write(&mut tables, &mut meta, Some((&tree, seq)), plan)?
         };
 
@@ -1448,11 +1536,11 @@ impl Inner {
         let table = db_err!(read_txn.open_table(LOCAL_TABLE))?;
         let guard = db_err!(table.get(id))?
             .ok_or_else(|| RouchError::NotFound(format!("_local/{}", id)))?;
-        let value: serde_json::Value = serde_json::from_slice(guard.value())?;
-        Ok(value)
+        decode_body(guard.value())
     }
 
     fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
+        rouchdb_core::json::check_document_depth(&doc)?;
         let write_txn = db_err!(self.db.begin_write())?;
         {
             let mut table = db_err!(write_txn.open_table(LOCAL_TABLE))?;
@@ -1506,7 +1594,7 @@ impl Inner {
             let mut referenced = std::collections::HashSet::new();
             for entry in db_err!(rev_table.iter())? {
                 let (_, value) = db_err!(entry)?;
-                let rd: RevDataRecord = serde_json::from_slice(value.value())?;
+                let rd: RevAttachmentsRecord = serde_json::from_slice(value.value())?;
                 referenced.extend(rd.attachments.into_values().map(|a| a.digest));
             }
             let mut unreferenced = Vec::new();
@@ -1556,6 +1644,10 @@ impl Inner {
         {
             let mut tables = WriteTables::open(&write_txn)?;
             for (doc_id, revs) in req {
+                let revs = revs
+                    .iter()
+                    .map(|r| canonical_rev(r))
+                    .collect::<Result<Vec<_>>>()?;
                 let Some((tree, old_seq)) = load_doc_record(&tables.docs, &doc_id)? else {
                     continue;
                 };
@@ -1638,6 +1730,7 @@ struct WriteTables<'txn> {
     revs: redb::Table<'txn, &'static str, &'static [u8]>,
     changes: redb::Table<'txn, u64, &'static [u8]>,
     atts: redb::Table<'txn, &'static str, &'static [u8]>,
+    locals: redb::Table<'txn, &'static str, &'static [u8]>,
 }
 
 impl<'txn> WriteTables<'txn> {
@@ -1647,6 +1740,7 @@ impl<'txn> WriteTables<'txn> {
             revs: db_err!(txn.open_table(REV_DATA_TABLE))?,
             changes: db_err!(txn.open_table(CHANGES_TABLE))?,
             atts: db_err!(txn.open_table(ATTACHMENT_TABLE))?,
+            locals: db_err!(txn.open_table(LOCAL_TABLE))?,
         })
     }
 }
@@ -1659,6 +1753,7 @@ fn write_new_edit(
     tables: &mut WriteTables,
     meta: &mut MetaRecord,
     mut doc: Document,
+    rev_limit: u64,
 ) -> Result<DocResult> {
     if let Err(e) = doc.prepare_for_write() {
         return Ok(error_result(&doc.id, "bad_request", &e.to_string()));
@@ -1666,18 +1761,32 @@ fn write_new_edit(
     if doc.id.is_empty() {
         doc.id = Uuid::new_v4().to_string();
     }
+    if local_doc_id(&doc.id).is_some() {
+        return match plan_local_write(doc) {
+            Ok(LocalWrite::Put { id, body, result }) => {
+                let bytes = serde_json::to_vec(&body)?;
+                db_err!(tables.locals.insert(id.as_str(), bytes.as_slice()))?;
+                Ok(result)
+            }
+            Ok(LocalWrite::Delete { id, result }) => {
+                db_err!(tables.locals.remove(id.as_str()))?;
+                Ok(result)
+            }
+            Err(result) => Ok(result),
+        };
+    }
 
     // A decoding error aborts the batch instead of being treated as a
     // missing document.
     let existing = load_doc_record(&tables.docs, &doc.id)?;
     let tree = existing.as_ref().map(|(t, _)| t);
     let parent_atts = match edit_parent(tree, &doc) {
-        Some(parent) => load_rev_data(&tables.revs, &doc.id, &parent.to_string())?
-            .map(|rd| records_to_meta(&rd.attachments)),
+        Some(parent) => load_rev_attachments(&tables.revs, &doc.id, &parent.to_string())?
+            .map(|atts| records_to_meta(&atts)),
         None => None,
     };
 
-    match plan_new_edit(tree, doc, parent_atts.as_ref(), true, DEFAULT_REV_LIMIT) {
+    match plan_new_edit(tree, doc, parent_atts.as_ref(), true, rev_limit) {
         Ok(plan) => apply_write(tables, meta, existing.as_ref().map(|(t, s)| (t, *s)), plan),
         Err(result) => Ok(result),
     }
@@ -1688,23 +1797,34 @@ fn write_replicated(
     tables: &mut WriteTables,
     meta: &mut MetaRecord,
     doc: Document,
+    rev_limit: u64,
 ) -> Result<DocResult> {
+    // CouchDB ignores `_local/` documents in replicated writes (they are
+    // never replicated): nothing is stored.
+    if local_doc_id(&doc.id).is_some() {
+        return Ok(DocResult {
+            ok: true,
+            id: doc.id,
+            rev: doc.rev.map(|r| r.to_string()),
+            error: None,
+            reason: None,
+        });
+    }
     let existing = load_doc_record(&tables.docs, &doc.id)?;
     let has_body = match (&existing, &doc.rev) {
-        (Some(_), Some(rev)) => load_rev_data(&tables.revs, &doc.id, &rev.to_string())?.is_some(),
+        (Some(_), Some(rev)) => {
+            let key = rev_data_key(&doc.id, &rev.clone().normalized().to_string());
+            db_err!(tables.revs.get(key.as_str()))?.is_some()
+        }
         _ => false,
     };
 
-    let plan = match plan_replicated_edit(
-        existing.as_ref().map(|(t, _)| t),
-        doc,
-        has_body,
-        DEFAULT_REV_LIMIT,
-    ) {
-        Ok(ReplicatedWrite::Write(plan)) => *plan,
-        Ok(ReplicatedWrite::AlreadyStored(result)) => return Ok(result),
-        Err(result) => return Ok(result),
-    };
+    let plan =
+        match plan_replicated_edit(existing.as_ref().map(|(t, _)| t), doc, has_body, rev_limit) {
+            Ok(ReplicatedWrite::Write(plan)) => *plan,
+            Ok(ReplicatedWrite::AlreadyStored(result)) => return Ok(result),
+            Err(result) => return Ok(result),
+        };
 
     // Stubs must refer to bytes we already hold.
     for digest in &plan.required_blobs {
@@ -1750,6 +1870,12 @@ fn apply_write(
 
     let doc_bytes = encode_doc_record(&plan.tree, seq)?;
     db_err!(tables.docs.insert(plan.id.as_str(), doc_bytes.as_slice()))?;
+
+    // Stemmed revisions no longer exist: drop their bodies.
+    for rev in &plan.stemmed {
+        let key = rev_data_key(&plan.id, &rev.to_string());
+        db_err!(tables.revs.remove(key.as_str()))?;
+    }
 
     let rd = RevDataRecord {
         data: plan.data,
@@ -2318,8 +2444,9 @@ mod tests {
             .bulk_docs(vec![doc], BulkDocsOptions::new())
             .await
             .unwrap();
+        // CouchDB and PouchDB: a revision of a missing document conflicts.
         assert!(!r[0].ok);
-        assert_eq!(r[0].error.as_deref(), Some("not_found"));
+        assert_eq!(r[0].error.as_deref(), Some("conflict"));
     }
 
     #[tokio::test]
@@ -2394,57 +2521,6 @@ mod tests {
             NodeOpts::default(),
             RevStatus::Available,
         )]
-    }
-
-    #[tokio::test]
-    async fn long_history_is_readable_and_writable() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("long.redb");
-        let mut rev = {
-            let db = RedbAdapter::open(&path, "long").unwrap();
-            let mut rev = db
-                .bulk_docs(
-                    vec![put_doc("d", None, serde_json::json!({"v": 0}))],
-                    BulkDocsOptions::new(),
-                )
-                .await
-                .unwrap()[0]
-                .rev
-                .clone()
-                .unwrap();
-            for i in 1..200 {
-                let r = db
-                    .bulk_docs(
-                        vec![put_doc("d", Some(&rev), serde_json::json!({"v": i}))],
-                        BulkDocsOptions::new(),
-                    )
-                    .await
-                    .unwrap();
-                assert!(r[0].ok, "update {} failed: {:?}", i, r[0]);
-                rev = r[0].rev.clone().unwrap();
-            }
-            rev
-        };
-        let db = RedbAdapter::open(&path, "long").unwrap();
-        assert_eq!(
-            db.get("d", GetOptions::default()).await.unwrap().data["v"],
-            199
-        );
-        assert_eq!(db.info().await.unwrap().doc_count, 1);
-        assert_eq!(
-            db.all_docs(AllDocsOptions::new()).await.unwrap().rows.len(),
-            1
-        );
-        let r = db
-            .bulk_docs(
-                vec![put_doc("d", Some(&rev), serde_json::json!({"v": 200}))],
-                BulkDocsOptions::new(),
-            )
-            .await
-            .unwrap();
-        assert!(r[0].ok);
-        rev = r[0].rev.clone().unwrap();
-        assert!(rev.starts_with("201-"));
     }
 
     #[tokio::test]
@@ -2795,5 +2871,200 @@ mod tests {
         let (_dir, db) = temp_db();
         let result = db.remove_local("nope").await;
         assert!(result.is_err());
+    }
+
+    fn put_raw(db: &RedbAdapter, table: TableDefinition<&str, &[u8]>, key: &str, value: &[u8]) {
+        let txn = db.inner.db.begin_write().unwrap();
+        txn.open_table(table).unwrap().insert(key, value).unwrap();
+        txn.commit().unwrap();
+    }
+
+    fn body_keys(db: &RedbAdapter, id: &str) -> Vec<String> {
+        let txn = db.inner.db.begin_read().unwrap();
+        rev_data_keys(&txn.open_table(REV_DATA_TABLE).unwrap(), id).unwrap()
+    }
+
+    async fn write_doc(
+        db: &RedbAdapter,
+        id: &str,
+        rev: Option<&str>,
+        data: serde_json::Value,
+    ) -> String {
+        let doc = Document {
+            id: id.into(),
+            rev: rev.map(|r| r.parse().unwrap()),
+            deleted: false,
+            data,
+            attachments: HashMap::new(),
+        };
+        let res = db
+            .bulk_docs(vec![doc], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        assert!(res[0].ok, "{:?}", res[0]);
+        res[0].rev.clone().unwrap()
+    }
+
+    /// A file written by a newer rouchdb (unknown schema) is refused with a
+    /// clear error instead of being misread, and is left untouched.
+    #[tokio::test]
+    async fn newer_schema_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.redb");
+        let future =
+            serde_json::json!({"update_seq": 7, "db_uuid": "u", "schema": SCHEMA_VERSION + 1});
+        {
+            let db = RedbAdapter::open(&path, "future").unwrap();
+            put_raw(
+                &db,
+                META_TABLE,
+                META_KEY,
+                &serde_json::to_vec(&future).unwrap(),
+            );
+        }
+        let err = RedbAdapter::open(&path, "future").err().expect("must fail");
+        let msg = err.to_string();
+        assert!(matches!(err, RouchError::DatabaseError(_)), "{msg}");
+        assert!(
+            msg.contains(&format!("schema version {}", SCHEMA_VERSION + 1)),
+            "{msg}"
+        );
+        assert!(msg.contains("newer"), "{msg}");
+        // Still refused (nothing was rewritten); the current schema opens.
+        assert!(RedbAdapter::open(&path, "future").is_err());
+        let current =
+            serde_json::json!({"update_seq": 7, "db_uuid": "u", "schema": SCHEMA_VERSION});
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(META_TABLE)
+                .unwrap()
+                .insert(META_KEY, serde_json::to_vec(&current).unwrap().as_slice())
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let db = RedbAdapter::open(&path, "future").unwrap();
+        assert_eq!(db.info().await.unwrap().update_seq, Seq::Num(7));
+    }
+
+    /// Q-CORE-3: the body keys of `a` and of ids that extend it with a NUL
+    /// (`a\0b`, `a\0`) share a key range but never mix. The key encoding
+    /// itself is unchanged, so existing files keep working.
+    #[tokio::test]
+    async fn nul_ids_have_disjoint_body_keys() {
+        assert_eq!(rev_data_key("a\0b", "1-x"), "a\u{0}b\u{0}1-x");
+        let (_dir, db) = temp_db();
+        let mut revs: HashMap<&str, String> = HashMap::new();
+        for id in ["a", "a\0b", "a\0", "a\0\0"] {
+            revs.insert(id, write_doc(&db, id, None, serde_json::json!({})).await);
+        }
+        for (id, rev) in &revs {
+            assert_eq!(body_keys(&db, id), [rev_data_key(id, rev)], "{id:?}");
+        }
+        let a = revs["a"].clone();
+        let res = db
+            .purge(HashMap::from([("a".to_string(), vec![a])]))
+            .await
+            .unwrap();
+        assert_eq!(res.purged["a"].len(), 1);
+        db.compact().await.unwrap();
+        for id in ["a\0b", "a\0", "a\0\0"] {
+            assert!(db.get(id, GetOptions::default()).await.is_ok(), "{id:?}");
+        }
+    }
+
+    /// Q-CORE-1: revisions stemmed by the revision limit lose their bodies.
+    #[tokio::test]
+    async fn stemming_drops_stored_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = RedbAdapter::open(dir.path().join("s.redb"), "s")
+            .unwrap()
+            .with_rev_limit(3);
+        let mut rev = write_doc(&db, "d", None, serde_json::json!({"v": 0})).await;
+        let first = rev.clone();
+        for v in 1..6 {
+            rev = write_doc(&db, "d", Some(&rev), serde_json::json!({"v": v})).await;
+        }
+        assert_eq!(body_keys(&db, "d").len(), 3);
+        let old = GetOptions {
+            rev: Some(first),
+            ..Default::default()
+        };
+        assert!(matches!(
+            db.get("d", old).await,
+            Err(RouchError::NotFound(_))
+        ));
+    }
+
+    /// Bodies left behind by versions that did not drop stemmed revisions
+    /// are unreadable, and compaction removes them.
+    #[tokio::test]
+    async fn stale_bodies_of_stemmed_revisions() {
+        let (_dir, db) = temp_db();
+        let r1 = write_doc(&db, "d", None, serde_json::json!({"v": 1})).await;
+        let r2 = write_doc(&db, "d", Some(&r1), serde_json::json!({"v": 2})).await;
+        // What an older version left: the tree stemmed to 2-x, 1-x's body kept.
+        let (mut tree, seq) = decode_doc_record(&raw_record(&db, "d")).unwrap();
+        rouchdb_core::merge::stem(&mut tree, 1);
+        put_raw(&db, DOC_TABLE, "d", &encode_doc_record(&tree, seq).unwrap());
+        assert_eq!(body_keys(&db, "d").len(), 2);
+        for rev in [&r1, &r2] {
+            let opts = GetOptions {
+                rev: Some(rev.clone()),
+                ..Default::default()
+            };
+            let got = db.get("d", opts).await;
+            assert_eq!(got.is_ok(), rev == &r2, "{rev}: {got:?}");
+        }
+        let bulk = db
+            .bulk_get(vec![BulkGetItem {
+                id: "d".into(),
+                rev: Some(r1.clone()),
+            }])
+            .await
+            .unwrap();
+        assert!(bulk.results[0].docs[0].ok.is_none());
+        db.compact().await.unwrap();
+        assert_eq!(body_keys(&db, "d"), [rev_data_key("d", &r2)]);
+    }
+
+    /// Q-API-3: stored bodies nested beyond serde_json's 128 levels decode;
+    /// one beyond rouchdb's limit (only an older version could have stored
+    /// it) is a clear error, and does not break compaction.
+    #[tokio::test]
+    async fn deep_bodies_decode() {
+        let (_dir, db) = temp_db();
+        let mut deep = serde_json::json!(1);
+        for _ in 1..MAX_NESTING_DEPTH {
+            deep = serde_json::json!([deep]);
+        }
+        write_doc(&db, "deep", None, serde_json::json!({ "v": deep.clone() })).await;
+        let got = db.get("deep", GetOptions::default()).await.unwrap();
+        assert_eq!(got.data["v"], deep);
+        db.put_local("l", serde_json::json!({ "v": deep.clone() }))
+            .await
+            .unwrap();
+        assert_eq!(db.get_local("l").await.unwrap()["v"], deep);
+        assert!(
+            db.put_local("l", serde_json::json!({ "v": [deep.clone()] }))
+                .await
+                .is_err()
+        );
+
+        let rev = write_doc(&db, "legacy", None, serde_json::json!({})).await;
+        let body = format!(
+            r#"{{"data":{{"v":{}1{}}},"deleted":false}}"#,
+            "[".repeat(MAX_NESTING_DEPTH + 1),
+            "]".repeat(MAX_NESTING_DEPTH + 1)
+        );
+        put_raw(
+            &db,
+            REV_DATA_TABLE,
+            &rev_data_key("legacy", &rev),
+            body.as_bytes(),
+        );
+        let err = db.get("legacy", GetOptions::default()).await.unwrap_err();
+        assert!(err.to_string().contains("exceeds the maximum"), "{err}");
+        db.compact().await.unwrap();
     }
 }

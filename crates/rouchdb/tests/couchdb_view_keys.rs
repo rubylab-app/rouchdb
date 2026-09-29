@@ -26,7 +26,7 @@ fn enc(value: &Value) -> String {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn view_keys_and_grouping_rules_match_couchdb() {
     let url = fresh_remote_db("c2_view_keys").await;
     let client = reqwest::Client::new();

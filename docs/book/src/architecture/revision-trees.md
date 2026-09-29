@@ -382,8 +382,12 @@ After:
   (pos adjusted from 1 to 3; "aaa" and "bbb" are returned as stemmed)
 ```
 
-The default `rev_limit` in the redb adapter is 1000, which matches CouchDB's
-default. PouchDB defaults to 1000 as well.
+The default `rev_limit` of the memory and redb adapters is 1000, which
+matches CouchDB's default. PouchDB defaults to 1000 as well; like PouchDB's
+`revs_limit` option it can be changed per handle with
+`MemoryAdapter::with_rev_limit` / `RedbAdapter::with_rev_limit` (0 means no
+limit). As in CouchDB, a stemmed revision no longer exists: its stored body
+is dropped by the write that stems it, and reading it is `not_found`.
 
 ## Revision Hash Generation
 

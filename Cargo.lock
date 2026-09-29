@@ -1653,10 +1653,12 @@ dependencies = [
  "base64",
  "clap",
  "predicates",
+ "reqwest",
  "rouchdb",
  "serde_json",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

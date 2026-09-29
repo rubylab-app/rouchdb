@@ -942,10 +942,13 @@ async fn design_doc_update_requires_rev() {
         language: None,
     };
 
-    let result = db.put_design(ddoc2).await.unwrap();
+    // Updating a design doc without its rev conflicts, reported as an
+    // error like `put` (not `Ok` with `ok: false`).
+    let result = db.put_design(ddoc2).await;
     assert!(
-        !result.ok,
-        "Updating design doc without rev should conflict"
+        matches!(result, Err(RouchError::Conflict)),
+        "Updating design doc without rev should conflict: {:?}",
+        result
     );
 }
 

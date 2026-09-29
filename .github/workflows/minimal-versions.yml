@@ -1,0 +1,55 @@
+name: Minimal versions
+
+# Checks that the lower bounds declared in the Cargo.toml files are true:
+# resolves every direct dependency to the lowest version its requirement
+# allows (`-Z direct-minimal-versions`, nightly cargo only) and builds with
+# the pinned toolchain. Runs when a manifest changes, and weekly because new
+# releases of indirect dependencies (still resolved to their maximum) can
+# break it.
+on:
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - ".github/workflows/minimal-versions.yml"
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - ".github/workflows/minimal-versions.yml"
+  schedule:
+    - cron: "17 4 * * 1" # Mondays 04:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  minimal-versions:
+    name: Direct minimal versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchains
+        run: |
+          rustup toolchain install
+          rustup toolchain install nightly --profile minimal
+
+      # Only the resolver needs nightly.
+      - name: Resolve direct dependencies to their minimal versions
+        run: cargo +nightly update -Z direct-minimal-versions
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check all targets and features
+        run: cargo check --workspace --all-targets --all-features --locked
+
+      - name: Check TLS feature combinations
+        run: |
+          cargo check -p rouchdb --locked --no-default-features
+          cargo check -p rouchdb --locked --no-default-features --features native-tls
+          cargo check -p rouchdb --locked --no-default-features --features rustls-tls-native-roots

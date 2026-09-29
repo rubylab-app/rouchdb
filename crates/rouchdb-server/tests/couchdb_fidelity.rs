@@ -720,7 +720,7 @@ fn outcome(status: u16, body: &Value) -> Value {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn couchdb_differential() {
     let couch_root = std::env::var("COUCHDB_URL")
         .unwrap_or_else(|_| "http://admin:password@localhost:15984".to_string());
