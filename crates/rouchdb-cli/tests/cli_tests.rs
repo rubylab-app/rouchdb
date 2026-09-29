@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use assert_cmd::Command;
 use base64::Engine;
@@ -86,10 +86,14 @@ fn b64(bytes: &[u8]) -> String {
 
 // ─── FAKE COUCHDB ───────────────────────────────────────────────────────────
 
+/// Server uuid the fake CouchDB reports in its welcome message (`GET /`).
+const FAKE_UUID: &str = "0f7ab6e3c1d24c8e9a5b3d2e1f0c9b8a";
+
 /// A request captured by the fake CouchDB server.
 #[derive(Debug, Clone)]
 struct FakeRequest {
     method: String,
+    /// Path and query string, as sent.
     path: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
@@ -103,8 +107,23 @@ impl FakeRequest {
             .map(|(_, v)| v.as_str())
     }
 
-    fn json(&self) -> serde_json::Value {
-        serde_json::from_slice(&self.body).unwrap()
+    /// The path without the query string.
+    fn route(&self) -> &str {
+        self.path.split('?').next().unwrap_or_default()
+    }
+
+    /// The raw value of query parameter `name`.
+    fn query(&self, name: &str) -> Option<&str> {
+        let (_, query) = self.path.split_once('?')?;
+        query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (key == name).then_some(value)
+        })
+    }
+
+    fn json(&self) -> Result<serde_json::Value, String> {
+        serde_json::from_slice(&self.body)
+            .map_err(|e| format!("{} {}: body is not JSON: {}", self.method, self.path, e))
     }
 }
 
@@ -145,87 +164,515 @@ fn read_request(stream: &TcpStream) -> Option<FakeRequest> {
     })
 }
 
-/// Serve a minimal CouchDB stand-in on an ephemeral port, one request per
-/// connection. Returns the base URL and the log of received requests.
-fn spawn_fake_couchdb<F>(handler: F) -> (String, Arc<Mutex<Vec<FakeRequest>>>)
-where
-    F: Fn(&FakeRequest) -> (u16, serde_json::Value) + Send + 'static,
-{
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let log_clone = log.clone();
+/// How the fake CouchDB answers one request.
+enum FakeReply {
+    Json(u16, serde_json::Value),
+    /// Close the connection without answering, like a network failure.
+    HangUp,
+}
+
+/// Behaviour switches of the fake CouchDB.
+#[derive(Debug, Default, Clone, Copy)]
+struct FakeConfig {
+    /// `_bulk_docs` rejects every document the way a `validate_doc_update`
+    /// function does (per-doc `forbidden`, HTTP 201).
+    reject_writes: bool,
+    /// Hang up on `PUT /db/_local/...`, so every checkpoint write fails.
+    hang_up_on_checkpoint: bool,
+}
+
+/// State of the fake CouchDB, which serves one database named `db`.
+#[derive(Default)]
+struct FakeState {
+    /// Every request received, in order.
+    requests: Vec<FakeRequest>,
+    /// Protocol violations and handler failures, answered with a 500. Tests
+    /// assert this stays empty, so a bad request fails the test with a
+    /// message rather than with a panic in the server thread (which the CLI
+    /// would only see as a reset connection).
+    problems: Vec<String>,
+    /// `_local` documents by id (without the `_local/` prefix), with `_rev`.
+    local: BTreeMap<String, serde_json::Value>,
+    /// Stored revisions in write order, each a full document with `_id`,
+    /// `_rev` and `_revisions`. A document's seq is the (1-based) position
+    /// of its last stored revision.
+    revs: Vec<serde_json::Value>,
+}
+
+fn doc_id(doc: &serde_json::Value) -> &str {
+    doc["_id"].as_str().unwrap_or_default()
+}
+
+fn doc_rev(doc: &serde_json::Value) -> &str {
+    doc["_rev"].as_str().unwrap_or_default()
+}
+
+fn is_deleted(doc: &serde_json::Value) -> bool {
+    doc["_deleted"] == true
+}
+
+/// `(pos, hash)` of a `pos-hash` revision.
+fn parse_rev(rev: &str) -> Option<(u64, &str)> {
+    let (pos, hash) = rev.split_once('-')?;
+    Some((pos.parse().ok()?, hash))
+}
+
+/// The revisions `doc` descends from, per its `_revisions`.
+fn ancestor_revs(doc: &serde_json::Value) -> Vec<String> {
+    let start = doc["_revisions"]["start"].as_u64().unwrap_or(0);
+    let ids = doc["_revisions"]["ids"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    ids.iter()
+        .enumerate()
+        .skip(1)
+        .filter_map(|(i, hash)| {
+            Some(format!(
+                "{}-{}",
+                start.checked_sub(i as u64)?,
+                hash.as_str()?
+            ))
+        })
+        .collect()
+}
+
+impl FakeState {
+    fn revs_of(&self, id: &str) -> Vec<&serde_json::Value> {
+        self.revs.iter().filter(|d| doc_id(d) == id).collect()
+    }
+
+    /// Leaf revisions of `id`, winner first: live before deleted, then the
+    /// highest revision (CouchDB's order).
+    fn leaves(&self, id: &str) -> Vec<&serde_json::Value> {
+        let revs = self.revs_of(id);
+        let inner: HashSet<String> = revs.iter().flat_map(|d| ancestor_revs(d)).collect();
+        let mut leaves: Vec<&serde_json::Value> = revs
+            .into_iter()
+            .filter(|d| !inner.contains(doc_rev(d)))
+            .collect();
+        let key = |d: &serde_json::Value| {
+            (
+                !is_deleted(d),
+                parse_rev(doc_rev(d)).map(|(pos, hash)| (pos, hash.to_string())),
+            )
+        };
+        leaves.sort_by_key(|d| std::cmp::Reverse(key(d)));
+        leaves
+    }
+
+    /// `(seq, id)` of every document, in seq order.
+    fn feed(&self) -> Vec<(u64, String)> {
+        let mut last_seq = BTreeMap::new();
+        for (i, doc) in self.revs.iter().enumerate() {
+            last_seq.insert(doc_id(doc).to_string(), i as u64 + 1);
+        }
+        let mut feed: Vec<(u64, String)> =
+            last_seq.into_iter().map(|(id, seq)| (seq, id)).collect();
+        feed.sort();
+        feed
+    }
+}
+
+/// Handle on a running fake CouchDB.
+struct FakeCouch {
+    base: String,
+    state: Arc<Mutex<FakeState>>,
+}
+
+impl FakeCouch {
+    /// URL of the database the fake serves.
+    fn db_url(&self) -> String {
+        format!("{}/db", self.base)
+    }
+
+    /// `db_url` with `userinfo` (`user:password`) in its authority.
+    fn db_url_with_userinfo(&self, userinfo: &str) -> String {
+        self.db_url()
+            .replacen("http://", &format!("http://{}@", userinfo), 1)
+    }
+
+    fn state(&self) -> MutexGuard<'_, FakeState> {
+        lock(&self.state)
+    }
+
+    fn requests(&self) -> Vec<FakeRequest> {
+        self.state().requests.clone()
+    }
+
+    /// Stored revisions ordered by document id then revision, as the
+    /// replicator may write a batch in any order.
+    fn stored_revs(&self) -> Vec<serde_json::Value> {
+        let mut revs = self.state().revs.clone();
+        revs.sort_by(|a, b| (doc_id(a), doc_rev(a)).cmp(&(doc_id(b), doc_rev(b))));
+        revs
+    }
+
+    fn assert_no_problems(&self) {
+        let problems = self.state().problems.clone();
+        assert!(
+            problems.is_empty(),
+            "fake CouchDB rejected requests: {:#?}",
+            problems
+        );
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A revision to seed the fake CouchDB with: `rev` is `pos-hash` and
+/// `ancestors` are the hashes of revisions `pos-1`, `pos-2`, ... (newest
+/// first), as in `_revisions.ids`.
+fn fake_rev(id: &str, rev: &str, ancestors: &[&str], body: serde_json::Value) -> serde_json::Value {
+    let (pos, hash) = parse_rev(rev).expect("rev is pos-hash");
+    let mut ids = vec![hash];
+    ids.extend_from_slice(ancestors);
+    let mut doc = body;
+    let obj = doc.as_object_mut().expect("body is an object");
+    obj.insert("_id".into(), id.into());
+    obj.insert("_rev".into(), rev.into());
+    obj.insert(
+        "_revisions".into(),
+        serde_json::json!({"start": pos, "ids": ids}),
+    );
+    doc
+}
+
+/// Serve a CouchDB stand-in holding the database `db` (seeded with `revs`)
+/// on an ephemeral port, one request per connection.
+fn spawn_fake_couchdb(config: FakeConfig, revs: Vec<serde_json::Value>) -> FakeCouch {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the fake CouchDB");
+    let port = listener.local_addr().expect("fake CouchDB address").port();
+    let state = Arc::new(Mutex::new(FakeState {
+        revs,
+        ..Default::default()
+    }));
+    let shared = state.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let Some(req) = read_request(&stream) else {
                 continue;
             };
-            let (status, body) = handler(&req);
-            log_clone.lock().unwrap().push(req);
-            let body = body.to_string();
-            let _ = write!(
-                stream,
-                "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                status,
-                body.len(),
-                body
-            );
+            let reply = {
+                let mut state = lock(&shared);
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle_fake_request(config, &mut state, &req)
+                }));
+                let reply = match outcome {
+                    Ok(Ok(reply)) => reply,
+                    Ok(Err(problem)) => {
+                        state.problems.push(problem.clone());
+                        FakeReply::Json(
+                            500,
+                            serde_json::json!({"error": "fake", "reason": problem}),
+                        )
+                    }
+                    Err(_) => {
+                        let problem = format!("handler panicked on {} {}", req.method, req.path);
+                        state.problems.push(problem.clone());
+                        FakeReply::Json(
+                            500,
+                            serde_json::json!({"error": "fake", "reason": problem}),
+                        )
+                    }
+                };
+                state.requests.push(req);
+                reply
+            };
+            match reply {
+                FakeReply::Json(status, body) => {
+                    let body = body.to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status,
+                        body.len(),
+                        body
+                    );
+                }
+                FakeReply::HangUp => drop(stream),
+            }
         }
     });
-    (base, log)
+    FakeCouch {
+        base: format!("http://127.0.0.1:{}", port),
+        state,
+    }
 }
 
-/// Handler emulating an empty CouchDB database named `db`. When
-/// `reject_writes` is set, `_bulk_docs` rejects every document the way a
-/// `validate_doc_update` function does (per-doc `forbidden`, HTTP 201).
-fn fake_target(reject_writes: bool) -> impl Fn(&FakeRequest) -> (u16, serde_json::Value) {
-    move |req| {
-        let path = req.path.split('?').next().unwrap_or("");
-        match (req.method.as_str(), path) {
-            ("GET", "/db") => (
+fn not_found() -> FakeReply {
+    FakeReply::Json(
+        404,
+        serde_json::json!({"error": "not_found", "reason": "missing"}),
+    )
+}
+
+fn handle_fake_request(
+    config: FakeConfig,
+    state: &mut FakeState,
+    req: &FakeRequest,
+) -> Result<FakeReply, String> {
+    let method = req.method.as_str();
+    if let Some(id) = req.route().strip_prefix("/db/_local/") {
+        return handle_fake_local(config, state, req, id);
+    }
+    match (method, req.route()) {
+        ("GET", "/") => Ok(FakeReply::Json(
+            200,
+            serde_json::json!({
+                "couchdb": "Welcome",
+                "version": "3.5.1",
+                "git_sha": "44f6a43d8",
+                "uuid": FAKE_UUID,
+                "features": ["access-ready", "partitioned", "pluggable-storage-engines", "reshard", "scheduler"],
+                "vendor": {"name": "The Apache Software Foundation"}
+            }),
+        )),
+        ("GET", "/db") => {
+            let feed = state.feed();
+            let deleted = feed
+                .iter()
+                .filter(|(_, id)| state.leaves(id).first().is_some_and(|d| is_deleted(d)))
+                .count();
+            Ok(FakeReply::Json(
                 200,
                 serde_json::json!({
-                    "db_name": "db", "doc_count": 0, "doc_del_count": 0, "update_seq": "0"
+                    "db_name": "db",
+                    "doc_count": feed.len() - deleted,
+                    "doc_del_count": deleted,
+                    "update_seq": state.revs.len(),
+                    "purge_seq": 0,
+                    "instance_start_time": "0"
                 }),
-            ),
-            ("GET", p) if p.starts_with("/db/_local/") => (
-                404,
-                serde_json::json!({"error": "not_found", "reason": "missing"}),
-            ),
-            ("PUT", p) if p.starts_with("/db/_local/") => (
+            ))
+        }
+        ("POST", "/db/_revs_diff") => fake_revs_diff(state, &req.json()?),
+        ("POST", "/db/_bulk_docs") => fake_bulk_docs(config, state, &req.json()?),
+        ("GET", "/db/_changes") => fake_changes(state, req),
+        ("POST", "/db/_bulk_get") => fake_bulk_get(state, req),
+        _ => Err(format!("unexpected request {} {}", method, req.path)),
+    }
+}
+
+/// `_local` documents, with CouchDB's `0-N` revisions. Stricter than
+/// CouchDB 3.5, which accepts any well-formed `0-N` `_rev` (and a missing
+/// one) on update: here an update must carry the current `_rev` or it is a
+/// conflict, so a replicator that drops or garbles the rev it read is caught.
+fn handle_fake_local(
+    config: FakeConfig,
+    state: &mut FakeState,
+    req: &FakeRequest,
+    id: &str,
+) -> Result<FakeReply, String> {
+    match req.method.as_str() {
+        "GET" => Ok(match state.local.get(id) {
+            Some(doc) => FakeReply::Json(200, doc.clone()),
+            None => not_found(),
+        }),
+        "PUT" if config.hang_up_on_checkpoint => Ok(FakeReply::HangUp),
+        "PUT" => {
+            let mut doc = req.json()?;
+            let current = state.local.get(id).map(|d| doc_rev(d).to_string());
+            let sent = doc["_rev"].as_str().map(String::from);
+            if sent != current {
+                return Ok(FakeReply::Json(
+                    409,
+                    serde_json::json!({"error": "conflict", "reason": "Document update conflict."}),
+                ));
+            }
+            let n: u64 = current
+                .as_deref()
+                .and_then(|rev| rev.strip_prefix("0-")?.parse().ok())
+                .unwrap_or(0);
+            let rev = format!("0-{}", n + 1);
+            let obj = doc
+                .as_object_mut()
+                .ok_or_else(|| format!("PUT _local/{}: body is not an object", id))?;
+            obj.insert("_id".into(), format!("_local/{}", id).into());
+            obj.insert("_rev".into(), rev.clone().into());
+            state.local.insert(id.to_string(), doc);
+            Ok(FakeReply::Json(
                 201,
-                serde_json::json!({"ok": true, "id": "_local/x", "rev": "0-1"}),
-            ),
-            ("POST", "/db/_revs_diff") => {
-                let mut out = serde_json::Map::new();
-                for (id, revs) in req.json().as_object().unwrap() {
-                    out.insert(id.clone(), serde_json::json!({"missing": revs}));
-                }
-                (200, serde_json::Value::Object(out))
-            }
-            ("POST", "/db/_bulk_docs") if reject_writes => {
-                let results: Vec<serde_json::Value> = req.json()["docs"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|d| {
-                        serde_json::json!({
-                            "id": d["_id"], "rev": d["_rev"],
-                            "error": "forbidden", "reason": "rejected by validator"
-                        })
-                    })
-                    .collect();
-                (201, serde_json::Value::Array(results))
-            }
-            // new_edits=false: an empty array means every doc was stored.
-            ("POST", "/db/_bulk_docs") => (201, serde_json::json!([])),
-            _ => (
-                404,
-                serde_json::json!({"error": "not_found", "reason": "missing"}),
-            ),
+                serde_json::json!({"ok": true, "id": format!("_local/{}", id), "rev": rev}),
+            ))
+        }
+        _ => Err(format!("unexpected request {} {}", req.method, req.path)),
+    }
+}
+
+/// `_revs_diff`: the revisions not stored yet, with the stored leaves they
+/// may descend from as `possible_ancestors`.
+fn fake_revs_diff(state: &FakeState, body: &serde_json::Value) -> Result<FakeReply, String> {
+    let request = body
+        .as_object()
+        .ok_or_else(|| format!("_revs_diff body is not an object: {}", body))?;
+    let mut response = serde_json::Map::new();
+    for (id, revs) in request {
+        let revs = revs
+            .as_array()
+            .and_then(|revs| revs.iter().map(|r| r.as_str()).collect::<Option<Vec<_>>>())
+            .ok_or_else(|| format!("_revs_diff: revs of {} are not strings: {}", id, revs))?;
+        let known: HashSet<&str> = state.revs_of(id).into_iter().map(doc_rev).collect();
+        let missing: Vec<&str> = revs.into_iter().filter(|r| !known.contains(r)).collect();
+        let Some(newest) = missing
+            .iter()
+            .filter_map(|r| parse_rev(r))
+            .map(|(pos, _)| pos)
+            .max()
+        else {
+            continue;
+        };
+        let mut entry = serde_json::json!({ "missing": missing });
+        let ancestors: Vec<&str> = state
+            .leaves(id)
+            .into_iter()
+            .map(doc_rev)
+            .filter(|r| parse_rev(r).is_some_and(|(pos, _)| pos < newest))
+            .collect();
+        if !ancestors.is_empty() {
+            entry["possible_ancestors"] = serde_json::json!(ancestors);
+        }
+        response.insert(id.clone(), entry);
+    }
+    Ok(FakeReply::Json(200, serde_json::Value::Object(response)))
+}
+
+/// `_bulk_docs` as a replicator must use it: `new_edits: false`, and every
+/// document with its `_rev` and a `_revisions` history ending in it.
+fn fake_bulk_docs(
+    config: FakeConfig,
+    state: &mut FakeState,
+    body: &serde_json::Value,
+) -> Result<FakeReply, String> {
+    if body["new_edits"] != false {
+        return Err(format!("_bulk_docs without new_edits:false: {}", body));
+    }
+    let docs = body["docs"]
+        .as_array()
+        .ok_or_else(|| format!("_bulk_docs body has no docs: {}", body))?;
+    for doc in docs {
+        let (pos, hash) = parse_rev(doc_rev(doc))
+            .filter(|_| !doc_id(doc).is_empty())
+            .ok_or_else(|| format!("_bulk_docs: doc without _id or _rev: {}", doc))?;
+        let revisions = &doc["_revisions"];
+        if revisions["start"] != pos || revisions["ids"][0] != hash {
+            return Err(format!(
+                "_bulk_docs: _revisions of {} {} do not end in that rev: {}",
+                doc_id(doc),
+                doc_rev(doc),
+                revisions
+            ));
         }
     }
+    if config.reject_writes {
+        let results = docs
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "id": d["_id"], "rev": d["_rev"],
+                    "error": "forbidden", "reason": "rejected by validator"
+                })
+            })
+            .collect();
+        return Ok(FakeReply::Json(201, serde_json::Value::Array(results)));
+    }
+    for doc in docs {
+        let stored = state
+            .revs
+            .iter()
+            .any(|d| doc_id(d) == doc_id(doc) && doc_rev(d) == doc_rev(doc));
+        if !stored {
+            state.revs.push(doc.clone());
+        }
+    }
+    // With new_edits:false CouchDB lists only the failures: [] means every
+    // document was stored.
+    Ok(FakeReply::Json(201, serde_json::json!([])))
+}
+
+/// `_changes`, which a replicator must read with `style=all_docs` so that
+/// conflicting leaves are listed too.
+fn fake_changes(state: &FakeState, req: &FakeRequest) -> Result<FakeReply, String> {
+    if req.query("style") != Some("all_docs") {
+        return Err(format!("_changes without style=all_docs: {}", req.path));
+    }
+    let since: u64 = req
+        .query("since")
+        .unwrap_or("0")
+        .parse()
+        .map_err(|e| format!("_changes since: {}: {}", req.path, e))?;
+    let limit: usize = match req.query("limit") {
+        Some(limit) => limit
+            .parse()
+            .map_err(|e| format!("_changes limit: {}: {}", req.path, e))?,
+        None => usize::MAX,
+    };
+    let results: Vec<serde_json::Value> = state
+        .feed()
+        .into_iter()
+        .filter(|(seq, _)| *seq > since)
+        .take(limit)
+        .map(|(seq, id)| {
+            let leaves = state.leaves(&id);
+            let changes: Vec<serde_json::Value> = leaves
+                .iter()
+                .map(|d| serde_json::json!({"rev": doc_rev(d)}))
+                .collect();
+            let mut row = serde_json::json!({"seq": seq, "id": id, "changes": changes});
+            if leaves.first().is_some_and(|d| is_deleted(d)) {
+                row["deleted"] = true.into();
+            }
+            row
+        })
+        .collect();
+    let last_seq = results
+        .last()
+        .map(|row| row["seq"].clone())
+        .unwrap_or_else(|| since.max(state.revs.len() as u64).into());
+    Ok(FakeReply::Json(
+        200,
+        serde_json::json!({"results": results, "last_seq": last_seq, "pending": 0}),
+    ))
+}
+
+/// `_bulk_get`, which a replicator must call with `revs=true` (to get the
+/// `_revisions` history), `attachments=true` and `latest=true`.
+fn fake_bulk_get(state: &FakeState, req: &FakeRequest) -> Result<FakeReply, String> {
+    for param in ["revs", "attachments", "latest"] {
+        if req.query(param) != Some("true") {
+            return Err(format!("_bulk_get without {}=true: {}", param, req.path));
+        }
+    }
+    let body = req.json()?;
+    let items = body["docs"]
+        .as_array()
+        .ok_or_else(|| format!("_bulk_get body has no docs: {}", body))?;
+    let mut results = Vec::new();
+    for item in items {
+        let id = item["id"]
+            .as_str()
+            .ok_or_else(|| format!("_bulk_get item without id: {}", item))?;
+        let found = match item["rev"].as_str() {
+            Some(rev) => state
+                .revs
+                .iter()
+                .find(|d| doc_id(d) == id && doc_rev(d) == rev),
+            None => state.leaves(id).first().copied(),
+        };
+        results.push(match found {
+            Some(doc) => serde_json::json!({"id": id, "docs": [{"ok": doc}]}),
+            None => serde_json::json!({"id": id, "docs": [{"error": {
+                "id": id, "rev": item["rev"], "error": "not_found", "reason": "missing"
+            }}]}),
+        });
+    }
+    Ok(FakeReply::Json(
+        200,
+        serde_json::json!({ "results": results }),
+    ))
 }
 
 /// A local URL whose port nothing is listening on.
@@ -312,13 +759,18 @@ async fn info_empty_database() {
 }
 
 #[tokio::test]
-async fn info_nonexistent_path_fails() {
-    // Use a path under a nonexistent directory so redb can't create the file
-    rouchdb_cmd()
-        .args(["info", "/tmp/no_such_dir_rouchdb/no_such.redb"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("Error"));
+async fn info_db_name_defaults_to_file_stem_and_can_be_overridden() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("inventory.redb");
+    let p = path_str(&path);
+    assert!(run(&["put", p, "a", "{}"]).status.success());
+
+    assert_eq!(stdout_json(&run(&["info", p]))["db_name"], "inventory");
+    let output = run(&["info", p, "--db-name", "warehouse"]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let v = stdout_json(&output);
+    assert_eq!(v["db_name"], "warehouse");
+    assert_eq!(v["doc_count"], 1);
 }
 
 // ─── GET ────────────────────────────────────────────────────────────────────
@@ -396,6 +848,45 @@ async fn get_with_specific_rev() {
     let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(v["_rev"], rev1);
     assert_eq!(v["version"], 1);
+}
+
+#[tokio::test]
+async fn get_conflicts_lists_losing_leaves_only_with_flag() {
+    let (_dir, db_path) = setup_db(&[]).await;
+    let [a, b, c] = ['a', 'b', 'c'].map(|h| format!("1-{}", h.to_string().repeat(32)));
+    {
+        // Three conflicting leaves, written the way replication does.
+        let db = rouchdb::Database::open(&db_path, "test").unwrap();
+        let leaves = [(&a, "a"), (&c, "c"), (&b, "b")]
+            .into_iter()
+            .map(|(rev, v)| rouchdb::Document {
+                id: "doc".into(),
+                rev: Some(rev.parse().unwrap()),
+                deleted: false,
+                data: serde_json::json!({ "v": v }),
+                attachments: HashMap::new(),
+            })
+            .collect();
+        let results = db
+            .bulk_docs(leaves, rouchdb::BulkDocsOptions::replication())
+            .await
+            .unwrap();
+        assert!(results.iter().all(|r| r.ok), "{:?}", results);
+    }
+    let p = path_str(&db_path);
+
+    // CouchDB 3.5.1 answers exactly this: the highest rev wins and the
+    // other leaves follow, highest first.
+    let output = run(&["get", p, "doc", "--conflicts"]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({"_id": "doc", "_rev": c, "v": "c", "_conflicts": [b, a]})
+    );
+    assert_eq!(
+        stdout_json(&run(&["get", p, "doc"])),
+        serde_json::json!({"_id": "doc", "_rev": c, "v": "c"})
+    );
 }
 
 // ─── ALL-DOCS ───────────────────────────────────────────────────────────────
@@ -555,10 +1046,73 @@ async fn find_with_selector() {
     assert!(output.status.success());
     let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let docs = v["docs"].as_array().unwrap();
-    assert_eq!(docs.len(), 2);
-    let names: Vec<&str> = docs.iter().map(|d| d["name"].as_str().unwrap()).collect();
-    assert!(names.contains(&"Apple"));
-    assert!(names.contains(&"Banana"));
+    // Without a sort, matches come in _id order.
+    let found: Vec<(&str, &str)> = docs
+        .iter()
+        .map(|d| (d["_id"].as_str().unwrap(), d["name"].as_str().unwrap()))
+        .collect();
+    assert_eq!(found, [("apple", "Apple"), ("banana", "Banana")]);
+}
+
+/// Ids of the documents in a `find` output, in order.
+fn found_ids(output: &Output) -> Vec<String> {
+    assert!(output.status.success(), "{}", stderr_str(output));
+    stdout_json(output)["docs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn find_sort_skip_and_limit_return_exact_ordered_ids() {
+    let (_dir, db_path) = setup_db(&[
+        ("p1", serde_json::json!({"name": "Carol", "age": 35})),
+        ("p2", serde_json::json!({"name": "Alice", "age": 30})),
+        ("p3", serde_json::json!({"name": "Bob", "age": 25})),
+        ("p4", serde_json::json!({"name": "Dave", "age": 40})),
+        ("other", serde_json::json!({"kind": "no age"})),
+    ])
+    .await;
+    let p = path_str(&db_path);
+    let find = |extra: &[&str]| {
+        let mut args = vec!["find", p, "--selector", r#"{"age": {"$gt": 0}}"#];
+        args.extend_from_slice(extra);
+        found_ids(&run(&args))
+    };
+
+    assert_eq!(find(&[]), ["p1", "p2", "p3", "p4"]);
+    assert_eq!(
+        find(&["--sort", r#"[{"age": "asc"}]"#]),
+        ["p3", "p2", "p1", "p4"]
+    );
+    assert_eq!(
+        find(&["--sort", r#"[{"age": "desc"}]"#]),
+        ["p4", "p1", "p2", "p3"]
+    );
+    assert_eq!(find(&["--sort", r#"["name"]"#]), ["p2", "p3", "p1", "p4"]);
+    assert_eq!(find(&["--skip", "1"]), ["p2", "p3", "p4"]);
+    assert_eq!(
+        find(&[
+            "--sort",
+            r#"[{"age": "desc"}]"#,
+            "--skip",
+            "1",
+            "--limit",
+            "2"
+        ]),
+        ["p1", "p2"]
+    );
+    assert_eq!(find(&["--skip", "4"]), Vec::<String>::new());
+
+    let output = run(&["find", p, "--selector", "{}", "--sort", "not json"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr_str(&output).contains("invalid sort JSON"),
+        "{}",
+        stderr_str(&output)
+    );
 }
 
 #[tokio::test]
@@ -611,65 +1165,145 @@ async fn find_invalid_selector_fails() {
 
 // ─── CHANGES ────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn changes_returns_all() {
-    let (_dir, db_path) = setup_db(&[
+/// a, b and c, then a new revision of a: the feed order is b, c, a.
+async fn setup_changes_db() -> (TempDir, PathBuf) {
+    let (dir, db_path) = setup_db(&[
         ("a", serde_json::json!({"x": 1})),
         ("b", serde_json::json!({"x": 2})),
         ("c", serde_json::json!({"x": 3})),
     ])
     .await;
-
-    let output = rouchdb_cmd()
-        .args(["changes", db_path.to_str().unwrap()])
-        .output()
+    {
+        let db = rouchdb::Database::open(&db_path, "test").unwrap();
+        let a = db.get("a").await.unwrap();
+        db.update(
+            "a",
+            &a.rev.unwrap().to_string(),
+            serde_json::json!({"x": 10}),
+        )
+        .await
         .unwrap();
+    }
+    (dir, db_path)
+}
 
-    assert!(output.status.success());
-    let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let results = v["results"].as_array().unwrap();
-    assert_eq!(results.len(), 3);
-    assert!(v["last_seq"].as_u64().unwrap() > 0);
+/// `(id, seq)` of the rows of a `changes` output, in order, and `last_seq`.
+fn change_rows(output: &Output) -> (Vec<(String, u64)>, serde_json::Value) {
+    assert!(output.status.success(), "{}", stderr_str(output));
+    let v = stdout_json(output);
+    let rows = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["id"].as_str().unwrap().to_string(),
+                r["seq"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    (rows, v["last_seq"].clone())
+}
+
+fn rows(expected: &[(&str, u64)]) -> Vec<(String, u64)> {
+    expected
+        .iter()
+        .map(|(id, seq)| (id.to_string(), *seq))
+        .collect()
+}
+
+#[tokio::test]
+async fn changes_returns_all() {
+    let (_dir, db_path) = setup_changes_db().await;
+    let p = path_str(&db_path);
+
+    assert_eq!(
+        change_rows(&run(&["changes", p])),
+        (rows(&[("b", 2), ("c", 3), ("a", 4)]), serde_json::json!(4))
+    );
 }
 
 #[tokio::test]
 async fn changes_with_limit() {
-    let (_dir, db_path) = setup_db(&[
-        ("a", serde_json::json!({})),
-        ("b", serde_json::json!({})),
-        ("c", serde_json::json!({})),
-    ])
-    .await;
+    let (_dir, db_path) = setup_changes_db().await;
+    let p = path_str(&db_path);
 
-    let output = rouchdb_cmd()
-        .args(["changes", db_path.to_str().unwrap(), "--limit", "2"])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let results = v["results"].as_array().unwrap();
-    assert_eq!(results.len(), 2);
+    assert_eq!(
+        change_rows(&run(&["changes", p, "--limit", "2"])),
+        (rows(&[("b", 2), ("c", 3)]), serde_json::json!(3))
+    );
 }
 
 #[tokio::test]
 async fn changes_with_since() {
-    let (_dir, db_path) = setup_db(&[
-        ("a", serde_json::json!({})),
-        ("b", serde_json::json!({})),
-        ("c", serde_json::json!({})),
-    ])
-    .await;
+    let (_dir, db_path) = setup_changes_db().await;
+    let p = path_str(&db_path);
 
-    let output = rouchdb_cmd()
-        .args(["changes", db_path.to_str().unwrap(), "--since", "2"])
-        .output()
-        .unwrap();
+    assert_eq!(
+        change_rows(&run(&["changes", p, "--since", "2"])),
+        (rows(&[("c", 3), ("a", 4)]), serde_json::json!(4))
+    );
+    assert_eq!(
+        change_rows(&run(&["changes", p, "--since", "4"])),
+        (rows(&[]), serde_json::json!(4))
+    );
+}
 
-    assert!(output.status.success());
-    let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let results = v["results"].as_array().unwrap();
-    assert_eq!(results.len(), 1);
+#[tokio::test]
+async fn changes_descending_lists_newest_first() {
+    let (_dir, db_path) = setup_changes_db().await;
+    let p = path_str(&db_path);
+
+    // As in CouchDB, last_seq is the seq of the last row returned.
+    assert_eq!(
+        change_rows(&run(&["changes", p, "--descending"])),
+        (rows(&[("a", 4), ("c", 3), ("b", 2)]), serde_json::json!(2))
+    );
+    assert_eq!(
+        change_rows(&run(&["changes", p, "--descending", "--limit", "2"])),
+        (rows(&[("a", 4), ("c", 3)]), serde_json::json!(3))
+    );
+}
+
+#[tokio::test]
+async fn changes_include_docs_adds_bodies() {
+    let (_dir, db_path) = setup_changes_db().await;
+    let p = path_str(&db_path);
+    let rev_b = stdout_json(&run(&["get", p, "b"]))["_rev"].clone();
+    let rev_a = stdout_json(&run(&["get", p, "a"]))["_rev"].clone();
+    let rev_c = stdout_json(&run(&["get", p, "c"]))["_rev"].clone();
+    let rev_c2 = rev_of(&run(&["delete", p, "c", "--rev", rev_c.as_str().unwrap()]));
+
+    let output = run(&["changes", p, "--include-docs"]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({
+            "last_seq": 5,
+            "results": [
+                {"seq": 2, "id": "b", "changes": [{"rev": rev_b}],
+                 "doc": {"_id": "b", "_rev": rev_b, "x": 2}},
+                {"seq": 4, "id": "a", "changes": [{"rev": rev_a}],
+                 "doc": {"_id": "a", "_rev": rev_a, "x": 10}},
+                {"seq": 5, "id": "c", "changes": [{"rev": rev_c2}], "deleted": true,
+                 "doc": {"_id": "c", "_rev": rev_c2, "_deleted": true}},
+            ]
+        })
+    );
+
+    // Without the flag the rows are the same minus the bodies.
+    let output = run(&["changes", p]);
+    let results = stdout_json(&output)["results"].clone();
+    let ids: Vec<&str> = results
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["b", "a", "c"]);
+    for row in results.as_array().unwrap() {
+        assert!(row.get("doc").is_none(), "{}", row);
+    }
 }
 
 // ─── DUMP ───────────────────────────────────────────────────────────────────
@@ -687,12 +1321,16 @@ async fn dump_exports_all() {
         .output()
         .unwrap();
 
-    assert!(output.status.success());
-    let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let docs = v.as_array().unwrap();
-    assert_eq!(docs.len(), 2);
-    assert!(docs[0].get("_id").is_some());
-    assert!(docs[0].get("_rev").is_some());
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(stderr_str(&output), "");
+    // Each document at its winning revision, in _id order.
+    let p = path_str(&db_path);
+    let expected: Vec<serde_json::Value> = ["doc1", "doc2"]
+        .iter()
+        .map(|id| stdout_json(&run(&["get", p, id])))
+        .collect();
+    assert_eq!(expected[1]["name"], "Bob");
+    assert_eq!(stdout_json(&output), serde_json::Value::Array(expected));
 }
 
 #[tokio::test]
@@ -712,40 +1350,194 @@ async fn dump_empty_database() {
 // ─── REPLICATE ──────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn replicate_redb_to_redb() {
-    // Set up source with 3 docs
+async fn replicate_redb_to_redb_copies_docs_revisions_and_conflicts() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.redb");
+    let s = path_str(&src);
+    rev_of(&run(&["put", s, "a", r#"{"x":1}"#]));
+    let b1 = rev_of(&run(&["put", s, "b", r#"{"x":2}"#]));
+    rev_of(&run(&["put", s, "b", r#"{"x":20}"#, "--rev", &b1]));
+    let c1 = rev_of(&run(&["put", s, "c", r#"{"x":3}"#]));
+    rev_of(&run(&["delete", s, "c", "--rev", &c1]));
+    rev_of(&run(&["put", s, "d", r#"{"v":"main"}"#]));
+    {
+        let db = rouchdb::Database::open(&src, "src").unwrap();
+        let branch = rouchdb::Document {
+            id: "d".into(),
+            rev: Some(rouchdb::Revision::new(1, "f".repeat(32))),
+            deleted: false,
+            data: serde_json::json!({"v": "branch"}),
+            attachments: HashMap::new(),
+        };
+        let results = db
+            .bulk_docs(vec![branch], rouchdb::BulkDocsOptions::replication())
+            .await
+            .unwrap();
+        assert!(results.iter().all(|r| r.ok), "{:?}", results);
+    }
+    let tgt = dir.path().join("tgt.redb");
+    let t = path_str(&tgt);
+
+    let output = run(&["replicate", s, t]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    // Four changes, five leaves (both sides of the conflict on d).
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({
+            "ok": true, "docs_read": 4, "docs_written": 5, "errors": [], "last_seq": 7
+        })
+    );
+
+    // The same live documents, at the same revisions, with the same bodies.
+    let source_docs = all_docs_with_bodies(&src);
+    let ids: Vec<&serde_json::Value> = source_docs.iter().map(|d| &d["_id"]).collect();
+    assert_eq!(ids, ["a", "b", "d"]);
+    assert_eq!(all_docs_with_bodies(&tgt), source_docs);
+    // The same conflict...
+    let conflicted = stdout_json(&run(&["get", s, "d", "--conflicts"]));
+    assert_eq!(conflicted["_conflicts"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        stdout_json(&run(&["get", t, "d", "--conflicts"])),
+        conflicted
+    );
+    // ...and the same deletion: the feeds match except for the seqs, which
+    // depend on the order the target stored the documents in.
+    let feed = |path: &str| {
+        let mut rows: Vec<serde_json::Value> = stdout_json(&run(&["changes", path]))["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(|mut row| {
+                row.as_object_mut().unwrap().remove("seq");
+                row
+            })
+            .collect();
+        rows.sort_by(|x, y| x["id"].as_str().cmp(&y["id"].as_str()));
+        rows
+    };
+    let source_feed = feed(s);
+    assert_eq!(source_feed[2]["id"], "c");
+    assert_eq!(source_feed[2]["deleted"], true);
+    assert_eq!(feed(t), source_feed);
+
+    // A second run resumes from the checkpoint.
+    let output = run(&["replicate", s, t]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({
+            "ok": true, "docs_read": 0, "docs_written": 0, "errors": [], "last_seq": 7
+        })
+    );
+}
+
+/// Every live document (`_id`, `_rev` and body), via `all-docs --include-docs`.
+fn all_docs_with_bodies(path: &Path) -> Vec<serde_json::Value> {
+    let output = run(&["all-docs", path_str(path), "--include-docs"]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    stdout_json(&output)["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["doc"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn replicate_selector_copies_only_matching_docs() {
+    let (_src_dir, src_path) = setup_db(&[
+        ("apple", serde_json::json!({"type": "fruit"})),
+        ("banana", serde_json::json!({"type": "fruit"})),
+        ("carrot", serde_json::json!({"type": "vegetable"})),
+        ("rock", serde_json::json!({})),
+    ])
+    .await;
+    let tgt_dir = tempfile::tempdir().unwrap();
+    let tgt_path = tgt_dir.path().join("target.redb");
+    let (s, t) = (path_str(&src_path), path_str(&tgt_path));
+    let source_docs = all_docs_with_bodies(&src_path);
+    let doc = |id: &str| source_docs.iter().find(|d| d["_id"] == id).unwrap().clone();
+
+    let output = run(&["replicate", s, t, "--selector", r#"{"type": "fruit"}"#]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({
+            "ok": true, "docs_read": 4, "docs_written": 2, "errors": [], "last_seq": 4
+        })
+    );
+    assert_eq!(
+        all_docs_with_bodies(&tgt_path),
+        [doc("apple"), doc("banana")]
+    );
+
+    // Another selector has its own checkpoint, so it scans the feed again.
+    let output = run(&["replicate", s, t, "--selector", r#"{"type": "vegetable"}"#]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({
+            "ok": true, "docs_read": 4, "docs_written": 1, "errors": [], "last_seq": 4
+        })
+    );
+    assert_eq!(
+        all_docs_with_bodies(&tgt_path),
+        [doc("apple"), doc("banana"), doc("carrot")]
+    );
+
+    let output = run(&["replicate", s, t, "--selector", "{not json"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        stderr_str(&output).contains("invalid selector JSON"),
+        "{}",
+        stderr_str(&output)
+    );
+}
+
+#[tokio::test]
+async fn replicate_source_and_target_names_select_the_checkpoint() {
+    // The replication id, and so the checkpoint, is derived from both
+    // database names, which default to the file stems ("test", "target").
     let (_src_dir, src_path) = setup_db(&[
         ("a", serde_json::json!({"x": 1})),
         ("b", serde_json::json!({"x": 2})),
-        ("c", serde_json::json!({"x": 3})),
     ])
     .await;
+    let tgt_dir = tempfile::tempdir().unwrap();
+    let tgt_path = tgt_dir.path().join("target.redb");
+    let replicate = |names: &[&str]| {
+        let mut args = vec!["replicate", path_str(&src_path), path_str(&tgt_path)];
+        args.extend_from_slice(names);
+        let output = run(&args);
+        assert!(output.status.success(), "{}", stderr_str(&output));
+        let v = stdout_json(&output);
+        (v["docs_read"].clone(), v["docs_written"].clone())
+    };
 
-    // Create empty target
-    let (_tgt_dir, tgt_path) = setup_db(&[]).await;
-
-    let output = rouchdb_cmd()
-        .args([
-            "replicate",
-            src_path.to_str().unwrap(),
-            tgt_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(v["ok"], true);
-    assert_eq!(v["docs_written"], 3);
-
-    // Verify target has docs
-    let output2 = rouchdb_cmd()
-        .args(["info", tgt_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-
-    let info: serde_json::Value = serde_json::from_slice(&output2.stdout).unwrap();
-    assert_eq!(info["doc_count"], 3);
+    assert_eq!(replicate(&[]), (2.into(), 2.into()));
+    assert_eq!(
+        replicate(&[]),
+        (0.into(), 0.into()),
+        "resumes from the checkpoint"
+    );
+    assert_eq!(
+        replicate(&["--source-name", "other"]),
+        (2.into(), 0.into()),
+        "another source name is another replication"
+    );
+    assert_eq!(replicate(&["--source-name", "other"]), (0.into(), 0.into()));
+    assert_eq!(
+        replicate(&["--target-name", "other"]),
+        (2.into(), 0.into()),
+        "another target name is another replication"
+    );
+    assert_eq!(
+        replicate(&["--source-name", "test", "--target-name", "target"]),
+        (0.into(), 0.into()),
+        "the default names are the file stems"
+    );
 }
 
 #[ignore = "requires CouchDB"]
@@ -789,16 +1581,6 @@ async fn compact_returns_ok() {
     assert!(output.status.success());
     let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(v["ok"], true);
-}
-
-#[tokio::test]
-async fn compact_nonexistent_fails() {
-    // Use a path under a nonexistent directory so redb can't create the file
-    rouchdb_cmd()
-        .args(["compact", "/tmp/no_such_dir_rouchdb/no_such.redb"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("Error"));
 }
 
 // ─── MISSING DATABASE FILES ─────────────────────────────────────────────────
@@ -862,6 +1644,52 @@ fn write_commands_create_missing_file() {
     let output = run(&["post", path_str(&post_path), r#"{"x":1}"#]);
     assert!(output.status.success(), "{}", stderr_str(&output));
     assert!(post_path.exists());
+}
+
+// ─── USAGE ERRORS ───────────────────────────────────────────────────────────
+
+#[test]
+fn usage_errors_exit_2_with_empty_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.redb");
+    let p = path_str(&path);
+
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        (vec![], "Usage: rouchdb [OPTIONS] <COMMAND>"),
+        (
+            vec!["frobnicate"],
+            "error: unrecognized subcommand 'frobnicate'",
+        ),
+        (
+            vec!["info"],
+            "error: the following required arguments were not provided:\n  <PATH>",
+        ),
+        (
+            vec!["info", p, "--bogus"],
+            "error: unexpected argument '--bogus' found",
+        ),
+        (vec!["find", p], "\n  --selector <SELECTOR>\n"),
+        (vec!["delete", p, "doc1"], "\n  --rev <REV>\n"),
+        (vec!["put", p, "doc1"], "\n  <BODY>\n"),
+        (vec!["replicate", p], "\n  <TARGET>\n"),
+        (
+            vec!["all-docs", p, "--limit", "many"],
+            "error: invalid value 'many' for '--limit <LIMIT>'",
+        ),
+    ];
+    for (args, message) in cases {
+        let output = run(&args);
+        let stderr = stderr_str(&output);
+        assert_eq!(output.status.code(), Some(2), "{:?}: {}", args, stderr);
+        assert!(
+            output.stdout.is_empty(),
+            "{:?} wrote to stdout: {}",
+            args,
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(stderr.contains(message), "{:?}: {}", args, stderr);
+        assert!(!path.exists(), "{:?} created the database file", args);
+    }
 }
 
 // ─── PUT / POST / DELETE ────────────────────────────────────────────────────
@@ -1317,6 +2145,110 @@ async fn dump_then_import_round_trip_preserves_data_and_attachments() {
     assert_eq!(strip_revs(redump), strip_revs(stdout_json(&dump)));
 }
 
+/// The documents of a `dump` output by id, without `_rev` (import gives
+/// documents new revisions). Fails on a document dumped twice.
+fn dumped_docs(output: &Output) -> BTreeMap<String, serde_json::Value> {
+    assert!(output.status.success(), "{}", stderr_str(output));
+    let mut docs = BTreeMap::new();
+    for mut doc in stdout_json(output).as_array().unwrap().iter().cloned() {
+        let obj = doc.as_object_mut().unwrap();
+        assert!(obj.remove("_rev").is_some(), "no _rev in {:?}", obj);
+        let id = obj["_id"].as_str().unwrap().to_string();
+        assert!(
+            docs.insert(id.clone(), doc).is_none(),
+            "{} dumped twice",
+            id
+        );
+    }
+    docs
+}
+
+#[tokio::test]
+async fn dump_then_import_round_trip_keeps_every_doc_design_doc_and_unicode_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.redb");
+    // Every document as a dump must show it, without its `_rev`: more than
+    // 1000 of them, a design doc and non-ASCII ids.
+    let mut expected: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    {
+        let db = rouchdb::Database::open(&src, "src").unwrap();
+        let mut bodies: Vec<(String, serde_json::Value)> = (0..1234)
+            .map(|i| {
+                let body = serde_json::json!({"i": i, "even": i % 2 == 0});
+                (format!("doc{:05}", i), body)
+            })
+            .collect();
+        bodies.extend([
+            (
+                "_design/app".to_string(),
+                serde_json::json!({
+                    "language": "javascript",
+                    "views": {"by_i": {"map": "function(doc) { emit(doc.i, null); }"}}
+                }),
+            ),
+            (
+                "ñandú".to_string(),
+                serde_json::json!({"name": "ñandú", "kind": "ave"}),
+            ),
+            ("日本".to_string(), serde_json::json!({"país": "日本"})),
+            (
+                "🦀 crab".to_string(),
+                serde_json::json!({"emoji": "🦀", "nested": {"list": [1, "dos", null, 3.5]}}),
+            ),
+        ]);
+        let docs = bodies
+            .iter()
+            .map(|(id, body)| rouchdb::Document {
+                id: id.clone(),
+                rev: None,
+                deleted: false,
+                data: body.clone(),
+                attachments: HashMap::new(),
+            })
+            .collect();
+        let results = db
+            .bulk_docs(docs, rouchdb::BulkDocsOptions::new())
+            .await
+            .unwrap();
+        assert!(results.iter().all(|r| r.ok), "{:?}", results);
+        for (id, body) in bodies {
+            let mut doc = body;
+            doc["_id"] = id.clone().into();
+            expected.insert(id, doc);
+        }
+
+        for (id, name, content_type, data) in [
+            ("ñandú", "foto ñ.png", "image/png", vec![0u8, 255, 1, 128]),
+            ("doc00007", "notes.txt", "text/plain", b"hola".to_vec()),
+        ] {
+            let rev = db.get(id).await.unwrap().rev.unwrap().to_string();
+            db.put_attachment(id, name, &rev, data.clone(), content_type)
+                .await
+                .unwrap();
+            expected.get_mut(id).unwrap()["_attachments"] = serde_json::json!({
+                name: {"content_type": content_type, "data": b64(&data)}
+            });
+        }
+    }
+    assert_eq!(expected.len(), 1238);
+
+    let dump = run(&["dump", path_str(&src)]);
+    assert_eq!(stderr_str(&dump), "");
+    assert_eq!(dumped_docs(&dump), expected);
+
+    let backup = dir.path().join("backup.json");
+    std::fs::write(&backup, &dump.stdout).unwrap();
+    let restored = dir.path().join("restored.redb");
+    let output = run(&["import", path_str(&restored), path_str(&backup)]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({"ok": true, "imported": 1238, "total": 1238, "errors": []})
+    );
+
+    assert_eq!(dumped_docs(&run(&["dump", path_str(&restored)])), expected);
+}
+
 #[tokio::test]
 async fn import_rejects_attachment_stubs_without_data() {
     let (dir, db_path) = setup_db(&[]).await;
@@ -1389,28 +2321,21 @@ async fn dump_warns_about_conflicting_revisions() {
 // ─── REPLICATE RESULTS ──────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn replicate_output_includes_errors_and_last_seq() {
-    let (_src_dir, src_path) = setup_db(&[("a", serde_json::json!({"x": 1}))]).await;
-    let (_tgt_dir, tgt_path) = setup_db(&[]).await;
-
-    let output = run(&["replicate", path_str(&src_path), path_str(&tgt_path)]);
-    assert!(output.status.success(), "{}", stderr_str(&output));
-    let v = stdout_json(&output);
-    assert_eq!(v["ok"], true);
-    assert_eq!(v["errors"], serde_json::json!([]));
-    assert_eq!(v["last_seq"], 1);
-}
-
-#[tokio::test]
 async fn replicate_with_rejected_docs_exits_non_zero() {
     let (_src_dir, src_path) = setup_db(&[
         ("a", serde_json::json!({"x": 1})),
         ("b", serde_json::json!({"x": 2})),
     ])
     .await;
-    let (base, _log) = spawn_fake_couchdb(fake_target(true));
+    let fake = spawn_fake_couchdb(
+        FakeConfig {
+            reject_writes: true,
+            ..Default::default()
+        },
+        vec![],
+    );
 
-    let output = run(&["replicate", path_str(&src_path), &format!("{}/db", base)]);
+    let output = run(&["replicate", path_str(&src_path), &fake.db_url()]);
     assert_eq!(
         output.status.code(),
         Some(1),
@@ -1419,13 +2344,22 @@ async fn replicate_with_rejected_docs_exits_non_zero() {
     );
     let v = stdout_json(&output);
     assert_eq!(v["ok"], false);
+    assert_eq!(v["docs_read"], 2);
     assert_eq!(v["docs_written"], 0);
-    let errors = v["errors"].as_array().unwrap();
-    assert_eq!(errors.len(), 2, "{:?}", errors);
-    assert!(
-        errors
-            .iter()
-            .all(|e| e.as_str().unwrap().contains("rejected by validator"))
+    // The replicator writes a batch in no particular order.
+    let mut errors: Vec<&str> = v["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_str().unwrap())
+        .collect();
+    errors.sort_unstable();
+    assert_eq!(
+        errors,
+        [
+            "write error for a: forbidden: rejected by validator",
+            "write error for b: forbidden: rejected by validator",
+        ]
     );
     // Forbidden docs are reported but, as in PouchDB, do not block progress:
     // the checkpoint moves past them so the replication cannot wedge.
@@ -1433,7 +2367,219 @@ async fn replicate_with_rejected_docs_exits_non_zero() {
         v["last_seq"], 2,
         "checkpoint moves past docs the target forbids"
     );
-    assert!(stderr_str(&output).contains("replication"));
+    let checkpoints: Vec<serde_json::Value> = fake.state().local.values().cloned().collect();
+    assert_eq!(checkpoints.len(), 1, "{:?}", checkpoints);
+    assert_eq!(checkpoints[0]["last_seq"], 2);
+    assert_eq!(
+        stderr_str(&output),
+        "Error: database error: replication incomplete: 2 error(s), see \"errors\" in the output\n"
+    );
+    fake.assert_no_problems();
+    assert_eq!(fake.stored_revs(), Vec::<serde_json::Value>::new());
+}
+
+/// The `_revisions` of revision `revs[0]`, whose ancestors are `revs[1..]`
+/// (newest first).
+fn revisions(revs: &[&str]) -> serde_json::Value {
+    let (start, _) = parse_rev(revs[0]).unwrap();
+    let ids: Vec<&str> = revs.iter().map(|r| parse_rev(r).unwrap().1).collect();
+    serde_json::json!({"start": start, "ids": ids})
+}
+
+fn rev_of(result: &Output) -> String {
+    assert!(result.status.success(), "{}", stderr_str(result));
+    stdout_json(result)["rev"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn replicate_to_couchdb_sends_revision_history_and_resumes_from_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.redb");
+    let p = path_str(&src);
+    let a1 = rev_of(&run(&["put", p, "a", r#"{"x":1}"#]));
+    let a2 = rev_of(&run(&["put", p, "a", r#"{"x":2}"#, "--rev", &a1]));
+    let b1 = rev_of(&run(&["put", p, "b", r#"{"y":1}"#]));
+    let c1 = rev_of(&run(&["put", p, "c", r#"{"z":1}"#]));
+    let c2 = rev_of(&run(&["delete", p, "c", "--rev", &c1]));
+    let fake = spawn_fake_couchdb(FakeConfig::default(), vec![]);
+
+    let output = run(&["replicate", p, &fake.db_url()]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({
+            "ok": true, "docs_read": 3, "docs_written": 3, "errors": [], "last_seq": 5
+        })
+    );
+    // Each leaf arrives with its whole history, so CouchDB can graft it
+    // onto the revisions it already has.
+    assert_eq!(
+        fake.stored_revs(),
+        vec![
+            serde_json::json!({"_id": "a", "_rev": a2, "_revisions": revisions(&[&a2, &a1]), "x": 2}),
+            serde_json::json!({"_id": "b", "_rev": b1, "_revisions": revisions(&[&b1]), "y": 1}),
+            serde_json::json!({
+                "_id": "c", "_rev": c2, "_deleted": true, "_revisions": revisions(&[&c2, &c1])
+            }),
+        ]
+    );
+    let checkpoint = {
+        let state = fake.state();
+        assert_eq!(state.local.len(), 1, "{:?}", state.local);
+        let (id, doc) = state.local.iter().next().unwrap();
+        assert_eq!(doc["_rev"], "0-1");
+        assert_eq!(doc["last_seq"], 5);
+        id.clone()
+    };
+
+    // Nothing changed: the checkpoint says so, nothing is diffed or written.
+    let seen = fake.requests().len();
+    let output = run(&["replicate", p, &fake.db_url()]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({
+            "ok": true, "docs_read": 0, "docs_written": 0, "errors": [], "last_seq": 5
+        })
+    );
+    let routes: Vec<String> = fake.requests()[seen..]
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.route()))
+        .collect();
+    assert!(routes.iter().all(|r| r.starts_with("GET ")), "{:?}", routes);
+
+    // A new revision of b: only it is sent, on top of the revision the
+    // target has, and the checkpoint is updated in place (0-1 -> 0-2).
+    let b2 = rev_of(&run(&["put", p, "b", r#"{"y":2}"#, "--rev", &b1]));
+    let seen = fake.requests().len();
+    let output = run(&["replicate", p, &fake.db_url()]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({
+            "ok": true, "docs_read": 1, "docs_written": 1, "errors": [], "last_seq": 6
+        })
+    );
+    let requests = fake.requests()[seen..].to_vec();
+    let revs_diff = requests
+        .iter()
+        .find(|r| r.route() == "/db/_revs_diff")
+        .expect("a _revs_diff request");
+    assert_eq!(revs_diff.json().unwrap(), serde_json::json!({"b": [b2]}));
+    let checkpoint_puts = requests
+        .iter()
+        .filter(|r| r.method == "PUT" && r.route() == format!("/db/_local/{}", checkpoint))
+        .count();
+    assert_eq!(
+        checkpoint_puts, 1,
+        "one checkpoint write, without a 409 retry"
+    );
+    assert_eq!(
+        fake.stored_revs()[1..3],
+        [
+            serde_json::json!({"_id": "b", "_rev": b1, "_revisions": revisions(&[&b1]), "y": 1}),
+            serde_json::json!({"_id": "b", "_rev": b2, "_revisions": revisions(&[&b2, &b1]), "y": 2}),
+        ]
+    );
+    let state = fake.state();
+    assert_eq!(state.local.len(), 1);
+    assert_eq!(state.local[&checkpoint]["_rev"], "0-2");
+    assert_eq!(state.local[&checkpoint]["last_seq"], 6);
+    drop(state);
+    fake.assert_no_problems();
+}
+
+#[tokio::test]
+async fn replicate_from_couchdb_copies_every_leaf_with_its_history() {
+    let h = |c: char| c.to_string().repeat(32);
+    let plain = format!("1-{}", h('a'));
+    let (edited1, edited2) = (format!("1-{}", h('b')), format!("2-{}", h('c')));
+    let (loser, winner) = (format!("1-{}", h('d')), format!("1-{}", h('e')));
+    let (gone1, gone2) = (format!("1-{}", h('f')), format!("2-{}", h('1')));
+    let fake = spawn_fake_couchdb(
+        FakeConfig::default(),
+        vec![
+            fake_rev("plain", &plain, &[], serde_json::json!({"v": "plain"})),
+            fake_rev("edited", &edited1, &[], serde_json::json!({"v": 1})),
+            fake_rev("edited", &edited2, &[&h('b')], serde_json::json!({"v": 2})),
+            fake_rev("conflicted", &loser, &[], serde_json::json!({"v": "loser"})),
+            fake_rev(
+                "conflicted",
+                &winner,
+                &[],
+                serde_json::json!({"v": "winner"}),
+            ),
+            fake_rev("gone", &gone1, &[], serde_json::json!({"v": 0})),
+            fake_rev(
+                "gone",
+                &gone2,
+                &[&h('f')],
+                serde_json::json!({"_deleted": true}),
+            ),
+        ],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("local.redb");
+    let t = path_str(&target);
+
+    let output = run(&["replicate", &fake.db_url(), t]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    // Four changes; five leaves (both sides of the conflict).
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({
+            "ok": true, "docs_read": 4, "docs_written": 5, "errors": [], "last_seq": 7
+        })
+    );
+    fake.assert_no_problems();
+
+    let ids: Vec<serde_json::Value> = stdout_json(&run(&["all-docs", t]))["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].clone())
+        .collect();
+    assert_eq!(ids, ["conflicted", "edited", "plain"]);
+    assert_eq!(
+        stdout_json(&run(&["get", t, "conflicted", "--conflicts"])),
+        serde_json::json!({
+            "_id": "conflicted", "_rev": winner, "v": "winner", "_conflicts": [loser]
+        })
+    );
+    assert_eq!(
+        stdout_json(&run(&["get", t, "edited"])),
+        serde_json::json!({"_id": "edited", "_rev": edited2, "v": 2})
+    );
+    let gone = run(&["get", t, "gone"]);
+    assert_eq!(gone.status.code(), Some(1));
+    assert!(
+        stderr_str(&gone).contains("not found"),
+        "{}",
+        stderr_str(&gone)
+    );
+    {
+        let db = rouchdb::Database::open(&target, "local").unwrap();
+        let edited = db
+            .get_with_opts(
+                "edited",
+                rouchdb::GetOptions {
+                    revs: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            edited.to_json()["_revisions"],
+            revisions(&[&edited2, &edited1])
+        );
+    }
+
+    // The checkpoint was saved on the source as well.
+    let state = fake.state();
+    let checkpoints: Vec<&serde_json::Value> = state.local.values().collect();
+    assert_eq!(checkpoints.len(), 1, "{:?}", checkpoints);
+    assert_eq!(checkpoints[0]["last_seq"], 7);
 }
 
 #[ignore = "requires CouchDB"]
@@ -1491,28 +2637,15 @@ async fn replicate_error_does_not_print_url_password() {
     }
 }
 
-#[tokio::test]
-async fn replicate_uses_credentials_from_env() {
-    let (_src_dir, src_path) = setup_db(&[("a", serde_json::json!({"x": 1}))]).await;
-    let (base, log) = spawn_fake_couchdb(fake_target(false));
-    let password = "p@ss:w/rd %?#";
-
-    let output = rouchdb_cmd()
-        .args(["replicate", path_str(&src_path), &format!("{}/db", base)])
-        .env("ROUCHDB_USER", "alice")
-        .env("ROUCHDB_PASSWORD", password)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{}", stderr_str(&output));
-    assert_eq!(stdout_json(&output)["docs_written"], 1);
-
-    let expected = format!("Basic {}", b64(format!("alice:{}", password).as_bytes()));
-    let log = log.lock().unwrap();
-    assert!(!log.is_empty());
-    for req in log.iter() {
+/// Assert that the fake saw requests and that every one of them carried
+/// `authorization` (`None`: no Authorization header at all).
+fn assert_every_request_authorization(fake: &FakeCouch, authorization: Option<&str>) {
+    let requests = fake.requests();
+    assert!(!requests.is_empty(), "the fake CouchDB saw no request");
+    for req in &requests {
         assert_eq!(
             req.header("authorization"),
-            Some(expected.as_str()),
+            authorization,
             "{} {}",
             req.method,
             req.path
@@ -1521,13 +2654,89 @@ async fn replicate_uses_credentials_from_env() {
 }
 
 #[tokio::test]
-async fn replicate_url_credentials_take_precedence_over_env() {
+async fn replicate_uses_credentials_from_env() {
     let (_src_dir, src_path) = setup_db(&[("a", serde_json::json!({"x": 1}))]).await;
-    let (base, log) = spawn_fake_couchdb(fake_target(false));
-    let url = base.replace("http://", "http://bob:hunter2@") + "/db";
+    let fake = spawn_fake_couchdb(FakeConfig::default(), vec![]);
+    let password = "p@ss:w/rd %?#";
 
     let output = rouchdb_cmd()
-        .args(["replicate", path_str(&src_path), &url])
+        .args(["replicate", path_str(&src_path), &fake.db_url()])
+        .env("ROUCHDB_USER", "alice")
+        .env("ROUCHDB_PASSWORD", password)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(stdout_json(&output)["docs_written"], 1);
+
+    let expected = format!("Basic {}", b64(format!("alice:{}", password).as_bytes()));
+    assert_every_request_authorization(&fake, Some(&expected));
+    fake.assert_no_problems();
+    let stored: Vec<String> = fake
+        .stored_revs()
+        .iter()
+        .map(|d| doc_id(d).to_string())
+        .collect();
+    assert_eq!(stored, ["a"]);
+}
+
+#[tokio::test]
+async fn replicate_env_credentials_apply_to_url_source() {
+    let rev = format!("1-{}", "a".repeat(32));
+    let fake = spawn_fake_couchdb(
+        FakeConfig::default(),
+        vec![fake_rev("a", &rev, &[], serde_json::json!({"x": 1}))],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("local.redb");
+
+    let output = rouchdb_cmd()
+        .args(["replicate", &fake.db_url(), path_str(&target)])
+        .env("ROUCHDB_USER", "alice")
+        .env("ROUCHDB_PASSWORD", "s3cret")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let v = stdout_json(&output);
+    assert_eq!(v["docs_written"], 1);
+
+    let expected = format!("Basic {}", b64(b"alice:s3cret"));
+    assert_every_request_authorization(&fake, Some(&expected));
+    fake.assert_no_problems();
+    assert_eq!(
+        stdout_json(&run(&["get", path_str(&target), "a"])),
+        serde_json::json!({"_id": "a", "_rev": rev, "x": 1})
+    );
+}
+
+#[tokio::test]
+async fn replicate_ignores_empty_env_user() {
+    // An empty ROUCHDB_USER means "no credentials", even with a password set.
+    let (_src_dir, src_path) = setup_db(&[("a", serde_json::json!({"x": 1}))]).await;
+    let fake = spawn_fake_couchdb(FakeConfig::default(), vec![]);
+
+    let output = rouchdb_cmd()
+        .args(["replicate", path_str(&src_path), &fake.db_url()])
+        .env("ROUCHDB_USER", "")
+        .env("ROUCHDB_PASSWORD", "s3cret")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(stdout_json(&output)["docs_written"], 1);
+    assert_every_request_authorization(&fake, None);
+    fake.assert_no_problems();
+}
+
+#[tokio::test]
+async fn replicate_url_credentials_take_precedence_over_env() {
+    let (_src_dir, src_path) = setup_db(&[("a", serde_json::json!({"x": 1}))]).await;
+    let fake = spawn_fake_couchdb(FakeConfig::default(), vec![]);
+
+    let output = rouchdb_cmd()
+        .args([
+            "replicate",
+            path_str(&src_path),
+            &fake.db_url_with_userinfo("bob:hunter2"),
+        ])
         .env("ROUCHDB_USER", "alice")
         .env("ROUCHDB_PASSWORD", "other")
         .output()
@@ -1535,8 +2744,61 @@ async fn replicate_url_credentials_take_precedence_over_env() {
     assert!(output.status.success(), "{}", stderr_str(&output));
 
     let expected = format!("Basic {}", b64(b"bob:hunter2"));
-    for req in log.lock().unwrap().iter() {
-        assert_eq!(req.header("authorization"), Some(expected.as_str()));
+    assert_every_request_authorization(&fake, Some(&expected));
+    fake.assert_no_problems();
+}
+
+#[tokio::test]
+async fn replicate_errors_in_output_do_not_print_url_password() {
+    let (_src_dir, src_path) = setup_db(&[("a", serde_json::json!({"x": 1}))]).await;
+
+    // (credentials in the URL, how they appear in the reported error)
+    for (userinfo, shown) in [
+        // reqwest strips credentials it can decode from its error URLs...
+        ("admin:s3cret", ""),
+        // ...but keeps them when it cannot percent-decode the username.
+        ("ad%FFmin:s3cret", "ad%FFmin:***@"),
+    ] {
+        // The checkpoint write fails with a network error naming its URL.
+        let fake = spawn_fake_couchdb(
+            FakeConfig {
+                hang_up_on_checkpoint: true,
+                ..Default::default()
+            },
+            vec![],
+        );
+        let output = run(&[
+            "replicate",
+            path_str(&src_path),
+            &fake.db_url_with_userinfo(userinfo),
+        ]);
+        assert_eq!(output.status.code(), Some(1), "{}", stderr_str(&output));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = stderr_str(&output);
+        assert!(!stdout.contains("s3cret"), "password leaked: {}", stdout);
+        assert!(!stderr.contains("s3cret"), "password leaked: {}", stderr);
+
+        let checkpoint_put = fake
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "PUT")
+            .expect("a checkpoint write");
+        let v = stdout_json(&output);
+        assert_eq!(
+            v["errors"],
+            serde_json::json!([format!(
+                "checkpoint write failed: database error: error sending request for url (http://{}{}{})",
+                shown,
+                fake.base.trim_start_matches("http://"),
+                checkpoint_put.path
+            )])
+        );
+        assert_eq!(v["docs_written"], 1);
+        assert_eq!(
+            stderr,
+            "Error: database error: replication incomplete: 1 error(s), see \"errors\" in the output\n"
+        );
+        fake.assert_no_problems();
     }
 }
 
@@ -1575,6 +2837,45 @@ async fn replicate_to_couchdb_with_env_credentials() {
     assert_eq!(v["docs_written"], 2);
 }
 
+#[ignore = "requires CouchDB"]
+#[tokio::test]
+async fn replicate_from_couchdb_with_env_credentials() {
+    let couch = common::couchdb();
+    let db = common::fresh_remote_db("cli_src_auth").await;
+    // The same URL without credentials; they come from the environment.
+    let plain_db_url = db.anonymous_url();
+
+    let (status, body) = couch_request("PUT", &format!("{}/a", db.url()), Some(r#"{"x":1}"#));
+    assert_eq!(status, 201, "{}", body);
+    let rev = serde_json::from_str::<serde_json::Value>(&body).unwrap()["rev"].clone();
+    let dir = tempfile::tempdir().unwrap();
+    let without_path = dir.path().join("without.redb");
+    let with_path = dir.path().join("with.redb");
+    let without_env = rouchdb_cmd()
+        .args(["replicate", &plain_db_url, path_str(&without_path)])
+        .env_remove("ROUCHDB_USER")
+        .env_remove("ROUCHDB_PASSWORD")
+        .output()
+        .unwrap();
+    let with_env = rouchdb_cmd()
+        .args(["replicate", &plain_db_url, path_str(&with_path)])
+        .env("ROUCHDB_USER", &couch.user)
+        .env("ROUCHDB_PASSWORD", &couch.password)
+        .output()
+        .unwrap();
+
+    assert_eq!(without_env.status.code(), Some(1));
+    assert_eq!(stderr_str(&without_env), "Error: unauthorized\n");
+    assert!(with_env.status.success(), "{}", stderr_str(&with_env));
+    let v = stdout_json(&with_env);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["docs_written"], 1);
+    assert_eq!(
+        stdout_json(&run(&["get", path_str(&with_path), "a"])),
+        serde_json::json!({"_id": "a", "_rev": rev, "x": 1})
+    );
+}
+
 // ─── BROKEN PIPE ────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1592,9 +2893,45 @@ async fn dump_to_closed_pipe_exits_cleanly() {
     let mut head = [0u8; 100];
     stdout.read_exact(&mut head).unwrap();
     drop(stdout);
+    assert!(
+        head.starts_with(br#"[{"_id":"doc00000","#),
+        "{}",
+        String::from_utf8_lossy(&head)
+    );
 
+    // A reader that goes away is not an error: nothing is reported.
     let output = child.wait_with_output().unwrap();
     let stderr = stderr_str(&output);
-    assert!(!stderr.contains("panicked"), "stderr: {}", stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr);
+    assert_eq!(stderr, "");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn output_write_errors_other_than_broken_pipe_fail() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    // ~4000 docs of ~280 bytes: far more than a socket buffer holds.
+    let (_dir, db_path) = setup_bulk_db(4000, 256).await;
+    // A non-blocking stdout whose reader is still there but never reads:
+    // once the buffer is full, writing fails with WouldBlock. Unlike a
+    // closed pipe, that is an error the user has to hear about, since the
+    // output is incomplete.
+    let (reader, writer) = UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rouchdb"))
+        .args(["all-docs", path_str(&db_path), "--include-docs"])
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .output()
+        .unwrap();
+    drop(reader);
+
+    let stderr = stderr_str(&output);
+    assert_eq!(output.status.code(), Some(1), "stderr: {}", stderr);
+    assert!(
+        stderr.starts_with("Error writing output: ") && stderr.lines().count() == 1,
+        "stderr: {}",
+        stderr
+    );
 }

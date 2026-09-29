@@ -108,7 +108,10 @@ async fn if_match_supplies_the_revision() {
     .await;
     assert_eq!(resp.status, StatusCode::CREATED);
     let rev2 = resp.json()["rev"].as_str().unwrap().to_string();
+    assert!(rev2.starts_with("2-"), "{rev2}");
+    assert_eq!(resp.json(), json!({"ok": true, "id": "a", "rev": rev2}));
     assert_eq!(resp.header("etag"), Some(format!("\"{rev2}\"").as_str()));
+    assert_eq!(db.get("a").await.unwrap().data, json!({"v": 2}));
 
     let resp = send(
         &app,
@@ -121,6 +124,9 @@ async fn if_match_supplies_the_revision() {
     )
     .await;
     assert_eq!(resp.status, StatusCode::OK);
+    let rev3 = resp.json()["rev"].as_str().unwrap().to_string();
+    assert!(rev3.starts_with("3-"), "{rev3}");
+    assert_eq!(resp.json(), json!({"ok": true, "id": "a", "rev": rev3}));
     assert!(db.get("a").await.is_err());
 }
 
@@ -171,6 +177,11 @@ async fn design_docs_use_the_same_revision_rules() {
     let resp = put(&app, "/db/_design/d", json!({"views": {}})).await;
     assert_eq!(resp.status, StatusCode::CREATED);
     let rev = resp.json()["rev"].as_str().unwrap().to_string();
+    assert!(rev.starts_with("1-"), "{rev}");
+    assert_eq!(
+        resp.json(),
+        json!({"ok": true, "id": "_design/d", "rev": rev})
+    );
 
     let resp = put(
         &app,
@@ -188,11 +199,11 @@ async fn design_docs_use_the_same_revision_rules() {
     .await;
     assert_eq!(resp.status, StatusCode::CREATED);
     let rev2 = resp.json()["rev"].as_str().unwrap().to_string();
+    assert!(rev2.starts_with("2-"), "{rev2}");
 
-    assert_eq!(
-        delete(&app, "/db/_design/d").await.status,
-        StatusCode::CONFLICT
-    );
+    let resp = delete(&app, "/db/_design/d").await;
+    assert_eq!(resp.status, StatusCode::CONFLICT);
+    assert_eq!(resp.json()["error"], "conflict");
     let resp = send(
         &app,
         req(
@@ -204,4 +215,14 @@ async fn design_docs_use_the_same_revision_rules() {
     )
     .await;
     assert_eq!(resp.status, StatusCode::OK);
+    let rev3 = resp.json()["rev"].as_str().unwrap().to_string();
+    assert!(rev3.starts_with("3-"), "{rev3}");
+    assert_eq!(
+        resp.json(),
+        json!({"ok": true, "id": "_design/d", "rev": rev3})
+    );
+    assert_eq!(
+        get(&app, "/db/_design/d").await.status,
+        StatusCode::NOT_FOUND
+    );
 }

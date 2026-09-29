@@ -233,7 +233,11 @@ async fn delete_index_requires_matching_ddoc_and_type() {
     ] {
         let resp = delete(&app, uri).await;
         assert_eq!(resp.status, StatusCode::NOT_FOUND, "{uri}");
-        assert_eq!(resp.json()["error"], "not_found");
+        assert_eq!(
+            resp.json(),
+            json!({"error": "not_found", "reason": "missing"}),
+            "{uri}"
+        );
     }
     assert_eq!(db.get_indexes().await.len(), 2);
 
@@ -265,13 +269,13 @@ async fn bulk_delete_removes_index_design_docs() {
     )
     .await;
     assert_eq!(resp.status, StatusCode::OK);
-    let body = resp.json();
     assert_eq!(
-        body["success"],
-        json!([{"id": "_design/my-idx", "ok": true}])
+        resp.json(),
+        json!({
+            "success": [{"id": "_design/my-idx", "ok": true}],
+            "fail": [{"id": "_design/nope", "error": "not_found"}],
+        })
     );
-    assert_eq!(body["fail"][0]["id"], "_design/nope");
-    assert_eq!(body["fail"][0]["error"], "not_found");
     assert!(db.get("_design/my-idx").await.is_err());
     assert!(db.get_indexes().await.is_empty());
 }

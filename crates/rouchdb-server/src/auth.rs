@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
+// tokio's Instant behaves like std's at runtime, but tests can pause and
+// advance it to exercise session expiry.
+use tokio::time::Instant;
 
 use crate::state::AppState;
 
