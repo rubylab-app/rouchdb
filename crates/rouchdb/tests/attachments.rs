@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{Database, GetAttachmentOptions, RouchError};
 
 /// Stores `data` as `name` on a new document and checks what CouchDB then
@@ -55,7 +55,7 @@ async fn roundtrip(db: &Database, name: &str, data: &[u8], content_type: &str) {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn attachment_put_and_get_http() {
     let url = fresh_remote_db("attach").await;
     let db = Database::http(&url);
@@ -66,15 +66,13 @@ async fn attachment_put_and_get_http() {
         "text/plain",
     )
     .await;
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn attachment_binary_data() {
     let url = fresh_remote_db("attach_bin").await;
     let db = Database::http(&url);
     let binary_data: Vec<u8> = (0..=255).collect();
     roundtrip(&db, "bytes.bin", &binary_data, "application/octet-stream").await;
-    delete_remote_db(&url).await;
 }

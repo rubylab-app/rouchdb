@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{AllDocsOptions, Database, DocResult, RouchError};
 
 fn assert_uuid_v4(id: &str) {
@@ -27,7 +27,7 @@ fn sorted_ids(results: &[&DocResult]) -> Vec<String> {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn post_to_couchdb() {
     let url = fresh_remote_db("post").await;
     let db = Database::http(&url);
@@ -46,12 +46,10 @@ async fn post_to_couchdb() {
     assert_eq!(doc.data, serde_json::json!({"name": "Alice"}));
 
     assert_eq!(all_ids(&db).await, sorted_ids(&[&r1, &r2]));
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn post_and_replicate_to_couchdb() {
     let url = fresh_remote_db("post_repl").await;
     let local = Database::memory("local");
@@ -81,8 +79,6 @@ async fn post_and_replicate_to_couchdb() {
             serde_json::json!({"type": "note", "title": title})
         );
     }
-
-    delete_remote_db(&url).await;
 }
 
 // -----------------------------------------------------------------------
@@ -90,7 +86,7 @@ async fn post_and_replicate_to_couchdb() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn remove_attachment_from_couchdb() {
     let url = fresh_remote_db("rm_att").await;
     let db = Database::http(&url);
@@ -147,6 +143,4 @@ async fn remove_attachment_from_couchdb() {
     // Removing it again is not found.
     let again = db.remove_attachment("doc1", "hello.txt", &rev4).await;
     assert!(matches!(again, Err(RouchError::NotFound(_))), "{again:?}");
-
-    delete_remote_db(&url).await;
 }

@@ -28,14 +28,26 @@ pub enum MergeResult {
 /// `rev_limit` revisions per root-to-leaf path, which also collapses roots
 /// that became duplicates.
 pub fn merge_tree(tree: &RevTree, new_path: &RevPath, rev_limit: u64) -> (RevTree, MergeResult) {
+    let (result_tree, merge_result, _stemmed) = merge_and_stem(tree, new_path, rev_limit);
+    (result_tree, merge_result)
+}
+
+/// [`merge_tree`], also returning the revisions stemmed out of the tree by
+/// `rev_limit` (a `rev_limit` of 0 means no limit). Like CouchDB, a stemmed
+/// revision no longer exists: adapters must drop its stored body.
+pub fn merge_and_stem(
+    tree: &RevTree,
+    new_path: &RevPath,
+    rev_limit: u64,
+) -> (RevTree, MergeResult, Vec<Revision>) {
     let (mut result_tree, merge_result) = do_merge(tree, new_path, false);
 
     // Always re-normalize through stem (an unlimited depth when there is no
     // rev_limit) so overlapping roots merged above are collapsed into one.
     let depth = if rev_limit > 0 { rev_limit } else { u64::MAX };
-    let _stemmed = stem(&mut result_tree, depth);
+    let stemmed = stem_revs(&mut result_tree, depth);
 
-    (result_tree, merge_result)
+    (result_tree, merge_result, stemmed)
 }
 
 /// Core merge logic (`doMerge` in pouchdb-merge).
@@ -228,6 +240,14 @@ fn max_depth(node: &RevNode) -> u64 {
 /// remaining path still needs it (a short branch keeps its full ancestry even
 /// when a sibling branch is deep). This is why a `RevTree` is a list of roots.
 pub fn stem(tree: &mut RevTree, depth: u64) -> Vec<String> {
+    stem_revs(tree, depth)
+        .into_iter()
+        .map(|rev| rev.hash)
+        .collect()
+}
+
+/// [`stem`], returning the removed revisions with their generation.
+pub fn stem_revs(tree: &mut RevTree, depth: u64) -> Vec<Revision> {
     let depth = depth.max(1);
     let mut stemmed: Vec<(u64, String)> = Vec::new();
     let mut result: RevTree = Vec::new();
@@ -259,7 +279,10 @@ pub fn stem(tree: &mut RevTree, depth: u64) -> Vec<String> {
     stemmed.retain(|(pos, hash)| !rev_exists(&result, *pos, hash));
 
     *tree = result;
-    stemmed.into_iter().map(|(_, hash)| hash).collect()
+    stemmed
+        .into_iter()
+        .map(|(pos, hash)| Revision::new(pos, hash))
+        .collect()
 }
 
 /// Rebuild a linear chain (root first) produced by `root_to_leaf`.
@@ -375,6 +398,50 @@ pub fn latest_leaf(tree: &RevTree, pos: u64, hash: &str) -> Option<Revision> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// revs_diff
+// ---------------------------------------------------------------------------
+
+/// CouchDB's `_revs_diff` answer for one document with revision tree
+/// `tree` (`None` if the document does not exist): which of `revs` it
+/// lacks, and the leaves that could be their ancestors.
+///
+/// Like CouchDB 3, `missing` is sorted by generation then id (duplicates
+/// kept) and `possible_ancestors` lists, once and in winner order (deleted
+/// leaves last), every leaf older than the newest missing revision.
+/// Revisions are parsed and normalized (upper-case hex ids are the same
+/// revisions); a malformed one is an error. Returns `None` when nothing is
+/// missing.
+pub fn revs_diff_one(
+    tree: Option<&RevTree>,
+    revs: &[String],
+) -> crate::error::Result<Option<crate::document::RevsDiffResult>> {
+    let mut missing = Vec::new();
+    for rev in revs {
+        let rev: Revision = rev.parse()?;
+        if !tree.is_some_and(|t| rev_exists(t, rev.pos, &rev.hash)) {
+            missing.push(rev);
+        }
+    }
+    let Some(newest) = missing.iter().map(|r| r.pos).max() else {
+        return Ok(None);
+    };
+    missing.sort();
+    let possible_ancestors = tree
+        .map(|t| {
+            collect_leaves(t)
+                .iter()
+                .filter(|leaf| leaf.pos < newest)
+                .map(|leaf| leaf.rev_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Some(crate::document::RevsDiffResult {
+        missing: missing.iter().map(|r| r.to_string()).collect(),
+        possible_ancestors,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,6 +1078,69 @@ mod tests {
         let (merged, result) = merge_tree(&tree, &path(4, &["d", "c", "b", "a"]), 1000);
         assert_eq!(result, MergeResult::NewLeaf);
         assert_eq!(dump(&merged), "1-a[2-b[3-c[4-d]]]");
+    }
+
+    #[test]
+    fn merge_and_stem_reports_stemmed_revisions() {
+        // 1-a -> 2-b -> 3-c, extended by 4-d with a limit of 2 revisions.
+        let tree = vec![RevPath {
+            pos: 1,
+            tree: node("a", vec![node("b", vec![leaf("c")])]),
+        }];
+        let path = build_path_from_revs(
+            4,
+            &["d".into(), "c".into()],
+            NodeOpts::default(),
+            RevStatus::Available,
+        );
+        let (merged, result, stemmed) = merge_and_stem(&tree, &path, 2);
+        assert_eq!(result, MergeResult::NewLeaf);
+        assert_eq!(
+            stemmed,
+            [Revision::new(1, "a".into()), Revision::new(2, "b".into())]
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!((merged[0].pos, merged[0].tree.hash.as_str()), (3, "c"));
+        // No limit (0): nothing is stemmed.
+        let (_, _, stemmed) = merge_and_stem(&tree, &path, 0);
+        assert!(stemmed.is_empty());
+        // Within the limit: nothing is stemmed either.
+        let (_, _, stemmed) = merge_and_stem(&tree, &path, 4);
+        assert!(stemmed.is_empty());
+    }
+
+    #[test]
+    fn revs_diff_one_matches_couchdb() {
+        // 1-a -> {2-b, 2-c (deleted)}, 1-a -> 2-x -> 3-y
+        let tree = vec![RevPath {
+            pos: 1,
+            tree: node(
+                "a",
+                vec![leaf("b"), deleted_leaf("c"), node("x", vec![leaf("y")])],
+            ),
+        }];
+        let revs = |r: &[&str]| r.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(
+            revs_diff_one(Some(&tree), &revs(&["1-a", "3-y"]))
+                .unwrap()
+                .is_none()
+        );
+        let diff = revs_diff_one(Some(&tree), &revs(&["4-z", "2-q", "4-z", "3-y"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(diff.missing, ["2-q", "4-z", "4-z"]);
+        assert_eq!(diff.possible_ancestors, ["3-y", "2-b", "2-c"]);
+        let diff = revs_diff_one(Some(&tree), &revs(&["3-q"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(diff.possible_ancestors, ["2-b", "2-c"]);
+        let diff = revs_diff_one(Some(&tree), &revs(&["2-q"]))
+            .unwrap()
+            .unwrap();
+        assert!(diff.possible_ancestors.is_empty());
+        let diff = revs_diff_one(None, &revs(&["1-q"])).unwrap().unwrap();
+        assert_eq!((diff.missing.len(), diff.possible_ancestors.len()), (1, 0));
+        assert!(revs_diff_one(Some(&tree), &revs(&["bad"])).is_err());
     }
 
     #[test]

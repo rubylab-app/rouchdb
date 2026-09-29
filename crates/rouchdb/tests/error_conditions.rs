@@ -6,7 +6,7 @@ mod backends;
 mod common;
 
 use backends::backends;
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{ChangesOptions, Database, FindOptions, GetOptions, RouchError, Seq, SortField};
 
 /// How an error is recognized.
@@ -213,18 +213,17 @@ async fn error_table_local() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn error_table_couchdb() {
     let url = fresh_remote_db("err_table").await;
     let db = Database::http(&url);
     error_table(&db, "couchdb").await;
-    delete_remote_db(&url).await;
 }
 
 /// A `validate_doc_update` rejection keeps its kind: `forbidden` and
 /// `unauthorized` are distinct errors, and nothing is written.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn error_validate_doc_update_rejections() {
     let url = fresh_remote_db("err_vdu").await;
     let db = Database::http(&url);
@@ -258,12 +257,10 @@ async fn error_validate_doc_update_rejections() {
     db.put("c", serde_json::json!({"kind": "ok"}))
         .await
         .unwrap();
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn error_get_deleted_doc() {
     let url = fresh_remote_db("err_deleted").await;
     let db = Database::http(&url);
@@ -293,6 +290,4 @@ async fn error_get_deleted_doc() {
         got.to_json(),
         serde_json::json!({"_id": "doc1", "_rev": tomb_rev, "_deleted": true})
     );
-
-    delete_remote_db(&url).await;
 }

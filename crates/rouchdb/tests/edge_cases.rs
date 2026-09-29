@@ -605,16 +605,15 @@ async fn design_doc_update_requires_rev() {
         let first = db.put_design(empty_design("_design/myapp")).await.unwrap();
         assert!(first.ok, "{}: {first:?}", b.name);
 
-        // Putting it again without the revision is a conflict and changes
-        // nothing. (put_design still reports it as Ok with ok: false where
-        // put returns Err(Conflict); that difference is being fixed
-        // separately, so either form is accepted here.)
+        // Putting it again without the revision is a conflict, reported as
+        // an error like `put` (not `Ok` with `ok: false`), and changes
+        // nothing.
         let result = db.put_design(empty_design("_design/myapp")).await;
-        match &result {
-            Err(RouchError::Conflict) => {}
-            Ok(r) if !r.ok && r.error.as_deref() == Some("conflict") => {}
-            other => panic!("{}: expected a conflict, got {other:?}", b.name),
-        }
+        assert!(
+            matches!(result, Err(RouchError::Conflict)),
+            "{}: expected a conflict, got {result:?}",
+            b.name
+        );
         let stored = db.get_design("myapp").await.unwrap();
         assert_eq!(stored.rev, first.rev, "{}", b.name);
         assert_eq!(
@@ -626,8 +625,6 @@ async fn design_doc_update_requires_rev() {
     }
 }
 
-/// `put_design` carries over what `DesignDocument` does not model from the
-/// revision it replaces, which is not always the winning one.
 /// What `put_design` removes through the struct stays removed: only fields
 /// the struct cannot represent are carried over from the replaced revision.
 #[tokio::test]
@@ -696,6 +693,8 @@ async fn put_design_update_drops_what_the_struct_removes() {
     }
 }
 
+/// `put_design` carries over what `DesignDocument` does not model from the
+/// revision it replaces, which is not always the winning one.
 #[tokio::test]
 async fn put_design_keeps_fields_of_the_revision_it_replaces() {
     for b in backends("test") {

@@ -139,7 +139,7 @@ fn range_queries() -> Vec<AllDocsOptions> {
             for inclusive_end in [true, false] {
                 // Known bug: when descending, an exclusive end bound that
                 // falls outside the partition drops the `users:` document
-                // (see partition_all_docs_edge_ids).
+                // (see blocked_on_q_api_1_partition_all_docs_edge_ids).
                 let end_outside = end_key.as_deref().is_none_or(|e| e < PREFIX);
                 if descending && !inclusive_end && end_outside {
                     continue;
@@ -253,7 +253,7 @@ async fn partition_all_docs_by_key_stays_in_the_partition() {
 /// exclusive end is only applied to the caller's own end key.
 #[tokio::test]
 #[ignore = "blocked on Q-API-1: partition bounds drop edge ids"]
-async fn partition_all_docs_edge_ids() {
+async fn blocked_on_q_api_1_partition_all_docs_edge_ids() {
     for b in backends("partition") {
         let edge = ["users:", "users:a", "users:\u{10FFFF}", "users:\u{10FFFF}z"];
         for id in edge.iter().chain(&["users9", "users;"]) {

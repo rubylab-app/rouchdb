@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{AllDocsOptions, Database};
 
 /// Replicates `docs` memory → CouchDB → (memory, redb) and checks every
@@ -48,8 +48,6 @@ async fn assert_roundtrip(prefix: &str, docs: &[(&str, serde_json::Value)]) {
             assert_eq!(doc.data, *body, "{name} {id}");
         }
     }
-
-    delete_remote_db(&url).await;
 }
 
 // =========================================================================
@@ -57,7 +55,7 @@ async fn assert_roundtrip(prefix: &str, docs: &[(&str, serde_json::Value)]) {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_nested_objects_roundtrip() {
     let data = serde_json::json!({
         "address": {
@@ -74,7 +72,7 @@ async fn data_nested_objects_roundtrip() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_arrays_roundtrip() {
     let data = serde_json::json!({
         "tags": ["rust", "database", "sync"],
@@ -85,7 +83,7 @@ async fn data_arrays_roundtrip() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_null_and_bool_roundtrip() {
     let data = serde_json::json!({
         "optional": null,
@@ -98,7 +96,7 @@ async fn data_null_and_bool_roundtrip() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_numeric_types_roundtrip() {
     let data = serde_json::json!({
         "integer": 42,
@@ -115,7 +113,7 @@ async fn data_numeric_types_roundtrip() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_empty_structures_roundtrip() {
     let data = serde_json::json!({
         "empty_arr": [],
@@ -127,7 +125,7 @@ async fn data_empty_structures_roundtrip() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_mixed_type_array_roundtrip() {
     let data = serde_json::json!({
         "mix": [1, "two", true, null, {"nested": 5}, [6, 7]]
@@ -136,7 +134,7 @@ async fn data_mixed_type_array_roundtrip() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_unicode_roundtrip() {
     let data = serde_json::json!({
         "emoji": "\u{1F980}\u{1F389}",
@@ -152,7 +150,7 @@ async fn data_unicode_roundtrip() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn data_large_document() {
     let mut obj = serde_json::Map::new();
     for i in 0..100 {
@@ -174,7 +172,7 @@ async fn data_large_document() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn special_id_with_spaces() {
     let url = fresh_remote_db("id_spaces").await;
     let db = Database::http(&url);
@@ -188,12 +186,10 @@ async fn special_id_with_spaces() {
     assert_eq!(doc.id, "my document");
     assert_eq!(doc.rev.unwrap().to_string(), r.rev.unwrap());
     assert_eq!(doc.data, serde_json::json!({"v": 1}));
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn special_id_with_unicode() {
     let url = fresh_remote_db("id_unicode").await;
     let db = Database::http(&url);
@@ -207,12 +203,10 @@ async fn special_id_with_unicode() {
     let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
     assert_eq!(all.rows.len(), 1);
     assert_eq!(all.rows[0].id, id);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn special_id_replicate_roundtrip() {
     let docs: Vec<(&str, serde_json::Value)> = [
         ("has spaces", "spaces"),

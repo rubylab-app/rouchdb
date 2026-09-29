@@ -390,7 +390,7 @@ async fn before_write_rejection_leaves_a_batch_unwritten() {
 /// reject them (CouchDB runs `validate_doc_update` on attachment updates).
 #[tokio::test]
 #[ignore = "blocked on Q-API-2: put_attachment/remove_attachment skip before_write"]
-async fn before_write_runs_on_attachment_writes() {
+async fn blocked_on_q_api_2_before_write_runs_on_attachment_writes() {
     for kind in KINDS {
         for op in ATTACHMENT_OPS {
             let log = Log::default();
@@ -492,8 +492,12 @@ async fn after_write_error_is_returned_but_the_write_is_kept() {
                     let r = retry.unwrap();
                     assert_eq!(r.error.as_deref(), Some("conflict"), "{kind}: {r:?}");
                 }
-                // put_design reports conflicts on its own (see edge_cases).
-                Op::PutDesign => {}
+                // Like CouchDB's DELETE, removing a document that is already
+                // deleted is not_found ("deleted"), not a conflict.
+                Op::Remove => assert!(
+                    matches!(retry, Err(RouchError::NotFound(_))),
+                    "{kind} {op:?}: {retry:?}"
+                ),
                 _ => assert!(
                     matches!(retry, Err(RouchError::Conflict)),
                     "{kind} {op:?}: {retry:?}"

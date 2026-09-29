@@ -1,6 +1,7 @@
 services:
   couchdb:
-    image: couchdb:3
+    # Pinned, like the CI service (.github/workflows/ci.yml).
+    image: couchdb:3.5.1
     ports:
       - "15984:5984"
     environment:
@@ -11,3 +12,23 @@ services:
       interval: 3s
       timeout: 5s
       retries: 10
+
+  # One-shot: CouchDB 3.4+ locks an account after 5 failed logins, and a
+  # locked-out test admin fails every remaining test with 403. The tests
+  # never log in as the admin with a wrong password, but turn the lockout
+  # off anyway, as CI does. (A read-only ini mounted into local.d would stop
+  # the image's entrypoint, which chowns everything under /opt/couchdb.)
+  couchdb-setup:
+    image: couchdb:3.5.1
+    depends_on:
+      couchdb:
+        condition: service_healthy
+    restart: "no"
+    entrypoint:
+      - curl
+      - -fsS
+      - -X
+      - PUT
+      - http://admin:password@couchdb:5984/_node/_local/_config/chttpd_auth_lockout/mode
+      - -d
+      - '"off"'

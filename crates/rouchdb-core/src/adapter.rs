@@ -99,7 +99,11 @@ pub trait Adapter: Send + Sync {
     /// attachment data.
     async fn compact(&self) -> Result<()>;
 
-    /// Destroy the database and all its data.
+    /// Destroy the database and all its data, local documents (replication
+    /// checkpoints) and the security document included.
+    ///
+    /// The adapter stays usable afterwards and behaves as a new, empty
+    /// database (a remote one is re-created on its next use).
     async fn destroy(&self) -> Result<()>;
 
     /// Close the database, releasing any held resources.

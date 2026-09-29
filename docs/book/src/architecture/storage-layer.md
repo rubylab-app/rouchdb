@@ -106,6 +106,12 @@ The `DocRecord` contains:
 revision string (e.g., `"3-abc123"`) separated by a null byte. The null byte
 ensures that keys for the same document are contiguous in the table.
 
+Document ids may themselves contain NUL (CouchDB accepts `"a\u0000b"`), so
+the key range of `a` (`"a\0"` .. `"a\x01"`) also holds the keys of `a\0b`.
+Revision ids never contain NUL (they are rejected), so a key in that range
+whose remainder contains a NUL belongs to a longer id and is skipped when
+the bodies of `a` are listed (compaction, purge).
+
 ```rust
 fn rev_data_key(doc_id: &str, rev_str: &str) -> String {
     format!("{}\0{}", doc_id, rev_str)
@@ -177,6 +183,9 @@ case is replication checkpoints (`_local/{replication_id}`).
 in CouchDB's HTTP API is stripped -- the key is just the ID portion.
 
 **Value:** Raw JSON bytes (`serde_json::Value` serialized with `to_vec`).
+A local document written through `bulk_docs` / `Database::put` with a
+`_local/` id carries its revision (`"_rev": "0-N"`) in the body, like the
+server's `PUT /{db}/_local/{id}`.
 
 Local documents do not have revision trees or sequence numbers. They are
 simple key-value pairs that can be read, written, and deleted. They do not
@@ -344,7 +353,8 @@ When `RedbAdapter::open` is called:
 
 `destroy()` drains all entries from all six tables and resets the metadata
 to `update_seq: 0` with a fresh UUID. The database file itself is not
-deleted -- it remains on disk but is empty.
+deleted -- it remains on disk but is empty, and the handle keeps working as
+a new, empty database.
 
 ## Revision Hash Generation
 

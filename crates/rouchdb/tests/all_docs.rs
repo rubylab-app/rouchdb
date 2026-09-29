@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{AllDocsOptions, AllDocsResponse, BulkDocsOptions, Database, Document};
 
 fn ids(result: &AllDocsResponse) -> Vec<&str> {
@@ -11,7 +11,7 @@ fn ids(result: &AllDocsResponse) -> Vec<&str> {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn all_docs_include_docs() {
     let url = fresh_remote_db("ad_incdocs").await;
     let db = Database::http(&url);
@@ -42,12 +42,10 @@ async fn all_docs_include_docs() {
             Some(serde_json::json!({"_id": r.id, "_rev": rev, "name": name}))
         );
     }
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn all_docs_key_range() {
     let url = fresh_remote_db("ad_range").await;
     let db = Database::http(&url);
@@ -68,12 +66,10 @@ async fn all_docs_key_range() {
     assert_eq!(ids(&result), ["banana", "cherry"]);
     let result = db.all_docs(range("b", "d", true)).await.unwrap();
     assert_eq!(ids(&result), ["banana", "cherry"]);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn all_docs_descending() {
     let url = fresh_remote_db("ad_desc").await;
     let db = Database::http(&url);
@@ -101,12 +97,10 @@ async fn all_docs_descending() {
         .await
         .unwrap();
     assert_eq!(ids(&result), ["bbb", "aaa"]);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn all_docs_skip_and_limit() {
     let url = fresh_remote_db("ad_paging").await;
     let db = Database::http(&url);
@@ -126,12 +120,10 @@ async fn all_docs_skip_and_limit() {
 
     assert_eq!(ids(&result), ["b", "c"]);
     assert_eq!(result.total_rows, 5);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn all_docs_empty_database() {
     let url = fresh_remote_db("ad_empty").await;
     let db = Database::http(&url);
@@ -139,15 +131,13 @@ async fn all_docs_empty_database() {
     let result = db.all_docs(AllDocsOptions::new()).await.unwrap();
     assert_eq!(result.total_rows, 0);
     assert_eq!(result.rows.len(), 0);
-
-    delete_remote_db(&url).await;
 }
 
 /// The same checks as parity_core's local all_docs tests, against CouchDB:
 /// `conflicts` lists the losing revisions of a real conflict and
 /// `update_seq` is the database's sequence.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn all_docs_conflicts_and_update_seq() {
     let url = fresh_remote_db("ad_conflicts").await;
     let db = Database::http(&url);
@@ -204,6 +194,4 @@ async fn all_docs_conflicts_and_update_seq() {
 
     let plain = db.all_docs(AllDocsOptions::new()).await.unwrap();
     assert!(plain.update_seq.is_none());
-
-    delete_remote_db(&url).await;
 }

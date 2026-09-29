@@ -2,11 +2,11 @@
 
 mod common;
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{AllDocsOptions, Database, GetOptions, RouchError};
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn database_info_http() {
     let url = fresh_remote_db("db_info").await;
     let db = Database::http(&url);
@@ -22,12 +22,10 @@ async fn database_info_http() {
     let info = db.info().await.unwrap();
     assert_eq!((info.doc_count, info.doc_del_count), (2, 1));
     assert_eq!(info.update_seq.as_num(), 4);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn database_compact_http() {
     let url = fresh_remote_db("db_compact").await;
     let db = Database::http(&url);
@@ -42,9 +40,9 @@ async fn database_compact_http() {
         .await
         .unwrap();
 
+    // CouchDB compacts in the background; the reads below do not depend
+    // on when it finishes, so there is nothing to wait for.
     db.compact().await.unwrap();
-
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let doc = db.get("doc1").await.unwrap();
     assert_eq!(doc.rev.unwrap().to_string(), r3.rev.unwrap());
@@ -52,12 +50,10 @@ async fn database_compact_http() {
 
     let info = db.info().await.unwrap();
     assert_eq!(info.doc_count, 1);
-
-    delete_remote_db(&url).await;
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn database_destroy_http() {
     let url = fresh_remote_db("db_destroy").await;
     let db = Database::http(&url);
@@ -66,22 +62,28 @@ async fn database_destroy_http() {
 
     db.destroy().await.unwrap();
 
-    let result = db.info().await;
-    assert!(matches!(result, Err(RouchError::NotFound(_))), "{result:?}");
-    // The database is gone from the server.
+    // The database is gone from the server...
     let status = reqwest::Client::new()
-        .get(&url)
+        .get(url.url())
         .send()
         .await
         .unwrap()
         .status();
     assert_eq!(status, 404);
+    // ...and, like the local adapters, the handle then behaves as a new,
+    // empty database: it is re-created on its next use.
+    let info = db.info().await.unwrap();
+    assert_eq!((info.doc_count, info.doc_del_count), (0, 0));
+    assert!(matches!(db.get("doc1").await, Err(RouchError::NotFound(_))));
+    let r = db.put("doc1", serde_json::json!({"v": 2})).await.unwrap();
+    assert!(r.rev.unwrap().starts_with("1-"));
+    db.destroy().await.unwrap();
 }
 
 /// Documents written on the memory backend, replicated to CouchDB and from
 /// there to redb, are the same documents (body and revision) everywhere.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn cross_adapter_fidelity_memory_couchdb_redb() {
     let url = fresh_remote_db("fidelity").await;
     let memory = Database::memory("mem");
@@ -217,6 +219,4 @@ async fn cross_adapter_fidelity_memory_couchdb_redb() {
             "{name}"
         );
     }
-
-    delete_remote_db(&url).await;
 }

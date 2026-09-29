@@ -2,18 +2,15 @@
 //! real CouchDB and against RouchDB, and compare the results in order.
 //!
 //! The Mango table holds the results CouchDB 3.5.1 returns. The
-//! `#[ignore]`d tests (run with `-- --ignored`, see `common`) check the
+//! tests marked "requires CouchDB" (run with `-- --ignored`, see `common`) check the
 //! table against CouchDB; `mango_table_matches_couchdb_results_locally` runs
 //! it on the memory and redb adapters in every `cargo test`.
 
 mod common;
 
 use std::future::Future;
-use std::panic::AssertUnwindSafe;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
-use common::{delete_remote_db, fresh_remote_db};
+use common::fresh_remote_db;
 use rouchdb::{
     BulkDocsOptions, Database, Document, FindOptions, IndexDefinition, ReduceFn, SortField,
     ViewQueryOptions, query_view,
@@ -24,43 +21,28 @@ use serde_json::{Value, json};
 // CouchDB helpers
 // =========================================================================
 
-/// A future that turns a panic while polling `F` into an `Err`.
-struct CatchUnwind<F>(Pin<Box<F>>);
-
-impl<F: Future> Future for CatchUnwind<F> {
-    type Output = std::thread::Result<F::Output>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let inner = self.0.as_mut();
-        match std::panic::catch_unwind(AssertUnwindSafe(|| inner.poll(cx))) {
-            Ok(Poll::Pending) => Poll::Pending,
-            Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
-            Err(panic) => Poll::Ready(Err(panic)),
-        }
-    }
-}
-
-/// Run `body` against a fresh single-shard CouchDB database, deleting the
-/// database afterwards even if `body` panics.
+/// Run `body` against a fresh single-shard CouchDB database. The
+/// `RemoteDb` guard deletes the database afterwards, also when `body`
+/// panics.
 ///
 /// With several shards CouchDB merges per-shard results, so duplicate
 /// `keys` and the `offset` of multi-key queries depend on the shard layout;
 /// one shard gives the plain semantics that PouchDB and RouchDB implement.
-async fn with_couch_db<F, Fut>(prefix: &str, body: F)
+async fn with_couch_db<F, Fut>(label: &str, body: F)
 where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let url = fresh_remote_db(prefix).await;
+    let db = fresh_remote_db(label).await;
     let client = reqwest::Client::new();
-    client.delete(&url).send().await.unwrap();
-    let created = client.put(format!("{url}?q=1")).send().await.unwrap();
+    client.delete(db.url()).send().await.unwrap();
+    let created = client
+        .put(format!("{}?q=1", db.url()))
+        .send()
+        .await
+        .unwrap();
     assert!(created.status().is_success(), "{}", created.status());
-    let result = CatchUnwind(Box::pin(body(url.clone()))).await;
-    delete_remote_db(&url).await;
-    if let Err(panic) = result {
-        std::panic::resume_unwind(panic);
-    }
+    body(db.url().to_string()).await;
 }
 
 async fn couch_bulk_docs(url: &str, docs: &[Value]) {
@@ -841,9 +823,9 @@ async fn couch_mismatches(url: &str, cases: &[(Value, Value)]) -> Vec<String> {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn mango_selectors_match_couchdb() {
-    with_couch_db("b1q_parity_mango", |url| async move {
+    with_couch_db("parity_mango", |url| async move {
         couch_bulk_docs(&url, &mango_corpus()).await;
         let mut mismatches = couch_mismatches(&url, &unindexed_queries()).await;
         for query in rejected_queries() {
@@ -1219,9 +1201,9 @@ async fn local_linked_revisions(db: &Database) {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn views_match_couchdb() {
-    with_couch_db("b1q_parity_views", |url| async move {
+    with_couch_db("parity_views", |url| async move {
         let local = Database::memory("local");
         let mut docs = view_docs();
         docs.extend(view_design_docs());
@@ -1273,11 +1255,11 @@ async fn views_match_couchdb() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires CouchDB"]
 async fn http_database_runs_mango_on_couchdb() {
     // F48: find/create_index on Database::http must use CouchDB's _find and
     // _index instead of downloading every document.
-    with_couch_db("b1q_remote_mango", |url| async move {
+    with_couch_db("remote_mango", |url| async move {
         let remote = Database::http(&url);
         for name in ["apple", "Banana", "cherry"] {
             remote.put(name, json!({"name": name})).await.unwrap();

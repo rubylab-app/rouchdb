@@ -30,6 +30,12 @@
 //! # }
 //! ```
 
+// The README's Rust examples are compiled (and run) as doctests of this
+// crate, so they cannot drift from the API.
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+struct ReadmeDoctests;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -40,6 +46,7 @@ use tokio::sync::RwLock;
 pub use rouchdb_core::adapter::Adapter;
 pub use rouchdb_core::document::*;
 pub use rouchdb_core::error::{Result, RouchError};
+pub use rouchdb_core::json::MAX_NESTING_DEPTH;
 pub use rouchdb_core::merge::{is_deleted, winning_rev};
 
 // Re-export adapters
@@ -496,13 +503,16 @@ impl Database {
 
     /// Delete a document (requires the current rev).
     ///
-    /// Returns `RouchError::Conflict` if `rev` is not a current leaf
-    /// revision of the document.
+    /// Like CouchDB's `DELETE` (and PouchDB's `remove`), a document that
+    /// does not exist or is already deleted is `RouchError::NotFound`;
+    /// `RouchError::Conflict` if `rev` is not a current leaf revision of the
+    /// document.
     pub async fn remove(&self, id: &str, rev: &str) -> Result<DocResult> {
         if id.is_empty() {
             return Err(RouchError::MissingId);
         }
         let revision: Revision = rev.parse()?;
+        self.ensure_live(id).await?;
         let doc = Document {
             id: id.to_string(),
             rev: Some(revision),
@@ -511,6 +521,19 @@ impl Database {
             attachments: HashMap::new(),
         };
         self.write_one(doc).await
+    }
+
+    /// `NotFound` unless `id` is a live document (or an existing local
+    /// document), the check CouchDB's `DELETE` makes before writing.
+    async fn ensure_live(&self, id: &str) -> Result<()> {
+        match rouchdb_core::write::local_doc_id(id) {
+            Some(local) => self.adapter.get_local(local).await.map(|_| ()),
+            None => self
+                .adapter
+                .get(id, GetOptions::default())
+                .await
+                .map(|_| ()),
+        }
     }
 
     /// Write a single document and turn a failed `DocResult` into an error.
@@ -945,6 +968,9 @@ impl Database {
 
     /// Store a design document.
     ///
+    /// Like `put`, a failed write (e.g. `RouchError::Conflict`) is an error,
+    /// never `Ok` with `ok: false`.
+    ///
     /// `DesignDocument` only models JavaScript views and a few fields. When
     /// updating (`ddoc.rev` is set), everything else in the revision being
     /// replaced (`views.lib`, Mango index views, view and ddoc `options`,
@@ -964,9 +990,9 @@ impl Database {
                 Err(e) => return Err(e),
             }
         }
-        let doc = Document::from_json(json)?;
-        let results = self.bulk_docs(vec![doc], BulkDocsOptions::new()).await?;
-        first_result(results)
+        let mut doc = Document::from_json(json)?;
+        doc.prepare_for_write()?;
+        self.write_one(doc).await
     }
 
     /// Retrieve a design document by name.
@@ -1118,7 +1144,15 @@ impl Database {
         self.adapter.compact().await
     }
 
-    /// Destroy the database and all its data, including its Mango indexes.
+    /// Destroy the database and all its data: documents, local documents
+    /// (replication checkpoints included), attachments, the security
+    /// document and its Mango indexes.
+    ///
+    /// The handle stays usable and then behaves as a new, empty database,
+    /// whatever the adapter: memory and redb start over in place, and an
+    /// http database is re-created on its next use (unless it was opened
+    /// with `skip_setup`, in which case operations fail with `NotFound`
+    /// until the database is created again).
     pub async fn destroy(&self) -> Result<()> {
         for plugin in &self.plugins {
             plugin.on_destroy().await?;

@@ -8,16 +8,20 @@ use uuid::Uuid;
 use rouchdb_core::adapter::Adapter;
 use rouchdb_core::document::*;
 use rouchdb_core::error::{Result, RouchError};
-use rouchdb_core::merge::{collect_conflicts, is_deleted, latest_leaf, remove_leaves, winning_rev};
+use rouchdb_core::merge::{
+    collect_conflicts, is_deleted, latest_leaf, remove_leaves, revs_diff_one, winning_rev,
+};
 use rouchdb_core::rev_tree::{
-    RevStatus, RevTree, collect_leaves, find_rev_ancestry, rev_exists, revs_info, traverse_rev_tree,
+    RevStatus, RevTree, collect_leaves, find_rev_ancestry, revs_info, traverse_rev_tree,
 };
 use rouchdb_core::write::{
-    PlannedWrite, ReplicatedWrite, edit_parent, error_result, ok_result, plan_new_edit,
-    plan_replicated_edit,
+    LocalWrite, PlannedWrite, ReplicatedWrite, edit_parent, error_result, local_doc_id,
+    local_document, ok_result, plan_local_write, plan_new_edit, plan_replicated_edit,
 };
 
-const DEFAULT_REV_LIMIT: u64 = 1000;
+/// Revisions kept per branch unless configured otherwise (CouchDB's
+/// default `_revs_limit`).
+pub const DEFAULT_REV_LIMIT: u64 = 1000;
 
 // ---------------------------------------------------------------------------
 // Internal storage types
@@ -47,6 +51,9 @@ struct Inner {
     changes: BTreeMap<u64, (String, bool)>,
     /// Local (non-replicated) documents.
     local_docs: HashMap<String, serde_json::Value>,
+    /// The security document (kept apart from local documents, so that
+    /// `_local/_security` is an ordinary local document as in CouchDB).
+    security: SecurityDocument,
     /// Attachment data keyed by digest.
     attachments: HashMap<String, Vec<u8>>,
     /// Number of purge requests applied.
@@ -57,6 +64,7 @@ struct Inner {
 #[derive(Debug, Clone)]
 pub struct MemoryAdapter {
     inner: Arc<RwLock<Inner>>,
+    rev_limit: u64,
 }
 
 impl MemoryAdapter {
@@ -68,10 +76,20 @@ impl MemoryAdapter {
                 update_seq: 0,
                 changes: BTreeMap::new(),
                 local_docs: HashMap::new(),
+                security: SecurityDocument::default(),
                 attachments: HashMap::new(),
                 purge_seq: 0,
             })),
+            rev_limit: DEFAULT_REV_LIMIT,
         }
+    }
+
+    /// Keep at most `limit` revisions per branch of a document's history
+    /// (PouchDB's `revs_limit`, CouchDB's `_revs_limit`; 0 means no limit).
+    /// Older revisions are stemmed away and are no longer readable.
+    pub fn with_rev_limit(mut self, limit: u64) -> Self {
+        self.rev_limit = limit;
+        self
     }
 }
 
@@ -79,14 +97,29 @@ impl MemoryAdapter {
 // Helper functions
 // ---------------------------------------------------------------------------
 
+/// Parse (and normalize) a revision string.
 fn parse_rev(rev_str: &str) -> Result<(u64, String)> {
-    let (pos_str, hash) = rev_str
-        .split_once('-')
-        .ok_or_else(|| RouchError::InvalidRev(rev_str.to_string()))?;
-    let pos: u64 = pos_str
-        .parse()
-        .map_err(|_| RouchError::InvalidRev(rev_str.to_string()))?;
-    Ok((pos, hash.to_string()))
+    let rev: Revision = rev_str.parse()?;
+    Ok((rev.pos, rev.hash))
+}
+
+/// The canonical form of a revision string (`InvalidRev` if malformed).
+fn canonical_rev(rev_str: &str) -> Result<String> {
+    Ok(rev_str.parse::<Revision>()?.to_string())
+}
+
+/// The answer to a `changes` request with `limit: 0`: no change, and the
+/// position the feed stands at (like CouchDB: `since`, or the current
+/// sequence when descending).
+fn empty_changes(opts: &ChangesOptions, update_seq: u64) -> ChangesResponse {
+    ChangesResponse {
+        results: Vec::new(),
+        last_seq: if opts.descending {
+            Seq::Num(update_seq)
+        } else {
+            opts.since.clone()
+        },
+    }
 }
 
 /// Map a failed attachment edit to the error the attachment APIs return.
@@ -131,15 +164,22 @@ impl Adapter for MemoryAdapter {
             ));
         }
 
+        let requested = opts.rev.as_deref().map(canonical_rev).transpose()?;
         let inner = self.inner.read().await;
+        if let Some(local) = local_doc_id(id) {
+            return match inner.local_docs.get(local) {
+                Some(stored) => Ok(local_document(local, stored.clone())),
+                None => Err(RouchError::NotFound("missing".into())),
+            };
+        }
         let stored = inner
             .docs
             .get(id)
             .ok_or_else(|| RouchError::NotFound(id.to_string()))?;
 
         // Determine which revision to return
-        let mut target_rev = if let Some(ref rev_str) = opts.rev {
-            rev_str.clone()
+        let mut target_rev = if let Some(rev_str) = requested {
+            rev_str
         } else {
             // Use the winning revision
             let winner = winning_rev(&stored.rev_tree)
@@ -157,8 +197,8 @@ impl Adapter for MemoryAdapter {
             target_rev = rev.to_string();
         }
 
-        // An unknown, compacted or otherwise body-less revision is missing,
-        // never an empty document.
+        // An unknown, stemmed, compacted or otherwise body-less revision is
+        // missing, never an empty document.
         let data = stored
             .rev_data
             .get(&target_rev)
@@ -249,9 +289,9 @@ impl Adapter for MemoryAdapter {
 
         for doc in docs {
             let result = if opts.new_edits {
-                process_doc_new_edits(&mut inner, doc, true)
+                process_doc_new_edits(&mut inner, doc, true, self.rev_limit)
             } else {
-                process_doc_replication(&mut inner, doc)
+                process_doc_replication(&mut inner, doc, self.rev_limit)
             };
             results.push(result);
         }
@@ -262,16 +302,8 @@ impl Adapter for MemoryAdapter {
     async fn all_docs(&self, opts: AllDocsOptions) -> Result<AllDocsResponse> {
         let inner = self.inner.read().await;
 
-        // Collect all doc IDs sorted
-        let mut doc_ids: Vec<&String> = inner.docs.keys().collect();
-        doc_ids.sort();
-
-        if opts.descending {
-            doc_ids.reverse();
-        }
-
-        // If specific keys are requested, use those instead (in request
-        // order, reversed for descending, like CouchDB)
+        // If specific keys are requested, use those (in request order,
+        // reversed for descending, like CouchDB); otherwise every id, sorted.
         let target_keys: Vec<String> = if let Some(ref keys) = opts.keys {
             let mut keys = keys.clone();
             if opts.descending {
@@ -281,7 +313,12 @@ impl Adapter for MemoryAdapter {
         } else if let Some(ref key) = opts.key {
             vec![key.clone()]
         } else {
-            doc_ids.iter().map(|k| (*k).clone()).collect()
+            let mut doc_ids: Vec<String> = inner.docs.keys().cloned().collect();
+            doc_ids.sort();
+            if opts.descending {
+                doc_ids.reverse();
+            }
+            doc_ids
         };
 
         let mut rows = Vec::new();
@@ -403,6 +440,9 @@ impl Adapter for MemoryAdapter {
 
     async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
         let inner = self.inner.read().await;
+        if opts.limit == Some(0) {
+            return Ok(empty_changes(&opts, inner.update_seq));
+        }
 
         let mut results = Vec::new();
         // Highest sequence actually inspected (even if filtered out), so the
@@ -526,41 +566,9 @@ impl Adapter for MemoryAdapter {
         let mut results = HashMap::new();
 
         for (doc_id, rev_list) in revs {
-            let mut missing = Vec::new();
-            let mut possible_ancestors = Vec::new();
-
-            let stored = inner.docs.get(&doc_id);
-
-            for rev_str in &rev_list {
-                let (pos, hash) = parse_rev(rev_str)?;
-
-                let exists = stored
-                    .map(|s| rev_exists(&s.rev_tree, pos, &hash))
-                    .unwrap_or(false);
-
-                if !exists {
-                    missing.push(rev_str.clone());
-
-                    // Find possible ancestors (existing revisions with lower pos)
-                    if let Some(stored) = stored {
-                        let leaves = collect_leaves(&stored.rev_tree);
-                        for leaf in &leaves {
-                            if leaf.pos < pos {
-                                possible_ancestors.push(leaf.rev_string());
-                            }
-                        }
-                    }
-                }
-            }
-
-            if !missing.is_empty() {
-                results.insert(
-                    doc_id,
-                    RevsDiffResult {
-                        missing,
-                        possible_ancestors,
-                    },
-                );
+            let tree = inner.docs.get(&doc_id).map(|s| &s.rev_tree);
+            if let Some(diff) = revs_diff_one(tree, &rev_list)? {
+                results.insert(doc_id, diff);
             }
         }
 
@@ -577,7 +585,7 @@ impl Adapter for MemoryAdapter {
             match inner.docs.get(&item.id) {
                 Some(stored) => {
                     let rev_str = if let Some(ref rev) = item.rev {
-                        rev.clone()
+                        canonical_rev(rev).unwrap_or_else(|_| rev.clone())
                     } else {
                         match winning_rev(&stored.rev_tree) {
                             Some(w) => w.to_string(),
@@ -712,15 +720,20 @@ impl Adapter for MemoryAdapter {
             .get(doc_id)
             .ok_or_else(|| RouchError::NotFound(doc_id.to_string()))?;
         let parent: Revision = rev.parse()?;
+        let rev = parent.to_string();
 
         // The new revision builds on `rev` (any leaf, not only the winner):
         // its body plus the parent's attachments with this one added.
         let doc_data = stored
             .rev_data
-            .get(rev)
+            .get(&rev)
             .cloned()
             .ok_or(RouchError::Conflict)?;
-        let parent_atts = stored.rev_attachments.get(rev).cloned().unwrap_or_default();
+        let parent_atts = stored
+            .rev_attachments
+            .get(&rev)
+            .cloned()
+            .unwrap_or_default();
         let mut attachments = parent_atts.clone();
         attachments.insert(
             att_id.to_string(),
@@ -741,14 +754,8 @@ impl Adapter for MemoryAdapter {
             attachments,
         };
         let tree = stored.rev_tree.clone();
-        let plan = plan_new_edit(
-            Some(&tree),
-            doc,
-            Some(&parent_atts),
-            false,
-            DEFAULT_REV_LIMIT,
-        )
-        .map_err(attachment_edit_error)?;
+        let plan = plan_new_edit(Some(&tree), doc, Some(&parent_atts), false, self.rev_limit)
+            .map_err(attachment_edit_error)?;
         Ok(apply_write(&mut inner, plan))
     }
 
@@ -766,7 +773,7 @@ impl Adapter for MemoryAdapter {
             .ok_or_else(|| RouchError::NotFound(doc_id.to_string()))?;
 
         let rev_str = if let Some(ref rev) = opts.rev {
-            rev.clone()
+            canonical_rev(rev)?
         } else {
             winning_rev(&stored.rev_tree)
                 .ok_or_else(|| RouchError::NotFound(doc_id.to_string()))?
@@ -796,13 +803,18 @@ impl Adapter for MemoryAdapter {
             .get(doc_id)
             .ok_or_else(|| RouchError::NotFound(doc_id.to_string()))?;
         let parent: Revision = rev.parse()?;
+        let rev = parent.to_string();
 
         let doc_data = stored
             .rev_data
-            .get(rev)
+            .get(&rev)
             .cloned()
             .ok_or(RouchError::Conflict)?;
-        let parent_atts = stored.rev_attachments.get(rev).cloned().unwrap_or_default();
+        let parent_atts = stored
+            .rev_attachments
+            .get(&rev)
+            .cloned()
+            .unwrap_or_default();
         if !parent_atts.contains_key(att_id) {
             return Err(RouchError::NotFound(format!(
                 "attachment {}/{}",
@@ -822,14 +834,8 @@ impl Adapter for MemoryAdapter {
             attachments,
         };
         let tree = stored.rev_tree.clone();
-        let plan = plan_new_edit(
-            Some(&tree),
-            doc,
-            Some(&parent_atts),
-            false,
-            DEFAULT_REV_LIMIT,
-        )
-        .map_err(attachment_edit_error)?;
+        let plan = plan_new_edit(Some(&tree), doc, Some(&parent_atts), false, self.rev_limit)
+            .map_err(attachment_edit_error)?;
         Ok(apply_write(&mut inner, plan))
     }
 
@@ -843,6 +849,7 @@ impl Adapter for MemoryAdapter {
     }
 
     async fn put_local(&self, id: &str, doc: serde_json::Value) -> Result<()> {
+        rouchdb_core::json::check_document_depth(&doc)?;
         let mut inner = self.inner.write().await;
         inner.local_docs.insert(id.to_string(), doc);
         Ok(())
@@ -885,6 +892,7 @@ impl Adapter for MemoryAdapter {
         inner.docs.clear();
         inner.changes.clear();
         inner.local_docs.clear();
+        inner.security = SecurityDocument::default();
         inner.attachments.clear();
         inner.update_seq = 0;
         inner.purge_seq = 0;
@@ -897,6 +905,10 @@ impl Adapter for MemoryAdapter {
         let mut bumped = false;
 
         for (doc_id, revs) in req {
+            let revs = revs
+                .iter()
+                .map(|r| canonical_rev(r))
+                .collect::<Result<Vec<_>>>()?;
             let Some(stored) = inner.docs.get(&doc_id) else {
                 continue;
             };
@@ -948,18 +960,11 @@ impl Adapter for MemoryAdapter {
     }
 
     async fn get_security(&self) -> Result<SecurityDocument> {
-        let inner = self.inner.read().await;
-        match inner.local_docs.get("_security") {
-            Some(val) => serde_json::from_value(val.clone())
-                .map_err(|e| RouchError::DatabaseError(e.to_string())),
-            None => Ok(SecurityDocument::default()),
-        }
+        Ok(self.inner.read().await.security.clone())
     }
 
     async fn put_security(&self, doc: SecurityDocument) -> Result<()> {
-        let mut inner = self.inner.write().await;
-        let val = serde_json::to_value(&doc)?;
-        inner.local_docs.insert("_security".to_string(), val);
+        self.inner.write().await.security = doc;
         Ok(())
     }
 }
@@ -971,12 +976,30 @@ impl Adapter for MemoryAdapter {
 /// Apply one `new_edits=true` write. The edit rules (conflicts, attachment
 /// inheritance, revision hashing) live in `rouchdb_core::write` so every
 /// adapter behaves the same; this only loads the inputs and stores the plan.
-fn process_doc_new_edits(inner: &mut Inner, mut doc: Document, inherit: bool) -> DocResult {
+fn process_doc_new_edits(
+    inner: &mut Inner,
+    mut doc: Document,
+    inherit: bool,
+    rev_limit: u64,
+) -> DocResult {
     if let Err(e) = doc.prepare_for_write() {
         return error_result(&doc.id, "bad_request", &e.to_string());
     }
     if doc.id.is_empty() {
         doc.id = Uuid::new_v4().to_string();
+    }
+    if local_doc_id(&doc.id).is_some() {
+        return match plan_local_write(doc) {
+            Ok(LocalWrite::Put { id, body, result }) => {
+                inner.local_docs.insert(id, body);
+                result
+            }
+            Ok(LocalWrite::Delete { id, result }) => {
+                inner.local_docs.remove(&id);
+                result
+            }
+            Err(result) => result,
+        };
     }
 
     let existing = inner.docs.get(&doc.id);
@@ -984,7 +1007,7 @@ fn process_doc_new_edits(inner: &mut Inner, mut doc: Document, inherit: bool) ->
     let parent_atts = edit_parent(tree, &doc)
         .and_then(|p| existing.and_then(|s| s.rev_attachments.get(&p.to_string()).cloned()));
 
-    match plan_new_edit(tree, doc, parent_atts.as_ref(), inherit, DEFAULT_REV_LIMIT) {
+    match plan_new_edit(tree, doc, parent_atts.as_ref(), inherit, rev_limit) {
         Ok(plan) => apply_write(inner, plan),
         Err(result) => result,
     }
@@ -994,19 +1017,25 @@ fn process_doc_new_edits(inner: &mut Inner, mut doc: Document, inherit: bool) ->
 // Document processing (new_edits = false, replication mode)
 // ---------------------------------------------------------------------------
 
-fn process_doc_replication(inner: &mut Inner, doc: Document) -> DocResult {
+fn process_doc_replication(inner: &mut Inner, doc: Document, rev_limit: u64) -> DocResult {
+    // CouchDB ignores `_local/` documents in replicated writes (they are
+    // never replicated): nothing is stored.
+    if local_doc_id(&doc.id).is_some() {
+        return DocResult {
+            ok: true,
+            id: doc.id,
+            rev: doc.rev.map(|r| r.to_string()),
+            error: None,
+            reason: None,
+        };
+    }
     let existing = inner.docs.get(&doc.id);
     let has_body = match (existing, &doc.rev) {
-        (Some(s), Some(r)) => s.rev_data.contains_key(&r.to_string()),
+        (Some(s), Some(r)) => s.rev_data.contains_key(&r.clone().normalized().to_string()),
         _ => false,
     };
 
-    let plan = match plan_replicated_edit(
-        existing.map(|s| &s.rev_tree),
-        doc,
-        has_body,
-        DEFAULT_REV_LIMIT,
-    ) {
+    let plan = match plan_replicated_edit(existing.map(|s| &s.rev_tree), doc, has_body, rev_limit) {
         Ok(ReplicatedWrite::Write(plan)) => *plan,
         Ok(ReplicatedWrite::AlreadyStored(result)) => return result,
         Err(result) => return result,
@@ -1056,6 +1085,13 @@ fn apply_write(inner: &mut Inner, plan: PlannedWrite) -> DocResult {
             seq: 0,
         });
 
+    // Stemmed revisions no longer exist: drop their bodies.
+    for rev in &plan.stemmed {
+        let rev = rev.to_string();
+        stored.rev_data.remove(&rev);
+        stored.rev_deleted.remove(&rev);
+        stored.rev_attachments.remove(&rev);
+    }
     stored.rev_tree = plan.tree;
     stored.rev_data.insert(rev_str.clone(), plan.data);
     stored.rev_deleted.insert(rev_str.clone(), plan.deleted);
@@ -1564,5 +1600,78 @@ mod tests {
         let inner = db.inner.read().await;
         assert_eq!(inner.attachments.len(), 1);
         assert!(inner.attachments.values().all(|b| b == &vec![2; 64]));
+    }
+
+    async fn edit(db: &MemoryAdapter, rev: Option<&str>, v: u64) -> String {
+        let doc = Document {
+            id: "d".into(),
+            rev: rev.map(|r| r.parse().unwrap()),
+            deleted: false,
+            data: serde_json::json!({ "v": v }),
+            attachments: HashMap::new(),
+        };
+        let res = db
+            .bulk_docs(vec![doc], BulkDocsOptions::new())
+            .await
+            .unwrap();
+        assert!(res[0].ok, "{:?}", res[0]);
+        res[0].rev.clone().unwrap()
+    }
+
+    /// Q-CORE-1: revisions stemmed by the revision limit lose their bodies.
+    #[tokio::test]
+    async fn stemming_drops_stored_bodies() {
+        let db = MemoryAdapter::new("s").with_rev_limit(3);
+        let mut rev = edit(&db, None, 0).await;
+        for v in 1..6 {
+            rev = edit(&db, Some(&rev), v).await;
+        }
+        let inner = db.inner.read().await;
+        let stored = &inner.docs["d"];
+        assert_eq!(stored.rev_data.len(), 3);
+        assert_eq!(stored.rev_deleted.len(), 3);
+        assert_eq!(stored.rev_attachments.len(), 3);
+    }
+
+    /// CouchDB's default `_revs_limit` (1000) applies without configuration.
+    #[tokio::test]
+    async fn default_rev_limit_is_1000() {
+        let db = new_db().await;
+        let first = edit(&db, None, 0).await;
+        let mut rev = first.clone();
+        for v in 1..=1000 {
+            rev = edit(&db, Some(&rev), v).await;
+        }
+        assert!(rev.starts_with("1001-"));
+        let old = GetOptions {
+            rev: Some(first),
+            ..Default::default()
+        };
+        assert!(matches!(
+            db.get("d", old).await,
+            Err(RouchError::NotFound(_))
+        ));
+        let got = db
+            .get(
+                "d",
+                GetOptions {
+                    revs: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            got.data["_revisions"]["ids"].as_array().unwrap().len(),
+            1000
+        );
+        assert_eq!(db.inner.read().await.docs["d"].rev_data.len(), 1000);
+        // 0 means no limit.
+        let unlimited = MemoryAdapter::new("u").with_rev_limit(0);
+        let mut rev = edit(&unlimited, None, 0).await;
+        for v in 1..=1000 {
+            rev = edit(&unlimited, Some(&rev), v).await;
+        }
+        assert_eq!(unlimited.inner.read().await.docs["d"].rev_data.len(), 1001);
     }
 }

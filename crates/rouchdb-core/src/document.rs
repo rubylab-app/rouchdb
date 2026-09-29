@@ -25,6 +25,29 @@ impl Revision {
     pub fn new(pos: u64, hash: String) -> Self {
         Self { pos, hash }
     }
+
+    /// The same revision in CouchDB's canonical form: a 32-digit hex id is
+    /// lower case (CouchDB stores it as 16 bytes, so `1-AB…` and `1-ab…`
+    /// are the same revision). Other ids are kept as they are.
+    pub fn normalized(mut self) -> Self {
+        if let std::borrow::Cow::Owned(hash) = normalize_rev_hash(&self.hash) {
+            self.hash = hash;
+        }
+        self
+    }
+}
+
+/// Canonical form of a revision id (the part after `pos-`): lower case for
+/// a 32-digit hex id, unchanged otherwise.
+pub fn normalize_rev_hash(hash: &str) -> std::borrow::Cow<'_, str> {
+    if hash.len() == 32
+        && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        && hash.bytes().any(|b| b.is_ascii_uppercase())
+    {
+        std::borrow::Cow::Owned(hash.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(hash)
+    }
 }
 
 impl fmt::Display for Revision {
@@ -36,6 +59,9 @@ impl fmt::Display for Revision {
 impl FromStr for Revision {
     type Err = RouchError;
 
+    /// Parse `pos-id`. The id is normalized (see [`Revision::normalized`]);
+    /// an empty id or one containing NUL (which storage keys cannot hold)
+    /// is rejected.
     fn from_str(s: &str) -> Result<Self> {
         let (pos_str, hash) = s
             .split_once('-')
@@ -43,12 +69,12 @@ impl FromStr for Revision {
         let pos: u64 = pos_str
             .parse()
             .map_err(|_| RouchError::InvalidRev(s.to_string()))?;
-        if hash.is_empty() {
+        if hash.is_empty() || hash.contains('\0') {
             return Err(RouchError::InvalidRev(s.to_string()));
         }
         Ok(Revision {
             pos,
-            hash: hash.to_string(),
+            hash: normalize_rev_hash(hash).into_owned(),
         })
     }
 }
@@ -148,7 +174,10 @@ impl Document {
     /// - read-only metadata (`_conflicts`, `_deleted_conflicts`, `_revs_info`,
     ///   `_revisions`, `_local_seq`) is dropped;
     /// - any other underscore member is rejected, as are ids that start with
-    ///   `_` other than `_design/` and `_local/`.
+    ///   `_` other than `_design/` and `_local/`;
+    /// - the revision is normalized ([`Revision::normalized`]);
+    /// - a body nested deeper than [`crate::json::MAX_NESTING_DEPTH`] is
+    ///   rejected.
     pub fn prepare_for_write(&mut self) -> Result<()> {
         let obj = self
             .data
@@ -200,6 +229,10 @@ impl Document {
                 "Only reserved document ids may start with underscore.".into(),
             ));
         }
+        if let Some(rev) = self.rev.take() {
+            self.rev = Some(rev.normalized());
+        }
+        crate::json::check_document_depth(&self.data)?;
 
         Ok(())
     }
@@ -340,6 +373,8 @@ fn parse_attachment(name: &str, meta: &serde_json::Value) -> Result<AttachmentMe
         return Err(invalid("multipart attachments (follows) are not supported"));
     }
 
+    // A stub refers to the parent revision's attachment of the same name
+    // (CouchDB matches stubs by name), so its digest is optional.
     let is_stub = obj.get("stub").and_then(|v| v.as_bool()).unwrap_or(false);
     match obj.get("digest").and_then(|v| v.as_str()) {
         Some(digest) => Ok(AttachmentMeta {
@@ -349,7 +384,13 @@ fn parse_attachment(name: &str, meta: &serde_json::Value) -> Result<AttachmentMe
             stub: true,
             data: None,
         }),
-        None if is_stub => Err(invalid("stub has no digest")),
+        None if is_stub => Ok(AttachmentMeta {
+            content_type,
+            digest: String::new(),
+            length: obj.get("length").and_then(|v| v.as_u64()).unwrap_or(0),
+            stub: true,
+            data: None,
+        }),
         None => Err(invalid("neither data nor a stub")),
     }
 }
@@ -527,6 +568,11 @@ pub struct AllDocsRowValue {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllDocsResponse {
     pub total_rows: u64,
+    /// The memory and redb adapters report the `skip` that was applied, as
+    /// PouchDB's local adapters do. CouchDB (and so the http adapter)
+    /// reports the number of rows before the first returned one, including
+    /// those before `start_key`, which needs a counted index the local
+    /// stores do not keep.
     pub offset: u64,
     pub rows: Vec<AllDocsRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -767,6 +813,60 @@ mod tests {
 
         let parsed: Revision = "3-abc123".parse().unwrap();
         assert_eq!(parsed, rev);
+    }
+
+    #[test]
+    fn revision_ids_are_normalized_like_couchdb() {
+        let upper = format!("2-{}", "AB".repeat(16));
+        let rev: Revision = upper.parse().unwrap();
+        assert_eq!(rev.to_string(), format!("2-{}", "ab".repeat(16)));
+        assert_eq!(
+            Revision::new(2, "AB".repeat(16)).normalized(),
+            Revision::new(2, "ab".repeat(16))
+        );
+        // Only 32-digit hex ids are canonicalized; others are kept.
+        for kept in ["1-ABC", "1-Zz", "0-1"] {
+            assert_eq!(kept.parse::<Revision>().unwrap().to_string(), kept);
+        }
+        let not_hex = format!("1-{}", "Z".repeat(32));
+        assert_eq!(not_hex.parse::<Revision>().unwrap().to_string(), not_hex);
+        let short = format!("1-{}", "A".repeat(31));
+        assert_eq!(short.parse::<Revision>().unwrap().to_string(), short);
+        // NUL cannot be stored in a revision id.
+        assert!(matches!(
+            "1-a\u{0}b".parse::<Revision>(),
+            Err(RouchError::InvalidRev(_))
+        ));
+    }
+
+    #[test]
+    fn prepare_for_write_normalizes_and_limits_depth() {
+        let mut doc = Document::from_json(serde_json::json!({"v": 1})).unwrap();
+        doc.rev = Some(Revision::new(1, "F".repeat(32)));
+        doc.prepare_for_write().unwrap();
+        assert_eq!(doc.rev.unwrap().hash, "f".repeat(32));
+
+        let mut deep = serde_json::json!(1);
+        for _ in 0..crate::json::MAX_NESTING_DEPTH {
+            deep = serde_json::json!([deep]);
+        }
+        let mut doc = Document::from_json(serde_json::json!({ "v": deep })).unwrap();
+        assert!(matches!(
+            doc.prepare_for_write(),
+            Err(RouchError::BadRequest(ref r)) if r.contains("nesting")
+        ));
+    }
+
+    #[test]
+    fn stub_without_digest_is_a_stub() {
+        let doc = Document::from_json(serde_json::json!({
+            "_attachments": {"a.txt": {"stub": true, "length": 5}}
+        }))
+        .unwrap();
+        let att = &doc.attachments["a.txt"];
+        assert!(att.stub && att.data.is_none() && att.digest.is_empty());
+        assert_eq!(att.length, 5);
+        assert!(Document::from_json(serde_json::json!({"_attachments": {"a": {}}})).is_err());
     }
 
     #[test]
