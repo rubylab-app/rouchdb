@@ -137,13 +137,7 @@ mod tests {
     async fn put_and_get_document() {
         let db = new_db().await;
 
-        let doc = Document {
-            id: "doc1".into(),
-            rev: None,
-            deleted: false,
-            data: serde_json::json!({"name": "Alice"}),
-            attachments: HashMap::new(),
-        };
+        let doc = Document::new("doc1", serde_json::json!({"name": "Alice"}));
 
         let results = db
             .bulk_docs(vec![doc], BulkDocsOptions::new())
@@ -284,7 +278,7 @@ Every test database starts with `rouchdb_test_`. If a run is killed before the g
 
 A test must be able to fail. In particular:
 
-- `put`, `update`, `remove` and `post` return a failed write as an error (`Err(RouchError::Conflict)`, `Err(RouchError::NotFound(_))`, `Err(RouchError::Forbidden(_))`, ...), never as `Ok` with `ok: false`. `bulk_docs` reports failures per document (`DocResult { ok: false, error: Some("conflict"), .. }`), so check each result's `ok` or `error`.
+- `put`, `update`, `remove` and `post` return a failed write as an error (`Err(RouchError::Conflict)`, `Err(RouchError::NotFound(_))`, `Err(RouchError::Forbidden(_))`, ...), never as `Ok` with `ok: false`. `bulk_docs` reports failures per document (`ok: false` and `error: Some("conflict")`), so check each result's `ok` or `error`.
 - Check the exact error with `matches!(result, Err(RouchError::Conflict))`, not `is_err()`: an unrelated failure passes `is_err()` too.
 - Compare exact values: the list of ids in order, the whole body, the revision. A count passes with the wrong documents, and `for row in &rows { assert!(..) }` passes when there are no rows.
 - Check the preconditions a test relies on (for example, which revision of a conflict wins) and that a rejected write left the database unchanged (same `update_seq`, same revision).

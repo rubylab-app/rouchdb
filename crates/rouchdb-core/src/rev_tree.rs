@@ -7,6 +7,8 @@
 /// Multiple roots arise when revisions are stemmed (pruned) and later a
 /// previously-stemmed branch is re-introduced during replication.
 /// Status of a revision's stored data.
+///
+/// Exhaustive on purpose: a revision's body is either stored or not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RevStatus {
     /// Full document data is stored for this revision.
@@ -49,7 +51,10 @@ pub struct RevPath {
 pub type RevTree = Vec<RevPath>;
 
 /// Information about a leaf node in the tree.
+///
+/// `#[non_exhaustive]`: returned by [`collect_leaves`], not built by callers.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct LeafInfo {
     pub pos: u64,
     pub hash: String,

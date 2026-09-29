@@ -69,8 +69,8 @@ db.remove("user:alice", &updated.rev.unwrap()).await?;
 
 // Bulk write
 let docs = vec![
-    Document { id: "a".into(), rev: None, deleted: false, data: json!({}), attachments: HashMap::new() },
-    Document { id: "b".into(), rev: None, deleted: false, data: json!({}), attachments: HashMap::new() },
+    Document::new("a", json!({})),
+    Document::new("b", json!({})),
 ];
 let results = db.bulk_docs(docs, BulkDocsOptions::new()).await?;
 

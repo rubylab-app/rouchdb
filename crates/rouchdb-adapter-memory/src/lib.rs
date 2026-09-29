@@ -109,10 +109,7 @@ impl MemoryAdapter {
             return;
         }
         for (seq, (doc_id, _)) in inner.changes.range(since + 1..) {
-            let _ = self.notices.send(ChangeNotice {
-                seq: Seq::Num(*seq),
-                doc_id: doc_id.clone(),
-            });
+            let _ = self.notices.send(ChangeNotice::new(*seq, doc_id.clone()));
         }
     }
 }
@@ -136,14 +133,12 @@ fn canonical_rev(rev_str: &str) -> Result<String> {
 /// position the feed stands at (like CouchDB: `since`, or the current
 /// sequence when descending).
 fn empty_changes(opts: &ChangesOptions, update_seq: u64) -> ChangesResponse {
-    ChangesResponse {
-        results: Vec::new(),
-        last_seq: if opts.descending {
-            Seq::Num(update_seq)
-        } else {
-            opts.since.clone()
-        },
-    }
+    let last_seq = if opts.descending {
+        Seq::Num(update_seq)
+    } else {
+        opts.since.clone()
+    };
+    ChangesResponse::new(Vec::new(), last_seq)
 }
 
 /// Map a failed attachment edit to the error the attachment APIs return.
@@ -173,12 +168,12 @@ impl Adapter for MemoryAdapter {
             }
         }
 
-        Ok(DbInfo {
-            db_name: inner.name.clone(),
+        Ok(DbInfo::new(
+            inner.name.clone(),
             doc_count,
             doc_del_count,
-            update_seq: Seq::Num(inner.update_seq),
-        })
+            inner.update_seq,
+        ))
     }
 
     async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
@@ -414,16 +409,13 @@ impl Adapter for MemoryAdapter {
                     None
                 };
 
-                rows.push(AllDocsRow {
-                    doc: doc_json,
-                    ..AllDocsRow::document(
+                rows.push(
+                    AllDocsRow::document(
                         key.clone(),
-                        AllDocsRowValue {
-                            rev: winner.to_string(),
-                            deleted: deleted.then_some(true),
-                        },
+                        AllDocsRowValue::new(winner.to_string(), deleted),
                     )
-                });
+                    .with_doc(doc_json),
+                );
             } else if opts.keys.is_some() {
                 // Every requested key gets a row (CouchDB).
                 rows.push(AllDocsRow::not_found(key.clone()));
@@ -456,12 +448,7 @@ impl Adapter for MemoryAdapter {
             None
         };
 
-        Ok(AllDocsResponse {
-            total_rows,
-            offset: opts.skip,
-            rows,
-            update_seq,
-        })
+        Ok(AllDocsResponse::new(total_rows, opts.skip, rows).with_update_seq(update_seq))
     }
 
     async fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
@@ -535,15 +522,13 @@ impl Adapter for MemoryAdapter {
                     // array (deletion is signaled by the `deleted` field).
                     collect_leaves(&s.rev_tree)
                         .iter()
-                        .map(|l| ChangeRev {
-                            rev: l.rev_string(),
-                        })
+                        .map(|l| l.rev_string())
                         .collect()
                 } else {
-                    vec![ChangeRev { rev: rev_str }]
+                    vec![rev_str]
                 }
             } else {
-                vec![ChangeRev { rev: rev_str }]
+                vec![rev_str]
             };
 
             // Collect conflicts if requested
@@ -562,14 +547,12 @@ impl Adapter for MemoryAdapter {
                 None
             };
 
-            results.push(ChangeEvent {
-                seq: Seq::Num(*seq),
-                id: doc_id.clone(),
-                changes: changes_list,
-                deleted: *deleted,
-                doc,
-                conflicts,
-            });
+            results.push(
+                ChangeEvent::new(*seq, doc_id.clone(), changes_list)
+                    .with_deleted(*deleted)
+                    .with_doc(doc)
+                    .with_conflicts(conflicts),
+            );
 
             if let Some(limit) = opts.limit
                 && results.len() >= limit as usize
@@ -584,7 +567,7 @@ impl Adapter for MemoryAdapter {
             .or_else(|| max_scanned.map(Seq::Num))
             .unwrap_or(opts.since.clone());
 
-        Ok(ChangesResponse { results, last_seq })
+        Ok(ChangesResponse::new(results, last_seq))
     }
 
     async fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
@@ -598,7 +581,7 @@ impl Adapter for MemoryAdapter {
             }
         }
 
-        Ok(RevsDiffResponse { results })
+        Ok(RevsDiffResponse::new(results))
     }
 
     async fn bulk_get(&self, docs: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
@@ -616,19 +599,13 @@ impl Adapter for MemoryAdapter {
                         match winning_rev(&stored.rev_tree) {
                             Some(w) => w.to_string(),
                             None => {
-                                bulk_docs.push(BulkGetDoc {
-                                    ok: None,
-                                    error: Some(BulkGetError {
-                                        id: item.id.clone(),
-                                        rev: item.rev.unwrap_or_default(),
-                                        error: "not_found".into(),
-                                        reason: "missing".into(),
-                                    }),
-                                });
-                                results.push(BulkGetResult {
-                                    id: item.id,
-                                    docs: bulk_docs,
-                                });
+                                bulk_docs.push(BulkGetDoc::error(BulkGetError::new(
+                                    item.id.clone(),
+                                    item.rev.unwrap_or_default(),
+                                    "not_found",
+                                    "missing",
+                                )));
+                                results.push(BulkGetResult::new(item.id, bulk_docs));
                                 continue;
                             }
                         }
@@ -674,42 +651,30 @@ impl Adapter for MemoryAdapter {
                             obj.insert("_attachments".into(), serde_json::Value::Object(att_map));
                         }
 
-                        bulk_docs.push(BulkGetDoc {
-                            ok: Some(serde_json::Value::Object(obj)),
-                            error: None,
-                        });
+                        bulk_docs.push(BulkGetDoc::ok(serde_json::Value::Object(obj)));
                     } else {
-                        bulk_docs.push(BulkGetDoc {
-                            ok: None,
-                            error: Some(BulkGetError {
-                                id: item.id.clone(),
-                                rev: rev_str,
-                                error: "not_found".into(),
-                                reason: "missing".into(),
-                            }),
-                        });
+                        bulk_docs.push(BulkGetDoc::error(BulkGetError::new(
+                            item.id.clone(),
+                            rev_str,
+                            "not_found",
+                            "missing",
+                        )));
                     }
                 }
                 None => {
-                    bulk_docs.push(BulkGetDoc {
-                        ok: None,
-                        error: Some(BulkGetError {
-                            id: item.id.clone(),
-                            rev: item.rev.unwrap_or_default(),
-                            error: "not_found".into(),
-                            reason: "missing".into(),
-                        }),
-                    });
+                    bulk_docs.push(BulkGetDoc::error(BulkGetError::new(
+                        item.id.clone(),
+                        item.rev.unwrap_or_default(),
+                        "not_found",
+                        "missing",
+                    )));
                 }
             }
 
-            results.push(BulkGetResult {
-                id: item.id,
-                docs: bulk_docs,
-            });
+            results.push(BulkGetResult::new(item.id, bulk_docs));
         }
 
-        Ok(BulkGetResponse { results })
+        Ok(BulkGetResponse::new(results))
     }
 
     async fn put_attachment(
@@ -963,10 +928,7 @@ impl Adapter for MemoryAdapter {
         collect_unreferenced_attachments(&mut inner);
         self.announce(&inner, since);
 
-        Ok(PurgeResponse {
-            purge_seq: Some(inner.purge_seq),
-            purged,
-        })
+        Ok(PurgeResponse::new(Some(inner.purge_seq), purged))
     }
 
     async fn get_security(&self) -> Result<SecurityDocument> {
@@ -1037,13 +999,9 @@ fn process_doc_replication(inner: &mut Inner, doc: Document, rev_limit: u64) -> 
     // CouchDB ignores `_local/` documents in replicated writes (they are
     // never replicated): nothing is stored.
     if local_doc_id(&doc.id).is_some() {
-        return DocResult {
-            ok: true,
-            id: doc.id,
-            rev: doc.rev.map(|r| r.to_string()),
-            error: None,
-            reason: None,
-        };
+        let mut result = DocResult::ok(doc.id, "");
+        result.rev = doc.rev.map(|r| r.to_string());
+        return result;
     }
     let existing = inner.docs.get(&doc.id);
     let has_body = match (existing, &doc.rev) {
@@ -1313,10 +1271,7 @@ mod tests {
             .bulk_docs(vec![doc("a"), doc("b")], BulkDocsOptions::new())
             .await
             .unwrap();
-        let notice = |seq: u64, id: &str| ChangeNotice {
-            seq: Seq::Num(seq),
-            doc_id: id.into(),
-        };
+        let notice = |seq: u64, id: &str| ChangeNotice::new(seq, id);
         assert_eq!(rx.try_recv().unwrap(), notice(1, "a"));
         assert_eq!(rx.try_recv().unwrap(), notice(2, "b"));
         // Nothing for a failed write or a local document.

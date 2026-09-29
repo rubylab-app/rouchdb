@@ -184,7 +184,7 @@ let (result, mut rx) = local.replicate_to_with_events(
 while let Ok(event) = rx.try_recv() {
     match event {
         ReplicationEvent::Active => println!("Replicacion iniciada"),
-        ReplicationEvent::Change { docs_read } => {
+        ReplicationEvent::Change { docs_read, .. } => {
             println!("Progreso: {} docs leidos", docs_read);
         }
         ReplicationEvent::Complete(r) => {
@@ -192,6 +192,8 @@ while let Ok(event) = rx.try_recv() {
         }
         ReplicationEvent::Error(msg) => println!("Error: {}", msg),
         ReplicationEvent::Paused => println!("Esperando cambios..."),
+        // `ReplicationEvent` es `#[non_exhaustive]`: puede tener nuevos eventos.
+        _ => {}
     }
 }
 ```

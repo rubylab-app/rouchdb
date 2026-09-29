@@ -37,7 +37,11 @@ use crate::rev_tree::{
 };
 
 /// Everything an adapter needs to persist one document write.
+///
+/// `#[non_exhaustive]`: only the planning functions of this module build it;
+/// adapters read its fields.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PlannedWrite {
     pub id: String,
     /// The revision being stored.
@@ -64,6 +68,10 @@ pub struct PlannedWrite {
 }
 
 /// Outcome of planning a replicated (`new_edits=false`) write.
+///
+/// Exhaustive on purpose: an adapter must handle every outcome to store the
+/// write correctly, so a new outcome has to be a compile error in the
+/// adapter, not a silently ignored catch-all arm.
 #[derive(Debug, Clone)]
 pub enum ReplicatedWrite {
     /// The revision must be stored.
@@ -72,26 +80,14 @@ pub enum ReplicatedWrite {
     AlreadyStored(DocResult),
 }
 
-/// Build a failed `DocResult`.
+/// Build a failed `DocResult` (same as [`DocResult::error`]).
 pub fn error_result(id: &str, error: &str, reason: &str) -> DocResult {
-    DocResult {
-        ok: false,
-        id: id.to_string(),
-        rev: None,
-        error: Some(error.into()),
-        reason: Some(reason.into()),
-    }
+    DocResult::error(id, error, reason)
 }
 
-/// Build a successful `DocResult`.
+/// Build a successful `DocResult` (same as [`DocResult::ok`]).
 pub fn ok_result(id: &str, rev: &Revision) -> DocResult {
-    DocResult {
-        ok: true,
-        id: id.to_string(),
-        rev: Some(rev.to_string()),
-        error: None,
-        reason: None,
-    }
+    DocResult::ok(id, rev)
 }
 
 fn conflict(id: &str) -> DocResult {
@@ -370,6 +366,9 @@ pub fn local_doc_id(id: &str) -> Option<&str> {
 }
 
 /// A planned write of a `_local/` document.
+///
+/// Exhaustive on purpose, like [`ReplicatedWrite`]: an adapter must handle
+/// every case to store the write correctly.
 #[derive(Debug, Clone)]
 pub enum LocalWrite {
     /// Store `body` (which carries its `_rev`) under `id` (no `_local/`).
@@ -407,13 +406,7 @@ pub fn plan_local_write(doc: Document) -> std::result::Result<LocalWrite, DocRes
         },
         Some(_) => return Err(error_result(&doc.id, "bad_request", "Invalid rev format")),
     };
-    let result = |rev: String| DocResult {
-        ok: true,
-        id: doc.id.clone(),
-        rev: Some(rev),
-        error: None,
-        reason: None,
-    };
+    let result = |rev: String| DocResult::ok(doc.id.clone(), rev);
     if doc.deleted {
         return Ok(LocalWrite::Delete {
             result: result("0-0".into()),

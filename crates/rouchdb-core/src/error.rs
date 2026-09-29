@@ -1,7 +1,11 @@
 use thiserror::Error;
 
 /// All errors that RouchDB can produce.
+///
+/// `#[non_exhaustive]`: new kinds of errors may be added in minor releases,
+/// so a `match` on it needs a catch-all arm (`_ => ...`).
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum RouchError {
     #[error("not found: {0}")]
     NotFound(String),

@@ -905,10 +905,7 @@ impl Inner {
             for entry in db_err!(changes.range(since + 1..))? {
                 let (seq, record) = db_err!(entry)?;
                 let record: ChangeRecord = serde_json::from_slice(record.value())?;
-                notices.push(ChangeNotice {
-                    seq: Seq::Num(seq.value()),
-                    doc_id: record.doc_id,
-                });
+                notices.push(ChangeNotice::new(seq.value(), record.doc_id));
             }
         }
         db_err!(txn.commit())?;
@@ -923,12 +920,12 @@ impl Inner {
         let read_txn = db_err!(self.db.begin_read())?;
         let meta = read_meta(&db_err!(read_txn.open_table(META_TABLE))?)?;
 
-        Ok(DbInfo {
-            db_name: self.name.clone(),
-            doc_count: meta.doc_count,
-            doc_del_count: meta.doc_del_count,
-            update_seq: Seq::Num(meta.update_seq),
-        })
+        Ok(DbInfo::new(
+            self.name.clone(),
+            meta.doc_count,
+            meta.doc_del_count,
+            meta.update_seq,
+        ))
     }
 
     fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
@@ -1112,16 +1109,10 @@ impl Inner {
             } else {
                 None
             };
-            Ok(Some(AllDocsRow {
-                doc: doc_json,
-                ..AllDocsRow::document(
-                    doc_id,
-                    AllDocsRowValue {
-                        rev: winner.to_string(),
-                        deleted: deleted.then_some(true),
-                    },
-                )
-            }))
+            Ok(Some(
+                AllDocsRow::document(doc_id, AllDocsRowValue::new(winner.to_string(), deleted))
+                    .with_doc(doc_json),
+            ))
         };
 
         if let Some(ref keys) = opts.keys {
@@ -1208,12 +1199,7 @@ impl Inner {
             None
         };
 
-        Ok(AllDocsResponse {
-            total_rows,
-            offset: opts.skip,
-            rows,
-            update_seq,
-        })
+        Ok(AllDocsResponse::new(total_rows, opts.skip, rows).with_update_seq(update_seq))
     }
 
     fn changes(&self, opts: ChangesOptions) -> Result<ChangesResponse> {
@@ -1226,10 +1212,7 @@ impl Inner {
             } else {
                 opts.since.clone()
             };
-            return Ok(ChangesResponse {
-                results: Vec::new(),
-                last_seq,
-            });
+            return Ok(ChangesResponse::new(Vec::new(), last_seq));
         }
         let changes_table = db_err!(read_txn.open_table(CHANGES_TABLE))?;
         let doc_table = db_err!(read_txn.open_table(DOC_TABLE))?;
@@ -1289,11 +1272,9 @@ impl Inner {
                 // All leaf revisions, including deleted ones.
                 (ChangesStyle::AllDocs, Some(tree)) => collect_leaves(tree)
                     .iter()
-                    .map(|l| ChangeRev {
-                        rev: l.rev_string(),
-                    })
+                    .map(|l| l.rev_string())
                     .collect(),
-                _ => vec![ChangeRev { rev: rev_str }],
+                _ => vec![rev_str],
             };
 
             // Collect conflicts if requested
@@ -1309,14 +1290,12 @@ impl Inner {
                 _ => None,
             };
 
-            results.push(ChangeEvent {
-                seq: Seq::Num(*seq),
-                id: change.doc_id.clone(),
-                changes: changes_list,
-                deleted: change.deleted,
-                doc,
-                conflicts,
-            });
+            results.push(
+                ChangeEvent::new(*seq, change.doc_id.clone(), changes_list)
+                    .with_deleted(change.deleted)
+                    .with_doc(doc)
+                    .with_conflicts(conflicts),
+            );
 
             if let Some(limit) = opts.limit
                 && results.len() >= limit as usize
@@ -1331,7 +1310,7 @@ impl Inner {
             .or_else(|| max_scanned.map(Seq::Num))
             .unwrap_or(opts.since.clone());
 
-        Ok(ChangesResponse { results, last_seq })
+        Ok(ChangesResponse::new(results, last_seq))
     }
 
     fn revs_diff(&self, revs: HashMap<String, Vec<String>>) -> Result<RevsDiffResponse> {
@@ -1347,7 +1326,7 @@ impl Inner {
             }
         }
 
-        Ok(RevsDiffResponse { results })
+        Ok(RevsDiffResponse::new(results))
     }
 
     fn bulk_get(&self, docs: Vec<BulkGetItem>) -> Result<BulkGetResponse> {
@@ -1359,14 +1338,13 @@ impl Inner {
         let mut results = Vec::new();
 
         for item in docs {
-            let not_found = |rev: String| BulkGetDoc {
-                ok: None,
-                error: Some(BulkGetError {
-                    id: item.id.clone(),
+            let not_found = |rev: String| {
+                BulkGetDoc::error(BulkGetError::new(
+                    item.id.clone(),
                     rev,
-                    error: "not_found".into(),
-                    reason: "missing".into(),
-                }),
+                    "not_found",
+                    "missing",
+                ))
             };
 
             let tree = load_doc_record(&doc_table, item.id.as_str())?.map(|(t, _)| t);
@@ -1414,21 +1392,15 @@ impl Inner {
                         obj.insert("_attachments".into(), serde_json::Value::Object(att_map));
                     }
 
-                    BulkGetDoc {
-                        ok: Some(serde_json::Value::Object(obj)),
-                        error: None,
-                    }
+                    BulkGetDoc::ok(serde_json::Value::Object(obj))
                 }
                 None => not_found(rev_str.unwrap_or_default()),
             };
 
-            results.push(BulkGetResult {
-                id: item.id.clone(),
-                docs: vec![bulk_doc],
-            });
+            results.push(BulkGetResult::new(item.id.clone(), vec![bulk_doc]));
         }
 
-        Ok(BulkGetResponse { results })
+        Ok(BulkGetResponse::new(results))
     }
 
     fn put_attachment(
@@ -1718,10 +1690,7 @@ impl Inner {
         write_meta(&mut db_err!(write_txn.open_table(META_TABLE))?, &meta)?;
         self.commit_announcing(write_txn, since)?;
 
-        Ok(PurgeResponse {
-            purge_seq: Some(meta.purge_seq),
-            purged,
-        })
+        Ok(PurgeResponse::new(Some(meta.purge_seq), purged))
     }
 
     fn get_security(&self) -> Result<SecurityDocument> {
@@ -1833,13 +1802,9 @@ fn write_replicated(
     // CouchDB ignores `_local/` documents in replicated writes (they are
     // never replicated): nothing is stored.
     if local_doc_id(&doc.id).is_some() {
-        return Ok(DocResult {
-            ok: true,
-            id: doc.id,
-            rev: doc.rev.map(|r| r.to_string()),
-            error: None,
-            reason: None,
-        });
+        let mut result = DocResult::ok(doc.id, "");
+        result.rev = doc.rev.map(|r| r.to_string());
+        return Ok(result);
     }
     let existing = load_doc_record(&tables.docs, &doc.id)?;
     let has_body = match (&existing, &doc.rev) {
@@ -2050,10 +2015,7 @@ mod tests {
             .bulk_docs(vec![doc("a"), doc("b")], BulkDocsOptions::new())
             .await
             .unwrap();
-        let notice = |seq: u64, id: &str| ChangeNotice {
-            seq: Seq::Num(seq),
-            doc_id: id.into(),
-        };
+        let notice = |seq: u64, id: &str| ChangeNotice::new(seq, id);
         assert_eq!(rx.try_recv().unwrap(), notice(1, "a"));
         assert_eq!(rx.try_recv().unwrap(), notice(2, "b"));
         db.bulk_docs(vec![doc("a")], BulkDocsOptions::new())

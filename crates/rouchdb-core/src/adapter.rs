@@ -8,12 +8,25 @@ use crate::error::Result;
 /// A change an adapter committed, announced to the subscribers of
 /// [`Adapter::subscribe`]: one notice per changed document, sent after the
 /// write is visible to readers.
+///
+/// `#[non_exhaustive]`: build it with [`ChangeNotice::new`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChangeNotice {
     /// The sequence of the change.
     pub seq: Seq,
     /// The id of the changed document.
     pub doc_id: String,
+}
+
+impl ChangeNotice {
+    /// Document `doc_id` changed at `seq`.
+    pub fn new(seq: impl Into<Seq>, doc_id: impl Into<String>) -> Self {
+        Self {
+            seq: seq.into(),
+            doc_id: doc_id.into(),
+        }
+    }
 }
 
 /// The trait all storage adapters must implement.

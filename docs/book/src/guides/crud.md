@@ -121,23 +121,10 @@ Write multiple documents in a single atomic operation. This is more efficient th
 
 ```rust
 use rouchdb::{Document, BulkDocsOptions};
-use std::collections::HashMap;
 
 let docs = vec![
-    Document {
-        id: "user:bob".into(),
-        rev: None,
-        deleted: false,
-        data: json!({"name": "Bob"}),
-        attachments: HashMap::new(),
-    },
-    Document {
-        id: "user:carol".into(),
-        rev: None,
-        deleted: false,
-        data: json!({"name": "Carol"}),
-        attachments: HashMap::new(),
-    },
+    Document::new("user:bob", json!({"name": "Bob"})),
+    Document::new("user:carol", json!({"name": "Carol"})),
 ];
 
 let results = db.bulk_docs(docs, BulkDocsOptions::new()).await?;

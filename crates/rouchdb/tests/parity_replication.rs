@@ -141,7 +141,7 @@ async fn replication_events_report_each_batch_then_complete() {
         .iter()
         .map(|e| match e {
             ReplicationEvent::Active => "active".into(),
-            ReplicationEvent::Change { docs_read } => format!("change {docs_read}"),
+            ReplicationEvent::Change { docs_read, .. } => format!("change {docs_read}"),
             ReplicationEvent::Complete(r) => format!("complete {}", r.docs_written),
             other => format!("{other:?}"),
         })
@@ -202,7 +202,7 @@ async fn live_replication_picks_up_new_docs() {
     assert!(
         wait_for(&mut rx, |e| matches!(
             e,
-            ReplicationEvent::Change { docs_read: 1 }
+            ReplicationEvent::Change { docs_read: 1, .. }
         ))
         .await
     );

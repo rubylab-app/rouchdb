@@ -15,6 +15,9 @@ use crate::rev_tree::RevTree;
 ///
 /// - `pos` is the generation number (starts at 1, increments each edit).
 /// - `hash` is a 32-character hex MD5 digest.
+///
+/// The fields are public and the struct can be built with a literal: a
+/// revision id is `{pos}-{hash}` by definition, so this type will not grow.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Revision {
     pub pos: u64,
@@ -99,6 +102,10 @@ impl PartialOrd for Revision {
 
 /// An attachment of a document revision, as CouchDB describes it in
 /// `_attachments`.
+///
+/// Build one with [`AttachmentMeta::new`], or with a struct literal ending
+/// in `..Default::default()`: fields may be added in minor releases, and a
+/// literal that lists every field would then stop compiling.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AttachmentMeta {
     pub content_type: String,
@@ -186,7 +193,23 @@ impl AttachmentMeta {
 // ---------------------------------------------------------------------------
 
 /// A CouchDB-compatible document.
-#[derive(Debug, Clone)]
+///
+/// Build one with [`Document::new`], [`Document::from_json`] or a struct
+/// literal ending in `..Default::default()`: fields may be added in minor
+/// releases, and a literal that lists every field would then stop compiling.
+///
+/// ```
+/// use rouchdb_core::document::Document;
+/// use serde_json::json;
+///
+/// let doc = Document::new("user:alice", json!({"name": "Alice"}));
+/// let tombstone = Document {
+///     deleted: true,
+///     ..Document::new("user:bob", json!({}))
+/// };
+/// assert!(doc.rev.is_none() && tombstone.deleted);
+/// ```
+#[derive(Debug, Clone, Default)]
 pub struct Document {
     pub id: String,
     pub rev: Option<Revision>,
@@ -199,6 +222,16 @@ pub struct Document {
 }
 
 impl Document {
+    /// A document to create: this id and body, no revision, not deleted and
+    /// without attachments.
+    pub fn new(id: impl Into<String>, data: serde_json::Value) -> Self {
+        Self {
+            id: id.into(),
+            data,
+            ..Self::default()
+        }
+    }
+
     /// Create a new document from a JSON value.
     ///
     /// Extracts `_id`, `_rev`, `_deleted`, and `_attachments` from the value
@@ -515,17 +548,46 @@ pub fn generate_rev_hash(
 // ---------------------------------------------------------------------------
 
 /// Internal metadata stored per document in the adapter.
+///
+/// `#[non_exhaustive]`: build it with [`DocMetadata::new`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DocMetadata {
     pub id: String,
     pub rev_tree: RevTree,
     pub seq: u64,
 }
 
+impl DocMetadata {
+    pub fn new(id: impl Into<String>, rev_tree: RevTree, seq: u64) -> Self {
+        Self {
+            id: id.into(),
+            rev_tree,
+            seq,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Option / response types shared across the crate
 // ---------------------------------------------------------------------------
 
+/// Options of [`Adapter::get`](crate::adapter::Adapter::get).
+///
+/// Set the options you need and fill the rest with `..Default::default()`
+/// (the default reads the winning revision without metadata): fields may be
+/// added in minor releases, and a literal that lists every field would then
+/// stop compiling.
+///
+/// ```
+/// use rouchdb_core::document::GetOptions;
+///
+/// let opts = GetOptions {
+///     conflicts: true,
+///     ..Default::default()
+/// };
+/// # let _ = opts;
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct GetOptions {
     /// Retrieve a specific revision.
@@ -546,25 +608,55 @@ pub struct GetOptions {
 
 /// Revision info entry returned when `revs_info` is requested.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RevInfo {
     pub rev: String,
     pub status: String, // "available", "missing", "deleted"
 }
 
+/// Which leaf revisions `open_revs` asks for.
+///
+/// Exhaustive on purpose: CouchDB's `open_revs` is either `"all"` or a list
+/// of revisions, so there is no third case to add.
 #[derive(Debug, Clone)]
 pub enum OpenRevs {
     All,
     Specific(Vec<String>),
 }
 
+/// The result of a single-document write.
+///
+/// `#[non_exhaustive]`: fields may be added in minor releases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PutResponse {
     pub ok: bool,
     pub id: String,
     pub rev: String,
 }
 
+/// The outcome of writing one document ([`Adapter::bulk_docs`], attachment
+/// writes): the new revision, or an `error`/`reason` pair as CouchDB reports
+/// it (`"conflict"`, `"forbidden"`, ...).
+///
+/// `#[non_exhaustive]`, so that fields can be added in minor releases: read
+/// the fields, and build results (in a custom [`Adapter`] or plugin) with
+/// [`DocResult::ok`] and [`DocResult::error`].
+///
+/// ```
+/// use rouchdb_core::document::DocResult;
+///
+/// let written = DocResult::ok("doc1", "1-abc");
+/// assert!(written.ok && written.rev.as_deref() == Some("1-abc"));
+///
+/// let failed = DocResult::error("doc2", "conflict", "Document update conflict.");
+/// assert!(!failed.ok && failed.error.as_deref() == Some("conflict"));
+/// ```
+///
+/// [`Adapter`]: crate::adapter::Adapter
+/// [`Adapter::bulk_docs`]: crate::adapter::Adapter::bulk_docs
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DocResult {
     pub ok: bool,
     pub id: String,
@@ -573,11 +665,44 @@ pub struct DocResult {
     pub reason: Option<String>,
 }
 
+impl DocResult {
+    /// A successful write of `id` that created revision `rev` (a
+    /// [`Revision`] or its string form).
+    pub fn ok(id: impl Into<String>, rev: impl ToString) -> Self {
+        Self {
+            ok: true,
+            id: id.into(),
+            rev: Some(rev.to_string()),
+            error: None,
+            reason: None,
+        }
+    }
+
+    /// A failed write of `id`: `error` is CouchDB's error name
+    /// (`"conflict"`, `"forbidden"`, `"not_found"`, ...) and `reason` the
+    /// human-readable explanation.
+    pub fn error(
+        id: impl Into<String>,
+        error: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            ok: false,
+            id: id.into(),
+            rev: None,
+            error: Some(error.into()),
+            reason: Some(reason.into()),
+        }
+    }
+}
+
 /// Options of [`Adapter::bulk_docs`](crate::adapter::Adapter::bulk_docs).
 ///
 /// `BulkDocsOptions::default()` is the same as [`BulkDocsOptions::new`]
 /// (normal writes); replication mode must be asked for explicitly with
-/// [`BulkDocsOptions::replication`].
+/// [`BulkDocsOptions::replication`]. Use these constructors, or a struct
+/// literal ending in `..Default::default()`: fields may be added in minor
+/// releases.
 #[derive(Debug, Clone)]
 pub struct BulkDocsOptions {
     /// When false (replication), accept revisions as-is.
@@ -606,7 +731,21 @@ impl Default for BulkDocsOptions {
 /// Options of [`Adapter::all_docs`](crate::adapter::Adapter::all_docs).
 ///
 /// `AllDocsOptions::default()` is the same as [`AllDocsOptions::new`]: every
-/// document, with an inclusive `end_key` (as in CouchDB).
+/// document, with an inclusive `end_key` (as in CouchDB). Set the options
+/// you need and fill the rest with `..Default::default()`: fields may be
+/// added in minor releases, and a literal that lists every field would then
+/// stop compiling.
+///
+/// ```
+/// use rouchdb_core::document::AllDocsOptions;
+///
+/// let opts = AllDocsOptions {
+///     include_docs: true,
+///     limit: Some(10),
+///     ..Default::default()
+/// };
+/// assert!(opts.inclusive_end);
+/// ```
 #[derive(Debug, Clone)]
 pub struct AllDocsOptions {
     pub start_key: Option<String>,
@@ -667,7 +806,12 @@ impl Default for AllDocsOptions {
 /// maps one-to-one onto the CouchDB/PouchDB JSON row and `row.key` is there
 /// for every kind of row; [`AllDocsRow::rev`], [`AllDocsRow::is_deleted`]
 /// and [`AllDocsRow::is_error`] cover the usual checks.
+///
+/// `#[non_exhaustive]`: build rows (in a custom adapter) with
+/// [`AllDocsRow::document`], [`AllDocsRow::with_doc`] and
+/// [`AllDocsRow::not_found`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AllDocsRow {
     /// The document id (`None` for an error row).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -696,6 +840,13 @@ impl AllDocsRow {
             doc: None,
             error: None,
         }
+    }
+
+    /// The same row with the document body (`include_docs`); `None` leaves
+    /// it without one.
+    pub fn with_doc(mut self, doc: impl Into<Option<serde_json::Value>>) -> Self {
+        self.doc = doc.into();
+        self
     }
 
     /// The row of a requested key that names no document:
@@ -727,14 +878,33 @@ impl AllDocsRow {
 }
 
 /// The `value` of an [`AllDocsRow`].
+///
+/// `#[non_exhaustive]`: build it with [`AllDocsRowValue::new`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AllDocsRowValue {
     pub rev: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted: Option<bool>,
 }
 
+impl AllDocsRowValue {
+    /// The winning revision `rev`; `deleted` is serialized (as `true`) only
+    /// for a deleted document, as CouchDB does.
+    pub fn new(rev: impl Into<String>, deleted: bool) -> Self {
+        Self {
+            rev: rev.into(),
+            deleted: deleted.then_some(true),
+        }
+    }
+}
+
+/// The response of [`Adapter::all_docs`](crate::adapter::Adapter::all_docs).
+///
+/// `#[non_exhaustive]`: build it (in a custom adapter) with
+/// [`AllDocsResponse::new`] and [`AllDocsResponse::with_update_seq`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AllDocsResponse {
     pub total_rows: u64,
     /// The memory and redb adapters report the `skip` that was applied, as
@@ -752,7 +922,31 @@ pub struct AllDocsResponse {
     pub update_seq: Option<Seq>,
 }
 
+impl AllDocsResponse {
+    /// A response without `update_seq`.
+    pub fn new(total_rows: u64, offset: u64, rows: Vec<AllDocsRow>) -> Self {
+        Self {
+            total_rows,
+            offset,
+            rows,
+            update_seq: None,
+        }
+    }
+
+    /// The same response with `update_seq` (asked for with
+    /// [`AllDocsOptions::update_seq`]); `None` leaves it out.
+    pub fn with_update_seq(mut self, update_seq: impl Into<Option<Seq>>) -> Self {
+        self.update_seq = update_seq.into();
+        self
+    }
+}
+
+/// Database information ([`Adapter::info`](crate::adapter::Adapter::info)).
+///
+/// `#[non_exhaustive]`, so that fields can be added in minor releases: build
+/// it (in a custom adapter) with [`DbInfo::new`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DbInfo {
     pub db_name: String,
     pub doc_count: u64,
@@ -761,10 +955,45 @@ pub struct DbInfo {
     pub update_seq: Seq,
 }
 
+impl DbInfo {
+    /// Information about `db_name`: live and deleted document counts and
+    /// the current update sequence.
+    pub fn new(
+        db_name: impl Into<String>,
+        doc_count: u64,
+        doc_del_count: u64,
+        update_seq: impl Into<Seq>,
+    ) -> Self {
+        Self {
+            db_name: db_name.into(),
+            doc_count,
+            doc_del_count,
+            update_seq: update_seq.into(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Changes types
 // ---------------------------------------------------------------------------
 
+/// Options of [`Adapter::changes`](crate::adapter::Adapter::changes).
+///
+/// Set the options you need and fill the rest with `..Default::default()`
+/// (the default reads every change from the start): fields may be added in
+/// minor releases, and a literal that lists every field would then stop
+/// compiling.
+///
+/// ```
+/// use rouchdb_core::document::{ChangesOptions, Seq};
+///
+/// let opts = ChangesOptions {
+///     since: Seq::Num(5),
+///     include_docs: true,
+///     ..Default::default()
+/// };
+/// # let _ = opts;
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct ChangesOptions {
     pub since: Seq,
@@ -782,6 +1011,9 @@ pub struct ChangesOptions {
 }
 
 /// Controls which revisions appear in each change event.
+///
+/// Exhaustive on purpose: these are CouchDB's two `style` values
+/// (`main_only` and `all_docs`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ChangesStyle {
     /// Default: only the winning revision.
@@ -791,7 +1023,12 @@ pub enum ChangesStyle {
     AllDocs,
 }
 
+/// A row of the changes feed.
+///
+/// `#[non_exhaustive]`: build it (in a custom adapter) with
+/// [`ChangeEvent::new`] and the `with_*` methods.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ChangeEvent {
     pub seq: Seq,
     pub id: String,
@@ -806,45 +1043,176 @@ pub struct ChangeEvent {
     pub conflicts: Option<Vec<String>>,
 }
 
+impl ChangeEvent {
+    /// The change of document `id` at `seq`, listing the revisions `revs`
+    /// (the winner, or every leaf with [`ChangesStyle::AllDocs`]); not
+    /// deleted, without document or conflicts.
+    pub fn new<R: Into<String>>(
+        seq: impl Into<Seq>,
+        id: impl Into<String>,
+        revs: impl IntoIterator<Item = R>,
+    ) -> Self {
+        Self {
+            seq: seq.into(),
+            id: id.into(),
+            changes: revs.into_iter().map(ChangeRev::new).collect(),
+            deleted: false,
+            doc: None,
+            conflicts: None,
+        }
+    }
+
+    /// The same event, marked deleted (or not).
+    pub fn with_deleted(mut self, deleted: bool) -> Self {
+        self.deleted = deleted;
+        self
+    }
+
+    /// The same event with the document body (`include_docs`); `None`
+    /// leaves it without one.
+    pub fn with_doc(mut self, doc: impl Into<Option<serde_json::Value>>) -> Self {
+        self.doc = doc.into();
+        self
+    }
+
+    /// The same event with the conflicting revisions (`conflicts`); `None`
+    /// leaves them out.
+    pub fn with_conflicts(mut self, conflicts: impl Into<Option<Vec<String>>>) -> Self {
+        self.conflicts = conflicts.into();
+        self
+    }
+}
+
+/// A revision listed in a [`ChangeEvent`].
+///
+/// `#[non_exhaustive]`: build it with [`ChangeRev::new`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ChangeRev {
     pub rev: String,
 }
 
+impl ChangeRev {
+    pub fn new(rev: impl Into<String>) -> Self {
+        Self { rev: rev.into() }
+    }
+}
+
+/// The response of [`Adapter::changes`](crate::adapter::Adapter::changes).
+///
+/// `#[non_exhaustive]`: build it (in a custom adapter) with
+/// [`ChangesResponse::new`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ChangesResponse {
     pub results: Vec<ChangeEvent>,
     pub last_seq: Seq,
+}
+
+impl ChangesResponse {
+    pub fn new(results: Vec<ChangeEvent>, last_seq: impl Into<Seq>) -> Self {
+        Self {
+            results,
+            last_seq: last_seq.into(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Replication-related types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A document (and optionally revision) requested from
+/// [`Adapter::bulk_get`](crate::adapter::Adapter::bulk_get).
+///
+/// Build it with [`BulkGetItem::new`] and [`BulkGetItem::with_rev`], or a
+/// struct literal ending in `..Default::default()`: fields may be added in
+/// minor releases (CouchDB's `_bulk_get` also knows `atts_since`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BulkGetItem {
     pub id: String,
     pub rev: Option<String>,
 }
 
+impl BulkGetItem {
+    /// The winning revision of `id`.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            rev: None,
+        }
+    }
+
+    /// The same request for revision `rev`.
+    pub fn with_rev(mut self, rev: impl Into<String>) -> Self {
+        self.rev = Some(rev.into());
+        self
+    }
+}
+
+/// The response of [`Adapter::bulk_get`](crate::adapter::Adapter::bulk_get).
+///
+/// `#[non_exhaustive]`, like [`BulkGetResult`], [`BulkGetDoc`] and
+/// [`BulkGetError`]: build them (in a custom adapter) with their `new` /
+/// `ok` / `error` constructors.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct BulkGetResponse {
     pub results: Vec<BulkGetResult>,
 }
 
+impl BulkGetResponse {
+    pub fn new(results: Vec<BulkGetResult>) -> Self {
+        Self { results }
+    }
+}
+
+/// The revisions returned for one requested id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct BulkGetResult {
     pub id: String,
     pub docs: Vec<BulkGetDoc>,
 }
 
+impl BulkGetResult {
+    pub fn new(id: impl Into<String>, docs: Vec<BulkGetDoc>) -> Self {
+        Self {
+            id: id.into(),
+            docs,
+        }
+    }
+}
+
+/// One revision of a [`BulkGetResult`]: the document (`ok`) or an error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct BulkGetDoc {
     pub ok: Option<serde_json::Value>,
     pub error: Option<BulkGetError>,
 }
 
+impl BulkGetDoc {
+    /// A revision that was found, with its JSON.
+    pub fn ok(doc: serde_json::Value) -> Self {
+        Self {
+            ok: Some(doc),
+            error: None,
+        }
+    }
+
+    /// A revision that could not be returned.
+    pub fn error(error: BulkGetError) -> Self {
+        Self {
+            ok: None,
+            error: Some(error),
+        }
+    }
+}
+
+/// Why a [`BulkGetDoc`] has no document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct BulkGetError {
     pub id: String,
     pub rev: String,
@@ -852,17 +1220,58 @@ pub struct BulkGetError {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl BulkGetError {
+    /// Revision `rev` of `id` failed with CouchDB error `error` (such as
+    /// `"not_found"`) and a human-readable `reason`.
+    pub fn new(
+        id: impl Into<String>,
+        rev: impl Into<String>,
+        error: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            rev: rev.into(),
+            error: error.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+/// The response of [`Adapter::revs_diff`](crate::adapter::Adapter::revs_diff),
+/// by document id.
+///
+/// `#[non_exhaustive]`: build it (in a custom adapter) with
+/// [`RevsDiffResponse::new`] and [`RevsDiffResult::new`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RevsDiffResponse {
     #[serde(flatten)]
     pub results: HashMap<String, RevsDiffResult>,
 }
 
+impl RevsDiffResponse {
+    pub fn new(results: HashMap<String, RevsDiffResult>) -> Self {
+        Self { results }
+    }
+}
+
+/// The revisions of one document the adapter is missing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RevsDiffResult {
     pub missing: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub possible_ancestors: Vec<String>,
+}
+
+impl RevsDiffResult {
+    pub fn new(missing: Vec<String>, possible_ancestors: Vec<String>) -> Self {
+        Self {
+            missing,
+            possible_ancestors,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -873,6 +1282,11 @@ pub struct RevsDiffResult {
 ///
 /// Local adapters use numeric sequences (0, 1, 2, ...).
 /// CouchDB 3.x uses opaque string sequences that must be passed back as-is.
+///
+/// Exhaustive on purpose: a sequence is a JSON number or a JSON string on
+/// the wire, and code that needs to tell them apart (to compare local
+/// sequences, or to pass an opaque one back unchanged) should be able to
+/// match both cases without a catch-all arm.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Seq {
@@ -933,16 +1347,34 @@ impl std::fmt::Display for Seq {
 // Purge types
 // ---------------------------------------------------------------------------
 
+/// The response of [`Adapter::purge`](crate::adapter::Adapter::purge).
+///
+/// `#[non_exhaustive]`: build it (in a custom adapter) with
+/// [`PurgeResponse::new`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PurgeResponse {
     pub purge_seq: Option<u64>,
     pub purged: HashMap<String, Vec<String>>,
+}
+
+impl PurgeResponse {
+    /// The purged revisions by document id, and the purge sequence after
+    /// the purge (if the adapter tracks one).
+    pub fn new(purge_seq: Option<u64>, purged: HashMap<String, Vec<String>>) -> Self {
+        Self { purge_seq, purged }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Security document
 // ---------------------------------------------------------------------------
 
+/// A database's `_security` document.
+///
+/// Unknown members round-trip through `extra`. Build it with a struct
+/// literal ending in `..Default::default()`: fields may be added in minor
+/// releases.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecurityDocument {
     #[serde(default)]
@@ -955,6 +1387,8 @@ pub struct SecurityDocument {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// The `admins` or `members` of a [`SecurityDocument`]. Build it with a
+/// struct literal ending in `..Default::default()`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecurityGroup {
     #[serde(default)]
@@ -967,6 +1401,11 @@ pub struct SecurityGroup {
 // Attachment options
 // ---------------------------------------------------------------------------
 
+/// Options of
+/// [`Adapter::get_attachment`](crate::adapter::Adapter::get_attachment).
+///
+/// Fill the options you do not set with `..Default::default()`: fields may
+/// be added in minor releases.
 #[derive(Debug, Clone, Default)]
 pub struct GetAttachmentOptions {
     pub rev: Option<String>,

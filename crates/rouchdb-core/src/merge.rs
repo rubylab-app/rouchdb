@@ -10,6 +10,10 @@ use crate::rev_tree::{
 };
 
 /// Result of merging a new path into the tree.
+///
+/// Exhaustive on purpose: these are the three outcomes of PouchDB's merge
+/// (extend a branch, add a branch, nothing new), which adapters must each
+/// handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeResult {
     /// The path extended an existing branch (normal edit).

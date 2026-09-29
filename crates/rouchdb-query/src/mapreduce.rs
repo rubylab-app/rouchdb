@@ -15,14 +15,32 @@ use rouchdb_core::document::{AllDocsOptions, GetOptions};
 use rouchdb_core::error::{Result, RouchError};
 
 /// A key-value pair emitted by a map function.
+///
+/// `#[non_exhaustive]`: build it with [`EmittedRow::new`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EmittedRow {
     pub id: String,
     pub key: serde_json::Value,
     pub value: serde_json::Value,
 }
 
+impl EmittedRow {
+    /// Document `id` emitted `key` and `value`.
+    pub fn new(id: impl Into<String>, key: serde_json::Value, value: serde_json::Value) -> Self {
+        Self {
+            id: id.into(),
+            key,
+            value,
+        }
+    }
+}
+
 /// Built-in reduce functions matching CouchDB's built-ins.
+///
+/// `#[non_exhaustive]`: more built-ins (such as CouchDB's
+/// `_approx_count_distinct`) may be added in minor releases.
+#[non_exhaustive]
 pub enum ReduceFn {
     /// Sum numeric values (arrays element-wise, objects field by field).
     Sum,
@@ -39,7 +57,26 @@ pub enum ReduceFn {
 }
 
 /// Options for querying a view.
-#[derive(Debug, Clone, Default)]
+///
+/// `ViewQueryOptions::default()` is the same as [`ViewQueryOptions::new`]:
+/// CouchDB's defaults, with `reduce` and `inclusive_end` on. Set the options
+/// you need and fill the rest with `..Default::default()`: fields may be
+/// added in minor releases, and a literal that lists every field would then
+/// stop compiling.
+///
+/// ```
+/// use rouchdb_query::ViewQueryOptions;
+/// use serde_json::json;
+///
+/// let opts = ViewQueryOptions {
+///     key: Some(json!("alice")),
+///     include_docs: true,
+///     reduce: false,
+///     ..Default::default()
+/// };
+/// assert!(opts.inclusive_end);
+/// ```
+#[derive(Debug, Clone)]
 pub struct ViewQueryOptions {
     /// Only return rows with this exact key. With `start_key` or `end_key`
     /// it is the other bound of the range (as when they follow `key` in a
@@ -66,8 +103,8 @@ pub struct ViewQueryOptions {
     /// `{"_id": ...}` (optionally with `_rev`) includes that document
     /// instead. Not allowed together with reduce.
     pub include_docs: bool,
-    /// Whether to run the reduce function, if one is given. `new()` turns
-    /// it on, like CouchDB's default.
+    /// Whether to run the reduce function, if one is given. On by default,
+    /// like in CouchDB.
     pub reduce: bool,
     /// Group by key. Grouping (this, or a `group_level` above 0) without a
     /// reduce is a `BadRequest`, as in CouchDB.
@@ -81,7 +118,11 @@ pub struct ViewQueryOptions {
 }
 
 /// Controls whether the index is rebuilt before querying.
+///
+/// `#[non_exhaustive]`: CouchDB's newer `update` parameter (`true`, `false`,
+/// `lazy`) may be mapped to new variants in a minor release.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StaleOption {
     /// Always rebuild the index before querying (default).
     #[default]
@@ -93,18 +134,39 @@ pub enum StaleOption {
 }
 
 impl ViewQueryOptions {
-    /// CouchDB's defaults: `inclusive_end` and `reduce` are on.
+    /// CouchDB's defaults: `inclusive_end` and `reduce` are on, everything
+    /// else is off or unset. Same as `ViewQueryOptions::default()`.
     pub fn new() -> Self {
         Self {
+            key: None,
+            keys: None,
+            start_key: None,
+            end_key: None,
             inclusive_end: true,
+            descending: false,
+            skip: 0,
+            limit: None,
+            include_docs: false,
             reduce: true,
-            ..Default::default()
+            group: false,
+            group_level: None,
+            stale: StaleOption::False,
         }
     }
 }
 
+impl Default for ViewQueryOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Result of querying a view.
+///
+/// `#[non_exhaustive]`, like [`ViewRow`]: fields may be added in minor
+/// releases (CouchDB can also return `update_seq`).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ViewResult {
     /// Rows in the whole view (for a reduce query, the number of reduced rows
     /// before skip/limit).
@@ -117,6 +179,7 @@ pub struct ViewResult {
 
 /// A single row in a view result.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ViewRow {
     pub id: Option<String>,
     pub key: serde_json::Value,
@@ -386,7 +449,7 @@ fn reducer<'a>(
 ///
 /// Unlike CouchDB, which reads a key as the range from the key to itself
 /// and so returns nothing for it with `inclusive_end=false`, a key always
-/// selects its rows: `ViewQueryOptions::default()` has `inclusive_end` off.
+/// selects its rows, even with `inclusive_end: false`.
 fn equal_range(rows: &[EmittedRow], key: &Value) -> (usize, usize) {
     (lower_bound(rows, key), upper_bound(rows, key))
 }
@@ -1386,6 +1449,51 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(r.rows[0].value, serde_json::json!([["LA", "bob"]]));
+    }
+
+    #[test]
+    fn default_view_options_are_couchdb_defaults() {
+        // `..Default::default()` must not silently turn reduce or the
+        // inclusive end off (it did before 0.5).
+        let d = ViewQueryOptions::default();
+        assert!(d.reduce && d.inclusive_end);
+        assert!(!d.descending && !d.include_docs && !d.group);
+        assert_eq!((d.skip, d.limit, d.group_level), (0, None, None));
+        assert!(d.key.is_none() && d.keys.is_none());
+        assert!(d.start_key.is_none() && d.end_key.is_none());
+        assert_eq!(d.stale, StaleOption::False);
+    }
+
+    #[tokio::test]
+    async fn default_view_options_reduce_and_include_the_end_key() {
+        let db = MemoryAdapter::new("t");
+        for id in ["a", "b", "c"] {
+            db.bulk_docs(
+                vec![Document::from_json(serde_json::json!({"_id": id})).unwrap()],
+                BulkDocsOptions::new(),
+            )
+            .await
+            .unwrap();
+        }
+        let map = |doc: &serde_json::Value| vec![(doc["_id"].clone(), serde_json::json!(1))];
+        let reduced = query_view(&db, &map, Some(&ReduceFn::Count), Default::default())
+            .await
+            .unwrap();
+        assert_eq!(reduced.rows.len(), 1);
+        assert_eq!(reduced.rows[0].value, serde_json::json!(3));
+        let range = query_view(
+            &db,
+            &map,
+            None,
+            ViewQueryOptions {
+                end_key: Some(serde_json::json!("b")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let keys: Vec<_> = range.rows.iter().map(|r| r.key.clone()).collect();
+        assert_eq!(keys, [serde_json::json!("a"), serde_json::json!("b")]);
     }
 
     #[test]
