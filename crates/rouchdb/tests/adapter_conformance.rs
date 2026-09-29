@@ -2830,17 +2830,7 @@ async fn local_ids_are_local_documents(mut fx: Fx) {
 /// Q-API-7: a failed `put_design` is an error, like `put`.
 async fn put_design_conflict_is_an_error(fx: Fx) {
     let db = fx.db();
-    let ddoc = || DesignDocument {
-        id: "_design/app".into(),
-        rev: None,
-        views: std::collections::HashMap::new(),
-        filters: std::collections::HashMap::new(),
-        validate_doc_update: None,
-        shows: std::collections::HashMap::new(),
-        lists: std::collections::HashMap::new(),
-        updates: std::collections::HashMap::new(),
-        language: None,
-    };
+    let ddoc = || DesignDocument::new("app");
     assert!(db.put_design(ddoc()).await.unwrap().ok);
     assert!(matches!(
         db.put_design(ddoc()).await,
@@ -2981,6 +2971,61 @@ async fn old_edit_of_deleted_document_conflicts(fx: Fx) {
     let r4 = db.put("d", serde_json::json!({"v": 3})).await.unwrap();
     assert_eq!(generation(r4.rev.as_deref().unwrap()), 4);
 }
+
+// === section: f55 ===
+
+/// F55: a design document goes through `get_design` + `put_design`
+/// unchanged, whatever it holds (`views.lib`, Mango index views, view and
+/// ddoc `options`, object-valued functions, custom fields, attachments), and
+/// survives a reopen; the server's Mango indexes read it back.
+async fn design_doc_round_trip_is_lossless(mut fx: Fx) {
+    let raw = serde_json::json!({
+        "language": "query",
+        "views": {
+            "lib": {"util": "exports.x = 1;"},
+            "by-age": {"map": {"fields": {"age": "asc"}, "partial_filter_selector": {}},
+                "reduce": "_count", "options": {"def": {"fields": ["age"]}}},
+            "js": {"map": "function(doc){ emit(doc._id); }", "options": {"local_seq": true}}
+        },
+        "filters": {"f": "function(doc){ return true; }", "erl": {"src": "x"}},
+        "options": {"partitioned": false},
+        "autoupdate": false,
+        "rewrites": [{"from": "/a", "to": "/b"}],
+        "custom": {"n": [1, 2.5, null, true, "s"]},
+        "_attachments": {"a.txt": {"content_type": "text/plain", "data": "aGk="}}
+    });
+    let r1 = fx
+        .db()
+        .put("_design/app", raw.clone())
+        .await
+        .unwrap()
+        .rev
+        .unwrap();
+    let ddoc = fx.db().get_design("app").await.unwrap();
+    assert_eq!(ddoc.rev.as_deref(), Some(r1.as_str()));
+    assert!(ddoc.extra["_attachments"]["a.txt"]["stub"] == true);
+    let r2 = fx.db().put_design(ddoc).await.unwrap().rev.unwrap();
+    assert_eq!(generation(&r2), 2);
+    fx.reopen();
+    let db = fx.db();
+    let stored = db.get("_design/app").await.unwrap();
+    let mut expected = raw.clone();
+    expected.as_object_mut().unwrap().remove("_attachments");
+    assert_eq!(stored.data, expected);
+    assert_eq!(stored.attachments["a.txt"].length, 2);
+    assert_eq!(
+        db.get_attachment("_design/app", "a.txt").await.unwrap(),
+        b"hi"
+    );
+    let mut again = db.get_design("app").await.unwrap().to_json();
+    let obj = again.as_object_mut().unwrap();
+    assert_eq!(obj.remove("_id"), Some(serde_json::json!("_design/app")));
+    assert_eq!(obj.remove("_rev"), Some(serde_json::json!(r2)));
+    assert_eq!(obj.remove("_attachments").unwrap()["a.txt"]["stub"], true);
+    assert_eq!(again, expected);
+}
+
+conformance!(f55: design_doc_round_trip_is_lossless);
 
 conformance!(storage_fidelity:
     unusual_ids_survive_compact_and_purge,

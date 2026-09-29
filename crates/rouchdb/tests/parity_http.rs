@@ -86,6 +86,7 @@ async fn design_doc_crud_on_http() {
                 rouchdb::ViewDef {
                     map: "function(doc) { emit(doc.type, 1); }".into(),
                     reduce: Some("_count".into()),
+                    ..Default::default()
                 },
             );
             v
@@ -96,6 +97,7 @@ async fn design_doc_crud_on_http() {
         lists: std::collections::HashMap::new(),
         updates: std::collections::HashMap::new(),
         language: Some("javascript".into()),
+        ..Default::default()
     };
 
     let result = db.put_design(ddoc).await.unwrap();

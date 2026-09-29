@@ -32,6 +32,7 @@ async fn put_and_get_design_document() {
                 ViewDef {
                     map: "function(doc) { emit(doc.type, 1); }".into(),
                     reduce: Some("_count".into()),
+                    ..Default::default()
                 },
             );
             views
@@ -42,6 +43,7 @@ async fn put_and_get_design_document() {
         lists: HashMap::new(),
         updates: HashMap::new(),
         language: Some("javascript".into()),
+        ..Default::default()
     };
 
     let result = db.put_design(ddoc).await.unwrap();
@@ -74,6 +76,7 @@ async fn get_design_with_full_id() {
         lists: HashMap::new(),
         updates: HashMap::new(),
         language: None,
+        ..Default::default()
     };
 
     db.put_design(ddoc).await.unwrap();
@@ -102,6 +105,7 @@ async fn delete_design_document() {
         lists: HashMap::new(),
         updates: HashMap::new(),
         language: None,
+        ..Default::default()
     };
 
     let result = db.put_design(ddoc).await.unwrap();
@@ -130,6 +134,7 @@ async fn update_design_document() {
         lists: HashMap::new(),
         updates: HashMap::new(),
         language: None,
+        ..Default::default()
     };
 
     let r1 = db.put_design(ddoc).await.unwrap();
@@ -142,6 +147,7 @@ async fn update_design_document() {
         ViewDef {
             map: "function(doc) { emit(doc._id, null); }".into(),
             reduce: None,
+            ..Default::default()
         },
     );
     ddoc2.rev = Some(rev1);
@@ -177,6 +183,7 @@ async fn design_document_with_filters_and_validate() {
         lists: HashMap::new(),
         updates: HashMap::new(),
         language: None,
+        ..Default::default()
     };
 
     let result = db.put_design(ddoc).await.unwrap();
@@ -219,6 +226,7 @@ async fn design_document_with_show_list_update() {
             u
         },
         language: None,
+        ..Default::default()
     };
 
     let result = db.put_design(ddoc).await.unwrap();
@@ -824,9 +832,10 @@ async fn destroy_clears_mango_indexes() {
 }
 
 #[tokio::test]
-async fn design_document_roundtrip_keeps_unmodeled_fields() {
-    // F55: get_design + put_design must not drop what DesignDocument does
-    // not model (views.lib, Mango index views, options, custom fields).
+async fn design_document_roundtrip_is_lossless() {
+    // F55: get_design + put_design keeps every member of the design
+    // document (views.lib, Mango index views, options, custom fields,
+    // attachments) and changes only what was edited.
     let db = Database::memory("test");
     let raw = serde_json::json!({
         "language": "javascript",
@@ -835,33 +844,49 @@ async fn design_document_roundtrip_keeps_unmodeled_fields() {
             "by_type": {"map": "function(doc){ emit(doc.type); }", "options": {"collation": "raw"}},
             "mango-idx": {"map": {"fields": {"age": "asc"}}, "reduce": "_count", "options": {"def": {"fields": ["age"]}}}
         },
+        "filters": {"erl": {"src": "x"}},
         "options": {"partitioned": false},
         "autoupdate": false,
         "custom": {"anything": [1, 2]}
     });
-    db.put("_design/app", raw.clone()).await.unwrap();
+    let r1 = db
+        .put("_design/app", raw.clone())
+        .await
+        .unwrap()
+        .rev
+        .unwrap();
+    let r2 = db
+        .put_attachment(
+            "_design/app",
+            "index.html",
+            &r1,
+            b"<p>".to_vec(),
+            "text/html",
+        )
+        .await
+        .unwrap()
+        .rev
+        .unwrap();
 
     let mut ddoc = db.get_design("app").await.unwrap();
+    assert_eq!(ddoc.rev.as_deref(), Some(r2.as_str()));
     ddoc.views.insert(
         "all".into(),
-        ViewDef {
-            map: "function(doc){ emit(doc._id); }".into(),
-            reduce: None,
-        },
+        ViewDef::new("function(doc){ emit(doc._id); }"),
     );
     db.put_design(ddoc).await.unwrap();
 
-    let stored = db.get("_design/app").await.unwrap().data;
-    assert_eq!(stored["views"]["lib"], raw["views"]["lib"]);
-    assert_eq!(stored["views"]["mango-idx"], raw["views"]["mango-idx"]);
+    let stored = db.get("_design/app").await.unwrap();
+    let mut expected = raw.clone();
+    expected["views"]["all"] = serde_json::json!({"map": "function(doc){ emit(doc._id); }"});
+    assert_eq!(stored.data, expected);
+    assert_eq!(stored.attachments["index.html"].length, 3);
     assert_eq!(
-        stored["views"]["by_type"]["options"],
-        raw["views"]["by_type"]["options"]
+        db.get_attachment("_design/app", "index.html")
+            .await
+            .unwrap(),
+        b"<p>"
     );
-    assert!(stored["views"]["all"]["map"].is_string());
-    assert_eq!(stored["options"], raw["options"]);
-    assert_eq!(stored["autoupdate"], raw["autoupdate"]);
-    assert_eq!(stored["custom"], raw["custom"]);
 
     // A view removed through the struct is really removed.
     let mut ddoc = db.get_design("app").await.unwrap();
@@ -899,6 +924,7 @@ async fn put_design_does_not_panic_when_a_plugin_drops_it() {
         lists: HashMap::new(),
         updates: HashMap::new(),
         language: None,
+        ..Default::default()
     };
     assert!(db.put_design(ddoc).await.is_err());
 }

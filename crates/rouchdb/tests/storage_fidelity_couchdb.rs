@@ -222,17 +222,7 @@ async fn local_documents_design_conflicts_and_destroy_over_http() {
         Err(RouchError::NotFound(_))
     ));
 
-    let ddoc = || DesignDocument {
-        id: "_design/app".into(),
-        rev: None,
-        views: HashMap::new(),
-        filters: HashMap::new(),
-        validate_doc_update: None,
-        shows: HashMap::new(),
-        lists: HashMap::new(),
-        updates: HashMap::new(),
-        language: None,
-    };
+    let ddoc = || DesignDocument::new("app");
     assert!(db.put_design(ddoc()).await.unwrap().ok);
     assert!(matches!(
         db.put_design(ddoc()).await,
@@ -368,4 +358,88 @@ async fn changes_limit_zero_over_http() {
         .unwrap();
     assert!(res.results.is_empty(), "{res:?}");
     delete_remote_db(&url).await;
+}
+
+/// The current JSON of a document, read straight from CouchDB.
+async fn couch_get(url: &str, id: &str) -> serde_json::Value {
+    let resp = reqwest::get(format!("{url}/{id}")).await.unwrap();
+    assert!(resp.status().is_success(), "{id}: {}", resp.status());
+    resp.json().await.unwrap()
+}
+
+/// F55: design documents written to CouchDB by other clients (Fauxton-style
+/// PUTs with `views.lib`, options and custom members, Mango `_index`) go
+/// through `get_design` + `put_design` unchanged, over http and through a
+/// local database replicated from and back to CouchDB.
+#[tokio::test]
+#[ignore = "requires CouchDB"]
+async fn couchdb_design_documents_round_trip() {
+    let url = fresh_remote_db("sfid_ddocs").await;
+    couch_put(
+        &url,
+        "_design/app",
+        serde_json::json!({
+            "language": "javascript",
+            "views": {
+                "lib": {"util": "exports.twice = function(x){ return 2*x; };"},
+                "by_type": {"map": "function (doc) {\n  emit(doc.type, 1);\n}",
+                    "reduce": "_count", "options": {"collation": "raw"}},
+                "by_n": {"map": "function(doc){ emit(require('views/lib/util').twice(doc.n)); }"}
+            },
+            "filters": {"users": "function(doc, req){ return doc.type === 'user'; }",
+                "erl": {"src": "x"}},
+            "validate_doc_update": "function(newDoc, oldDoc, userCtx){ }",
+            "options": {"partitioned": false, "local_seq": true},
+            "autoupdate": false,
+            "rewrites": [{"from": "/a", "to": "/b"}],
+            "custom": {"nested": [1, 2.5, "x", null, true]}
+        })
+        .to_string(),
+    )
+    .await;
+    let resp = reqwest::Client::new()
+        .post(format!("{url}/_index"))
+        .json(&serde_json::json!({"index": {"fields": ["t"]}, "ddoc": "mango", "name": "by-t"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let ids = ["_design/app", "_design/mango"];
+
+    let remote = Database::http(&url);
+    for id in ids {
+        let before = couch_get(&url, id).await;
+        let ddoc = remote.get_design(id).await.unwrap();
+        assert_eq!(ddoc.to_json(), before, "{id}");
+        let rev = remote.put_design(ddoc).await.unwrap().rev.unwrap();
+        let mut after = couch_get(&url, id).await;
+        assert_eq!(after["_rev"], rev, "{id}");
+        after["_rev"] = before["_rev"].clone();
+        assert_eq!(after, before, "{id}");
+    }
+
+    // Replicated into a local database, edited there and pushed back.
+    let local = Database::memory("ddocs");
+    assert!(local.replicate_from(&remote).await.unwrap().ok);
+    for id in ids {
+        assert_eq!(
+            local.get_design(id).await.unwrap().to_json(),
+            couch_get(&url, id).await,
+            "{id}"
+        );
+    }
+    let mut ddoc = local.get_design("app").await.unwrap();
+    ddoc.extra
+        .insert("custom".into(), serde_json::json!("edited"));
+    ddoc.other_views.remove("lib");
+    local.put_design(ddoc.clone()).await.unwrap();
+    assert!(local.replicate_to(&remote).await.unwrap().ok);
+    let mut pushed = couch_get(&url, "_design/app").await;
+    let mut expected = local.get_design("app").await.unwrap().to_json();
+    assert_eq!(pushed["_rev"], expected["_rev"]);
+    assert_eq!(pushed["custom"], "edited");
+    assert!(pushed["views"].get("lib").is_none());
+    pushed["_rev"] = serde_json::Value::Null;
+    expected["_rev"] = serde_json::Value::Null;
+    assert_eq!(pushed, expected);
 }

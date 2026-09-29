@@ -236,10 +236,10 @@ async fn all_docs_paging_and_range_edge_cases() {
 async fn design_doc_full_roundtrip() {
     for b in backends("test") {
         let db = &b.db;
-        let named = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+        let named = |pairs: &[(&str, &str)]| -> HashMap<String, serde_json::Value> {
             pairs
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .map(|(k, v)| (k.to_string(), serde_json::json!(v)))
                 .collect()
         };
         let ddoc = DesignDocument {
@@ -251,6 +251,7 @@ async fn design_doc_full_roundtrip() {
                     ViewDef {
                         map: "function(doc) { emit(doc.type, 1); }".into(),
                         reduce: Some("_count".into()),
+                        ..Default::default()
                     },
                 ),
                 (
@@ -258,6 +259,7 @@ async fn design_doc_full_roundtrip() {
                     ViewDef {
                         map: "function(doc) { emit(doc.name, null); }".into(),
                         reduce: None,
+                        ..Default::default()
                     },
                 ),
             ]),
@@ -267,6 +269,7 @@ async fn design_doc_full_roundtrip() {
             lists: named(&[("all", "function(head,req) {}")]),
             updates: named(&[("bump", "function(doc,req) {}")]),
             language: Some("javascript".into()),
+            ..Default::default()
         };
 
         let result = db.put_design(ddoc.clone()).await.unwrap();

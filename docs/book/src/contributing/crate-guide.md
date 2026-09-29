@@ -111,7 +111,7 @@ The foundation crate. Everything else depends on it.
 **Responsibility:** Design documents and the persistent view engine.
 
 **Key files:**
-- `src/lib.rs` -- `DesignDocument` struct (with views, filters, validate_doc_update) and `ViewEngine` for persistent map/reduce indexes.
+- `src/design_doc.rs` -- the lossless `DesignDocument` struct (typed views, filters, validate_doc_update, plus `other_views` and `extra` for every other member); `src/engine.rs` -- `ViewEngine` for persistent map/reduce indexes.
 
 ### `rouchdb`
 
