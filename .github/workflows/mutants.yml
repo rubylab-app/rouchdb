@@ -13,6 +13,8 @@ on:
   pull_request:
     paths:
       - "crates/*/src/**.rs"
+      # A change to this file runs it too (usually with no mutants).
+      - ".github/workflows/mutants.yml"
 
 permissions:
   contents: read
