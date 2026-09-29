@@ -308,7 +308,8 @@ async fn http_errors_keep_couchdb_meaning() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(err, rouchdb::RouchError::BadRequest(_)), "{err:?}");
+    // CouchDB's 400 "Invalid rev format", reported like the local adapters.
+    assert!(matches!(err, rouchdb::RouchError::InvalidRev(_)), "{err:?}");
 
     // A random user that does not exist: failed logins as the real admin
     // make CouchDB 3.4+ lock the account, and every later test gets a 403.
