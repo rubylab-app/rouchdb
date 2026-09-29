@@ -648,8 +648,8 @@ type HashInput = (
 proptest! {
     #![proptest_config(config())]
 
-    /// P7: distinct (deleted, parent, body, attachment set) inputs never
-    /// produce the same revision hash.
+    /// P7: distinct (deleted, parent, body, attachment name/digest/type)
+    /// inputs never produce the same revision hash; `revpos` is ignored.
     #[test]
     fn rev_hash_is_injective(
         inputs in prop::collection::vec(
@@ -669,11 +669,22 @@ proptest! {
             let hash = generate_rev_hash(&body, deleted, prev.as_deref(), &stub_attachments(&atts));
             prop_assert_eq!(hash.len(), 32);
             prop_assert!(hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
-            let input: HashInput = (deleted, prev, body.to_string(), atts);
+            let input: HashInput = (deleted, prev.clone(), body.to_string(), atts.clone());
             if let Some(other) = seen.get(&hash) {
                 prop_assert_eq!(other, &input, "hash collision {}", hash);
             }
-            seen.insert(hash, input);
+            seen.insert(hash.clone(), input);
+
+            // `revpos` is not part of the hash: the same content uploaded at
+            // another generation hashes the same.
+            let mut moved = stub_attachments(&atts);
+            for meta in moved.values_mut() {
+                meta.revpos += 7;
+            }
+            prop_assert_eq!(
+                generate_rev_hash(&body, deleted, prev.as_deref(), &moved),
+                hash
+            );
         }
     }
 
@@ -705,7 +716,12 @@ proptest! {
         deleted in any::<bool>(),
         body in body(),
         stubs in attachment_specs(),
-        inline in prop::collection::btree_map("[cd]{1,2}", prop::collection::vec(any::<u8>(), 0..8), 0..3),
+        stub_extra in prop::collection::vec((0u64..4, prop::option::of(("gzip|identity", 0u64..100))), 3),
+        inline in prop::collection::btree_map(
+            "[cd]{1,2}",
+            (prop::collection::vec(any::<u8>(), 0..8), 0u64..4),
+            0..3,
+        ),
     ) {
         use base64::Engine as _;
         let mut json = Value::Object(body.clone());
@@ -715,12 +731,24 @@ proptest! {
         }
         json["_deleted"] = json!(deleted);
         let mut atts = serde_json::Map::new();
-        for (name, (digest, ct)) in &stubs {
-            atts.insert(name.clone(), json!({"stub": true, "digest": digest, "content_type": ct, "length": 3}));
+        for ((name, (digest, ct)), (revpos, encoding)) in stubs.iter().zip(&stub_extra) {
+            let mut stub = json!({"stub": true, "digest": digest, "content_type": ct, "length": 3});
+            if *revpos > 0 {
+                stub["revpos"] = json!(revpos);
+            }
+            if let Some((encoding, encoded_length)) = encoding {
+                stub["encoding"] = json!(encoding);
+                stub["encoded_length"] = json!(encoded_length);
+            }
+            atts.insert(name.clone(), stub);
         }
-        for (name, bytes) in &inline {
+        for (name, (bytes, revpos)) in &inline {
             let data = base64::engine::general_purpose::STANDARD.encode(bytes);
-            atts.insert(name.clone(), json!({"content_type": "application/x", "data": data}));
+            let mut att = json!({"content_type": "application/x", "data": data});
+            if *revpos > 0 {
+                att["revpos"] = json!(revpos);
+            }
+            atts.insert(name.clone(), att);
         }
         if !atts.is_empty() {
             json["_attachments"] = Value::Object(atts);
@@ -741,6 +769,9 @@ proptest! {
             prop_assert_eq!(b.length, a.length);
             prop_assert_eq!(b.stub, a.stub);
             prop_assert_eq!(&b.data, &a.data);
+            prop_assert_eq!(b.revpos, a.revpos);
+            prop_assert_eq!(&b.encoding, &a.encoding);
+            prop_assert_eq!(b.encoded_length, a.encoded_length);
         }
     }
 }
