@@ -1,9 +1,54 @@
 //! Document data diversity: type roundtrips through CouchDB and special IDs.
+//!
+//! Each document is written on the memory backend, pushed to CouchDB, and
+//! pulled from CouchDB into a fresh memory and a redb database; every copy
+//! must have exactly the written body under the same revision.
 
 mod common;
 
 use common::fresh_remote_db;
-use rouchdb::Database;
+use rouchdb::{AllDocsOptions, Database};
+
+/// Replicates `docs` memory → CouchDB → (memory, redb) and checks every
+/// copy of every document.
+async fn assert_roundtrip(prefix: &str, docs: &[(&str, serde_json::Value)]) {
+    let url = fresh_remote_db(prefix).await;
+    let local = Database::memory("local");
+    let remote = Database::http(&url);
+    let pulled = Database::memory("pulled");
+    let dir = tempfile::tempdir().unwrap();
+    let redb = Database::open(dir.path().join("pulled.redb"), "pulled").unwrap();
+
+    let mut written = Vec::new();
+    for (id, body) in docs {
+        let r = local.put(id, body.clone()).await.unwrap();
+        written.push((id.to_string(), r.rev.unwrap(), body.clone()));
+    }
+    let push = local.replicate_to(&remote).await.unwrap();
+    assert_eq!(push.docs_written, docs.len() as u64);
+    pulled.replicate_from(&remote).await.unwrap();
+    redb.replicate_from(&remote).await.unwrap();
+
+    let mut ids: Vec<String> = docs.iter().map(|(id, _)| id.to_string()).collect();
+    ids.sort();
+    for (db, name) in [
+        (&local, "memory"),
+        (&remote, "couchdb"),
+        (&pulled, "pulled memory"),
+        (&redb, "pulled redb"),
+    ] {
+        let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
+        let mut listed: Vec<String> = all.rows.iter().map(|r| r.id.clone()).collect();
+        listed.sort();
+        assert_eq!(listed, ids, "{name}");
+        for (id, rev, body) in &written {
+            let doc = db.get(id).await.unwrap();
+            assert_eq!(doc.id, *id, "{name}");
+            assert_eq!(doc.rev.unwrap().to_string(), *rev, "{name} {id}");
+            assert_eq!(doc.data, *body, "{name} {id}");
+        }
+    }
+}
 
 // =========================================================================
 // Data type roundtrips
@@ -12,10 +57,6 @@ use rouchdb::Database;
 #[tokio::test]
 #[ignore = "requires CouchDB"]
 async fn data_nested_objects_roundtrip() {
-    let url = fresh_remote_db("data_nested").await;
-    let local = Database::memory("local");
-    let remote = Database::http(&url);
-
     let data = serde_json::json!({
         "address": {
             "street": "123 Main St",
@@ -27,51 +68,23 @@ async fn data_nested_objects_roundtrip() {
             "phones": { "home": "555-0100", "work": "555-0200" }
         }
     });
-
-    local.put("doc1", data.clone()).await.unwrap();
-    local.replicate_to(&remote).await.unwrap();
-
-    let doc = remote.get("doc1").await.unwrap();
-    assert_eq!(doc.data["address"]["city"], "New York");
-    assert_eq!(doc.data["address"]["geo"]["lat"], 40.7128);
-    assert_eq!(doc.data["contacts"]["phones"]["work"], "555-0200");
-
-    let local2 = Database::memory("local2");
-    local2.replicate_from(&remote).await.unwrap();
-    let doc2 = local2.get("doc1").await.unwrap();
-    assert_eq!(doc2.data["address"]["geo"]["lng"], -74.006);
+    assert_roundtrip("data_nested", &[("doc1", data)]).await;
 }
 
 #[tokio::test]
 #[ignore = "requires CouchDB"]
 async fn data_arrays_roundtrip() {
-    let url = fresh_remote_db("data_arrays").await;
-    let local = Database::memory("local");
-    let remote = Database::http(&url);
-
     let data = serde_json::json!({
         "tags": ["rust", "database", "sync"],
         "matrix": [[1, 2, 3], [4, 5, 6]],
         "nested": [{"name": "a"}, {"name": "b"}]
     });
-
-    local.put("doc1", data).await.unwrap();
-    local.replicate_to(&remote).await.unwrap();
-
-    let doc = remote.get("doc1").await.unwrap();
-    assert_eq!(doc.data["tags"][0], "rust");
-    assert_eq!(doc.data["tags"][2], "sync");
-    assert_eq!(doc.data["matrix"][1][2], 6);
-    assert_eq!(doc.data["nested"][0]["name"], "a");
+    assert_roundtrip("data_arrays", &[("doc1", data)]).await;
 }
 
 #[tokio::test]
 #[ignore = "requires CouchDB"]
 async fn data_null_and_bool_roundtrip() {
-    let url = fresh_remote_db("data_nullbool").await;
-    let local = Database::memory("local");
-    let remote = Database::http(&url);
-
     let data = serde_json::json!({
         "optional": null,
         "nested_null": {"inner": null},
@@ -79,25 +92,12 @@ async fn data_null_and_bool_roundtrip() {
         "deleted": false,
         "flags": [true, false, null]
     });
-
-    local.put("doc1", data).await.unwrap();
-    local.replicate_to(&remote).await.unwrap();
-
-    let doc = remote.get("doc1").await.unwrap();
-    assert!(doc.data["optional"].is_null());
-    assert!(doc.data["nested_null"]["inner"].is_null());
-    assert_eq!(doc.data["active"], true);
-    assert_eq!(doc.data["deleted"], false);
-    assert!(doc.data["flags"][2].is_null());
+    assert_roundtrip("data_nullbool", &[("doc1", data)]).await;
 }
 
 #[tokio::test]
 #[ignore = "requires CouchDB"]
 async fn data_numeric_types_roundtrip() {
-    let url = fresh_remote_db("data_nums").await;
-    let local = Database::memory("local");
-    let remote = Database::http(&url);
-
     let data = serde_json::json!({
         "integer": 42,
         "negative": -7,
@@ -105,77 +105,37 @@ async fn data_numeric_types_roundtrip() {
         "float": 3.14160,
         "small_float": 0.001,
         "negative_float": -273.15,
-        "big": 9999999999_i64
+        "exponent": 1.5e-7,
+        "big": 9999999999_i64,
+        "max_safe": 9007199254740991_i64
     });
-
-    local.put("doc1", data).await.unwrap();
-    local.replicate_to(&remote).await.unwrap();
-
-    let doc = remote.get("doc1").await.unwrap();
-    assert_eq!(doc.data["integer"], 42);
-    assert_eq!(doc.data["negative"], -7);
-    assert_eq!(doc.data["zero"], 0);
-    assert!((doc.data["float"].as_f64().unwrap() - 3.14160).abs() < 1e-10);
-    assert_eq!(doc.data["small_float"], 0.001);
-    assert_eq!(doc.data["negative_float"], -273.15);
-    assert_eq!(doc.data["big"], 9999999999_i64);
+    assert_roundtrip("data_nums", &[("doc1", data)]).await;
 }
 
 #[tokio::test]
 #[ignore = "requires CouchDB"]
 async fn data_empty_structures_roundtrip() {
-    let url = fresh_remote_db("data_empty").await;
-    let local = Database::memory("local");
-    let remote = Database::http(&url);
-
     let data = serde_json::json!({
         "empty_arr": [],
         "empty_obj": {},
         "empty_str": "",
         "nested_empty": {"a": [], "b": {}}
     });
-
-    local.put("doc1", data).await.unwrap();
-    local.replicate_to(&remote).await.unwrap();
-
-    let doc = remote.get("doc1").await.unwrap();
-    assert_eq!(doc.data["empty_arr"].as_array().unwrap().len(), 0);
-    assert_eq!(doc.data["empty_obj"].as_object().unwrap().len(), 0);
-    assert_eq!(doc.data["empty_str"], "");
-    assert_eq!(doc.data["nested_empty"]["a"].as_array().unwrap().len(), 0);
+    assert_roundtrip("data_empty", &[("doc1", data)]).await;
 }
 
 #[tokio::test]
 #[ignore = "requires CouchDB"]
 async fn data_mixed_type_array_roundtrip() {
-    let url = fresh_remote_db("data_mixed").await;
-    let local = Database::memory("local");
-    let remote = Database::http(&url);
-
     let data = serde_json::json!({
         "mix": [1, "two", true, null, {"nested": 5}, [6, 7]]
     });
-
-    local.put("doc1", data).await.unwrap();
-    local.replicate_to(&remote).await.unwrap();
-
-    let doc = remote.get("doc1").await.unwrap();
-    let mix = doc.data["mix"].as_array().unwrap();
-    assert_eq!(mix[0], 1);
-    assert_eq!(mix[1], "two");
-    assert_eq!(mix[2], true);
-    assert!(mix[3].is_null());
-    assert_eq!(mix[4]["nested"], 5);
-    assert_eq!(mix[5][1], 7);
+    assert_roundtrip("data_mixed", &[("doc1", data)]).await;
 }
 
 #[tokio::test]
 #[ignore = "requires CouchDB"]
 async fn data_unicode_roundtrip() {
-    let url = fresh_remote_db("data_unicode").await;
-    let local = Database::memory("local");
-    let remote = Database::http(&url);
-
     let data = serde_json::json!({
         "emoji": "\u{1F980}\u{1F389}",
         "japanese": "\u{6771}\u{4EAC}",
@@ -183,29 +143,15 @@ async fn data_unicode_roundtrip() {
         "korean": "\u{C548}\u{B155}\u{D558}\u{C138}\u{C694}",
         "arabic": "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}",
         "accented": "caf\u{00E9} na\u{00EF}ve r\u{00E9}sum\u{00E9}",
-        "special_chars": "line1\nline2\ttab\\backslash"
+        "special_chars": "line1\nline2\ttab\\backslash\"quote\u{0001}",
+        "\u{1F511}": "unicode key"
     });
-
-    local.put("doc1", data).await.unwrap();
-    local.replicate_to(&remote).await.unwrap();
-
-    let doc = remote.get("doc1").await.unwrap();
-    assert_eq!(doc.data["emoji"], "\u{1F980}\u{1F389}");
-    assert_eq!(doc.data["japanese"], "\u{6771}\u{4EAC}");
-    assert_eq!(
-        doc.data["accented"],
-        "caf\u{00E9} na\u{00EF}ve r\u{00E9}sum\u{00E9}"
-    );
-    assert_eq!(doc.data["special_chars"], "line1\nline2\ttab\\backslash");
+    assert_roundtrip("data_unicode", &[("doc1", data)]).await;
 }
 
 #[tokio::test]
 #[ignore = "requires CouchDB"]
 async fn data_large_document() {
-    let url = fresh_remote_db("data_large").await;
-    let local = Database::memory("local");
-    let remote = Database::http(&url);
-
     let mut obj = serde_json::Map::new();
     for i in 0..100 {
         obj.insert(
@@ -217,15 +163,8 @@ async fn data_large_document() {
             }),
         );
     }
-    let data = serde_json::Value::Object(obj);
-
-    local.put("big_doc", data).await.unwrap();
-    local.replicate_to(&remote).await.unwrap();
-
-    let doc = remote.get("big_doc").await.unwrap();
-    assert_eq!(doc.data["field_0"]["index"], 0);
-    assert_eq!(doc.data["field_99"]["value"], "value_99");
-    assert_eq!(doc.data["field_50"]["nested"]["data"][2], 150);
+    obj.insert("text".into(), serde_json::json!("x".repeat(100_000)));
+    assert_roundtrip("data_large", &[("big_doc", serde_json::Value::Object(obj))]).await;
 }
 
 // =========================================================================
@@ -238,12 +177,15 @@ async fn special_id_with_spaces() {
     let url = fresh_remote_db("id_spaces").await;
     let db = Database::http(&url);
 
-    db.put("my document", serde_json::json!({"v": 1}))
+    let r = db
+        .put("my document", serde_json::json!({"v": 1}))
         .await
         .unwrap();
+    assert_eq!(r.id, "my document");
     let doc = db.get("my document").await.unwrap();
-    assert_eq!(doc.data["v"], 1);
     assert_eq!(doc.id, "my document");
+    assert_eq!(doc.rev.unwrap().to_string(), r.rev.unwrap());
+    assert_eq!(doc.data, serde_json::json!({"v": 1}));
 }
 
 #[tokio::test]
@@ -252,42 +194,32 @@ async fn special_id_with_unicode() {
     let url = fresh_remote_db("id_unicode").await;
     let db = Database::http(&url);
 
-    db.put("doc_\u{00E9}\u{00E8}\u{00EA}", serde_json::json!({"v": 1}))
-        .await
-        .unwrap();
-    let doc = db.get("doc_\u{00E9}\u{00E8}\u{00EA}").await.unwrap();
-    assert_eq!(doc.data["v"], 1);
+    let id = "doc_\u{00E9}\u{00E8}\u{00EA}_\u{1F600}";
+    let r = db.put(id, serde_json::json!({"v": 1})).await.unwrap();
+    assert_eq!(r.id, id);
+    let doc = db.get(id).await.unwrap();
+    assert_eq!(doc.id, id);
+    assert_eq!(doc.data, serde_json::json!({"v": 1}));
+    let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
+    assert_eq!(all.rows.len(), 1);
+    assert_eq!(all.rows[0].id, id);
 }
 
 #[tokio::test]
 #[ignore = "requires CouchDB"]
 async fn special_id_replicate_roundtrip() {
-    let url = fresh_remote_db("id_repl").await;
-    let local = Database::memory("local");
-    let remote = Database::http(&url);
-
-    local
-        .put("has spaces", serde_json::json!({"t": "spaces"}))
-        .await
-        .unwrap();
-    local
-        .put("has/slash", serde_json::json!({"t": "slash"}))
-        .await
-        .unwrap();
-    local
-        .put("has+plus", serde_json::json!({"t": "plus"}))
-        .await
-        .unwrap();
-    local
-        .put("has?question", serde_json::json!({"t": "question"}))
-        .await
-        .unwrap();
-
-    local.replicate_to(&remote).await.unwrap();
-
-    let doc = remote.get("has spaces").await.unwrap();
-    assert_eq!(doc.data["t"], "spaces");
-
-    let doc = remote.get("has+plus").await.unwrap();
-    assert_eq!(doc.data["t"], "plus");
+    let docs: Vec<(&str, serde_json::Value)> = [
+        ("has spaces", "spaces"),
+        ("has/slash", "slash"),
+        ("has+plus", "plus"),
+        ("has?question", "question"),
+        ("has#hash", "hash"),
+        ("has%25percent", "percent"),
+        ("has&amp", "amp"),
+        ("has\u{e9}accent", "accent"),
+    ]
+    .into_iter()
+    .map(|(id, t)| (id, serde_json::json!({"t": t})))
+    .collect();
+    assert_roundtrip("id_repl", &docs).await;
 }

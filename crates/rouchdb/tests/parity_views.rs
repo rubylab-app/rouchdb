@@ -1,16 +1,18 @@
 //! Tests for design documents and persistent views:
 //! - DesignDocument CRUD (put, get, delete)
-//! - ViewEngine with Rust map functions
-//! - Incremental view index updates
-//! - Multi-key view queries
-//! - StaleOption
+//! - ViewEngine: the incremental index compared with a full rebuild
+//!   (`query_view`) after every kind of write, incrementality, stale
 //! - view_cleanup()
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rouchdb::{
-    Database, DesignDocument, ReduceFn, ViewDef, ViewEngine, ViewQueryOptions, query_view,
+    BulkDocsOptions, Database, DesignDocument, Document, ReduceFn, RouchError, StaleOption,
+    ViewDef, ViewEngine, ViewQueryOptions, ViewResult, query_view,
 };
+use serde_json::{Value, json};
 
 // =========================================================================
 // Design document CRUD
@@ -83,6 +85,7 @@ async fn get_design_with_full_id() {
     // Retrieve using short name
     let retrieved = db.get_design("app").await.unwrap();
     assert_eq!(retrieved.id, "_design/app");
+    assert_eq!(retrieved.name(), "app");
 }
 
 #[tokio::test]
@@ -110,7 +113,7 @@ async fn delete_design_document() {
 
     // Should be gone
     let err = db.get_design("myapp").await;
-    assert!(err.is_err());
+    assert!(matches!(err, Err(RouchError::NotFound(_))));
 }
 
 #[tokio::test]
@@ -228,175 +231,400 @@ async fn design_document_with_show_list_update() {
 }
 
 // =========================================================================
-// ViewEngine with Rust map functions
+// ViewEngine: the incremental index against a full rebuild
 // =========================================================================
+
+type Emitted = Vec<(Value, Value)>;
+
+/// Emits `(val, 1)` for the documents that have a `val`.
+fn by_val(doc: &Value) -> Emitted {
+    match doc.get("val") {
+        Some(v) => vec![(v.clone(), json!(1))],
+        None => vec![],
+    }
+}
+
+fn engine_by_val() -> ViewEngine {
+    let mut engine = ViewEngine::new();
+    engine.register_map("app", "by_val", by_val);
+    engine
+}
+
+/// A view result as JSON (totals, ids, keys, values and docs), to compare
+/// results exactly.
+fn result_json(result: &ViewResult) -> Value {
+    let rows: Vec<Value> = result
+        .rows
+        .iter()
+        .map(|r| json!({"id": r.id, "key": r.key, "value": r.value, "doc": r.doc}))
+        .collect();
+    json!({"total_rows": result.total_rows, "offset": result.offset, "rows": rows})
+}
+
+/// The queries compared after every step.
+fn probe_queries() -> Vec<(Option<ReduceFn>, ViewQueryOptions)> {
+    vec![
+        (None, ViewQueryOptions::new()),
+        (
+            None,
+            ViewQueryOptions {
+                include_docs: true,
+                ..ViewQueryOptions::new()
+            },
+        ),
+        (
+            None,
+            ViewQueryOptions {
+                descending: true,
+                skip: 1,
+                limit: Some(3),
+                ..ViewQueryOptions::new()
+            },
+        ),
+        (
+            None,
+            ViewQueryOptions {
+                start_key: Some(json!(2)),
+                end_key: Some(json!("s")),
+                inclusive_end: false,
+                ..ViewQueryOptions::new()
+            },
+        ),
+        (
+            None,
+            ViewQueryOptions {
+                keys: Some(vec![json!(3), json!("s1"), json!(15)]),
+                ..ViewQueryOptions::new()
+            },
+        ),
+        (Some(ReduceFn::Count), ViewQueryOptions::new()),
+        (
+            Some(ReduceFn::Sum),
+            ViewQueryOptions {
+                group: true,
+                ..ViewQueryOptions::new()
+            },
+        ),
+        (
+            Some(ReduceFn::Count),
+            ViewQueryOptions {
+                group_level: Some(1),
+                descending: true,
+                ..ViewQueryOptions::new()
+            },
+        ),
+    ]
+}
+
+/// Every probe query answered from the engine's index must equal the
+/// same query run from scratch over the current documents.
+async fn assert_engine_matches_rebuild(engine: &mut ViewEngine, db: &Database, step: &str) {
+    for (reduce, opts) in probe_queries() {
+        let indexed = engine
+            .query(db.adapter(), "app", "by_val", reduce.as_ref(), opts.clone())
+            .await
+            .unwrap();
+        let rebuilt = query_view(db.adapter(), &by_val, reduce.as_ref(), opts.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            result_json(&indexed),
+            result_json(&rebuilt),
+            "{step}: {opts:?}"
+        );
+    }
+}
+
+async fn put(db: &Database, id: &str, body: Value) {
+    db.put(id, body).await.unwrap();
+}
+
+async fn update(db: &Database, id: &str, body: Value) {
+    let rev = db.get(id).await.unwrap().rev.unwrap().to_string();
+    db.update(id, &rev, body).await.unwrap();
+}
+
+async fn remove(db: &Database, id: &str) {
+    let rev = db.get(id).await.unwrap().rev.unwrap().to_string();
+    db.remove(id, &rev).await.unwrap();
+}
+
+/// Write a revision as replication does (keeping `_rev` and `_revisions`).
+async fn put_replicated(db: &Database, doc: Value) {
+    let doc = Document::from_json(doc).unwrap();
+    let result = db
+        .bulk_docs(vec![doc], BulkDocsOptions::replication())
+        .await
+        .unwrap();
+    assert!(result[0].ok, "{:?}", result[0]);
+}
+
+async fn run_engine_differential(db: &Database) {
+    let mut engine = engine_by_val();
+    assert_engine_matches_rebuild(&mut engine, db, "empty").await;
+
+    put(db, "doc1", json!({"val": 10})).await;
+    put(db, "doc2", json!({"val": 20})).await;
+    assert_engine_matches_rebuild(&mut engine, db, "first documents").await;
+
+    put(db, "doc3", json!({"val": 3})).await;
+    assert_engine_matches_rebuild(&mut engine, db, "one more").await;
+
+    update(db, "doc1", json!({"val": 15})).await;
+    assert_engine_matches_rebuild(&mut engine, db, "doc1 updated").await;
+
+    update(db, "doc2", json!({"other": 1})).await;
+    assert_engine_matches_rebuild(&mut engine, db, "doc2 stops emitting").await;
+
+    update(db, "doc2", json!({"val": "s1"})).await;
+    assert_engine_matches_rebuild(&mut engine, db, "doc2 emits again").await;
+
+    remove(db, "doc3").await;
+    assert_engine_matches_rebuild(&mut engine, db, "doc3 deleted").await;
+
+    put(db, "doc3", json!({"val": 3})).await;
+    assert_engine_matches_rebuild(&mut engine, db, "doc3 recreated").await;
+
+    update(db, "doc1", json!({"val": 4})).await;
+    update(db, "doc1", json!({"val": 2})).await;
+    assert_engine_matches_rebuild(&mut engine, db, "doc1 updated twice").await;
+
+    // Conflicting revisions: the winner (highest hash) is mapped, and the
+    // loser once the winner is deleted.
+    let first = db
+        .put("doc4", json!({"val": 1}))
+        .await
+        .unwrap()
+        .rev
+        .unwrap();
+    let first_hash = first.split_once('-').unwrap().1.to_string();
+    for (hash, val) in [("a".repeat(32), 11), ("f".repeat(32), 12)] {
+        put_replicated(
+            db,
+            json!({"_id": "doc4", "_rev": format!("2-{hash}"), "val": val,
+                   "_revisions": {"start": 2, "ids": [hash, first_hash]}}),
+        )
+        .await;
+    }
+    assert_eq!(db.get("doc4").await.unwrap().data["val"], 12);
+    assert_engine_matches_rebuild(&mut engine, db, "conflict").await;
+    db.remove("doc4", &format!("2-{}", "f".repeat(32)))
+        .await
+        .unwrap();
+    assert_eq!(db.get("doc4").await.unwrap().data["val"], 11);
+    assert_engine_matches_rebuild(&mut engine, db, "winning revision deleted").await;
+
+    put(db, "_design/app", json!({"val": 99})).await;
+    assert_engine_matches_rebuild(&mut engine, db, "design document").await;
+
+    for i in 0..15 {
+        let val = match i % 5 {
+            0 => json!(i % 4),
+            1 => json!(format!("s{}", i % 3)),
+            2 => json!([i % 2, "x"]),
+            3 => json!(null),
+            _ => json!({"k": i % 2}),
+        };
+        put(db, &format!("n{i:02}"), json!({"val": val})).await;
+    }
+    assert_engine_matches_rebuild(&mut engine, db, "mixed keys").await;
+
+    let rev = db.get("doc1").await.unwrap().rev.unwrap().to_string();
+    db.purge("doc1", vec![rev]).await.unwrap();
+    assert_engine_matches_rebuild(&mut engine, db, "doc1 purged").await;
+}
+
+#[tokio::test]
+async fn view_engine_matches_a_rebuild_after_every_write() {
+    run_engine_differential(&Database::memory("engine")).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let redb = Database::open(dir.path().join("engine.redb"), "engine").unwrap();
+    run_engine_differential(&redb).await;
+}
 
 #[tokio::test]
 async fn view_engine_register_and_query() {
     let db = Database::memory("test");
-
-    db.put(
+    put(
+        &db,
         "alice",
-        serde_json::json!({"type": "user", "name": "Alice", "age": 30}),
+        json!({"type": "user", "name": "Alice", "age": 30}),
     )
-    .await
-    .unwrap();
-    db.put(
+    .await;
+    put(
+        &db,
         "bob",
-        serde_json::json!({"type": "user", "name": "Bob", "age": 25}),
+        json!({"type": "user", "name": "Bob", "age": 25}),
     )
-    .await
-    .unwrap();
-    db.put(
-        "inv1",
-        serde_json::json!({"type": "invoice", "amount": 100}),
-    )
-    .await
-    .unwrap();
-
-    let mut engine = ViewEngine::new();
-    engine.register_map("myapp", "by_name", |doc| {
-        if doc.get("type").and_then(|t| t.as_str()) == Some("user") {
+    .await;
+    put(&db, "inv1", json!({"type": "invoice", "amount": 100})).await;
+    let by_name = |doc: &Value| -> Emitted {
+        if doc["type"] == "user" {
             vec![(doc["name"].clone(), doc["age"].clone())]
         } else {
             vec![]
         }
-    });
-
-    engine
-        .update_index(db.adapter(), "myapp", "by_name")
-        .await
-        .unwrap();
-
-    let index = engine.get_index("myapp", "by_name").unwrap();
-    assert_eq!(index.entries.len(), 2);
-
-    // Should have entries for alice and bob
-    assert!(index.entries.contains_key("alice"));
-    assert!(index.entries.contains_key("bob"));
-    assert!(!index.entries.contains_key("inv1"));
-}
-
-#[tokio::test]
-async fn view_engine_incremental_update() {
-    let db = Database::memory("test");
-
-    db.put("doc1", serde_json::json!({"val": 10}))
-        .await
-        .unwrap();
-
-    let mut engine = ViewEngine::new();
-    engine.register_map("app", "all", |doc| {
-        if let Some(val) = doc.get("val") {
-            vec![(val.clone(), serde_json::json!(1))]
-        } else {
-            vec![]
-        }
-    });
-
-    // First update
-    engine
-        .update_index(db.adapter(), "app", "all")
-        .await
-        .unwrap();
-    assert_eq!(engine.get_index("app", "all").unwrap().entries.len(), 1);
-
-    // Add more docs
-    db.put("doc2", serde_json::json!({"val": 20}))
-        .await
-        .unwrap();
-    db.put("doc3", serde_json::json!({"val": 30}))
-        .await
-        .unwrap();
-
-    // Incremental update
-    engine
-        .update_index(db.adapter(), "app", "all")
-        .await
-        .unwrap();
-    assert_eq!(engine.get_index("app", "all").unwrap().entries.len(), 3);
-}
-
-#[tokio::test]
-async fn view_engine_handles_deleted_docs() {
-    let db = Database::memory("test");
-
-    let r1 = db
-        .put("doc1", serde_json::json!({"val": 10}))
-        .await
-        .unwrap();
-    db.put("doc2", serde_json::json!({"val": 20}))
-        .await
-        .unwrap();
-
-    let mut engine = ViewEngine::new();
-    engine.register_map("app", "all", |doc| {
-        if let Some(val) = doc.get("val") {
-            vec![(val.clone(), serde_json::json!(null))]
-        } else {
-            vec![]
-        }
-    });
-
-    engine
-        .update_index(db.adapter(), "app", "all")
-        .await
-        .unwrap();
-    assert_eq!(engine.get_index("app", "all").unwrap().entries.len(), 2);
-
-    // Delete doc1
-    assert!(db.remove("doc1", &r1.rev.unwrap()).await.unwrap().ok);
-
-    engine
-        .update_index(db.adapter(), "app", "all")
-        .await
-        .unwrap();
-    assert_eq!(engine.get_index("app", "all").unwrap().entries.len(), 1);
-    assert!(
-        engine
-            .get_index("app", "all")
-            .unwrap()
-            .entries
-            .contains_key("doc2")
-    );
-}
-
-#[tokio::test]
-async fn view_engine_skips_design_docs() {
-    let db = Database::memory("test");
-
-    db.put("doc1", serde_json::json!({"val": 1})).await.unwrap();
-
-    // Store a design doc
-    let ddoc = DesignDocument {
-        id: "_design/app".into(),
-        rev: None,
-        views: HashMap::new(),
-        filters: HashMap::new(),
-        validate_doc_update: None,
-        shows: HashMap::new(),
-        lists: HashMap::new(),
-        updates: HashMap::new(),
-        language: None,
     };
-    db.put_design(ddoc).await.unwrap();
-
     let mut engine = ViewEngine::new();
-    engine.register_map("app", "all", |doc| {
-        vec![(
-            doc.get("_id").cloned().unwrap_or(serde_json::json!(null)),
-            serde_json::json!(null),
-        )]
-    });
+    engine.register_map("myapp", "by_name", by_name);
 
-    engine
-        .update_index(db.adapter(), "app", "all")
+    let result = engine
+        .query(
+            db.adapter(),
+            "myapp",
+            "by_name",
+            None,
+            ViewQueryOptions::new(),
+        )
         .await
         .unwrap();
 
-    // Should NOT include the design doc
-    let index = engine.get_index("app", "all").unwrap();
-    assert!(!index.entries.keys().any(|k| k.starts_with("_design/")));
+    assert_eq!(
+        result_json(&result),
+        json!({"total_rows": 2, "offset": 0, "rows": [
+            {"id": "alice", "key": "Alice", "value": 30, "doc": null},
+            {"id": "bob", "key": "Bob", "value": 25, "doc": null}
+        ]})
+    );
+    let rebuilt = query_view(db.adapter(), &by_name, None, ViewQueryOptions::new())
+        .await
+        .unwrap();
+    assert_eq!(result_json(&result), result_json(&rebuilt));
+}
+
+#[tokio::test]
+async fn view_engine_maps_only_the_changed_documents() {
+    // The index is updated from the changes feed: after the first build,
+    // a query maps at most the changed documents plus the change the index
+    // stopped at (re-read to notice a recreated database).
+    let db = Database::memory("test");
+    for i in 0..10 {
+        put(&db, &format!("d{i}"), json!({"val": i})).await;
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut engine = ViewEngine::new();
+    let counter = Arc::clone(&calls);
+    engine.register_map("app", "by_val", move |doc| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        by_val(doc)
+    });
+    let mut query = async |step: &str, max_calls: usize| {
+        calls.store(0, Ordering::SeqCst);
+        engine
+            .query(db.adapter(), "app", "by_val", None, ViewQueryOptions::new())
+            .await
+            .unwrap();
+        let mapped = calls.load(Ordering::SeqCst);
+        assert!(mapped <= max_calls, "{step}: {mapped} documents mapped");
+    };
+
+    query("first build", 10).await;
+    query("nothing changed", 1).await;
+    update(&db, "d3", json!({"val": 33})).await;
+    query("d3 updated", 2).await;
+    update(&db, "d3", json!({"val": 34})).await;
+    query("d3 updated again", 1).await;
+    update(&db, "d5", json!({"val": 55})).await;
+    update(&db, "d6", json!({"val": 66})).await;
+    query("two updates", 3).await;
+    remove(&db, "d7").await;
+    query("d7 deleted", 2).await;
+}
+
+#[tokio::test]
+async fn view_engine_rebuilds_a_recreated_database_of_the_same_shape() {
+    // After destroy, a database with as many documents and writes as
+    // before has the same doc_count and update_seq; only the change the
+    // index stopped at (another revision, or another document) tells.
+    for new_ids in [["a", "b"], ["c", "d"]] {
+        let db = Database::memory("test");
+        put(&db, "a", json!({"val": 1})).await;
+        put(&db, "b", json!({"val": 2})).await;
+        let mut engine = engine_by_val();
+        assert_engine_matches_rebuild(&mut engine, &db, "before destroy").await;
+        let before = db.info().await.unwrap();
+
+        db.destroy().await.unwrap();
+        put(&db, new_ids[0], json!({"val": 10})).await;
+        put(&db, new_ids[1], json!({"val": 20})).await;
+        let after = db.info().await.unwrap();
+        assert_eq!(
+            (after.doc_count, after.update_seq),
+            (before.doc_count, before.update_seq),
+            "fixture: same shape"
+        );
+        assert_engine_matches_rebuild(&mut engine, &db, &format!("recreated as {new_ids:?}")).await;
+    }
+}
+
+#[tokio::test]
+async fn view_engine_resets_after_database_recreated() {
+    // F52: a destroyed and recreated database starts its sequence again.
+    let db = Database::memory("test");
+    for i in 0..5 {
+        put(&db, &format!("old{i}"), json!({"val": i})).await;
+    }
+    let mut engine = engine_by_val();
+    assert_engine_matches_rebuild(&mut engine, &db, "old").await;
+
+    db.destroy().await.unwrap();
+    put(&db, "new", json!({"val": 42})).await;
+    assert_engine_matches_rebuild(&mut engine, &db, "recreated with fewer writes").await;
+
+    // Recreated again with more updates than the index has seen.
+    db.destroy().await.unwrap();
+    for i in 0..8 {
+        put(&db, &format!("n{i}"), json!({"val": i})).await;
+    }
+    assert_engine_matches_rebuild(&mut engine, &db, "recreated with more writes").await;
+}
+
+#[tokio::test]
+async fn view_engine_drops_purged_docs() {
+    // F52: purged documents leave no change behind, but must leave the index.
+    let db = Database::memory("test");
+    let r1 = db.put("doc1", json!({"val": 1})).await.unwrap();
+    put(&db, "doc2", json!({"val": 2})).await;
+    let mut engine = engine_by_val();
+    assert_engine_matches_rebuild(&mut engine, &db, "before purge").await;
+
+    db.purge("doc1", vec![r1.rev.unwrap()]).await.unwrap();
+    assert_engine_matches_rebuild(&mut engine, &db, "after purge").await;
+    let result = engine
+        .query(db.adapter(), "app", "by_val", None, ViewQueryOptions::new())
+        .await
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].id.as_deref(), Some("doc2"));
+}
+
+#[tokio::test]
+async fn view_engine_reregistering_map_rebuilds_index() {
+    // F51: a new map function must not be mixed with rows of the old one.
+    let db = Database::memory("test");
+    put(&db, "doc1", json!({"val": 1, "other": "x"})).await;
+    let mut engine = engine_by_val();
+    engine
+        .query(db.adapter(), "app", "by_val", None, ViewQueryOptions::new())
+        .await
+        .unwrap();
+
+    let by_other = |doc: &Value| -> Emitted {
+        match doc.get("other") {
+            Some(v) => vec![(v.clone(), json!(2))],
+            None => vec![],
+        }
+    };
+    engine.register_map("app", "by_val", by_other);
+    let result = engine
+        .query(db.adapter(), "app", "by_val", None, ViewQueryOptions::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        result_json(&result)["rows"],
+        json!([{"id": "doc1", "key": "x", "value": 2, "doc": null}])
+    );
 }
 
 #[tokio::test]
@@ -405,268 +633,97 @@ async fn view_engine_unregistered_map_returns_error() {
     let mut engine = ViewEngine::new();
 
     let result = engine.update_index(db.adapter(), "unknown", "view").await;
-    assert!(result.is_err());
+    assert!(matches!(result, Err(RouchError::BadRequest(_))));
+    let result = engine
+        .query(
+            db.adapter(),
+            "unknown",
+            "view",
+            None,
+            ViewQueryOptions::new(),
+        )
+        .await;
+    assert!(matches!(result, Err(RouchError::BadRequest(_))));
 }
 
 #[tokio::test]
 async fn view_engine_remove_indexes_not_in() {
     let db = Database::memory("test");
-    db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
+    put(&db, "doc1", json!({"v": 1})).await;
 
     let mut engine = ViewEngine::new();
     engine.register_map("app", "v1", |_| vec![]);
     engine.register_map("app", "v2", |_| vec![]);
     engine.register_map("old", "stale", |_| vec![]);
+    for (ddoc, view) in [("app", "v1"), ("app", "v2"), ("old", "stale")] {
+        engine.update_index(db.adapter(), ddoc, view).await.unwrap();
+    }
+    let mut names = engine.index_names();
+    names.sort();
+    assert_eq!(names, ["app/v1", "app/v2", "old/stale"]);
 
-    engine
-        .update_index(db.adapter(), "app", "v1")
-        .await
-        .unwrap();
-    engine
-        .update_index(db.adapter(), "app", "v2")
-        .await
-        .unwrap();
-    engine
-        .update_index(db.adapter(), "old", "stale")
-        .await
-        .unwrap();
-
-    assert_eq!(engine.index_names().len(), 3);
-
-    // Keep only app views
-    let valid: std::collections::HashSet<String> =
-        vec!["app/v1".into(), "app/v2".into()].into_iter().collect();
+    let valid: HashSet<String> = ["app/v1".to_string(), "app/v2".to_string()].into();
     engine.remove_indexes_not_in(&valid);
 
-    assert_eq!(engine.index_names().len(), 2);
-    assert!(engine.get_index("app", "v1").is_some());
-    assert!(engine.get_index("app", "v2").is_some());
+    let mut names = engine.index_names();
+    names.sort();
+    assert_eq!(names, ["app/v1", "app/v2"]);
     assert!(engine.get_index("old", "stale").is_none());
+    // The map function is gone too.
+    assert!(
+        engine
+            .update_index(db.adapter(), "old", "stale")
+            .await
+            .is_err()
+    );
 }
 
-// =========================================================================
-// view_cleanup()
-// =========================================================================
-
 #[tokio::test]
-async fn view_cleanup_succeeds() {
+async fn view_cleanup_keeps_indexes_and_documents() {
+    // view_cleanup is a no-op kept for PouchDB compatibility: Mango indexes
+    // are removed with delete_index only.
     let db = Database::memory("test");
-    // view_cleanup is a no-op in the base implementation, but should not error
-    db.view_cleanup().await.unwrap();
-}
-
-// =========================================================================
-// Map/reduce with multi-key query (keys option)
-// =========================================================================
-
-#[tokio::test]
-async fn view_query_with_keys() {
-    let db = Database::memory("test");
-
-    db.put("a", serde_json::json!({"name": "Alice", "dept": "eng"}))
-        .await
-        .unwrap();
-    db.put("b", serde_json::json!({"name": "Bob", "dept": "sales"}))
-        .await
-        .unwrap();
-    db.put("c", serde_json::json!({"name": "Charlie", "dept": "eng"}))
-        .await
-        .unwrap();
-    db.put("d", serde_json::json!({"name": "Diana", "dept": "hr"}))
-        .await
-        .unwrap();
-
-    let map_fn = |doc: &serde_json::Value| -> Vec<(serde_json::Value, serde_json::Value)> {
-        vec![(doc["dept"].clone(), doc["name"].clone())]
-    };
-
-    // Query with specific keys
-    let results = query_view(
-        db.adapter(),
-        &map_fn,
-        None,
-        ViewQueryOptions {
-            keys: Some(vec![serde_json::json!("eng"), serde_json::json!("hr")]),
-            ..ViewQueryOptions::new()
-        },
-    )
+    put(&db, "a", json!({"age": 1})).await;
+    db.create_index(rouchdb::IndexDefinition {
+        name: "by-age".into(),
+        fields: vec![rouchdb::SortField::Simple("age".into())],
+        ddoc: None,
+    })
     .await
     .unwrap();
 
-    // Should only return eng and hr, not sales
-    assert_eq!(results.rows.len(), 3); // Alice, Charlie (eng) + Diana (hr)
-    assert!(results.rows.iter().all(|r| r.key == "eng" || r.key == "hr"));
+    db.view_cleanup().await.unwrap();
+
+    let names: Vec<_> = db.get_indexes().await.into_iter().map(|i| i.name).collect();
+    assert_eq!(names, ["by-age"]);
+    assert_eq!(db.get("a").await.unwrap().data, json!({"age": 1}));
 }
 
 #[tokio::test]
 async fn view_query_with_single_key() {
     let db = Database::memory("test");
-
-    db.put("a", serde_json::json!({"dept": "eng"}))
-        .await
-        .unwrap();
-    db.put("b", serde_json::json!({"dept": "sales"}))
-        .await
-        .unwrap();
-
-    let map_fn = |doc: &serde_json::Value| -> Vec<(serde_json::Value, serde_json::Value)> {
-        vec![(doc["dept"].clone(), serde_json::json!(1))]
-    };
+    put(&db, "a", json!({"dept": "eng"})).await;
+    put(&db, "b", json!({"dept": "sales"})).await;
+    let map_fn = |doc: &Value| -> Emitted { vec![(doc["dept"].clone(), json!(1))] };
 
     let results = query_view(
         db.adapter(),
         &map_fn,
         None,
         ViewQueryOptions {
-            key: Some(serde_json::json!("eng")),
+            key: Some(json!("eng")),
             ..ViewQueryOptions::new()
         },
     )
     .await
     .unwrap();
 
-    assert_eq!(results.rows.len(), 1);
-    assert_eq!(results.rows[0].key, "eng");
-}
-
-// =========================================================================
-// Map/reduce with reduce and group
-// =========================================================================
-
-#[tokio::test]
-async fn view_reduce_stats() {
-    let db = Database::memory("test");
-
-    db.put("a", serde_json::json!({"score": 10})).await.unwrap();
-    db.put("b", serde_json::json!({"score": 20})).await.unwrap();
-    db.put("c", serde_json::json!({"score": 30})).await.unwrap();
-
-    let map_fn = |doc: &serde_json::Value| -> Vec<(serde_json::Value, serde_json::Value)> {
-        vec![(serde_json::json!("all"), doc["score"].clone())]
-    };
-
-    let results = query_view(
-        db.adapter(),
-        &map_fn,
-        Some(&ReduceFn::Stats),
-        ViewQueryOptions {
-            reduce: true,
-            ..ViewQueryOptions::new()
-        },
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(results.rows.len(), 1);
-    let stats = &results.rows[0].value;
-    assert_eq!(stats["count"], 3);
-    assert_eq!(stats["sum"], 60.0);
-    assert_eq!(stats["min"], 10.0);
-    assert_eq!(stats["max"], 30.0);
-}
-
-// =========================================================================
-// Regression tests for audited findings
-// =========================================================================
-
-fn engine_by_val() -> ViewEngine {
-    let mut engine = ViewEngine::new();
-    engine.register_map("app", "by_val", |doc| match doc.get("val") {
-        Some(v) => vec![(v.clone(), serde_json::json!(1))],
-        None => vec![],
-    });
-    engine
-}
-
-#[tokio::test]
-async fn view_engine_reregistering_map_rebuilds_index() {
-    // F51: a new map function must not be mixed with rows of the old one.
-    let db = Database::memory("test");
-    db.put("doc1", serde_json::json!({"val": 1, "other": "x"}))
-        .await
-        .unwrap();
-    let mut engine = engine_by_val();
-    engine
-        .update_index(db.adapter(), "app", "by_val")
-        .await
-        .unwrap();
-
-    engine.register_map("app", "by_val", |doc| match doc.get("other") {
-        Some(v) => vec![(v.clone(), serde_json::json!(2))],
-        None => vec![],
-    });
-    engine
-        .update_index(db.adapter(), "app", "by_val")
-        .await
-        .unwrap();
-    let index = engine.get_index("app", "by_val").unwrap();
     assert_eq!(
-        index.entries["doc1"],
-        vec![(serde_json::json!("x"), serde_json::json!(2))]
+        result_json(&results),
+        json!({"total_rows": 2, "offset": 0, "rows": [
+            {"id": "a", "key": "eng", "value": 1, "doc": null}
+        ]})
     );
-}
-
-#[tokio::test]
-async fn view_engine_drops_purged_docs() {
-    // F52: purged documents leave no change behind, but must leave the index.
-    let db = Database::memory("test");
-    let r1 = db.put("doc1", serde_json::json!({"val": 1})).await.unwrap();
-    db.put("doc2", serde_json::json!({"val": 2})).await.unwrap();
-    let mut engine = engine_by_val();
-    engine
-        .update_index(db.adapter(), "app", "by_val")
-        .await
-        .unwrap();
-    assert_eq!(engine.get_index("app", "by_val").unwrap().entries.len(), 2);
-
-    db.purge("doc1", vec![r1.rev.unwrap()]).await.unwrap();
-    engine
-        .update_index(db.adapter(), "app", "by_val")
-        .await
-        .unwrap();
-    let index = engine.get_index("app", "by_val").unwrap();
-    assert!(!index.entries.contains_key("doc1"));
-    assert!(index.entries.contains_key("doc2"));
-}
-
-#[tokio::test]
-async fn view_engine_resets_after_database_recreated() {
-    // F52: a destroyed and recreated database starts its sequence again.
-    let db = Database::memory("test");
-    for i in 0..5 {
-        db.put(&format!("old{i}"), serde_json::json!({"val": i}))
-            .await
-            .unwrap();
-    }
-    let mut engine = engine_by_val();
-    engine
-        .update_index(db.adapter(), "app", "by_val")
-        .await
-        .unwrap();
-
-    db.destroy().await.unwrap();
-    db.put("new", serde_json::json!({"val": 42})).await.unwrap();
-    engine
-        .update_index(db.adapter(), "app", "by_val")
-        .await
-        .unwrap();
-    let index = engine.get_index("app", "by_val").unwrap();
-    assert_eq!(index.entries.keys().collect::<Vec<_>>(), vec!["new"]);
-
-    // Recreated again with more updates than the index has seen.
-    db.destroy().await.unwrap();
-    for i in 0..8 {
-        db.put(&format!("n{i}"), serde_json::json!({"val": i}))
-            .await
-            .unwrap();
-    }
-    engine
-        .update_index(db.adapter(), "app", "by_val")
-        .await
-        .unwrap();
-    let index = engine.get_index("app", "by_val").unwrap();
-    assert_eq!(index.entries.len(), 8);
-    assert!(index.entries.keys().all(|k| k.starts_with('n')));
 }
 
 #[tokio::test]
@@ -674,7 +731,7 @@ async fn view_engine_query_uses_the_index() {
     // F56: ViewEngine can be queried with the same options as query_view.
     let db = Database::memory("test");
     for (id, val) in [("a", 3), ("b", 1), ("c", 2)] {
-        db.put(id, serde_json::json!({"val": val})).await.unwrap();
+        put(&db, id, json!({"val": val})).await;
     }
     let mut engine = engine_by_val();
 
@@ -685,7 +742,7 @@ async fn view_engine_query_uses_the_index() {
             "by_val",
             None,
             ViewQueryOptions {
-                start_key: Some(serde_json::json!(2)),
+                start_key: Some(json!(2)),
                 include_docs: true,
                 ..ViewQueryOptions::new()
             },
@@ -708,7 +765,7 @@ async fn view_engine_query_uses_the_index() {
         )
         .await
         .unwrap();
-    assert_eq!(result.rows[0].value, serde_json::json!(3));
+    assert_eq!(result.rows[0].value, json!(3));
 }
 
 #[tokio::test]
@@ -716,61 +773,31 @@ async fn view_engine_query_honors_stale() {
     // F56: stale=ok serves the index as it is; update_after refreshes it
     // after answering; the default brings it up to date first.
     let db = Database::memory("test");
-    db.put("a", serde_json::json!({"val": 1})).await.unwrap();
+    put(&db, "a", json!({"val": 1})).await;
     let mut engine = engine_by_val();
-    let count = |r: &rouchdb::ViewResult| r.rows.len();
-
-    let r = engine
-        .query(db.adapter(), "app", "by_val", None, ViewQueryOptions::new())
-        .await
-        .unwrap();
-    assert_eq!(count(&r), 1);
-
-    db.put("b", serde_json::json!({"val": 2})).await.unwrap();
-    let stale = |stale| ViewQueryOptions {
-        stale,
-        ..ViewQueryOptions::new()
+    let mut ids = async |stale| {
+        let opts = ViewQueryOptions {
+            stale,
+            ..ViewQueryOptions::new()
+        };
+        let result = engine
+            .query(db.adapter(), "app", "by_val", None, opts)
+            .await
+            .unwrap();
+        result
+            .rows
+            .iter()
+            .map(|r| r.id.clone().unwrap())
+            .collect::<Vec<_>>()
     };
-    let r = engine
-        .query(
-            db.adapter(),
-            "app",
-            "by_val",
-            None,
-            stale(rouchdb::StaleOption::Ok),
-        )
-        .await
-        .unwrap();
-    assert_eq!(count(&r), 1);
-    let r = engine
-        .query(
-            db.adapter(),
-            "app",
-            "by_val",
-            None,
-            stale(rouchdb::StaleOption::UpdateAfter),
-        )
-        .await
-        .unwrap();
-    assert_eq!(count(&r), 1);
-    let r = engine
-        .query(
-            db.adapter(),
-            "app",
-            "by_val",
-            None,
-            stale(rouchdb::StaleOption::Ok),
-        )
-        .await
-        .unwrap();
-    assert_eq!(count(&r), 2);
 
-    db.put("c", serde_json::json!({"val": 3})).await.unwrap();
-    let r = engine
-        .query(db.adapter(), "app", "by_val", None, ViewQueryOptions::new())
-        .await
-        .unwrap();
-    assert_eq!(count(&r), 3);
+    assert_eq!(ids(StaleOption::False).await, ["a"]);
+    put(&db, "b", json!({"val": 2})).await;
+    assert_eq!(ids(StaleOption::Ok).await, ["a"]);
+    assert_eq!(ids(StaleOption::UpdateAfter).await, ["a"]);
+    assert_eq!(ids(StaleOption::Ok).await, ["a", "b"]);
+    put(&db, "c", json!({"val": 3})).await;
+    assert_eq!(ids(StaleOption::False).await, ["a", "b", "c"]);
 }
 
 #[tokio::test]

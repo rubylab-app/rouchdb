@@ -1,13 +1,20 @@
 //! Tests for Plugin architecture and Partitioned databases:
-//! - Plugin trait (before_write, after_write, on_destroy)
-//! - Multiple plugins
-//! - Partition scoped queries (all_docs, find, get, put)
+//! - Plugins that change, count or validate documents
+//! - Partition scoped queries (find, get)
+//!
+//! The ordering and error contract of plugins is in plugin_contract.rs and
+//! the partition query contract in partition.rs.
+
+mod backends;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use rouchdb::{AllDocsOptions, Database, DocResult, Document, FindOptions, Plugin, Result};
+use backends::{Backend, KINDS};
+use rouchdb::{
+    BulkDocsOptions, Database, DocResult, Document, FindOptions, Plugin, Result, RouchError, Seq,
+};
 
 // =========================================================================
 // Plugin: before_write hook
@@ -36,17 +43,24 @@ impl Plugin for TimestampPlugin {
 
 #[tokio::test]
 async fn plugin_before_write_modifies_docs() {
-    let db = Database::memory("test").with_plugin(Arc::new(TimestampPlugin));
+    for kind in KINDS {
+        let b =
+            Backend::open(kind, "test").configure(|db| db.with_plugin(Arc::new(TimestampPlugin)));
 
-    let result = db
-        .put("doc1", serde_json::json!({"name": "Alice"}))
-        .await
-        .unwrap();
-    assert!(result.ok);
+        let result =
+            b.db.put("doc1", serde_json::json!({"name": "Alice"}))
+                .await
+                .unwrap();
+        assert!(result.ok);
 
-    let doc = db.get("doc1").await.unwrap();
-    assert_eq!(doc.data["name"], "Alice");
-    assert_eq!(doc.data["created_at"], "2026-02-10T00:00:00Z");
+        let doc = b.db.get("doc1").await.unwrap();
+        assert_eq!(doc.rev.unwrap().to_string(), result.rev.unwrap(), "{kind}");
+        assert_eq!(
+            doc.data,
+            serde_json::json!({"name": "Alice", "created_at": "2026-02-10T00:00:00Z"}),
+            "{kind}"
+        );
+    }
 }
 
 // =========================================================================
@@ -82,112 +96,54 @@ impl Plugin for CountPlugin {
     }
 }
 
-#[tokio::test]
-async fn plugin_after_write_tracks_count() {
-    let counter = Arc::new(CountPlugin::new());
-    let db = Database::memory("test").with_plugin(counter.clone());
-
-    db.put("doc1", serde_json::json!({})).await.unwrap();
-    assert_eq!(counter.count(), 1);
-
-    db.put("doc2", serde_json::json!({})).await.unwrap();
-    assert_eq!(counter.count(), 2);
-
-    // bulk_docs
-    let docs = vec![
-        Document {
-            id: "doc3".into(),
-            rev: None,
-            deleted: false,
-            data: serde_json::json!({}),
-            attachments: HashMap::new(),
-        },
-        Document {
-            id: "doc4".into(),
-            rev: None,
-            deleted: false,
-            data: serde_json::json!({}),
-            attachments: HashMap::new(),
-        },
-    ];
-    db.bulk_docs(docs, rouchdb::BulkDocsOptions::new())
-        .await
-        .unwrap();
-    assert_eq!(counter.count(), 4);
-}
-
-// =========================================================================
-// Plugin: on_destroy hook
-// =========================================================================
-
-struct DestroyPlugin {
-    destroyed: AtomicBool,
-}
-
-impl DestroyPlugin {
-    fn new() -> Self {
-        Self {
-            destroyed: AtomicBool::new(false),
-        }
-    }
-
-    fn was_destroyed(&self) -> bool {
-        self.destroyed.load(Ordering::SeqCst)
-    }
-}
-
-#[async_trait::async_trait]
-impl Plugin for DestroyPlugin {
-    fn name(&self) -> &str {
-        "destroy-tracker"
-    }
-
-    async fn on_destroy(&self) -> Result<()> {
-        self.destroyed.store(true, Ordering::SeqCst);
-        Ok(())
+fn new_doc(id: &str) -> Document {
+    Document {
+        id: id.into(),
+        rev: None,
+        deleted: false,
+        data: serde_json::json!({}),
+        attachments: HashMap::new(),
     }
 }
 
 #[tokio::test]
-async fn plugin_on_destroy_called() {
-    let destroy_plugin = Arc::new(DestroyPlugin::new());
-    let db = Database::memory("test").with_plugin(destroy_plugin.clone());
+async fn plugin_after_write_sees_every_write_result() {
+    for kind in KINDS {
+        let counter = Arc::new(CountPlugin::new());
+        let b = Backend::open(kind, "test").configure(|db| db.with_plugin(counter.clone()));
+        let db = &b.db;
 
-    db.put("doc1", serde_json::json!({})).await.unwrap();
+        db.put("doc1", serde_json::json!({})).await.unwrap();
+        assert_eq!(counter.count(), 1, "{kind}");
 
-    assert!(!destroy_plugin.was_destroyed());
-    db.destroy().await.unwrap();
-    assert!(destroy_plugin.was_destroyed());
-}
+        let r2 = db.put("doc2", serde_json::json!({})).await.unwrap();
+        assert_eq!(counter.count(), 2, "{kind}");
 
-// =========================================================================
-// Multiple plugins
-// =========================================================================
+        // A batch reports each document; the conflicting doc1 is not ok.
+        let results = db
+            .bulk_docs(
+                vec![new_doc("doc3"), new_doc("doc4"), new_doc("doc1")],
+                BulkDocsOptions::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results[2].error.as_deref(), Some("conflict"), "{kind}");
+        assert_eq!(counter.count(), 4, "{kind}");
 
-#[tokio::test]
-async fn multiple_plugins_all_called() {
-    let counter = Arc::new(CountPlugin::new());
-    let destroy_tracker = Arc::new(DestroyPlugin::new());
-
-    let db = Database::memory("test")
-        .with_plugin(Arc::new(TimestampPlugin))
-        .with_plugin(counter.clone())
-        .with_plugin(destroy_tracker.clone());
-
-    db.put("doc1", serde_json::json!({"name": "Test"}))
-        .await
-        .unwrap();
-
-    // TimestampPlugin should have added created_at
-    let doc = db.get("doc1").await.unwrap();
-    assert_eq!(doc.data["created_at"], "2026-02-10T00:00:00Z");
-
-    // CountPlugin should have counted
-    assert_eq!(counter.count(), 1);
-
-    // DestroyPlugin should trigger on destroy
-    db.destroy().await.unwrap();
-    assert!(destroy_tracker.was_destroyed());
+        // Attachment writes and deletions are writes too.
+        let r2 = db
+            .put_attachment(
+                "doc2",
+                "a.txt",
+                &r2.rev.unwrap(),
+                b"a".to_vec(),
+                "text/plain",
+            )
+            .await
+            .unwrap();
+        db.remove("doc2", &r2.rev.unwrap()).await.unwrap();
+        assert_eq!(counter.count(), 6, "{kind}");
+    }
 }
 
 // =========================================================================
@@ -216,99 +172,50 @@ impl Plugin for ValidationPlugin {
 
 #[tokio::test]
 async fn plugin_validation_rejects_invalid_docs() {
-    let db = Database::memory("test").with_plugin(Arc::new(ValidationPlugin));
+    for kind in KINDS {
+        let b =
+            Backend::open(kind, "test").configure(|db| db.with_plugin(Arc::new(ValidationPlugin)));
+        let db = &b.db;
 
-    // Valid doc — has name
-    let result = db.put("doc1", serde_json::json!({"name": "Alice"})).await;
-    assert!(result.is_ok());
+        // Valid doc — has name
+        let r1 = db
+            .put("doc1", serde_json::json!({"name": "Alice"}))
+            .await
+            .unwrap();
 
-    // Invalid doc — no name field
-    let result = db.put("doc2", serde_json::json!({"age": 25})).await;
-    assert!(result.is_err());
+        // Invalid doc — no name field
+        let result = db.put("doc2", serde_json::json!({"age": 25})).await;
+        assert!(
+            matches!(&result, Err(RouchError::BadRequest(reason)) if reason == "name field is required"),
+            "{kind}: {result:?}"
+        );
+        assert!(
+            matches!(db.get("doc2").await, Err(RouchError::NotFound(_))),
+            "{kind}"
+        );
+        // Nor can a valid document lose its name.
+        let result = db
+            .update("doc1", r1.rev.as_ref().unwrap(), serde_json::json!({}))
+            .await;
+        assert!(
+            matches!(result, Err(RouchError::BadRequest(_))),
+            "{kind}: {result:?}"
+        );
+        assert_eq!(db.get("doc1").await.unwrap().data["name"], "Alice");
+        assert_eq!(db.info().await.unwrap().update_seq, Seq::Num(1), "{kind}");
+
+        // A deletion carries no body and is allowed.
+        db.remove("doc1", &r1.rev.unwrap()).await.unwrap();
+        assert!(
+            matches!(db.get("doc1").await, Err(RouchError::NotFound(_))),
+            "{kind}"
+        );
+    }
 }
 
 // =========================================================================
 // Partitioned databases
 // =========================================================================
-
-#[tokio::test]
-async fn partition_put_and_get() {
-    let db = Database::memory("test");
-    let partition = db.partition("users");
-
-    let result = partition
-        .put("alice", serde_json::json!({"name": "Alice"}))
-        .await
-        .unwrap();
-    assert!(result.ok);
-    assert_eq!(result.id, "users:alice");
-
-    let doc = partition.get("alice").await.unwrap();
-    assert_eq!(doc.data["name"], "Alice");
-    assert_eq!(doc.id, "users:alice");
-
-    // Also accessible from the main db with full ID
-    let doc2 = db.get("users:alice").await.unwrap();
-    assert_eq!(doc2.data["name"], "Alice");
-}
-
-#[tokio::test]
-async fn partition_put_with_full_id() {
-    let db = Database::memory("test");
-    let partition = db.partition("products");
-
-    // Put with full partition prefix
-    partition
-        .put("products:widget", serde_json::json!({"name": "Widget"}))
-        .await
-        .unwrap();
-
-    let doc = partition.get("widget").await.unwrap();
-    assert_eq!(doc.id, "products:widget");
-    assert_eq!(doc.data["name"], "Widget");
-}
-
-#[tokio::test]
-async fn partition_all_docs() {
-    let db = Database::memory("test");
-
-    // Put docs in different partitions
-    db.put("users:alice", serde_json::json!({"type": "user"}))
-        .await
-        .unwrap();
-    db.put("users:bob", serde_json::json!({"type": "user"}))
-        .await
-        .unwrap();
-    db.put("orders:o1", serde_json::json!({"type": "order"}))
-        .await
-        .unwrap();
-    db.put("orders:o2", serde_json::json!({"type": "order"}))
-        .await
-        .unwrap();
-    db.put("orders:o3", serde_json::json!({"type": "order"}))
-        .await
-        .unwrap();
-
-    let users_partition = db.partition("users");
-    let user_docs = users_partition
-        .all_docs(AllDocsOptions {
-            include_docs: true,
-            ..AllDocsOptions::new()
-        })
-        .await
-        .unwrap();
-    assert_eq!(user_docs.rows.len(), 2);
-
-    let orders_partition = db.partition("orders");
-    let order_docs = orders_partition
-        .all_docs(AllDocsOptions {
-            include_docs: true,
-            ..AllDocsOptions::new()
-        })
-        .await
-        .unwrap();
-    assert_eq!(order_docs.rows.len(), 3);
-}
 
 #[tokio::test]
 async fn partition_find() {
@@ -327,8 +234,14 @@ async fn partition_find() {
     .await
     .unwrap();
     db.put(
+        "users:carol",
+        serde_json::json!({"type": "user", "name": "Carol", "age": 40}),
+    )
+    .await
+    .unwrap();
+    db.put(
         "orders:o1",
-        serde_json::json!({"type": "order", "amount": 100}),
+        serde_json::json!({"type": "order", "amount": 100, "age": 50}),
     )
     .await
     .unwrap();
@@ -342,17 +255,13 @@ async fn partition_find() {
         .await
         .unwrap();
 
-    assert_eq!(result.docs.len(), 1);
+    let ids: Vec<&str> = result
+        .docs
+        .iter()
+        .map(|d| d["_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["users:alice", "users:carol"]);
     assert_eq!(result.docs[0]["name"], "Alice");
-}
-
-#[tokio::test]
-async fn partition_get_nonexistent() {
-    let db = Database::memory("test");
-    let partition = db.partition("users");
-
-    let err = partition.get("nonexistent").await;
-    assert!(err.is_err());
 }
 
 #[tokio::test]
@@ -369,45 +278,24 @@ async fn partition_isolation() {
 
     let team_a = db.partition("team_a");
     let doc = team_a.get("doc1").await.unwrap();
-    assert_eq!(doc.data["team"], "A");
+    assert_eq!(
+        (doc.id.as_str(), &doc.data["team"]),
+        ("team_a:doc1", &serde_json::json!("A"))
+    );
 
     let team_b = db.partition("team_b");
     let doc = team_b.get("doc1").await.unwrap();
-    assert_eq!(doc.data["team"], "B");
-}
+    assert_eq!(
+        (doc.id.as_str(), &doc.data["team"]),
+        ("team_b:doc1", &serde_json::json!("B"))
+    );
 
-// =========================================================================
-// Database constructors
-// =========================================================================
-
-#[tokio::test]
-async fn from_adapter_works() {
-    let adapter = Arc::new(rouchdb::MemoryAdapter::new("custom"));
-    let db = Database::from_adapter(adapter);
-
-    db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
-    let info = db.info().await.unwrap();
-    assert_eq!(info.doc_count, 1);
-    assert_eq!(info.db_name, "custom");
-}
-
-#[tokio::test]
-async fn redb_adapter_persistence() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("test.redb");
-
-    // Write data
-    {
-        let db = Database::open(&path, "persist_test").unwrap();
-        db.put("doc1", serde_json::json!({"persistent": true}))
-            .await
-            .unwrap();
-    }
-
-    // Reopen and verify
-    {
-        let db = Database::open(&path, "persist_test").unwrap();
-        let doc = db.get("doc1").await.unwrap();
-        assert_eq!(doc.data["persistent"], true);
-    }
+    // Writing through one partition leaves the other untouched.
+    let rev = doc.rev.unwrap().to_string();
+    team_b
+        .put("doc1", serde_json::json!({"team": "B", "_rev": rev}))
+        .await
+        .unwrap();
+    assert_eq!(team_a.get("doc1").await.unwrap().rev.unwrap().pos, 1);
+    assert_eq!(team_b.get("doc1").await.unwrap().rev.unwrap().pos, 2);
 }

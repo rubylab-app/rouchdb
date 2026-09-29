@@ -1,821 +1,140 @@
-//! Bug-hunting tests: edge cases, boundary conditions, and regression tests.
-//! These tests are designed to expose bugs in the implementation.
+//! Regression tests for bugs found while hunting through the `Database`
+//! API. Each section states the behavior it pins; most run on the memory
+//! and the redb backend.
+//!
+//! The partition, plugin, document JSON and error-variant tests that used
+//! to live here are in partition.rs, plugin_contract.rs, parity_core.rs and
+//! error_conditions.rs.
+
+mod backends;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
+use backends::{Backend, KINDS, backends, row_ids};
 use rouchdb::{
     AllDocsOptions, BulkDocsOptions, ChangesOptions, ChangesStreamOptions, Database,
-    DesignDocument, Document, FindOptions, GetOptions, Plugin, Result, Revision, SecurityDocument,
-    SecurityGroup, SortField, ViewDef, ViewEngine, ViewQueryOptions, query_view,
+    DesignDocument, Document, FindOptions, GetOptions, Revision, RouchError, Seq, SortField,
+    ViewDef, ViewEngine, ViewQueryOptions, query_view,
 };
 
 // =========================================================================
-// BUG: Partition find() doesn't escape regex metacharacters
+// Purge removes a leaf revision for good and ignores inner revisions
 // =========================================================================
 
 #[tokio::test]
-async fn partition_name_with_regex_metacharacters() {
-    let db = Database::memory("test");
-
-    // Put docs with different prefixes
-    db.put("user.test:doc1", serde_json::json!({"type": "a"}))
-        .await
-        .unwrap();
-    db.put("userXtest:doc2", serde_json::json!({"type": "b"}))
-        .await
-        .unwrap();
-    db.put("user_test:doc3", serde_json::json!({"type": "c"}))
-        .await
-        .unwrap();
-
-    // "user.test" as partition name — the "." is a regex metacharacter
-    let partition = db.partition("user.test");
-    let result = partition
-        .find(FindOptions {
-            selector: serde_json::json!({"type": {"$exists": true}}),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-    // Should ONLY match "user.test:" prefix, not "userXtest:"
-    // Because "." in regex matches any character
-    for doc in &result.docs {
-        let id = doc["_id"].as_str().unwrap();
-        assert!(
-            id.starts_with("user.test:"),
-            "Partition find should only return docs with exact prefix, got: {}",
-            id
-        );
-    }
-}
-
-// =========================================================================
-// BUG: Partition all_docs() can escape partition boundaries
-// =========================================================================
-
-#[tokio::test]
-async fn partition_all_docs_enforces_boundaries() {
-    let db = Database::memory("test");
-
-    db.put("users:alice", serde_json::json!({"type": "user"}))
-        .await
-        .unwrap();
-    db.put("users:bob", serde_json::json!({"type": "user"}))
-        .await
-        .unwrap();
-    db.put("zzz:other", serde_json::json!({"type": "other"}))
-        .await
-        .unwrap();
-
-    let partition = db.partition("users");
-
-    // User tries to escape partition by providing start_key outside bounds
-    let result = partition
-        .all_docs(AllDocsOptions {
-            start_key: Some("a".to_string()), // before "users:"
-            include_docs: true,
-            ..AllDocsOptions::new()
-        })
-        .await
-        .unwrap();
-
-    // Should still only return docs from users partition
-    for row in &result.rows {
-        assert!(
-            row.id.starts_with("users:"),
-            "Partition should enforce boundaries, got: {}",
-            row.id
-        );
-    }
-}
-
-// =========================================================================
-// BUG: Empty partition name
-// =========================================================================
-
-#[tokio::test]
-async fn partition_empty_name() {
-    let db = Database::memory("test");
-    db.put(":doc1", serde_json::json!({"v": 1})).await.unwrap();
-    db.put("normal_doc", serde_json::json!({"v": 2}))
-        .await
-        .unwrap();
-
-    let partition = db.partition("");
-    let result = partition.all_docs(AllDocsOptions::new()).await.unwrap();
-
-    // Empty partition name creates ":" prefix
-    // This should only match docs starting with ":"
-    for row in &result.rows {
-        assert!(
-            row.id.starts_with(':'),
-            "Empty partition should match ':' prefix, got: {}",
-            row.id
-        );
-    }
-}
-
-// =========================================================================
-// BUG: Document from_json/to_json roundtrip loses _attachments
-// =========================================================================
-
-#[tokio::test]
-async fn document_roundtrip_preserves_attachments() {
-    // Attachment stub exactly as CouchDB 3.5.1 returns it from `GET /db/doc1`
-    // ("Hello, World!" stored as application/octet-stream).
-    let json = serde_json::json!({
-        "_id": "doc1",
-        "_rev": "1-d13178e2b436fa29621d6329b3a5f83b",
-        "_attachments": {
-            "file.txt": {
-                "content_type": "application/octet-stream",
-                "revpos": 1,
-                "digest": "md5-ZajifYh5KDgxtmS9i38K1A==",
-                "length": 13,
-                "stub": true
-            }
-        },
-        "name": "test"
-    });
-
-    let doc = Document::from_json(json).unwrap();
-    assert_eq!(doc.attachments.len(), 1);
-    assert!(doc.attachments.contains_key("file.txt"));
-
-    // Roundtrip
-    let json_out = doc.to_json();
-    let doc2 = Document::from_json(json_out).unwrap();
-    assert_eq!(doc2.attachments.len(), 1);
-    let att = &doc2.attachments["file.txt"];
-    assert_eq!(att.content_type, "application/octet-stream");
-    assert_eq!(att.digest, "md5-ZajifYh5KDgxtmS9i38K1A==");
-    assert_eq!(att.length, 13);
-    assert!(att.stub);
-    assert!(att.data.is_none());
-}
-
-#[tokio::test]
-async fn document_from_json_with_empty_attachments() {
-    let json = serde_json::json!({
-        "_id": "doc1",
-        "_attachments": {},
-        "name": "test"
-    });
-
-    let doc = Document::from_json(json).unwrap();
-    assert!(doc.attachments.is_empty());
-}
-
-#[tokio::test]
-async fn document_from_json_without_id() {
-    let json = serde_json::json!({"name": "test"});
-    let doc = Document::from_json(json).unwrap();
-    assert!(doc.id.is_empty());
-}
-
-#[tokio::test]
-async fn document_from_json_non_object() {
-    let json = serde_json::json!("just a string");
-    let result = Document::from_json(json);
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn document_from_json_with_invalid_rev() {
-    let json = serde_json::json!({
-        "_id": "doc1",
-        "_rev": "not-a-valid-rev"
-    });
-    let result = Document::from_json(json);
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn document_to_json_preserves_all_fields() {
-    let doc = Document {
-        id: "doc1".into(),
-        rev: Some(Revision::new(1, "abc".into())),
-        deleted: false,
-        data: serde_json::json!({"name": "Alice", "nested": {"a": 1}}),
-        attachments: HashMap::new(),
-    };
-
-    let json = doc.to_json();
-    assert_eq!(json["_id"], "doc1");
-    assert_eq!(json["_rev"], "1-abc");
-    assert_eq!(json["name"], "Alice");
-    assert_eq!(json["nested"]["a"], 1);
-    assert!(json.get("_deleted").is_none());
-}
-
-#[tokio::test]
-async fn document_to_json_deleted_doc() {
-    let doc = Document {
-        id: "doc1".into(),
-        rev: Some(Revision::new(2, "def".into())),
-        deleted: true,
-        data: serde_json::json!({}),
-        attachments: HashMap::new(),
-    };
-
-    let json = doc.to_json();
-    assert_eq!(json["_deleted"], true);
-}
-
-// =========================================================================
-// BUG: Purge doesn't clean rev_tree
-// =========================================================================
-
-#[tokio::test]
-async fn purge_then_get_returns_not_found() {
-    let db = Database::memory("test");
-    let r1 = db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
-    let rev = r1.rev.unwrap();
-
-    db.purge("doc1", vec![rev]).await.unwrap();
-
-    // After purge, doc should be completely gone
-    let result = db.get("doc1").await;
-    assert!(result.is_err(), "Purged doc should not be retrievable");
-}
-
-#[tokio::test]
-async fn purge_then_changes_excludes_purged() {
-    let db = Database::memory("test");
-    let r1 = db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
-    db.put("doc2", serde_json::json!({"v": 2})).await.unwrap();
-
-    db.purge("doc1", vec![r1.rev.unwrap()]).await.unwrap();
-
-    let changes = db.changes(ChangesOptions::default()).await.unwrap();
-    let ids: Vec<&str> = changes.results.iter().map(|r| r.id.as_str()).collect();
-    assert!(
-        !ids.contains(&"doc1"),
-        "Purged doc should not appear in changes"
-    );
-    assert!(ids.contains(&"doc2"));
-}
-
-#[tokio::test]
-async fn purge_partial_revs() {
-    let db = Database::memory("test");
-
-    // Create doc with two revisions
-    let r1 = db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
-    let rev1 = r1.rev.unwrap();
-    let r2 = db
-        .update("doc1", &rev1, serde_json::json!({"v": 2}))
-        .await
-        .unwrap();
-    let _rev2 = r2.rev.unwrap();
-
-    // Purging a non-leaf revision is ignored (CouchDB reports it with an
-    // empty list); the document is untouched.
-    let purge_result = db.purge("doc1", vec![rev1]).await.unwrap();
-    assert_eq!(purge_result.purged["doc1"], Vec::<String>::new());
-
-    // Doc should still be accessible via latest rev
-    let doc = db.get("doc1").await.unwrap();
-    assert_eq!(doc.data["v"], 2);
-}
-
-// =========================================================================
-// BUG: ViewQueryOptions descending with start/end key
-// =========================================================================
-
-#[tokio::test]
-async fn view_descending_with_key_range() {
-    let db = Database::memory("test");
-
-    for i in 0..10 {
-        db.put(&format!("doc{}", i), serde_json::json!({"n": i}))
-            .await
-            .unwrap();
-    }
-
-    let map_fn = |doc: &serde_json::Value| -> Vec<(serde_json::Value, serde_json::Value)> {
-        vec![(doc["n"].clone(), serde_json::json!(1))]
-    };
-
-    // Descending order with start_key=7, end_key=3
-    // Should return 7, 6, 5, 4, 3
-    let results = query_view(
-        db.adapter(),
-        &map_fn,
-        None,
-        ViewQueryOptions {
-            descending: true,
-            start_key: Some(serde_json::json!(7)),
-            end_key: Some(serde_json::json!(3)),
-            inclusive_end: true,
-            ..ViewQueryOptions::new()
-        },
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(
-        results.rows.len(),
-        5,
-        "Descending range 7..=3 should have 5 rows"
-    );
-
-    // Verify order is descending
-    let keys: Vec<i64> = results
-        .rows
-        .iter()
-        .map(|r| r.key.as_i64().unwrap())
-        .collect();
-    assert_eq!(keys, vec![7, 6, 5, 4, 3]);
-}
-
-#[tokio::test]
-async fn view_descending_without_range() {
-    let db = Database::memory("test");
-
-    db.put("a", serde_json::json!({"n": 1})).await.unwrap();
-    db.put("b", serde_json::json!({"n": 2})).await.unwrap();
-    db.put("c", serde_json::json!({"n": 3})).await.unwrap();
-
-    let map_fn = |doc: &serde_json::Value| -> Vec<(serde_json::Value, serde_json::Value)> {
-        vec![(doc["n"].clone(), serde_json::json!(null))]
-    };
-
-    let results = query_view(
-        db.adapter(),
-        &map_fn,
-        None,
-        ViewQueryOptions {
-            descending: true,
-            ..ViewQueryOptions::new()
-        },
-    )
-    .await
-    .unwrap();
-
-    let keys: Vec<i64> = results
-        .rows
-        .iter()
-        .map(|r| r.key.as_i64().unwrap())
-        .collect();
-    assert_eq!(keys, vec![3, 2, 1]);
-}
-
-// =========================================================================
-// Plugin: multiple plugins, first modifies then second rejects
-// =========================================================================
-
-struct AddFieldPlugin {
-    field: String,
-    value: serde_json::Value,
-}
-
-#[async_trait::async_trait]
-impl Plugin for AddFieldPlugin {
-    fn name(&self) -> &str {
-        "add-field"
-    }
-    async fn before_write(&self, docs: &mut Vec<Document>) -> Result<()> {
-        for doc in docs.iter_mut() {
-            if let serde_json::Value::Object(ref mut map) = doc.data {
-                map.insert(self.field.clone(), self.value.clone());
-            }
-        }
-        Ok(())
-    }
-}
-
-struct RejectPlugin;
-
-#[async_trait::async_trait]
-impl Plugin for RejectPlugin {
-    fn name(&self) -> &str {
-        "reject"
-    }
-    async fn before_write(&self, _docs: &mut Vec<Document>) -> Result<()> {
-        Err(rouchdb::RouchError::BadRequest("rejected".into()))
-    }
-}
-
-#[tokio::test]
-async fn plugin_first_modifies_second_rejects_no_write() {
-    let db = Database::memory("test")
-        .with_plugin(Arc::new(AddFieldPlugin {
-            field: "modified".into(),
-            value: serde_json::json!(true),
-        }))
-        .with_plugin(Arc::new(RejectPlugin));
-
-    let result = db.put("doc1", serde_json::json!({"v": 1})).await;
-    assert!(result.is_err());
-
-    // Doc should NOT have been written
-    let get_result = db.get("doc1").await;
-    assert!(get_result.is_err(), "Rejected doc should not be stored");
-}
-
-#[tokio::test]
-async fn plugin_before_write_called_on_update() {
-    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let counter_clone = counter.clone();
-
-    struct WriteCountPlugin(Arc<std::sync::atomic::AtomicU64>);
-
-    #[async_trait::async_trait]
-    impl Plugin for WriteCountPlugin {
-        fn name(&self) -> &str {
-            "write-count"
-        }
-        async fn before_write(&self, _docs: &mut Vec<Document>) -> Result<()> {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    let db = Database::memory("test").with_plugin(Arc::new(WriteCountPlugin(counter_clone)));
-
-    let r1 = db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
-    assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
-
-    assert!(
-        db.update("doc1", &r1.rev.unwrap(), serde_json::json!({"v": 2}))
+async fn purge_removes_a_leaf_and_ignores_inner_revisions() {
+    for b in backends("test") {
+        let db = &b.db;
+        let r1 = db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
+        let rev1 = r1.rev.unwrap();
+        let rev2 = db
+            .update("doc1", &rev1, serde_json::json!({"v": 2}))
             .await
             .unwrap()
-            .ok
-    );
-    assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
-}
-
-#[tokio::test]
-async fn plugin_before_write_called_on_remove() {
-    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let counter_clone = counter.clone();
-
-    struct WriteCountPlugin2(Arc<std::sync::atomic::AtomicU64>);
-
-    #[async_trait::async_trait]
-    impl Plugin for WriteCountPlugin2 {
-        fn name(&self) -> &str {
-            "write-count"
-        }
-        async fn before_write(&self, _docs: &mut Vec<Document>) -> Result<()> {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    let db = Database::memory("test").with_plugin(Arc::new(WriteCountPlugin2(counter_clone)));
-
-    let r1 = db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
-    assert!(db.remove("doc1", &r1.rev.unwrap()).await.unwrap().ok);
-    assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
-}
-
-// =========================================================================
-// Changes feed: selector with all results filtered should still advance seq
-// =========================================================================
-
-#[tokio::test]
-async fn changes_selector_advances_last_seq_even_when_all_filtered() {
-    let db = Database::memory("test");
-    db.put("a", serde_json::json!({"type": "x"})).await.unwrap();
-    db.put("b", serde_json::json!({"type": "x"})).await.unwrap();
-
-    // Selector matches nothing — but last_seq should still advance
-    let changes = db
-        .changes(ChangesOptions {
-            selector: Some(serde_json::json!({"type": "nonexistent"})),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(changes.results.len(), 0);
-    // last_seq should NOT be the default — it should reflect the adapter's state
-    assert_ne!(
-        changes.last_seq,
-        rouchdb::Seq::default(),
-        "last_seq should advance even when all changes are filtered"
-    );
-}
-
-// =========================================================================
-// allDocs: edge cases
-// =========================================================================
-
-#[tokio::test]
-async fn all_docs_skip_beyond_total() {
-    let db = Database::memory("test");
-    db.put("a", serde_json::json!({})).await.unwrap();
-    db.put("b", serde_json::json!({})).await.unwrap();
-
-    let result = db
-        .all_docs(AllDocsOptions {
-            skip: 100,
-            ..AllDocsOptions::new()
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(result.rows.len(), 0);
-    assert_eq!(result.total_rows, 2);
-}
-
-#[tokio::test]
-async fn all_docs_limit_zero() {
-    let db = Database::memory("test");
-    db.put("a", serde_json::json!({})).await.unwrap();
-
-    let result = db
-        .all_docs(AllDocsOptions {
-            limit: Some(0),
-            ..AllDocsOptions::new()
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(result.rows.len(), 0);
-}
-
-#[tokio::test]
-async fn all_docs_descending() {
-    let db = Database::memory("test");
-    db.put("a", serde_json::json!({})).await.unwrap();
-    db.put("b", serde_json::json!({})).await.unwrap();
-    db.put("c", serde_json::json!({})).await.unwrap();
-
-    let result = db
-        .all_docs(AllDocsOptions {
-            descending: true,
-            ..AllDocsOptions::new()
-        })
-        .await
-        .unwrap();
-
-    let ids: Vec<&str> = result.rows.iter().map(|r| r.id.as_str()).collect();
-    assert_eq!(ids, vec!["c", "b", "a"]);
-}
-
-#[tokio::test]
-async fn all_docs_start_end_key_range() {
-    let db = Database::memory("test");
-    db.put("a", serde_json::json!({})).await.unwrap();
-    db.put("b", serde_json::json!({})).await.unwrap();
-    db.put("c", serde_json::json!({})).await.unwrap();
-    db.put("d", serde_json::json!({})).await.unwrap();
-
-    let result = db
-        .all_docs(AllDocsOptions {
-            start_key: Some("b".into()),
-            end_key: Some("c".into()),
-            ..AllDocsOptions::new()
-        })
-        .await
-        .unwrap();
-
-    let ids: Vec<&str> = result.rows.iter().map(|r| r.id.as_str()).collect();
-    assert_eq!(ids, vec!["b", "c"]);
-}
-
-#[tokio::test]
-async fn all_docs_with_nonexistent_keys() {
-    let db = Database::memory("test");
-    db.put("a", serde_json::json!({})).await.unwrap();
-
-    let result = db
-        .all_docs(AllDocsOptions {
-            keys: Some(vec!["a".into(), "nonexistent".into()]),
-            ..AllDocsOptions::new()
-        })
-        .await
-        .unwrap();
-
-    // Should return what exists
-    assert!(result.rows.iter().any(|r| r.id == "a"));
-}
-
-// =========================================================================
-// Design doc: roundtrip via put/get preserves all fields
-// =========================================================================
-
-#[tokio::test]
-async fn design_doc_full_roundtrip() {
-    let db = Database::memory("test");
-
-    let ddoc = DesignDocument {
-        id: "_design/full".into(),
-        rev: None,
-        views: {
-            let mut v = HashMap::new();
-            v.insert(
-                "by_type".into(),
-                ViewDef {
-                    map: "function(doc) { emit(doc.type, 1); }".into(),
-                    reduce: Some("_count".into()),
-                },
-            );
-            v.insert(
-                "by_name".into(),
-                ViewDef {
-                    map: "function(doc) { emit(doc.name, null); }".into(),
-                    reduce: None,
-                },
-            );
-            v
-        },
-        filters: {
-            let mut f = HashMap::new();
-            f.insert("my_filter".into(), "function(doc) { return true; }".into());
-            f
-        },
-        validate_doc_update: Some("function(n,o,u) {}".into()),
-        shows: {
-            let mut s = HashMap::new();
-            s.insert("detail".into(), "function(doc,req) {}".into());
-            s
-        },
-        lists: {
-            let mut l = HashMap::new();
-            l.insert("all".into(), "function(head,req) {}".into());
-            l
-        },
-        updates: {
-            let mut u = HashMap::new();
-            u.insert("bump".into(), "function(doc,req) {}".into());
-            u
-        },
-        language: Some("javascript".into()),
-    };
-
-    db.put_design(ddoc.clone()).await.unwrap();
-
-    let retrieved = db.get_design("full").await.unwrap();
-    assert_eq!(retrieved.views.len(), 2);
-    assert_eq!(retrieved.filters.len(), 1);
-    assert!(retrieved.validate_doc_update.is_some());
-    assert_eq!(retrieved.shows.len(), 1);
-    assert_eq!(retrieved.lists.len(), 1);
-    assert_eq!(retrieved.updates.len(), 1);
-    assert_eq!(retrieved.language, Some("javascript".into()));
-
-    // Verify individual fields survived the roundtrip
-    assert_eq!(retrieved.views["by_type"].reduce, Some("_count".into()));
-    assert_eq!(retrieved.views["by_name"].reduce, None);
-}
-
-// =========================================================================
-// Mango find: edge cases
-// =========================================================================
-
-#[tokio::test]
-async fn find_with_empty_selector_matches_all() {
-    let db = Database::memory("test");
-    db.put("a", serde_json::json!({"v": 1})).await.unwrap();
-    db.put("b", serde_json::json!({"v": 2})).await.unwrap();
-
-    let result = db
-        .find(FindOptions {
-            selector: serde_json::json!({}),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(result.docs.len(), 2);
-}
-
-#[tokio::test]
-async fn find_with_sort_and_limit() {
-    let db = Database::memory("test");
-    db.put("a", serde_json::json!({"name": "Zara", "age": 20}))
-        .await
-        .unwrap();
-    db.put("b", serde_json::json!({"name": "Alice", "age": 30}))
-        .await
-        .unwrap();
-    db.put("c", serde_json::json!({"name": "Bob", "age": 25}))
-        .await
-        .unwrap();
-
-    let result = db
-        .find(FindOptions {
-            selector: serde_json::json!({"age": {"$exists": true}}),
-            sort: Some(vec![SortField::Simple("name".into())]),
-            limit: Some(2),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(result.docs.len(), 2);
-    assert_eq!(result.docs[0]["name"], "Alice");
-    assert_eq!(result.docs[1]["name"], "Bob");
-}
-
-#[tokio::test]
-async fn find_with_skip() {
-    let db = Database::memory("test");
-    for i in 0..5 {
-        db.put(&format!("doc{}", i), serde_json::json!({"i": i}))
-            .await
+            .rev
             .unwrap();
+        db.put("doc2", serde_json::json!({"v": 2})).await.unwrap();
+
+        // Purging a non-leaf revision is ignored (CouchDB reports it with an
+        // empty list); the document is untouched.
+        let result = db.purge("doc1", vec![rev1]).await.unwrap();
+        assert_eq!(result.purged["doc1"], Vec::<String>::new(), "{}", b.name);
+        let doc = db.get("doc1").await.unwrap();
+        assert_eq!(doc.rev.unwrap().to_string(), rev2, "{}", b.name);
+        assert_eq!(doc.data, serde_json::json!({"v": 2}), "{}", b.name);
+
+        // Purging the leaf erases the document: not readable, not listed,
+        // and gone from the changes feed (so it never replicates).
+        let result = db.purge("doc1", vec![rev2.clone()]).await.unwrap();
+        assert_eq!(result.purged["doc1"], [rev2], "{}", b.name);
+        assert!(
+            matches!(db.get("doc1").await, Err(RouchError::NotFound(_))),
+            "{}",
+            b.name
+        );
+        let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
+        assert_eq!(row_ids(&all), ["doc2"], "{}", b.name);
+        let changes = db.changes(ChangesOptions::default()).await.unwrap();
+        let ids: Vec<&str> = changes.results.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["doc2"], "{}", b.name);
+        let info = db.info().await.unwrap();
+        assert_eq!((info.doc_count, info.doc_del_count), (1, 0), "{}", b.name);
     }
-
-    let result = db
-        .find(FindOptions {
-            selector: serde_json::json!({"i": {"$exists": true}}),
-            skip: Some(3),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(result.docs.len(), 2);
-}
-
-#[tokio::test]
-async fn find_with_fields_projection() {
-    let db = Database::memory("test");
-    db.put(
-        "a",
-        serde_json::json!({"name": "Alice", "age": 30, "email": "alice@example.com"}),
-    )
-    .await
-    .unwrap();
-
-    let result = db
-        .find(FindOptions {
-            selector: serde_json::json!({"name": "Alice"}),
-            fields: Some(vec!["name".into(), "age".into()]),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(result.docs.len(), 1);
-    assert_eq!(result.docs[0]["name"], "Alice");
-    assert_eq!(result.docs[0]["age"], 30);
-    // email should NOT be present
-    assert!(result.docs[0].get("email").is_none());
 }
 
 // =========================================================================
-// Security: update and verify
+// Views: descending swaps the roles of start_key and end_key
 // =========================================================================
 
 #[tokio::test]
-async fn security_overwrite() {
-    let db = Database::memory("test");
+async fn view_descending_swaps_the_range_bounds() {
+    for b in backends("test") {
+        let db = &b.db;
+        for i in 0..10 {
+            db.put(&format!("doc{i}"), serde_json::json!({"n": i}))
+                .await
+                .unwrap();
+        }
+        let map_fn = |doc: &serde_json::Value| -> Vec<(serde_json::Value, serde_json::Value)> {
+            vec![(doc["n"].clone(), serde_json::json!(1))]
+        };
+        let keys = |opts: ViewQueryOptions| async move {
+            let result = query_view(db.adapter(), &map_fn, None, opts).await.unwrap();
+            let rows: Vec<(i64, String)> = result
+                .rows
+                .iter()
+                .map(|r| (r.key.as_i64().unwrap(), r.id.clone().unwrap()))
+                .collect();
+            rows
+        };
+        let desc = |start: Option<i64>, end: Option<i64>, inclusive_end| ViewQueryOptions {
+            descending: true,
+            start_key: start.map(serde_json::Value::from),
+            end_key: end.map(serde_json::Value::from),
+            inclusive_end,
+            ..ViewQueryOptions::new()
+        };
+        let expect = |keys: &[i64]| -> Vec<(i64, String)> {
+            keys.iter().map(|&k| (k, format!("doc{k}"))).collect()
+        };
 
-    let sec1 = SecurityDocument {
-        admins: SecurityGroup {
-            names: vec!["admin1".into()],
-            roles: vec![],
-        },
-        members: SecurityGroup::default(),
-        ..Default::default()
-    };
-    db.put_security(sec1).await.unwrap();
-
-    let sec2 = SecurityDocument {
-        admins: SecurityGroup {
-            names: vec!["admin2".into()],
-            roles: vec!["role1".into()],
-        },
-        members: SecurityGroup::default(),
-        ..Default::default()
-    };
-    db.put_security(sec2).await.unwrap();
-
-    let fetched = db.get_security().await.unwrap();
-    assert_eq!(fetched.admins.names, vec!["admin2"]);
-    assert_eq!(fetched.admins.roles, vec!["role1"]);
+        // start_key is the upper bound, end_key the lower one.
+        assert_eq!(
+            keys(desc(Some(7), Some(3), true)).await,
+            expect(&[7, 6, 5, 4, 3]),
+            "{}",
+            b.name
+        );
+        assert_eq!(
+            keys(desc(Some(7), Some(3), false)).await,
+            expect(&[7, 6, 5, 4]),
+            "{}",
+            b.name
+        );
+        assert_eq!(
+            keys(desc(None, Some(7), true)).await,
+            expect(&[9, 8, 7]),
+            "{}",
+            b.name
+        );
+        assert_eq!(
+            keys(desc(Some(2), None, true)).await,
+            expect(&[2, 1, 0]),
+            "{}",
+            b.name
+        );
+        assert_eq!(
+            keys(desc(None, None, true)).await,
+            expect(&[9, 8, 7, 6, 5, 4, 3, 2, 1, 0]),
+            "{}",
+            b.name
+        );
+    }
 }
 
 // =========================================================================
-// Replication: sync with concurrent modifications
-// =========================================================================
-
-#[tokio::test]
-async fn sync_idempotent() {
-    let a = Database::memory("a");
-    let b = Database::memory("b");
-
-    a.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
-
-    // Sync twice — second should be a no-op
-    a.sync(&b).await.unwrap();
-    let (push, pull) = a.sync(&b).await.unwrap();
-    assert!(push.ok);
-    assert!(pull.ok);
-    assert_eq!(push.docs_written, 0);
-}
-
-// =========================================================================
-// Live changes: adding docs during streaming
+// Changes feed: documents written after a live feed starts are streamed
 // =========================================================================
 
 #[tokio::test]
@@ -837,24 +156,286 @@ async fn live_changes_picks_up_docs_added_after_start() {
         .unwrap()
         .unwrap();
     assert_eq!(event.id, "late_doc");
+    assert_eq!(event.seq, Seq::Num(1));
 
     handle.cancel();
 }
 
 // =========================================================================
-// ViewEngine: multiple emits per document
+// allDocs: paging past the end, limit 0, descending, ranges and keys
 // =========================================================================
+
+#[tokio::test]
+async fn all_docs_paging_and_range_edge_cases() {
+    for b in backends("test") {
+        let db = &b.db;
+        for id in ["a", "b", "c", "d"] {
+            db.put(id, serde_json::json!({})).await.unwrap();
+        }
+        let query = |opts: AllDocsOptions| async move { db.all_docs(opts).await.unwrap() };
+
+        let past_end = query(AllDocsOptions {
+            skip: 100,
+            ..AllDocsOptions::new()
+        })
+        .await;
+        assert!(past_end.rows.is_empty(), "{}", b.name);
+        assert_eq!(past_end.total_rows, 4, "{}", b.name);
+
+        let none = query(AllDocsOptions {
+            limit: Some(0),
+            ..AllDocsOptions::new()
+        })
+        .await;
+        assert!(none.rows.is_empty(), "{}", b.name);
+        assert_eq!(none.total_rows, 4, "{}", b.name);
+
+        let desc = query(AllDocsOptions {
+            descending: true,
+            ..AllDocsOptions::new()
+        })
+        .await;
+        assert_eq!(row_ids(&desc), ["d", "c", "b", "a"], "{}", b.name);
+
+        let range = query(AllDocsOptions {
+            start_key: Some("b".into()),
+            end_key: Some("c".into()),
+            ..AllDocsOptions::new()
+        })
+        .await;
+        assert_eq!(row_ids(&range), ["b", "c"], "{}", b.name);
+
+        // Keys that do not exist are left out.
+        let keys = query(AllDocsOptions {
+            keys: Some(vec!["a".into(), "nonexistent".into(), "c".into()]),
+            ..AllDocsOptions::new()
+        })
+        .await;
+        assert_eq!(row_ids(&keys), ["a", "c"], "{}", b.name);
+        let unknown = query(AllDocsOptions {
+            keys: Some(vec!["fake1".into(), "fake2".into()]),
+            ..AllDocsOptions::new()
+        })
+        .await;
+        assert!(unknown.rows.is_empty(), "{}", b.name);
+    }
+}
+
+// =========================================================================
+// Design doc: every field survives a put/get round trip
+// =========================================================================
+
+#[tokio::test]
+async fn design_doc_full_roundtrip() {
+    for b in backends("test") {
+        let db = &b.db;
+        let named = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let ddoc = DesignDocument {
+            id: "_design/full".into(),
+            rev: None,
+            views: HashMap::from([
+                (
+                    "by_type".to_string(),
+                    ViewDef {
+                        map: "function(doc) { emit(doc.type, 1); }".into(),
+                        reduce: Some("_count".into()),
+                    },
+                ),
+                (
+                    "by_name".to_string(),
+                    ViewDef {
+                        map: "function(doc) { emit(doc.name, null); }".into(),
+                        reduce: None,
+                    },
+                ),
+            ]),
+            filters: named(&[("my_filter", "function(doc) { return true; }")]),
+            validate_doc_update: Some("function(n,o,u) {}".into()),
+            shows: named(&[("detail", "function(doc,req) {}")]),
+            lists: named(&[("all", "function(head,req) {}")]),
+            updates: named(&[("bump", "function(doc,req) {}")]),
+            language: Some("javascript".into()),
+        };
+
+        let result = db.put_design(ddoc.clone()).await.unwrap();
+        assert!(result.ok, "{}: {result:?}", b.name);
+
+        let retrieved = db.get_design("full").await.unwrap();
+        assert_eq!(retrieved.rev, result.rev, "{}", b.name);
+        let expected = DesignDocument {
+            rev: result.rev.clone(),
+            ..ddoc
+        };
+        assert_eq!(
+            serde_json::to_value(&retrieved).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "{}",
+            b.name
+        );
+    }
+}
+
+// =========================================================================
+// Mango find: empty selector, sort, skip, limit and fields
+// =========================================================================
+
+#[tokio::test]
+async fn find_sort_skip_limit_and_fields() {
+    for b in backends("test") {
+        let db = &b.db;
+        for (id, doc) in [
+            ("a", serde_json::json!({"name": "Zara", "age": 20})),
+            (
+                "b",
+                serde_json::json!({"name": "Alice", "age": 30, "email": "alice@example.com"}),
+            ),
+            ("c", serde_json::json!({"name": "Bob", "age": 25})),
+            ("d", serde_json::json!({"name": "Carol", "age": 35})),
+            ("e", serde_json::json!({"name": "Eve"})),
+        ] {
+            db.put(id, doc).await.unwrap();
+        }
+        let find = |opts: FindOptions| async move {
+            let docs = db.find(opts).await.unwrap().docs;
+            docs.iter()
+                .map(|d| d["_id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let has_age = serde_json::json!({"age": {"$exists": true}});
+        let by_name = Some(vec![SortField::Simple("name".into())]);
+
+        // An empty selector matches every document, in id order.
+        let all = find(FindOptions {
+            selector: serde_json::json!({}),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(all, ["a", "b", "c", "d", "e"], "{}", b.name);
+
+        let sorted = find(FindOptions {
+            selector: has_age.clone(),
+            sort: by_name.clone(),
+            limit: Some(2),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(sorted, ["b", "c"], "{}", b.name);
+
+        let paged = find(FindOptions {
+            selector: has_age.clone(),
+            sort: by_name,
+            skip: Some(1),
+            limit: Some(2),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(paged, ["c", "d"], "{}", b.name);
+
+        let skipped = find(FindOptions {
+            selector: has_age.clone(),
+            skip: Some(3),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(skipped, ["d"], "{}", b.name);
+
+        let descending = find(FindOptions {
+            selector: has_age,
+            sort: Some(vec![SortField::WithDirection(HashMap::from([(
+                "age".to_string(),
+                "desc".to_string(),
+            )]))]),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(descending, ["d", "b", "c", "a"], "{}", b.name);
+
+        // Only the requested fields are returned.
+        let projected = db
+            .find(FindOptions {
+                selector: serde_json::json!({"name": "Alice"}),
+                fields: Some(vec!["name".into(), "age".into()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            projected.docs,
+            [serde_json::json!({"name": "Alice", "age": 30})],
+            "{}",
+            b.name
+        );
+    }
+}
+
+// =========================================================================
+// Replication: syncing again writes nothing and duplicates nothing
+// =========================================================================
+
+#[tokio::test]
+async fn sync_is_idempotent() {
+    for kind in KINDS {
+        let a = Backend::open(kind, "a");
+        let b = Backend::open(kind, "b");
+        let (a, b) = (&a.db, &b.db);
+        let r1 = a.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
+        let r2 = b.put("doc2", serde_json::json!({"v": 2})).await.unwrap();
+
+        let (push, pull) = a.sync(b).await.unwrap();
+        assert_eq!((push.docs_written, pull.docs_written), (1, 1), "{kind}");
+        for _ in 0..2 {
+            let (push, pull) = a.sync(b).await.unwrap();
+            assert!(push.ok && pull.ok, "{kind}");
+            assert_eq!((push.docs_written, pull.docs_written), (0, 0), "{kind}");
+        }
+
+        for db in [a, b] {
+            let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
+            assert_eq!(row_ids(&all), ["doc1", "doc2"], "{kind}");
+            assert_eq!(all.rows[0].value.rev, *r1.rev.as_ref().unwrap(), "{kind}");
+            assert_eq!(all.rows[1].value.rev, *r2.rev.as_ref().unwrap(), "{kind}");
+            let info = db.info().await.unwrap();
+            assert_eq!((info.doc_count, info.doc_del_count), (2, 0), "{kind}");
+        }
+    }
+}
+
+// =========================================================================
+// ViewEngine: every pair a document emits is indexed, and replaced when
+// the document changes
+// =========================================================================
+
+/// The (key, id) rows of the `app/by_tag` view.
+async fn tag_rows(engine: &mut ViewEngine, db: &Database) -> Vec<(String, String)> {
+    let result = engine
+        .query(db.adapter(), "app", "by_tag", None, ViewQueryOptions::new())
+        .await
+        .unwrap();
+    result
+        .rows
+        .iter()
+        .map(|r| (r.key.as_str().unwrap().to_string(), r.id.clone().unwrap()))
+        .collect()
+}
 
 #[tokio::test]
 async fn view_engine_multiple_emits_per_doc() {
     let db = Database::memory("test");
-
-    db.put(
-        "doc1",
-        serde_json::json!({"tags": ["rust", "db", "local-first"]}),
-    )
-    .await
-    .unwrap();
+    let r1 = db
+        .put(
+            "doc1",
+            serde_json::json!({"tags": ["rust", "db", "local-first"]}),
+        )
+        .await
+        .unwrap();
+    db.put("doc2", serde_json::json!({"tags": ["db"]}))
+        .await
+        .unwrap();
 
     let mut engine = ViewEngine::new();
     engine.register_map("app", "by_tag", |doc| {
@@ -866,89 +447,117 @@ async fn view_engine_multiple_emits_per_doc() {
         }
         emitted
     });
+    let pairs = |p: &[(&str, &str)]| -> Vec<(String, String)> {
+        p.iter()
+            .map(|(k, i)| (k.to_string(), i.to_string()))
+            .collect()
+    };
 
-    engine
-        .update_index(db.adapter(), "app", "by_tag")
-        .await
-        .unwrap();
+    assert_eq!(
+        tag_rows(&mut engine, &db).await,
+        pairs(&[
+            ("db", "doc1"),
+            ("db", "doc2"),
+            ("local-first", "doc1"),
+            ("rust", "doc1")
+        ])
+    );
+    assert_eq!(
+        engine.get_index("app", "by_tag").unwrap().entries["doc1"].len(),
+        3
+    );
 
-    let index = engine.get_index("app", "by_tag").unwrap();
-    // doc1 should have 3 emitted pairs
-    assert_eq!(index.entries["doc1"].len(), 3);
+    // Dropping a tag removes its row on the next update.
+    db.update(
+        "doc1",
+        &r1.rev.unwrap(),
+        serde_json::json!({"tags": ["rust"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        tag_rows(&mut engine, &db).await,
+        pairs(&[("db", "doc2"), ("rust", "doc1")])
+    );
 }
 
 // =========================================================================
-// Conflicts: creating and querying
+// Conflicts: a replicated sibling revision makes a deterministic winner
 // =========================================================================
 
 #[tokio::test]
 async fn create_conflict_via_bulk_docs() {
-    let db = Database::memory("test");
+    for b in backends("test") {
+        let db = &b.db;
+        // Create initial doc
+        let local_rev = db
+            .put("doc1", serde_json::json!({"v": 1}))
+            .await
+            .unwrap()
+            .rev
+            .unwrap();
 
-    // Create initial doc
-    let local_rev = db
-        .put("doc1", serde_json::json!({"v": 1}))
-        .await
-        .unwrap()
-        .rev
-        .unwrap();
+        // Force a conflicting revision via replication mode
+        let conflict_rev = "1-conflicting_hash".to_string();
+        let conflict_doc = Document {
+            id: "doc1".into(),
+            rev: Some(Revision::new(1, "conflicting_hash".into())),
+            deleted: false,
+            data: serde_json::json!({"v": "conflict"}),
+            attachments: HashMap::new(),
+        };
 
-    // Force a conflicting revision via replication mode
-    let conflict_rev = "1-conflicting_hash".to_string();
-    let conflict_doc = Document {
-        id: "doc1".into(),
-        rev: Some(Revision::new(1, "conflicting_hash".into())),
-        deleted: false,
-        data: serde_json::json!({"v": "conflict"}),
-        attachments: HashMap::new(),
-    };
+        let results = db
+            .bulk_docs(vec![conflict_doc], BulkDocsOptions::replication())
+            .await
+            .unwrap();
+        assert!(results.iter().all(|r| r.ok), "{results:?}");
 
-    let results = db
-        .bulk_docs(vec![conflict_doc], BulkDocsOptions::replication())
-        .await
-        .unwrap();
-    assert!(results.iter().all(|r| r.ok), "{results:?}");
+        // Both leaves are generation 1 and live, so the winner is the one
+        // with the lexicographically greater hash (deterministic, like
+        // CouchDB).
+        let (winner, loser, winner_v) = if conflict_rev > local_rev {
+            (&conflict_rev, &local_rev, serde_json::json!("conflict"))
+        } else {
+            (&local_rev, &conflict_rev, serde_json::json!(1))
+        };
 
-    // Both leaves are generation 1 and live, so the winner is the one with
-    // the lexicographically greater hash (deterministic, like CouchDB).
-    let (winner, loser, winner_v) = if conflict_rev > local_rev {
-        (&conflict_rev, &local_rev, serde_json::json!("conflict"))
-    } else {
-        (&local_rev, &conflict_rev, serde_json::json!(1))
-    };
-
-    let doc = db
-        .get_with_opts(
-            "doc1",
-            GetOptions {
-                conflicts: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(&doc.rev.unwrap().to_string(), winner);
-    assert_eq!(doc.data["v"], winner_v);
-    assert_eq!(doc.data["_conflicts"], serde_json::json!([loser]));
+        let doc = db
+            .get_with_opts(
+                "doc1",
+                GetOptions {
+                    conflicts: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(&doc.rev.unwrap().to_string(), winner, "{}", b.name);
+        assert_eq!(doc.data["v"], winner_v, "{}", b.name);
+        assert_eq!(
+            doc.data["_conflicts"],
+            serde_json::json!([loser]),
+            "{}",
+            b.name
+        );
+    }
 }
 
 // =========================================================================
-// Edge case: put with very large document
+// Edge case: a large document is stored whole
 // =========================================================================
 
 #[tokio::test]
 async fn put_large_document() {
-    let db = Database::memory("test");
+    for b in backends("test") {
+        let large_array: Vec<i64> = (0..10000).collect();
+        let body = serde_json::json!({"data": large_array, "text": "x".repeat(100_000)});
+        let result = b.db.put("large", body.clone()).await.unwrap();
+        assert!(result.ok);
 
-    let large_array: Vec<i64> = (0..10000).collect();
-    let result = db
-        .put("large", serde_json::json!({"data": large_array}))
-        .await
-        .unwrap();
-    assert!(result.ok);
-
-    let doc = db.get("large").await.unwrap();
-    assert_eq!(doc.data["data"].as_array().unwrap().len(), 10000);
+        let doc = b.db.get("large").await.unwrap();
+        assert_eq!(doc.data, body, "{}", b.name);
+    }
 }
 
 // =========================================================================
@@ -957,131 +566,74 @@ async fn put_large_document() {
 
 #[tokio::test]
 async fn special_characters_in_doc_id() {
-    let db = Database::memory("test");
+    for b in backends("test") {
+        let db = &b.db;
+        let mut ids = vec![
+            "doc with spaces",
+            "doc/with/slashes",
+            "doc-with-dashes",
+            "doc_with_underscores",
+            "123numeric",
+            "UPPERCASE",
+            "plus+sign",
+            "question?mark",
+            "percent%20",
+            "hash#tag",
+            "caf\u{e9}",
+            "\u{1F600}",
+        ];
 
-    let ids = vec![
-        "doc with spaces",
-        "doc/with/slashes",
-        "doc-with-dashes",
-        "doc_with_underscores",
-        "123numeric",
-        "UPPERCASE",
-    ];
+        for id in &ids {
+            let result = db.put(id, serde_json::json!({"id": id})).await.unwrap();
+            assert_eq!(result.id, *id, "{}", b.name);
 
-    for id in &ids {
-        let result = db.put(id, serde_json::json!({"id": id})).await.unwrap();
-        assert!(result.ok, "Failed to put doc with id: {}", id);
-
-        let doc = db.get(id).await.unwrap();
-        assert_eq!(doc.data["id"], *id);
+            let doc = db.get(id).await.unwrap();
+            assert_eq!(doc.id, *id, "{}", b.name);
+            assert_eq!(doc.data["id"], *id, "{}", b.name);
+        }
+        ids.sort();
+        let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
+        assert_eq!(row_ids(&all), ids, "{}", b.name);
     }
 }
 
 // =========================================================================
-// Edge case: empty database operations
+// Edge case: an empty database answers every query with nothing
 // =========================================================================
 
 #[tokio::test]
 async fn operations_on_empty_db() {
-    let db = Database::memory("test");
+    for b in backends("test") {
+        let db = &b.db;
+        let info = db.info().await.unwrap();
+        assert_eq!(
+            (info.doc_count, info.doc_del_count, info.update_seq),
+            (0, 0, Seq::Num(0)),
+            "{}",
+            b.name
+        );
 
-    let info = db.info().await.unwrap();
-    assert_eq!(info.doc_count, 0);
+        let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
+        assert!(all.rows.is_empty(), "{}", b.name);
+        assert_eq!(all.total_rows, 0, "{}", b.name);
 
-    let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
-    assert_eq!(all.rows.len(), 0);
+        let changes = db.changes(ChangesOptions::default()).await.unwrap();
+        assert!(changes.results.is_empty(), "{}", b.name);
+        assert_eq!(changes.last_seq, Seq::Num(0), "{}", b.name);
 
-    let changes = db.changes(ChangesOptions::default()).await.unwrap();
-    assert_eq!(changes.results.len(), 0);
+        let find = db
+            .find(FindOptions {
+                selector: serde_json::json!({}),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(find.docs.is_empty(), "{}", b.name);
 
-    let find = db
-        .find(FindOptions {
-            selector: serde_json::json!({}),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    assert_eq!(find.docs.len(), 0);
-}
-
-// =========================================================================
-// Edge case: update with wrong rev
-// =========================================================================
-
-#[tokio::test]
-async fn update_with_wrong_rev_fails() {
-    let db = Database::memory("test");
-    db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
-
-    let result = db
-        .update("doc1", "1-wronghash", serde_json::json!({"v": 2}))
-        .await;
-    assert!(
-        matches!(result, Err(rouchdb::RouchError::Conflict)),
-        "Update with wrong rev should fail: {:?}",
-        result
-    );
-}
-
-#[tokio::test]
-async fn remove_with_wrong_rev_fails() {
-    let db = Database::memory("test");
-    db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
-
-    let result = db.remove("doc1", "1-wronghash").await;
-    assert!(
-        matches!(result, Err(rouchdb::RouchError::Conflict)),
-        "Remove with wrong rev should fail: {:?}",
-        result
-    );
-}
-
-// =========================================================================
-// Explain: with multiple indexes, picks the right one
-// =========================================================================
-
-#[tokio::test]
-async fn explain_picks_matching_index() {
-    let db = Database::memory("test");
-
-    db.put(
-        "a",
-        serde_json::json!({"name": "Alice", "age": 30, "city": "NYC"}),
-    )
-    .await
-    .unwrap();
-
-    db.create_index(rouchdb::IndexDefinition {
-        name: "".into(),
-        fields: vec![SortField::Simple("age".into())],
-        ddoc: None,
-    })
-    .await
-    .unwrap();
-
-    db.create_index(rouchdb::IndexDefinition {
-        name: "".into(),
-        fields: vec![SortField::Simple("city".into())],
-        ddoc: None,
-    })
-    .await
-    .unwrap();
-
-    // Query on age — should pick age index
-    let explanation = db
-        .explain(FindOptions {
-            selector: serde_json::json!({"age": {"$gt": 20}}),
-            ..Default::default()
-        })
-        .await;
-    assert_eq!(explanation.index.name, "idx-age");
-
-    // Query on city — should pick city index
-    let explanation = db
-        .explain(FindOptions {
-            selector: serde_json::json!({"city": "NYC"}),
-            ..Default::default()
-        })
-        .await;
-    assert_eq!(explanation.index.name, "idx-city");
+        assert!(
+            matches!(db.get("anything").await, Err(RouchError::NotFound(_))),
+            "{}",
+            b.name
+        );
+    }
 }

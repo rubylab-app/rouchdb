@@ -1162,140 +1162,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_and_get_document() {
-        let db = new_db().await;
-
-        let doc = Document {
-            id: "doc1".into(),
-            rev: None,
-            deleted: false,
-            data: serde_json::json!({"name": "Alice"}),
-            attachments: HashMap::new(),
-        };
-
-        let results = db
-            .bulk_docs(vec![doc], BulkDocsOptions::new())
-            .await
-            .unwrap();
-        assert!(results[0].ok);
-        assert_eq!(results[0].id, "doc1");
-        assert!(results[0].rev.is_some());
-
-        let fetched = db.get("doc1", GetOptions::default()).await.unwrap();
-        assert_eq!(fetched.id, "doc1");
-        assert_eq!(fetched.data["name"], "Alice");
-        assert!(fetched.rev.is_some());
-    }
-
-    #[tokio::test]
-    async fn update_document() {
-        let db = new_db().await;
-
-        // Create
-        let doc = Document {
-            id: "doc1".into(),
-            rev: None,
-            deleted: false,
-            data: serde_json::json!({"name": "Alice"}),
-            attachments: HashMap::new(),
-        };
-        let results = db
-            .bulk_docs(vec![doc], BulkDocsOptions::new())
-            .await
-            .unwrap();
-        let rev1 = results[0].rev.clone().unwrap();
-
-        // Update
-        let rev_parsed: Revision = rev1.parse().unwrap();
-        let doc2 = Document {
-            id: "doc1".into(),
-            rev: Some(rev_parsed),
-            deleted: false,
-            data: serde_json::json!({"name": "Bob"}),
-            attachments: HashMap::new(),
-        };
-        let results = db
-            .bulk_docs(vec![doc2], BulkDocsOptions::new())
-            .await
-            .unwrap();
-        assert!(results[0].ok);
-
-        let fetched = db.get("doc1", GetOptions::default()).await.unwrap();
-        assert_eq!(fetched.data["name"], "Bob");
-    }
-
-    #[tokio::test]
-    async fn conflict_on_wrong_rev() {
-        let db = new_db().await;
-
-        let doc = Document {
-            id: "doc1".into(),
-            rev: None,
-            deleted: false,
-            data: serde_json::json!({"v": 1}),
-            attachments: HashMap::new(),
-        };
-        db.bulk_docs(vec![doc], BulkDocsOptions::new())
-            .await
-            .unwrap();
-
-        // Try updating with wrong rev
-        let doc2 = Document {
-            id: "doc1".into(),
-            rev: Some(Revision::new(1, "wronghash".into())),
-            deleted: false,
-            data: serde_json::json!({"v": 2}),
-            attachments: HashMap::new(),
-        };
-        let results = db
-            .bulk_docs(vec![doc2], BulkDocsOptions::new())
-            .await
-            .unwrap();
-        assert!(!results[0].ok);
-        assert_eq!(results[0].error.as_deref(), Some("conflict"));
-    }
-
-    #[tokio::test]
-    async fn delete_document() {
-        let db = new_db().await;
-
-        let doc = Document {
-            id: "doc1".into(),
-            rev: None,
-            deleted: false,
-            data: serde_json::json!({"name": "Alice"}),
-            attachments: HashMap::new(),
-        };
-        let results = db
-            .bulk_docs(vec![doc], BulkDocsOptions::new())
-            .await
-            .unwrap();
-        let rev1: Revision = results[0].rev.clone().unwrap().parse().unwrap();
-
-        // Delete
-        let del = Document {
-            id: "doc1".into(),
-            rev: Some(rev1),
-            deleted: true,
-            data: serde_json::json!({}),
-            attachments: HashMap::new(),
-        };
-        let results = db
-            .bulk_docs(vec![del], BulkDocsOptions::new())
-            .await
-            .unwrap();
-        assert!(results[0].ok);
-
-        // Get should fail
-        let err = db.get("doc1", GetOptions::default()).await;
-        assert!(err.is_err());
-
-        // Info should show 0 docs
-        let info = db.info().await.unwrap();
-        assert_eq!(info.doc_count, 0);
-    }
-
-    #[tokio::test]
     async fn recreate_deleted_doc_with_same_content() {
         let db = new_db().await;
 
@@ -1351,31 +1217,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_docs() {
-        let db = new_db().await;
-
-        for name in ["charlie", "alice", "bob"] {
-            let doc = Document {
-                id: name.into(),
-                rev: None,
-                deleted: false,
-                data: serde_json::json!({"name": name}),
-                attachments: HashMap::new(),
-            };
-            db.bulk_docs(vec![doc], BulkDocsOptions::new())
-                .await
-                .unwrap();
-        }
-
-        let result = db.all_docs(AllDocsOptions::new()).await.unwrap();
-        assert_eq!(result.total_rows, 3);
-        // Should be sorted alphabetically
-        assert_eq!(result.rows[0].id, "alice");
-        assert_eq!(result.rows[1].id, "bob");
-        assert_eq!(result.rows[2].id, "charlie");
-    }
-
-    #[tokio::test]
     async fn all_docs_with_include_docs() {
         let db = new_db().await;
 
@@ -1386,50 +1227,23 @@ mod tests {
             data: serde_json::json!({"name": "Alice"}),
             attachments: HashMap::new(),
         };
-        db.bulk_docs(vec![doc], BulkDocsOptions::new())
+        let rev = db
+            .bulk_docs(vec![doc], BulkDocsOptions::new())
             .await
+            .unwrap()[0]
+            .rev
+            .clone()
             .unwrap();
 
         let mut opts = AllDocsOptions::new();
         opts.include_docs = true;
         let result = db.all_docs(opts).await.unwrap();
-        assert!(result.rows[0].doc.is_some());
-        let doc = result.rows[0].doc.as_ref().unwrap();
-        assert_eq!(doc["name"], "Alice");
-        assert_eq!(doc["_id"], "doc1");
-    }
-
-    #[tokio::test]
-    async fn changes_feed() {
-        let db = new_db().await;
-
-        for i in 0..3 {
-            let doc = Document {
-                id: format!("doc{}", i),
-                rev: None,
-                deleted: false,
-                data: serde_json::json!({"i": i}),
-                attachments: HashMap::new(),
-            };
-            db.bulk_docs(vec![doc], BulkDocsOptions::new())
-                .await
-                .unwrap();
-        }
-
-        let changes = db.changes(ChangesOptions::default()).await.unwrap();
-        assert_eq!(changes.results.len(), 3);
-        assert_eq!(changes.last_seq, Seq::Num(3));
-
-        // Changes since seq 2
-        let changes = db
-            .changes(ChangesOptions {
-                since: Seq::Num(2),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(changes.results.len(), 1);
-        assert_eq!(changes.results[0].id, "doc2");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].value.rev, rev);
+        assert_eq!(
+            result.rows[0].doc,
+            Some(serde_json::json!({"_id": "doc1", "_rev": rev, "name": "Alice"}))
+        );
     }
 
     #[tokio::test]
@@ -1457,73 +1271,18 @@ mod tests {
         revs.insert("doc2".into(), vec!["1-abc".into()]);
 
         let diff = db.revs_diff(revs).await.unwrap();
+        assert_eq!(diff.results.len(), 2);
 
-        // doc1: existing_rev should not be missing, 2-doesnotexist should be
+        // doc1: only the unknown rev is missing; the stored leaf (a lower
+        // generation) may be its ancestor.
         let doc1_diff = diff.results.get("doc1").unwrap();
-        assert!(!doc1_diff.missing.contains(&existing_rev));
-        assert!(doc1_diff.missing.contains(&"2-doesnotexist".to_string()));
+        assert_eq!(doc1_diff.missing, ["2-doesnotexist"]);
+        assert_eq!(doc1_diff.possible_ancestors, [existing_rev]);
 
-        // doc2: completely missing
+        // doc2: completely missing, nothing to descend from.
         let doc2_diff = diff.results.get("doc2").unwrap();
-        assert!(doc2_diff.missing.contains(&"1-abc".to_string()));
-    }
-
-    #[tokio::test]
-    async fn local_docs() {
-        let db = new_db().await;
-
-        let doc = serde_json::json!({"checkpoint": 42});
-        db.put_local("repl-123", doc.clone()).await.unwrap();
-
-        let fetched = db.get_local("repl-123").await.unwrap();
-        assert_eq!(fetched["checkpoint"], 42);
-
-        db.remove_local("repl-123").await.unwrap();
-        assert!(db.get_local("repl-123").await.is_err());
-    }
-
-    #[tokio::test]
-    async fn replication_mode_bulk_docs() {
-        let db = new_db().await;
-
-        // Insert with explicit revision (replication mode)
-        let doc = Document {
-            id: "doc1".into(),
-            rev: Some(Revision::new(1, "abc123".into())),
-            deleted: false,
-            data: serde_json::json!({"name": "replicated"}),
-            attachments: HashMap::new(),
-        };
-
-        let results = db
-            .bulk_docs(vec![doc], BulkDocsOptions::replication())
-            .await
-            .unwrap();
-        assert!(results[0].ok);
-
-        let fetched = db.get("doc1", GetOptions::default()).await.unwrap();
-        assert_eq!(fetched.data["name"], "replicated");
-        assert_eq!(fetched.rev.unwrap().to_string(), "1-abc123");
-    }
-
-    #[tokio::test]
-    async fn auto_generate_id() {
-        let db = new_db().await;
-
-        let doc = Document {
-            id: String::new(),
-            rev: None,
-            deleted: false,
-            data: serde_json::json!({"name": "no-id"}),
-            attachments: HashMap::new(),
-        };
-
-        let results = db
-            .bulk_docs(vec![doc], BulkDocsOptions::new())
-            .await
-            .unwrap();
-        assert!(results[0].ok);
-        assert!(!results[0].id.is_empty());
+        assert_eq!(doc2_diff.missing, ["1-abc"]);
+        assert!(doc2_diff.possible_ancestors.is_empty());
     }
 
     #[tokio::test]
@@ -1537,16 +1296,47 @@ mod tests {
             data: serde_json::json!({}),
             attachments: HashMap::new(),
         };
-        db.bulk_docs(vec![doc], BulkDocsOptions::new())
+        let rev = db
+            .bulk_docs(vec![doc], BulkDocsOptions::new())
+            .await
+            .unwrap()[0]
+            .rev
+            .clone()
+            .unwrap();
+        db.put_attachment("doc1", "a", &rev, b"bytes".to_vec(), "text/plain")
             .await
             .unwrap();
         db.put_local("x", serde_json::json!({})).await.unwrap();
+        db.put_security(SecurityDocument {
+            admins: rouchdb_core::document::SecurityGroup {
+                names: vec!["bob".into()],
+                roles: vec![],
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
 
         db.destroy().await.unwrap();
 
         let info = db.info().await.unwrap();
-        assert_eq!(info.doc_count, 0);
+        assert_eq!((info.doc_count, info.doc_del_count), (0, 0));
         assert_eq!(info.update_seq, Seq::Num(0));
+        assert!(matches!(
+            db.get("doc1", GetOptions::default()).await,
+            Err(RouchError::NotFound(_))
+        ));
+        assert!(matches!(
+            db.get_local("x").await,
+            Err(RouchError::NotFound(_))
+        ));
+        let changes = db.changes(ChangesOptions::default()).await.unwrap();
+        assert!(changes.results.is_empty());
+        assert_eq!(changes.last_seq, Seq::Num(0));
+        assert!(db.get_security().await.unwrap().admins.names.is_empty());
+        let inner = db.inner.read().await;
+        assert!(inner.attachments.is_empty());
+        assert_eq!(inner.purge_seq, 0);
     }
 
     #[tokio::test]
@@ -1571,8 +1361,8 @@ mod tests {
             .put_attachment("doc1", "hi.txt", &rev1, b"hi!".to_vec(), "text/plain")
             .await
             .unwrap();
-        assert!(r2.ok);
         let rev2 = r2.rev.clone().unwrap();
+        assert!(rev2.starts_with("2-"), "{}", rev2);
 
         let bytes = db
             .get_attachment("doc1", "hi.txt", GetAttachmentOptions::default())
@@ -1599,11 +1389,23 @@ mod tests {
 
         // Removing the attachment makes it unretrievable on the new rev.
         let r3 = db.remove_attachment("doc1", "hi.txt", &rev2).await.unwrap();
-        assert!(r3.ok);
+        assert!(r3.rev.as_deref().unwrap().starts_with("3-"), "{:?}", r3);
         let err = db
             .get_attachment("doc1", "hi.txt", GetAttachmentOptions::default())
             .await;
-        assert!(err.is_err());
+        assert!(matches!(err, Err(RouchError::NotFound(_))), "{:?}", err);
+        // The previous revision still serves its bytes.
+        let old = db
+            .get_attachment(
+                "doc1",
+                "hi.txt",
+                GetAttachmentOptions {
+                    rev: Some(rev2.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(old, b"hi!");
     }
 
     #[tokio::test]
@@ -1629,7 +1431,8 @@ mod tests {
             ..AllDocsOptions::new()
         };
         let result = db.all_docs(opts).await.unwrap();
-        assert_eq!(result.rows.len(), 1);
+        let ids: Vec<&str> = result.rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["b"]);
         assert_eq!(result.total_rows, 4);
     }
 
@@ -1679,18 +1482,22 @@ mod tests {
             .await
             .unwrap();
         let rev1: Revision = r[0].rev.clone().unwrap().parse().unwrap();
-        db.bulk_docs(
-            vec![Document {
-                id: "doc1".into(),
-                rev: Some(rev1),
-                deleted: true,
-                data: serde_json::json!({}),
-                attachments: HashMap::new(),
-            }],
-            BulkDocsOptions::new(),
-        )
-        .await
-        .unwrap();
+        let tomb = db
+            .bulk_docs(
+                vec![Document {
+                    id: "doc1".into(),
+                    rev: Some(rev1),
+                    deleted: true,
+                    data: serde_json::json!({}),
+                    attachments: HashMap::new(),
+                }],
+                BulkDocsOptions::new(),
+            )
+            .await
+            .unwrap()[0]
+            .rev
+            .clone()
+            .unwrap();
 
         let changes = db
             .changes(ChangesOptions {
@@ -1699,12 +1506,13 @@ mod tests {
             })
             .await
             .unwrap();
-        let ev = changes.results.iter().find(|e| e.id == "doc1").unwrap();
+        assert_eq!(changes.results.len(), 1);
+        let ev = &changes.results[0];
+        assert_eq!(ev.id, "doc1");
         assert!(ev.deleted);
-        assert!(
-            !ev.changes.is_empty(),
-            "deleted doc must still list its leaf rev"
-        );
+        // A deleted doc still lists its (tombstone) leaf rev.
+        let revs: Vec<&str> = ev.changes.iter().map(|c| c.rev.as_str()).collect();
+        assert_eq!(revs, [tomb.as_str()]);
     }
 
     #[tokio::test]
@@ -1755,40 +1563,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_get_documents() {
-        let db = new_db().await;
-
-        let doc = Document {
-            id: "doc1".into(),
-            rev: None,
-            deleted: false,
-            data: serde_json::json!({"name": "test"}),
-            attachments: HashMap::new(),
-        };
-        db.bulk_docs(vec![doc], BulkDocsOptions::new())
-            .await
-            .unwrap();
-
-        let result = db
-            .bulk_get(vec![
-                BulkGetItem {
-                    id: "doc1".into(),
-                    rev: None,
-                },
-                BulkGetItem {
-                    id: "missing".into(),
-                    rev: None,
-                },
-            ])
-            .await
-            .unwrap();
-
-        assert_eq!(result.results.len(), 2);
-        assert!(result.results[0].docs[0].ok.is_some());
-        assert!(result.results[1].docs[0].error.is_some());
-    }
-
-    #[tokio::test]
     async fn attachment_store_is_garbage_collected() {
         let db = new_db().await;
         let doc = Document {
@@ -1812,11 +1586,11 @@ mod tests {
             .rev
             .unwrap();
         // A rejected write must not leave its bytes behind.
-        assert!(
+        assert!(matches!(
             db.put_attachment("d", "a", &r1, vec![9; 64], "application/octet-stream")
-                .await
-                .is_err()
-        );
+                .await,
+            Err(RouchError::Conflict)
+        ));
         assert_eq!(db.inner.read().await.attachments.len(), 1);
         // Replacing the attachment and compacting frees the old bytes.
         db.put_attachment("d", "a", &r2, vec![2; 64], "application/octet-stream")

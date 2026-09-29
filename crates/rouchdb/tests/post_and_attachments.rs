@@ -1,9 +1,26 @@
-//! Integration tests for db.post() and removeAttachment().
+//! Integration tests for db.post() and removeAttachment() against CouchDB.
 
 mod common;
 
 use common::fresh_remote_db;
-use rouchdb::Database;
+use rouchdb::{AllDocsOptions, Database, DocResult, RouchError};
+
+fn assert_uuid_v4(id: &str) {
+    let uuid = uuid::Uuid::parse_str(id).unwrap_or_else(|e| panic!("{id} is not a UUID: {e}"));
+    assert_eq!(uuid.get_version_num(), 4, "{id}");
+}
+
+/// The ids of all documents, sorted.
+async fn all_ids(db: &Database) -> Vec<String> {
+    let all = db.all_docs(AllDocsOptions::new()).await.unwrap();
+    all.rows.into_iter().map(|r| r.id).collect()
+}
+
+fn sorted_ids(results: &[&DocResult]) -> Vec<String> {
+    let mut ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
+    ids.sort();
+    ids
+}
 
 // -----------------------------------------------------------------------
 // db.post() tests
@@ -17,17 +34,18 @@ async fn post_to_couchdb() {
 
     let r1 = db.post(serde_json::json!({"name": "Alice"})).await.unwrap();
     assert!(r1.ok);
-    assert!(!r1.id.is_empty());
+    assert_uuid_v4(&r1.id);
 
     let r2 = db.post(serde_json::json!({"name": "Bob"})).await.unwrap();
     assert!(r2.ok);
+    assert_uuid_v4(&r2.id);
     assert_ne!(r1.id, r2.id);
 
     let doc = db.get(&r1.id).await.unwrap();
-    assert_eq!(doc.data["name"], "Alice");
+    assert_eq!(doc.rev.unwrap().to_string(), r1.rev.clone().unwrap());
+    assert_eq!(doc.data, serde_json::json!({"name": "Alice"}));
 
-    let info = db.info().await.unwrap();
-    assert_eq!(info.doc_count, 2);
+    assert_eq!(all_ids(&db).await, sorted_ids(&[&r1, &r2]));
 }
 
 #[tokio::test]
@@ -50,8 +68,17 @@ async fn post_and_replicate_to_couchdb() {
     assert!(result.ok);
     assert_eq!(result.docs_written, 2);
 
-    remote.get(&r1.id).await.unwrap();
-    remote.get(&r2.id).await.unwrap();
+    // The target has exactly the posted documents, under the same ids and
+    // revisions.
+    assert_eq!(all_ids(&remote).await, sorted_ids(&[&r1, &r2]));
+    for (r, title) in [(&r1, "Hello"), (&r2, "World")] {
+        let doc = remote.get(&r.id).await.unwrap();
+        assert_eq!(doc.rev.unwrap().to_string(), r.rev.clone().unwrap());
+        assert_eq!(
+            doc.data,
+            serde_json::json!({"type": "note", "title": title})
+        );
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -64,50 +91,56 @@ async fn remove_attachment_from_couchdb() {
     let url = fresh_remote_db("rm_att").await;
     let db = Database::http(&url);
 
-    // Create a doc and add an attachment
+    // Create a doc and add two attachments
     let r1 = db.put("doc1", serde_json::json!({"v": 1})).await.unwrap();
-    let rev1 = r1.rev.unwrap();
-
-    let att_result = db
-        .adapter()
+    let rev2 = db
         .put_attachment(
             "doc1",
             "hello.txt",
-            &rev1,
+            &r1.rev.unwrap(),
             b"Hello, World!".to_vec(),
             "text/plain",
         )
         .await
+        .unwrap()
+        .rev
         .unwrap();
-    let rev2 = att_result.rev.unwrap();
+    let rev3 = db
+        .put_attachment("doc1", "keep.txt", &rev2, b"keep".to_vec(), "text/plain")
+        .await
+        .unwrap()
+        .rev
+        .unwrap();
 
     // Verify attachment exists
-    let att_data = db
-        .adapter()
-        .get_attachment(
-            "doc1",
-            "hello.txt",
-            rouchdb::GetAttachmentOptions { rev: None },
-        )
-        .await
-        .unwrap();
-    assert_eq!(att_data, b"Hello, World!");
+    assert_eq!(
+        db.get_attachment("doc1", "hello.txt").await.unwrap(),
+        b"Hello, World!"
+    );
 
-    // Remove the attachment
+    // Remove one attachment
     let rm_result = db
-        .remove_attachment("doc1", "hello.txt", &rev2)
+        .remove_attachment("doc1", "hello.txt", &rev3)
         .await
         .unwrap();
     assert!(rm_result.ok);
+    let rev4 = rm_result.rev.unwrap();
+    assert!(rev4.starts_with("4-"), "{rev4}");
 
-    // Verify attachment is gone
-    let err = db
-        .adapter()
-        .get_attachment(
-            "doc1",
-            "hello.txt",
-            rouchdb::GetAttachmentOptions { rev: None },
-        )
-        .await;
-    assert!(err.is_err());
+    // It is gone; the other attachment and the body stay.
+    let err = db.get_attachment("doc1", "hello.txt").await;
+    assert!(matches!(err, Err(RouchError::NotFound(_))), "{err:?}");
+    assert_eq!(
+        db.get_attachment("doc1", "keep.txt").await.unwrap(),
+        b"keep"
+    );
+    let doc = db.get("doc1").await.unwrap();
+    assert_eq!(doc.rev.unwrap().to_string(), rev4);
+    assert_eq!(doc.data, serde_json::json!({"v": 1}));
+    let names: Vec<&String> = doc.attachments.keys().collect();
+    assert_eq!(names, ["keep.txt"]);
+
+    // Removing it again is not found.
+    let again = db.remove_attachment("doc1", "hello.txt", &rev4).await;
+    assert!(matches!(again, Err(RouchError::NotFound(_))), "{again:?}");
 }

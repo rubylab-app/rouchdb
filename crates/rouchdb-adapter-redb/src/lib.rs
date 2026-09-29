@@ -1924,73 +1924,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_and_get() {
-        let (_dir, db) = temp_db();
-
-        let doc = Document {
-            id: "doc1".into(),
-            rev: None,
-            deleted: false,
-            data: serde_json::json!({"name": "Alice"}),
-            attachments: HashMap::new(),
-        };
-        let results = db
-            .bulk_docs(vec![doc], BulkDocsOptions::new())
-            .await
-            .unwrap();
-        assert!(results[0].ok);
-
-        let fetched = db.get("doc1", GetOptions::default()).await.unwrap();
-        assert_eq!(fetched.data["name"], "Alice");
-    }
-
-    #[tokio::test]
-    async fn update_and_conflict() {
-        let (_dir, db) = temp_db();
-
-        let doc = Document {
-            id: "doc1".into(),
-            rev: None,
-            deleted: false,
-            data: serde_json::json!({"v": 1}),
-            attachments: HashMap::new(),
-        };
-        let r1 = db
-            .bulk_docs(vec![doc], BulkDocsOptions::new())
-            .await
-            .unwrap();
-        let rev1: Revision = r1[0].rev.clone().unwrap().parse().unwrap();
-
-        // Successful update
-        let doc2 = Document {
-            id: "doc1".into(),
-            rev: Some(rev1),
-            deleted: false,
-            data: serde_json::json!({"v": 2}),
-            attachments: HashMap::new(),
-        };
-        let r2 = db
-            .bulk_docs(vec![doc2], BulkDocsOptions::new())
-            .await
-            .unwrap();
-        assert!(r2[0].ok);
-
-        // Conflict
-        let bad = Document {
-            id: "doc1".into(),
-            rev: Some(Revision::new(1, "wrong".into())),
-            deleted: false,
-            data: serde_json::json!({"v": 3}),
-            attachments: HashMap::new(),
-        };
-        let r3 = db
-            .bulk_docs(vec![bad], BulkDocsOptions::new())
-            .await
-            .unwrap();
-        assert!(!r3[0].ok);
-    }
-
-    #[tokio::test]
     async fn all_docs_descending_with_range() {
         let (_dir, db) = temp_db();
         for name in ["a", "b", "c", "d"] {
@@ -2059,50 +1992,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changes_feed() {
-        let (_dir, db) = temp_db();
-
-        for i in 0..3 {
-            let doc = Document {
-                id: format!("doc{}", i),
-                rev: None,
-                deleted: false,
-                data: serde_json::json!({"i": i}),
-                attachments: HashMap::new(),
-            };
-            db.bulk_docs(vec![doc], BulkDocsOptions::new())
-                .await
-                .unwrap();
-        }
-
-        let changes = db.changes(ChangesOptions::default()).await.unwrap();
-        assert_eq!(changes.results.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn all_docs_sorted() {
-        let (_dir, db) = temp_db();
-
-        for name in ["charlie", "alice", "bob"] {
-            let doc = Document {
-                id: name.into(),
-                rev: None,
-                deleted: false,
-                data: serde_json::json!({}),
-                attachments: HashMap::new(),
-            };
-            db.bulk_docs(vec![doc], BulkDocsOptions::new())
-                .await
-                .unwrap();
-        }
-
-        let result = db.all_docs(AllDocsOptions::new()).await.unwrap();
-        assert_eq!(result.rows[0].id, "alice");
-        assert_eq!(result.rows[1].id, "bob");
-        assert_eq!(result.rows[2].id, "charlie");
-    }
-
-    #[tokio::test]
     async fn local_docs() {
         let (_dir, db) = temp_db();
 
@@ -2113,28 +2002,10 @@ mod tests {
         assert_eq!(fetched["seq"], 5);
 
         db.remove_local("ck1").await.unwrap();
-        assert!(db.get_local("ck1").await.is_err());
-    }
-
-    #[tokio::test]
-    async fn replication_mode() {
-        let (_dir, db) = temp_db();
-
-        let doc = Document {
-            id: "doc1".into(),
-            rev: Some(Revision::new(1, "abc".into())),
-            deleted: false,
-            data: serde_json::json!({"from": "remote"}),
-            attachments: HashMap::new(),
-        };
-        let results = db
-            .bulk_docs(vec![doc], BulkDocsOptions::replication())
-            .await
-            .unwrap();
-        assert!(results[0].ok);
-
-        let fetched = db.get("doc1", GetOptions::default()).await.unwrap();
-        assert_eq!(fetched.rev.unwrap().to_string(), "1-abc");
+        assert!(matches!(
+            db.get_local("ck1").await,
+            Err(RouchError::NotFound(_))
+        ));
     }
 
     #[tokio::test]
@@ -2148,14 +2019,49 @@ mod tests {
             data: serde_json::json!({}),
             attachments: HashMap::new(),
         };
-        db.bulk_docs(vec![doc], BulkDocsOptions::new())
+        let rev = db
+            .bulk_docs(vec![doc], BulkDocsOptions::new())
+            .await
+            .unwrap()[0]
+            .rev
+            .clone()
+            .unwrap();
+        db.put_attachment("doc1", "a", &rev, b"bytes".to_vec(), "text/plain")
             .await
             .unwrap();
+        db.put_local("x", serde_json::json!({})).await.unwrap();
+        db.put_security(SecurityDocument {
+            admins: rouchdb_core::document::SecurityGroup {
+                names: vec!["bob".into()],
+                roles: vec![],
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
 
         db.destroy().await.unwrap();
         let info = db.info().await.unwrap();
-        assert_eq!(info.doc_count, 0);
+        assert_eq!((info.doc_count, info.doc_del_count), (0, 0));
         assert_eq!(info.update_seq, Seq::Num(0));
+        assert!(matches!(
+            db.get("doc1", GetOptions::default()).await,
+            Err(RouchError::NotFound(_))
+        ));
+        assert!(matches!(
+            db.get_local("x").await,
+            Err(RouchError::NotFound(_))
+        ));
+        let changes = db.changes(ChangesOptions::default()).await.unwrap();
+        assert!(changes.results.is_empty());
+        assert!(db.get_security().await.unwrap().admins.names.is_empty());
+        // Every table is empty again, including the attachment store.
+        use redb::ReadableTableMetadata;
+        let txn = db.inner.db.begin_read().unwrap();
+        for table in [DOC_TABLE, REV_DATA_TABLE, LOCAL_TABLE, ATTACHMENT_TABLE] {
+            assert!(txn.open_table(table).unwrap().is_empty().unwrap());
+        }
+        assert!(txn.open_table(CHANGES_TABLE).unwrap().is_empty().unwrap());
     }
 
     #[tokio::test]
@@ -2276,13 +2182,15 @@ mod tests {
         revs.insert("doc2".into(), vec!["1-xyz".into()]);
 
         let diff = db.revs_diff(revs).await.unwrap();
-        // doc1: 2-def missing, 1-abc exists
+        assert_eq!(diff.results.len(), 2);
+        // doc1: 2-def missing (1-abc exists and may be its ancestor)
         let d1 = &diff.results["doc1"];
-        assert!(d1.missing.contains(&"2-def".to_string()));
-        assert!(!d1.missing.contains(&"1-abc".to_string()));
+        assert_eq!(d1.missing, ["2-def"]);
+        assert_eq!(d1.possible_ancestors, ["1-abc"]);
         // doc2: entirely missing
         let d2 = &diff.results["doc2"];
-        assert!(d2.missing.contains(&"1-xyz".to_string()));
+        assert_eq!(d2.missing, ["1-xyz"]);
+        assert!(d2.possible_ancestors.is_empty());
     }
 
     #[tokio::test]
@@ -2315,66 +2223,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.results.len(), 2);
-        // doc1 should be found
-        assert!(response.results[0].docs[0].ok.is_some());
+        // doc1 should be found, with its ancestry
         let ok_doc = response.results[0].docs[0].ok.as_ref().unwrap();
-        assert_eq!(ok_doc["name"], "Alice");
-        assert!(ok_doc["_revisions"].is_object());
+        let rev: Revision = ok_doc["_rev"].as_str().unwrap().parse().unwrap();
+        assert_eq!(rev.pos, 1);
+        assert_eq!(
+            ok_doc,
+            &serde_json::json!({
+                "_id": "doc1", "_rev": rev.to_string(), "name": "Alice",
+                "_revisions": {"start": 1, "ids": [rev.hash]}
+            })
+        );
         // nonexistent should error
-        assert!(response.results[1].docs[0].error.is_some());
-    }
-
-    #[tokio::test]
-    async fn auto_generate_id() {
-        let (_dir, db) = temp_db();
-
-        let doc = Document {
-            id: String::new(),
-            rev: None,
-            deleted: false,
-            data: serde_json::json!({"auto": true}),
-            attachments: HashMap::new(),
-        };
-        let results = db
-            .bulk_docs(vec![doc], BulkDocsOptions::new())
-            .await
-            .unwrap();
-        assert!(results[0].ok);
-        assert!(!results[0].id.is_empty());
-
-        let fetched = db.get(&results[0].id, GetOptions::default()).await.unwrap();
-        assert_eq!(fetched.data["auto"], true);
-    }
-
-    #[tokio::test]
-    async fn conflict_put_without_rev_on_existing() {
-        let (_dir, db) = temp_db();
-
-        let doc = Document {
-            id: "doc1".into(),
-            rev: None,
-            deleted: false,
-            data: serde_json::json!({"v": 1}),
-            attachments: HashMap::new(),
-        };
-        db.bulk_docs(vec![doc], BulkDocsOptions::new())
-            .await
-            .unwrap();
-
-        // Try to create again without rev => conflict
-        let doc2 = Document {
-            id: "doc1".into(),
-            rev: None,
-            deleted: false,
-            data: serde_json::json!({"v": 2}),
-            attachments: HashMap::new(),
-        };
-        let r = db
-            .bulk_docs(vec![doc2], BulkDocsOptions::new())
-            .await
-            .unwrap();
-        assert!(!r[0].ok);
-        assert_eq!(r[0].error.as_deref(), Some("conflict"));
+        let err = response.results[1].docs[0].error.as_ref().unwrap();
+        assert_eq!(
+            (err.id.as_str(), err.error.as_str()),
+            ("nonexistent", "not_found")
+        );
+        assert!(response.results[1].docs[0].ok.is_none());
     }
 
     #[tokio::test]
@@ -2560,6 +2426,24 @@ mod tests {
 
         let db = RedbAdapter::open(&path, "legacy").unwrap();
         assert_eq!(db.info().await.unwrap().doc_count, 2);
+        // Node status survives the legacy decoding: only the leaf has a body.
+        let shallow = db
+            .get(
+                "shallow",
+                GetOptions {
+                    revs_info: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let statuses: Vec<&str> = shallow.data["_revs_info"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(statuses, ["available", "missing", "missing"]);
         for (id, len) in docs {
             let leaf = format!("{}-{:032x}", len, len);
             let got = db.get(id, GetOptions::default()).await.unwrap();
@@ -2606,15 +2490,53 @@ mod tests {
                 BulkDocsOptions::new(),
             )
             .await;
-        assert!(res.is_err(), "{:?}", res);
-        assert!(db.get("d", GetOptions::default()).await.is_err());
+        assert!(
+            matches!(res, Err(RouchError::DatabaseError(_))),
+            "{:?}",
+            res
+        );
+        assert!(matches!(
+            db.get("d", GetOptions::default()).await,
+            Err(RouchError::DatabaseError(_))
+        ));
         let diff = db
             .revs_diff(HashMap::from([(
                 "d".to_string(),
                 vec!["1-abc".to_string()],
             )]))
             .await;
-        assert!(diff.is_err());
+        assert!(matches!(diff, Err(RouchError::DatabaseError(_))));
+    }
+
+    #[test]
+    fn record_with_bad_parent_index_is_an_error() {
+        // A parent index must point at an EARLIER node; anything else (self,
+        // later, or out of range) is corruption, reported as an error rather
+        // than a panic or a silently different tree.
+        for parent in [1u32, 2, 99] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "revs": [
+                    {"pos": 1, "hash": "a"},
+                    {"pos": 2, "hash": "b", "parent": parent},
+                ],
+                "seq": 1
+            }))
+            .unwrap();
+            assert!(
+                matches!(decode_doc_record(&bytes), Err(RouchError::DatabaseError(_))),
+                "parent {}",
+                parent
+            );
+        }
+        let ok = serde_json::to_vec(&serde_json::json!({
+            "revs": [{"pos": 1, "hash": "a"}, {"pos": 2, "hash": "b", "parent": 0}],
+            "seq": 1
+        }))
+        .unwrap();
+        let (tree, seq) = decode_doc_record(&ok).unwrap();
+        assert_eq!(seq, 1);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].tree.children[0].hash, "b");
     }
 
     #[test]
@@ -2695,7 +2617,8 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(page.rows.len(), 2);
+        let ids = |r: &AllDocsResponse| r.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&page), ["a", "b"]);
         assert_eq!(page.total_rows, 4);
         let range = db
             .all_docs(AllDocsOptions {
@@ -2705,7 +2628,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(range.rows.len(), 2);
+        assert_eq!(ids(&range), ["b", "c"]);
         let key = db
             .all_docs(AllDocsOptions {
                 key: Some("a".into()),
@@ -2713,7 +2636,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(key.rows.len(), 1);
+        assert_eq!(ids(&key), ["a"]);
         let ch = db
             .changes(ChangesOptions {
                 limit: Some(2),
@@ -2721,9 +2644,17 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(ch.results.len(), 2);
+        let seqs: Vec<(u64, &str)> = ch
+            .results
+            .iter()
+            .map(|c| (c.seq.as_num(), c.id.as_str()))
+            .collect();
+        assert_eq!(seqs, [(1, "a"), (2, "b")]);
         // Scanning into the corrupt record still reports the error.
-        assert!(db.all_docs(AllDocsOptions::new()).await.is_err());
+        assert!(matches!(
+            db.all_docs(AllDocsOptions::new()).await,
+            Err(RouchError::DatabaseError(_))
+        ));
     }
 
     /// F87: storage work (fsync'd commits, scans) must not run on the async
@@ -2758,12 +2689,6 @@ mod tests {
                 ticks
             );
         });
-    }
-
-    #[tokio::test]
-    async fn compact_empty_db() {
-        let (_dir, db) = temp_db();
-        db.compact().await.unwrap();
     }
 
     /// F05: files written by rouchdb <= 0.4 stored attachment bytes under
@@ -2819,13 +2744,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_nonexistent_returns_not_found() {
-        let (_dir, db) = temp_db();
-        let result = db.get("nope", GetOptions::default()).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn get_with_conflicts() {
         let (_dir, db) = temp_db();
 
@@ -2862,15 +2780,21 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(fetched.data["_conflicts"].is_array());
-        assert_eq!(fetched.data["_conflicts"].as_array().unwrap().len(), 1);
+        // Same generation: the higher hash wins, the other is the conflict.
+        assert_eq!(fetched.rev.unwrap().to_string(), "1-bbb");
+        assert_eq!(fetched.data["branch"], "b");
+        assert_eq!(fetched.data["_conflicts"], serde_json::json!(["1-aaa"]));
     }
 
     #[tokio::test]
     async fn remove_local_nonexistent() {
         let (_dir, db) = temp_db();
         let result = db.remove_local("nope").await;
-        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(RouchError::NotFound(_))),
+            "{:?}",
+            result
+        );
     }
 
     fn put_raw(db: &RedbAdapter, table: TableDefinition<&str, &[u8]>, key: &str, value: &[u8]) {

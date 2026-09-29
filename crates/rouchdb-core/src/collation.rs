@@ -505,19 +505,40 @@ mod tests {
             json!("ab"),
             json!("b"),
             json!("\u{E9}"),
+            json!("\u{D7FF}"),
+            json!("\u{10000}"),
             json!("\u{1F600}"),
+            json!("\u{1F601}"),
+            json!("\u{10FFFF}"),
+            json!("\u{E000}"),
             json!("\u{FF21}"),
+            json!("\u{FFFF}"),
             json!([]),
+            json!([null]),
+            json!([""]),
+            json!(["", 1]),
+            json!(["\u{0}"]),
+            json!(["\u{1}"]),
+            json!(["\u{2}"]),
+            json!(["\u{2}", 1]),
             json!([1]),
             json!([[1], 2]),
             json!([[1, 2]]),
             json!([1, 2]),
             json!(["a"]),
             json!({}),
+            json!({"": null}),
+            json!({"a": null}),
             json!({"a": 1}),
             json!({"a": 1, "b": 2}),
             json!({"a": 2}),
+            json!({"a ": 1}),
+            json!({"a!": 1}),
+            json!({"a\u{0}": 1}),
+            json!({"ab": 1}),
             json!({"b": 1}),
+            json!({"\u{E000}": 1}),
+            json!({"\u{1F600}": 1}),
         ];
         for a in &values {
             for b in &values {
@@ -526,6 +547,183 @@ mod tests {
                     collate(a, b),
                     "{a} vs {b}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn indexable_string_format() {
+        // The format documented on `to_indexable_string`: type rank, value,
+        // `\0` terminator; \0, \1 and \2 escaped as in pouchdb-collate.
+        for (value, encoded) in [
+            (json!(null), "1\0"),
+            (json!(false), "2F\0"),
+            (json!(true), "2T\0"),
+            (json!(0), "31\0"),
+            (json!(-0.0), "31\0"),
+            (json!(1), "325001\0"),
+            (json!(1.5), "3250015\0"),
+            (json!(-1), "305008:\0"),
+            (json!(120), "3250212\0"),
+            (
+                json!("a\u{0}\u{1}\u{2}\u{3}"),
+                "4a\u{1}\u{1}\u{1}\u{2}\u{2}\u{2}\u{3}\0",
+            ),
+            (json!([]), "5\0"),
+            (json!([null, "b"]), "51\u{0}4b\0\0"),
+            (json!({"a": 1}), "64a\u{0}325001\0\0"),
+        ] {
+            assert_eq!(to_indexable_string(&value), encoded, "{value}");
+        }
+    }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Characters around every boundary of the string encoding: the
+        /// escaped \0, \1 and \2, ASCII below and above the type ranks,
+        /// Latin-1, both sides of the surrogate range, and supplementary
+        /// characters (surrogate pairs in UTF-16).
+        const CHARS: &[char] = &[
+            '\u{0}',
+            '\u{1}',
+            '\u{2}',
+            '\u{3}',
+            ' ',
+            '!',
+            '1',
+            'B',
+            'a',
+            'b',
+            'z',
+            '\u{E9}',
+            '\u{F1}',
+            '\u{7FF}',
+            '\u{D7FF}',
+            '\u{E000}',
+            '\u{FF21}',
+            '\u{FFFF}',
+            '\u{10000}',
+            '\u{1F600}',
+            '\u{1F601}',
+            '\u{10FFFF}',
+        ];
+
+        fn string() -> impl Strategy<Value = String> {
+            prop::collection::vec(prop::sample::select(CHARS), 0..4)
+                .prop_map(|chars| chars.into_iter().collect())
+        }
+
+        /// Object keys: few enough to be shared between objects, with keys
+        /// that are prefixes of others.
+        fn key() -> impl Strategy<Value = String> {
+            prop_oneof![
+                prop::sample::select(vec![
+                    "",
+                    "a",
+                    "a ",
+                    "a!",
+                    "a\u{0}",
+                    "ab",
+                    "b",
+                    "\u{E000}",
+                    "\u{1F600}"
+                ])
+                .prop_map(String::from),
+                string(),
+            ]
+        }
+
+        fn number() -> impl Strategy<Value = Value> {
+            prop_oneof![
+                (-3i64..=3).prop_map(Value::from),
+                any::<i64>().prop_map(Value::from),
+                any::<u64>().prop_map(Value::from),
+                // Fractions, integral floats and -0.0.
+                (
+                    -40i32..=40,
+                    prop::sample::select(vec![1.0, 2.0, 4.0, 10.0, 3.0])
+                )
+                    .prop_map(|(n, d)| json!(f64::from(n) / d)),
+                prop::sample::select(vec![
+                    -0.0,
+                    1e-300,
+                    -1e-300,
+                    1e300,
+                    -1e300,
+                    9_007_199_254_740_992.0
+                ])
+                .prop_map(|f| json!(f)),
+                any::<f64>()
+                    .prop_filter("JSON numbers are finite", |f| f.is_finite())
+                    .prop_map(|f| json!(f)),
+            ]
+        }
+
+        /// Nested JSON values of every type.
+        fn value() -> impl Strategy<Value = Value> {
+            let leaf = prop_oneof![
+                Just(Value::Null),
+                any::<bool>().prop_map(Value::Bool),
+                number(),
+                string().prop_map(Value::String),
+            ];
+            leaf.prop_recursive(3, 24, 4, |inner| {
+                prop_oneof![
+                    prop::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                    prop::collection::vec((key(), inner), 0..4)
+                        .prop_map(|entries| Value::Object(entries.into_iter().collect())),
+                ]
+            })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 300,
+                failure_persistence: None,
+                // Bound shrinking so a failure is reported in seconds (the
+                // default is unbounded, which can take minutes on nested
+                // values and makes mutation runs time out).
+                max_shrink_iters: 1024,
+                ..ProptestConfig::default()
+            })]
+
+            /// `collate` is a total order, and ordering by the indexable
+            /// encoding is the same order.
+            #[test]
+            fn collate_is_a_total_order_matched_by_the_encoding(
+                values in prop::collection::vec(value(), 1..10)
+            ) {
+                let encoded: Vec<String> = values.iter().map(to_indexable_string).collect();
+                for (i, a) in values.iter().enumerate() {
+                    prop_assert_eq!(collate(a, a), Ordering::Equal, "reflexive: {}", a);
+                    for (j, b) in values.iter().enumerate() {
+                        let ab = collate(a, b);
+                        prop_assert_eq!(ab, collate(b, a).reverse(), "antisymmetric: {} {}", a, b);
+                        prop_assert_eq!(
+                            encoded[i].cmp(&encoded[j]),
+                            ab,
+                            "encoding of {} ({:?}) vs {} ({:?})",
+                            a,
+                            encoded[i],
+                            b,
+                            encoded[j]
+                        );
+                        for c in &values {
+                            if ab != Ordering::Greater && collate(b, c) != Ordering::Greater {
+                                prop_assert_ne!(
+                                    collate(a, c),
+                                    Ordering::Greater,
+                                    "transitive: {} <= {} <= {}",
+                                    a,
+                                    b,
+                                    c
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
