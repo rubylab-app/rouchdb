@@ -30,6 +30,21 @@ pub enum RouchError {
     #[error("database error: {0}")]
     DatabaseError(String),
 
+    /// A redb file written by rouchdb 0.4 or earlier was opened without
+    /// allowing its upgrade. The file was not modified.
+    #[error(
+        "{} was written by rouchdb 0.4 or earlier and must be upgraded before this version \
+         can open it (the file was not modified). Run `rouchdb migrate {}` (it keeps a \
+         backup), or open it with OpenOptions::new().upgrade(UpgradePolicy::WithBackup(None)). \
+         Once upgraded, rouchdb 0.4 can no longer open the file",
+        path.display(),
+        path.display()
+    )]
+    UpgradeRequired {
+        /// The database file.
+        path: std::path::PathBuf,
+    },
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

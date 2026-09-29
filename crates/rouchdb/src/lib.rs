@@ -53,7 +53,9 @@ pub use rouchdb_core::merge::{is_deleted, winning_rev};
 pub use rouchdb_adapter_http::auth::{AuthClient, Session, UserContext};
 pub use rouchdb_adapter_http::{HttpAdapter, HttpAdapterOptions};
 pub use rouchdb_adapter_memory::MemoryAdapter;
-pub use rouchdb_adapter_redb::RedbAdapter;
+pub use rouchdb_adapter_redb::{
+    OpenOptions, RedbAdapter, StoredFormat, UpgradePolicy, UpgradeReport,
+};
 
 // Re-export subsystems
 pub use rouchdb_changes::{
@@ -409,8 +411,44 @@ impl Database {
     }
 
     /// Open or create a persistent database backed by redb.
+    ///
+    /// **Files written by rouchdb 0.4 or earlier are not opened**: this
+    /// returns [`RouchError::UpgradeRequired`] and leaves the file untouched.
+    /// Upgrade such a file once with `rouchdb migrate <path>` (which keeps a
+    /// verified backup), [`RedbAdapter::upgrade`], or
+    /// [`Database::open_with`] and [`UpgradePolicy::WithBackup`]. Upgraded
+    /// files, and files created by 0.5, can no longer be opened by 0.4 (it
+    /// refuses them instead of misreading them). See
+    /// [`RedbAdapter::open`] for details.
     pub fn open(path: impl AsRef<Path>, name: &str) -> Result<Self> {
-        let adapter = RedbAdapter::open(path, name)?;
+        Self::open_with(path, name, OpenOptions::default())
+    }
+
+    /// Open or create a persistent database backed by redb, choosing what
+    /// happens to a file written by rouchdb 0.4 or earlier:
+    ///
+    /// ```no_run
+    /// # async fn run() -> rouchdb::Result<()> {
+    /// use rouchdb::{Database, OpenOptions, UpgradePolicy};
+    ///
+    /// // A 0.4 file is upgraded after a verified backup of it is written to
+    /// // `app.redb.rouchdb-0.4.bak`.
+    /// let db = Database::open_with(
+    ///     "app.redb",
+    ///     "app",
+    ///     OpenOptions::new().upgrade(UpgradePolicy::WithBackup(None)),
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The first `compact()` after an upgrade deletes the bodies of old
+    /// revisions and attachment bytes only they reference (0.4 never
+    /// compacted): see [`RedbAdapter::upgrade`]. To get the
+    /// [`UpgradeReport`], open the adapter with [`RedbAdapter::open_with`]
+    /// and wrap it with [`Database::from_adapter`].
+    pub fn open_with(path: impl AsRef<Path>, name: &str, options: OpenOptions) -> Result<Self> {
+        let adapter = RedbAdapter::open_with(path, name, options)?;
         Ok(Self {
             adapter: Arc::new(adapter),
             remote: None,

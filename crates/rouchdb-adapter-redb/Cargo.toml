@@ -15,7 +15,7 @@ readme.workspace = true
 rouchdb-core = { path = "../rouchdb-core", version = "0.5.0" }
 async-trait = "0.1.68"
 base64 = "0.22.1"
-redb = "2"
+redb = "2.3"
 serde = { version = "1.0.184", features = ["derive"] }
 serde_json = { version = "1.0.106", features = ["unbounded_depth"] }
 tokio = { version = "1.37", features = ["rt", "sync"] }
