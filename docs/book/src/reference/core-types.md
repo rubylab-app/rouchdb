@@ -6,6 +6,8 @@ All core types are defined in the `rouchdb-core` crate and re-exported from the 
 use rouchdb::*; // Re-exports all types from rouchdb-core::document
 ```
 
+Types marked `#[non_exhaustive]` below are read by applications but built by the library (or by custom adapters, through their constructors); option and data structs are built with a struct literal ending in `..Default::default()`. See [API Stability](api-stability.md) for the rules.
+
 ---
 
 ## Document
@@ -34,6 +36,7 @@ pub struct Document {
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
+| `new` | `fn new(id: impl Into<String>, data: serde_json::Value) -> Self` | A document to create: no revision, not deleted, no attachments. `Document` also implements `Default`, so a struct literal can end with `..Default::default()` (or `..Document::new(id, data)`). |
 | `from_json` | `fn from_json(value: serde_json::Value) -> Result<Self>` | Parse a CouchDB-style JSON object. Extracts `_id`, `_rev`, `_deleted`, and `_attachments` from the value and puts the remaining fields in `data`. Returns `RouchError::BadRequest` if the value is not a JSON object. |
 | `to_json` | `fn to_json(&self) -> serde_json::Value` | Convert back to a CouchDB-style JSON object with underscore-prefixed metadata fields included. |
 
@@ -145,9 +148,11 @@ pub enum Seq {
 Database metadata returned by `Adapter::info()`.
 
 ```rust
+#[non_exhaustive]
 pub struct DbInfo {
     pub db_name: String,
     pub doc_count: u64,
+    pub doc_del_count: u64,
     pub update_seq: Seq,
 }
 ```
@@ -156,7 +161,10 @@ pub struct DbInfo {
 |-------|------|-------------|
 | `db_name` | `String` | The name of the database. |
 | `doc_count` | `u64` | Number of non-deleted documents. |
+| `doc_del_count` | `u64` | Number of deleted documents. |
 | `update_seq` | `Seq` | The current update sequence number. Increments with every write. |
+
+Custom adapters build it with `DbInfo::new(db_name, doc_count, doc_del_count, update_seq)`.
 
 ---
 
@@ -165,6 +173,7 @@ pub struct DbInfo {
 The result of a single document write operation.
 
 ```rust
+#[non_exhaustive]
 pub struct DocResult {
     pub ok: bool,
     pub id: String,
@@ -181,6 +190,8 @@ pub struct DocResult {
 | `rev` | `Option<String>` | The new revision string if the write succeeded. |
 | `error` | `Option<String>` | Error type (e.g., `"conflict"`) if the write failed. |
 | `reason` | `Option<String>` | Human-readable error description. |
+
+Custom adapters and plugins build it with `DocResult::ok(id, rev)` or `DocResult::error(id, error, reason)`.
 
 ---
 
@@ -221,6 +232,7 @@ pub struct AttachmentMeta {
 Internal metadata stored per document in an adapter. Not typically used in application code.
 
 ```rust
+#[non_exhaustive]
 pub struct DocMetadata {
     pub id: String,
     pub rev_tree: RevTree,
@@ -241,6 +253,7 @@ pub struct DocMetadata {
 Simple response for a successful document write (used in some internal paths).
 
 ```rust
+#[non_exhaustive]
 pub struct PutResponse {
     pub ok: bool,
     pub id: String,
@@ -418,6 +431,7 @@ pub struct FindOptions {
 #### SortField
 
 ```rust
+#[non_exhaustive]
 pub enum SortField {
     Simple(String),
     WithDirection(HashMap<String, String>),
@@ -492,6 +506,7 @@ pub struct GetAttachmentOptions {
 ### AllDocsResponse
 
 ```rust
+#[non_exhaustive]
 pub struct AllDocsResponse {
     pub total_rows: u64,
     pub offset: u64,
@@ -510,6 +525,7 @@ pub struct AllDocsResponse {
 ### AllDocsRow
 
 ```rust
+#[non_exhaustive]
 pub struct AllDocsRow {
     pub id: Option<String>,
     pub key: String,
@@ -542,6 +558,7 @@ The row is a struct with optional members rather than an enum so it maps one-to-
 ### AllDocsRowValue
 
 ```rust
+#[non_exhaustive]
 pub struct AllDocsRowValue {
     pub rev: String,
     pub deleted: Option<bool>,
@@ -558,6 +575,7 @@ pub struct AllDocsRowValue {
 ### ChangesResponse
 
 ```rust
+#[non_exhaustive]
 pub struct ChangesResponse {
     pub results: Vec<ChangeEvent>,
     pub last_seq: Seq,
@@ -572,6 +590,7 @@ pub struct ChangesResponse {
 ### ChangeEvent
 
 ```rust
+#[non_exhaustive]
 pub struct ChangeEvent {
     pub seq: Seq,
     pub id: String,
@@ -594,6 +613,7 @@ pub struct ChangeEvent {
 ### ChangeRev
 
 ```rust
+#[non_exhaustive]
 pub struct ChangeRev {
     pub rev: String,
 }
@@ -610,6 +630,7 @@ pub struct ChangeRev {
 Result of a Mango find query (from `rouchdb-query`).
 
 ```rust
+#[non_exhaustive]
 pub struct FindResponse {
     pub docs: Vec<serde_json::Value>,
 }
@@ -626,6 +647,7 @@ pub struct FindResponse {
 Result of a map/reduce view query (from `rouchdb-query`).
 
 ```rust
+#[non_exhaustive]
 pub struct ViewResult {
     pub total_rows: u64,
     pub offset: u64,
@@ -642,6 +664,7 @@ pub struct ViewResult {
 ### ViewRow
 
 ```rust
+#[non_exhaustive]
 pub struct ViewRow {
     pub id: Option<String>,
     pub key: serde_json::Value,
@@ -680,6 +703,7 @@ pub struct BulkGetItem {
 ### BulkGetResponse
 
 ```rust
+#[non_exhaustive]
 pub struct BulkGetResponse {
     pub results: Vec<BulkGetResult>,
 }
@@ -688,6 +712,7 @@ pub struct BulkGetResponse {
 ### BulkGetResult
 
 ```rust
+#[non_exhaustive]
 pub struct BulkGetResult {
     pub id: String,
     pub docs: Vec<BulkGetDoc>,
@@ -697,6 +722,7 @@ pub struct BulkGetResult {
 ### BulkGetDoc
 
 ```rust
+#[non_exhaustive]
 pub struct BulkGetDoc {
     pub ok: Option<serde_json::Value>,
     pub error: Option<BulkGetError>,
@@ -711,6 +737,7 @@ pub struct BulkGetDoc {
 ### BulkGetError
 
 ```rust
+#[non_exhaustive]
 pub struct BulkGetError {
     pub id: String,
     pub rev: String,
@@ -729,6 +756,7 @@ pub struct BulkGetError {
 ### RevsDiffResponse
 
 ```rust
+#[non_exhaustive]
 pub struct RevsDiffResponse {
     pub results: HashMap<String, RevsDiffResult>,
 }
@@ -739,6 +767,7 @@ The `results` field is flattened during serialization (`#[serde(flatten)]`), so 
 ### RevsDiffResult
 
 ```rust
+#[non_exhaustive]
 pub struct RevsDiffResult {
     pub missing: Vec<String>,
     pub possible_ancestors: Vec<String>,
@@ -757,6 +786,7 @@ pub struct RevsDiffResult {
 Built-in reduce functions for map/reduce views (from `rouchdb-query`).
 
 ```rust
+#[non_exhaustive]
 pub enum ReduceFn {
     Sum,
     Count,

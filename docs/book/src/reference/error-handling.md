@@ -20,8 +20,11 @@ Every async method on `Database` and every `Adapter` trait method returns `Resul
 
 ## RouchError Variants
 
+`RouchError` is `#[non_exhaustive]`: new kinds of errors may be added in minor releases, so a `match` on it needs a catch-all arm (`Err(e) => ...`), as in the examples below.
+
 ```rust
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum RouchError {
     NotFound(String),
     Conflict,

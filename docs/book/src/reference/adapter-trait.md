@@ -177,7 +177,7 @@ This distinction is critical for correct replication behavior. When documents ar
 - Supports `limit` to cap the number of results, `descending` for reverse order, and `doc_ids` to filter by specific document IDs.
 - The `last_seq` in the response can be passed as `since` in the next call for incremental polling.
 
-**`subscribe` (optional):** an adapter that can announce its changes returns a `tokio::sync::broadcast::Receiver<ChangeNotice>` and sends one `ChangeNotice { seq, doc_id }` per changed document once the write is committed (visible to readers); local documents are not announced. The default returns `None`. Live changes streams and live replication wait on these notices and poll `changes` only for adapters without them. The memory and redb adapters implement it; the HTTP adapter does not. Notices are wake-ups: a subscriber that lags (`RecvError::Lagged`) re-reads the changes feed from its last sequence.
+**`subscribe` (optional):** an adapter that can announce its changes returns a `tokio::sync::broadcast::Receiver<ChangeNotice>` and sends one `ChangeNotice::new(seq, doc_id)` per changed document once the write is committed (visible to readers); local documents are not announced. The default returns `None`. Live changes streams and live replication wait on these notices and poll `changes` only for adapters without them. The memory and redb adapters implement it; the HTTP adapter does not. Notices are wake-ups: a subscriber that lags (`RecvError::Lagged`) re-reads the changes feed from its last sequence.
 
 **When they are called:** `all_docs` is called by `Database::all_docs` and internally by the Mango query engine and map/reduce views. `changes` is called by `Database::changes` and is the starting point of every replication cycle.
 
@@ -313,7 +313,8 @@ pub struct MyAdapter { /* ... */ }
 #[async_trait]
 impl Adapter for MyAdapter {
     async fn info(&self) -> Result<DbInfo> {
-        // ...
+        // db_name, doc_count, doc_del_count, update_seq
+        Ok(DbInfo::new("mydb", 0, 0, 0))
     }
 
     async fn get(&self, id: &str, opts: GetOptions) -> Result<Document> {
@@ -323,6 +324,8 @@ impl Adapter for MyAdapter {
     // ... implement all other methods
 }
 ```
+
+The result types adapters return are `#[non_exhaustive]`: build them with their constructors (`DbInfo::new`, `DocResult::ok` / `DocResult::error`, `AllDocsResponse::new`, `AllDocsRow::document` / `not_found`, `ChangesResponse::new`, `ChangeEvent::new`, `RevsDiffResponse::new`, `BulkGetResponse::new`, `BulkGetDoc::ok` / `error`, `PurgeResponse::new`, `ChangeNotice::new`, ...). See [Building Results](../guides/adapters.md#building-results) and [API Stability](api-stability.md).
 
 Then use it with `Database`:
 
