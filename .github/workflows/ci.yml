@@ -90,6 +90,25 @@ jobs:
       - name: Run unit tests with arbitrary-precision numbers
         run: cargo test --workspace --locked --no-fail-fast --features rouchdb/arbitrary-precision
 
+  # The redb upgrade, its backup (create, sync, rename) and the CLI touch the
+  # filesystem in ways that differ on Windows (a file opened read-only
+  # cannot be flushed, open files cannot be renamed over). The CouchDB tests
+  # are #[ignore]d, so none of this needs a server.
+  windows:
+    name: Tests (Windows, redb + CLI)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the redb adapter, CLI and 0.4 compatibility tests
+        run: cargo test -p rouchdb-adapter-redb -p rouchdb-cli -p rouchdb-compat-tests --locked --no-fail-fast
+
   couchdb:
     name: CouchDB integration tests
     runs-on: ubuntu-latest
