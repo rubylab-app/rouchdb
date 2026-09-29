@@ -996,11 +996,19 @@ fn backup_logical(db: &Database, dest: &Path) -> Result<()> {
         .create_new(true)
         .open(&partial)
         .map_err(|e| {
-            RouchError::DatabaseError(format!(
-                "cannot create the backup file {}: {} (nothing was changed)",
-                partial.display(),
-                e
-            ))
+            RouchError::DatabaseError(if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "{} exists, left by an interrupted backup; delete it and retry (nothing \
+                     was changed)",
+                    partial.display()
+                )
+            } else {
+                format!(
+                    "cannot create the backup file {}: {} (nothing was changed)",
+                    partial.display(),
+                    e
+                )
+            })
         })?;
 
     let result = copy_and_verify(db, &partial).and_then(|()| {
@@ -1569,6 +1577,18 @@ mod tests {
             .expect("refused");
         assert!(err.to_string().contains("already exists"), "{err}");
         assert_eq!(std::fs::read(&taken).unwrap(), b"someone's file");
+
+        // A partial copy left by an interrupted backup is never overwritten.
+        let interrupted = dir.path().join("i.bak");
+        std::fs::write(dir.path().join("i.bak.partial"), b"half").unwrap();
+        let err = RedbAdapter::upgrade(&path, UpgradePolicy::WithBackup(Some(interrupted.clone())))
+            .expect_err("refused");
+        assert!(err.to_string().contains("interrupted backup"), "{err}");
+        assert_eq!(
+            std::fs::read(dir.path().join("i.bak.partial")).unwrap(),
+            b"half"
+        );
+        assert!(!interrupted.exists());
 
         let nowhere = dir.path().join("missing-dir").join("x.bak");
         let err = RedbAdapter::upgrade(&path, UpgradePolicy::WithBackup(Some(nowhere.clone())))
