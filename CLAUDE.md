@@ -118,7 +118,7 @@ Clap-based CLI. Read commands: `info`, `get`, `all-docs`, `find`, `changes`, `du
 
 - **Edition 2024**, resolver 3, stable Rust (no nightly features). MSRV 1.88 (`rust-version`); the dev/CI toolchain is pinned in `rust-toolchain.toml`
 - Workspace-level `version` in root `Cargo.toml` — all crate versions must stay in sync
-- Internal dependency versions must match workspace version (e.g., `rouchdb-core = { path = "../rouchdb-core", version = "0.5.0" }`)
+- Internal dependency versions must match workspace version (e.g., `rouchdb-core = { path = "../rouchdb-core", version = "0.5.1" }`)
 - All async via Tokio; tests use `#[tokio::test]`
 - CouchDB integration tests are `#[ignore = "requires CouchDB"]` — they need CouchDB at `http://admin:password@localhost:15984` (override with `COUCHDB_URL` env var). Create their databases with `common::fresh_remote_db` (an RAII guard that deletes it on drop, names start with `rouchdb_test_`) and take host/credentials from `common::couchdb()`; never log in as the admin with a wrong password (CouchDB locks the account)
 - A test that exposes a known unfixed bug is marked `#[ignore = "blocked on Fxx"]` and named `blocked_on_fxx_*` rather than weakened; `scripts/test-couchdb.sh` skips those by name and `scripts/test-blocked.sh` checks they still fail

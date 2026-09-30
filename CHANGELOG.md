@@ -6,7 +6,9 @@ This project follows [Semantic Versioning](https://semver.org/). Since we are pr
 
 ---
 
-## [Unreleased]
+## [0.5.1] - 2026-09-30
+
+Patch release. The only library change is in `rouchdb-adapter-http`: it retries the transient 500s CouchDB 3.5.1 answers right after a database is deleted (see Fixed); there are no API changes. The rest affects `rouchdb-server`, which is not published on crates.io and is installed from the repository: it is hardened (see Security, **two breaking changes to how the server starts and which `Host` headers it answers**) and no longer runs out of stack on deeply nested documents.
 
 ### Security
 
