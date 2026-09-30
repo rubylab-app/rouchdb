@@ -54,6 +54,7 @@ The workspace contains these crates:
 | `rouchdb-server` | CouchDB-compatible HTTP server (not published) |
 | `rouchdb-cli` | Command-line tool (not published) |
 | `rouchdb-bench` | Criterion benchmarks (not published) |
+| `rouchdb-compat-tests` | Cross-version tests against rouchdb 0.4.0 from crates.io (not published) |
 
 ## Running Unit Tests
 
