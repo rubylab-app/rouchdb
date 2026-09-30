@@ -45,6 +45,22 @@ impl AppState {
         self.deleted.swap(deleted, Ordering::SeqCst)
     }
 
+    /// The uuid reported by `GET /` and `GET /{db}`: 32 hex digits (like
+    /// CouchDB's), the MD5 of the served database's persistent identity
+    /// ([`Adapter::id`](rouchdb_core::adapter::Adapter::id)).
+    ///
+    /// HTTP clients identify a database by this uuid plus its name (the
+    /// replication checkpoints of `rouchdb-adapter-http` and PouchDB), so it
+    /// must differ between servers: for a redb file it is stable across
+    /// restarts and differs between files (and for a copy of a file), and
+    /// like the identity it changes when `DELETE /{db}` destroys the
+    /// database.
+    pub async fn uuid(&self) -> Result<String, AppError> {
+        use md5::{Digest, Md5};
+        let id = self.db.adapter().id().await?;
+        Ok(format!("{:x}", Md5::digest(id.as_bytes())))
+    }
+
     /// Check that `db` names the served database and that it exists, as the
     /// first step of every database-level route.
     pub fn check_db(&self, db: &str) -> Result<(), AppError> {

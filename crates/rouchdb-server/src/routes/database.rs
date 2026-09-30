@@ -18,6 +18,7 @@ pub async fn get_db_info(
     state.check_db(&db)?;
 
     let info = state.db.info().await?;
+    let uuid = state.uuid().await?;
     Ok(Json(serde_json::json!({
         "db_name": info.db_name,
         "doc_count": info.doc_count,
@@ -31,7 +32,7 @@ pub async fn get_db_info(
         "disk_format_version": 8,
         "committed_update_seq": info.update_seq,
         "compacted_seq": 0,
-        "uuid": "rouchdb",
+        "uuid": uuid,
         "sizes": {
             "file": 0,
             "external": 0,

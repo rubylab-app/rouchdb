@@ -59,6 +59,8 @@ pub struct Auth {
     sessions: Mutex<HashMap<String, Instant>>,
     /// Sessions that are not used for this long are forgotten.
     timeout: Duration,
+    /// Whether `X-Forwarded-Proto` comes from a trusted reverse proxy.
+    trust_proxy: bool,
 }
 
 /// Result of inspecting the credentials sent with a request.
@@ -85,15 +87,34 @@ impl Auth {
             admin,
             sessions: Mutex::new(HashMap::new()),
             timeout,
+            trust_proxy: false,
         }
     }
 
-    /// The `Set-Cookie` value for a session token. `Max-Age` is the session
-    /// timeout, rounded up to whole seconds (0 would delete the cookie).
-    pub fn session_cookie(&self, token: &str) -> String {
+    /// Trust the `X-Forwarded-Proto` header of the requests (set by a
+    /// reverse proxy that terminates TLS): when it says `https`, session
+    /// cookies get the `Secure` attribute. Off by default, since a client
+    /// talking to the server directly could send any value.
+    pub fn trust_proxy(mut self, trust: bool) -> Self {
+        self.trust_proxy = trust;
+        self
+    }
+
+    /// The `Set-Cookie` value for a session token issued in answer to a
+    /// request with these headers. `Max-Age` is the session timeout, rounded
+    /// up to whole seconds (0 would delete the cookie). The cookie is
+    /// `Secure` only when the proxy is trusted and says the client connected
+    /// over HTTPS: a `Secure` cookie would not come back over plain HTTP, so
+    /// logging in on `http://localhost` would not work.
+    pub fn session_cookie(&self, token: &str, headers: &HeaderMap) -> String {
         let max_age = self.timeout.as_secs() + u64::from(self.timeout.subsec_nanos() > 0);
+        let secure = if self.trust_proxy && forwarded_https(headers) {
+            "; Secure"
+        } else {
+            ""
+        };
         format!(
-            "{SESSION_COOKIE}={token}; Version=1; Max-Age={max_age}; Path=/; HttpOnly; SameSite=Strict"
+            "{SESSION_COOKIE}={token}; Version=1; Max-Age={max_age}; Path=/; HttpOnly; SameSite=Strict{secure}"
         )
     }
 
@@ -166,11 +187,29 @@ impl Auth {
     }
 }
 
+/// Whether a reverse proxy says the client connected over HTTPS: the first
+/// (client-side) entry of `X-Forwarded-Proto` is `https`.
+fn forwarded_https(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .is_some_and(|proto| proto.trim().eq_ignore_ascii_case("https"))
+}
+
+/// Compare two secrets in a time that does not depend on their contents, and
+/// without stopping early when their lengths differ: every byte up to the
+/// longer length is compared (the shorter one padded with zeros) and the
+/// length difference is folded into the result.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(x ^ y);
     }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    // Keep the optimizer from turning the loop into an early exit.
+    std::hint::black_box(diff) == 0
 }
 
 /// Decode `Authorization: Basic base64(user:pass)`.
@@ -277,15 +316,15 @@ pub async fn require_auth(State(state): State<AppState>, req: Request, next: Nex
     }
 
     // Basic credentials take precedence over the cookie in `authenticate`.
-    let session = if basic_credentials(req.headers()).is_none() {
-        session_token(req.headers())
+    let cookie = if basic_credentials(req.headers()).is_none() {
+        session_token(req.headers()).map(|token| auth.session_cookie(&token, req.headers()))
     } else {
         None
     };
     let mut resp = next.run(req).await;
-    if let Some(token) = session
+    if let Some(cookie) = cookie
         && !resp.headers().contains_key(header::SET_COOKIE)
-        && let Ok(cookie) = auth.session_cookie(&token).parse()
+        && let Ok(cookie) = cookie.parse()
     {
         resp.headers_mut().insert(header::SET_COOKIE, cookie);
     }
@@ -301,4 +340,66 @@ pub fn unauthorized(reason: &str) -> Response {
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_time_eq_compares_contents_and_lengths() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"s3cret", b"s3cret"));
+        for (a, b) in [
+            (&b"s3cret"[..], &b"s3creT"[..]),
+            (b"s3cret", b"S3cret"),
+            (b"s3cret", b"s3cre"),
+            (b"s3cret", b"s3cret!"),
+            (b"", b"x"),
+            // Zero padding must not make a prefix equal: the length
+            // difference counts, even when it is a multiple of 256.
+            (b"abc", b"abc\0"),
+            (b"", &[0u8; 256]),
+        ] {
+            assert!(!constant_time_eq(a, b), "{a:?} == {b:?}");
+            assert!(!constant_time_eq(b, a), "{b:?} == {a:?}");
+        }
+    }
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(*name, value.parse().unwrap());
+        }
+        map
+    }
+
+    #[test]
+    fn session_cookie_is_secure_only_behind_a_trusted_https_proxy() {
+        let admin = AdminCredentials::parse("admin:s3cret").unwrap();
+        let plain = "AuthSession=t; Version=1; Max-Age=600; Path=/; HttpOnly; SameSite=Strict";
+        let secure = format!("{plain}; Secure");
+        let https = headers(&[("x-forwarded-proto", "https")]);
+
+        let untrusted = Auth::new(admin.clone());
+        assert_eq!(untrusted.session_cookie("t", &https), plain);
+        assert_eq!(untrusted.session_cookie("t", &HeaderMap::new()), plain);
+
+        let trusted = Auth::new(admin).trust_proxy(true);
+        assert_eq!(trusted.session_cookie("t", &HeaderMap::new()), plain);
+        for (value, is_secure) in [
+            ("https", true),
+            ("HTTPS", true),
+            (" https ", true),
+            ("https, http", true),
+            ("http", false),
+            ("http, https", false),
+            ("", false),
+            ("httpsx", false),
+        ] {
+            let map = headers(&[("x-forwarded-proto", value)]);
+            let expected = if is_secure { secure.as_str() } else { plain };
+            assert_eq!(trusted.session_cookie("t", &map), expected, "{value:?}");
+        }
+    }
 }

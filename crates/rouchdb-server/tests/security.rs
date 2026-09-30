@@ -483,3 +483,411 @@ async fn http_adapter_authenticates_with_url_credentials() {
     assert!(res.ok);
     assert_eq!(remote.get("doc1").await.unwrap().data["x"], 1);
 }
+
+// ─── Host header (DNS rebinding) ────────────────────────────────────────────
+
+const REBOUND: &str = "rebind.attacker.example:5984";
+
+fn assert_host_rejected(resp: &Resp, host: &str) {
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST, "{host}");
+    assert_eq!(
+        resp.json(),
+        json!({
+            "error": "bad_request",
+            "reason": format!("Host {host:?} is not allowed (see --allowed-host)"),
+        })
+    );
+    assert_eq!(resp.header("access-control-allow-origin"), None, "{host}");
+    assert_eq!(resp.header("set-cookie"), None, "{host}");
+    assert_eq!(resp.header("x-content-type-options"), Some("nosniff"));
+}
+
+/// On the default loopback address, a request addressed to another name
+/// (a DNS-rebinding page) is a 400 before anything else runs: no route (not
+/// even the public ones and Fauxton), no authentication, no CORS.
+#[tokio::test]
+async fn loopback_server_rejects_unknown_host_names_before_anything_else() {
+    let config = ServerConfig {
+        cors_origins: vec![APP.into()],
+        ..with_admin()
+    };
+    let db = Arc::new(Database::memory(DB));
+    db.put("a", json!({"v": 1})).await.unwrap();
+    let app = app_with(db.clone(), &config);
+    let auth = basic("admin", "s3cret");
+    let wrong = basic("admin", "wrong");
+
+    for uri in [
+        "/",
+        "/_utils/",
+        "/_utils",
+        "/_uuids",
+        "/_session",
+        "/db",
+        "/db/a",
+    ] {
+        let resp = get_with(&app, uri, &[("host", REBOUND), ("authorization", &auth)]).await;
+        assert_host_rejected(&resp, REBOUND);
+        // Not a 401 either: the Host check runs before authentication.
+        let resp = get_with(&app, uri, &[("host", REBOUND), ("authorization", &wrong)]).await;
+        assert_host_rejected(&resp, REBOUND);
+    }
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri("/db")
+        .header(header::HOST, REBOUND)
+        .header(header::AUTHORIZATION, &auth)
+        .body(Body::empty())
+        .unwrap();
+    assert_host_rejected(&send(&app, req).await, REBOUND);
+    assert!(db.get("a").await.is_ok(), "the rejected DELETE did nothing");
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/_session")
+        .header(header::HOST, REBOUND)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"name": "admin", "password": "s3cret"}"#))
+        .unwrap();
+    assert_host_rejected(&send(&app, req).await, REBOUND);
+    // A CORS preflight too, even from an allowed origin.
+    let req = Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/db")
+        .header(header::HOST, REBOUND)
+        .header(header::ORIGIN, APP)
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "DELETE")
+        .body(Body::empty())
+        .unwrap();
+    assert_host_rejected(&send(&app, req).await, REBOUND);
+
+    // An absolute-form request target (or an HTTP/2 authority) is checked
+    // like the Host header, and every Host header must be allowed.
+    let req = Request::builder()
+        .uri("http://rebind.attacker.example/db")
+        .header(header::AUTHORIZATION, &auth)
+        .body(Body::empty())
+        .unwrap();
+    assert_host_rejected(&send(&app, req).await, "rebind.attacker.example");
+    let req = Request::builder()
+        .uri("/db")
+        .header(header::HOST, "localhost:5984")
+        .header(header::HOST, REBOUND)
+        .header(header::AUTHORIZATION, &auth)
+        .body(Body::empty())
+        .unwrap();
+    assert_host_rejected(&send(&app, req).await, REBOUND);
+
+    let req = Request::builder()
+        .uri("/db")
+        .header(header::HOST, &b"caf\xe9"[..])
+        .body(Body::empty())
+        .unwrap();
+    let resp = send(&app, req).await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        resp.json(),
+        json!({"error": "bad_request", "reason": "Malformed Host header"})
+    );
+}
+
+#[tokio::test]
+async fn loopback_server_answers_loopback_names_and_requests_without_host() {
+    let app = app();
+    for host in [
+        "localhost",
+        "localhost:5984",
+        "LocalHost:5984",
+        "127.0.0.1",
+        "127.0.0.1:5984",
+        "[::1]",
+        "[::1]:5984",
+    ] {
+        let resp = get_with(&app, "/db", &[("host", host)]).await;
+        assert_eq!(resp.status, StatusCode::OK, "{host}");
+    }
+    for host in ["127.0.0.1.nip.io", "localhost.attacker.example", "::1"] {
+        let resp = get_with(&app, "/db", &[("host", host)]).await;
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST, "{host}");
+    }
+    // HTTP/1.0 requests may omit Host; browsers never do.
+    assert_eq!(get(&app, "/db").await.status, StatusCode::OK);
+    let req = Request::builder()
+        .uri("http://127.0.0.1:5984/db")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&app, req).await.status, StatusCode::OK);
+}
+
+/// The names a reverse proxy forwards are declared with `allowed_hosts`
+/// (`--allowed-host`); the bind address is accepted too.
+#[tokio::test]
+async fn allowed_hosts_extend_the_loopback_names() {
+    let config = ServerConfig {
+        host: "127.0.0.2".into(),
+        allowed_hosts: vec!["db.example.com".into(), "10.0.0.5".into()],
+        ..config()
+    };
+    let app = app_with(Arc::new(Database::memory(DB)), &config);
+    for host in [
+        "db.example.com",
+        "DB.example.com:443",
+        "10.0.0.5:5984",
+        "127.0.0.2:5984",
+        "localhost:5984",
+    ] {
+        let resp = get_with(&app, "/db", &[("host", host)]).await;
+        assert_eq!(resp.status, StatusCode::OK, "{host}");
+    }
+    for host in ["example.com", "www.db.example.com", "10.0.0.6"] {
+        let resp = get_with(&app, "/db", &[("host", host)]).await;
+        assert_host_rejected(&resp, host);
+    }
+}
+
+/// On a non-loopback address the Host header is only checked when
+/// `allowed_hosts` lists names: then those, the loopback names and the bind
+/// address are accepted.
+#[tokio::test]
+async fn non_loopback_server_checks_host_only_with_allowed_hosts() {
+    let open = ServerConfig {
+        host: "0.0.0.0".into(),
+        ..with_admin()
+    };
+    let app = app_with(Arc::new(Database::memory(DB)), &open);
+    let auth = basic("admin", "s3cret");
+    for host in [REBOUND, "db.example.com", "192.168.1.10:5984"] {
+        let resp = get_with(&app, "/db", &[("host", host), ("authorization", &auth)]).await;
+        assert_eq!(resp.status, StatusCode::OK, "{host}");
+    }
+
+    for bind in ["0.0.0.0", "::", "192.168.1.10"] {
+        let checked = ServerConfig {
+            host: bind.into(),
+            allowed_hosts: vec!["db.example.com".into()],
+            ..with_admin()
+        };
+        let app = app_with(Arc::new(Database::memory(DB)), &checked);
+        let bind_host = if bind.contains(':') {
+            format!("[{bind}]:5984")
+        } else {
+            format!("{bind}:5984")
+        };
+        for host in [
+            "db.example.com:5984",
+            "localhost",
+            "127.0.0.1:5984",
+            "[::1]:5984",
+            &bind_host,
+        ] {
+            let resp = get_with(&app, "/db", &[("host", host), ("authorization", &auth)]).await;
+            assert_eq!(resp.status, StatusCode::OK, "{bind}: {host}");
+        }
+        let resp = get_with(&app, "/db", &[("host", REBOUND), ("authorization", &auth)]).await;
+        assert_host_rejected(&resp, REBOUND);
+    }
+}
+
+/// Through a real socket (hyper parses the request): the client's Host
+/// header decides.
+#[tokio::test]
+async fn host_check_applies_to_requests_over_tcp() {
+    let addr = serve(app()).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("http://{addr}/db"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let resp = client
+        .get(format!("http://{addr}/db"))
+        .header("host", REBOUND)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(body["error"], "bad_request");
+}
+
+// ─── Startup checks ─────────────────────────────────────────────────────────
+
+#[test]
+fn non_loopback_address_without_admin_is_refused() {
+    for host in ["0.0.0.0", "::", "[::]", "192.168.1.10", "myhost.local"] {
+        let unauthenticated = ServerConfig {
+            host: host.into(),
+            ..config()
+        };
+        let err = unauthenticated.validate().unwrap_err();
+        assert!(err.contains(&format!("{host:?}")), "{err}");
+        assert!(err.contains("--admin user:password"), "{err}");
+        assert!(err.contains("ROUCHDB_ADMIN"), "{err}");
+        assert!(err.contains("--allow-unauthenticated"), "{err}");
+        assert!(err.contains("ROUCHDB_ALLOW_UNAUTHENTICATED=1"), "{err}");
+
+        let with_auth = ServerConfig {
+            host: host.into(),
+            ..with_admin()
+        };
+        assert_eq!(with_auth.validate(), Ok(()), "{host}");
+        let opted_in = ServerConfig {
+            host: host.into(),
+            allow_unauthenticated: true,
+            ..config()
+        };
+        assert_eq!(opted_in.validate(), Ok(()), "{host}");
+    }
+    for host in ["127.0.0.1", "127.0.0.2", "::1", "[::1]", "localhost"] {
+        let loopback = ServerConfig {
+            host: host.into(),
+            ..config()
+        };
+        assert_eq!(loopback.validate(), Ok(()), "{host}");
+    }
+
+    let bad_host = ServerConfig {
+        allowed_hosts: vec!["db.example.com:443".into()],
+        ..config()
+    };
+    assert!(
+        bad_host
+            .validate()
+            .unwrap_err()
+            .contains("db.example.com:443")
+    );
+}
+
+/// `start_server` refuses before binding. (192.0.2.1 is a documentation
+/// address that no machine has, so a regression fails to bind instead of
+/// listening.)
+#[tokio::test]
+async fn start_server_refuses_before_binding() {
+    let config = ServerConfig {
+        host: "192.0.2.1".into(),
+        port: 0,
+        ..config()
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        rouchdb_server::start_server(Arc::new(Database::memory(DB)), config),
+    )
+    .await
+    .expect("start_server returned");
+    let err = result.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    assert!(err.to_string().contains("--allow-unauthenticated"), "{err}");
+}
+
+// ─── Response headers ───────────────────────────────────────────────────────
+
+/// Every response says `X-Content-Type-Options: nosniff`, so a browser
+/// never runs an attachment or a Fauxton file as another type (the
+/// attachments are also sandboxed).
+#[tokio::test]
+async fn responses_forbid_content_sniffing() {
+    let app = app();
+    let resp = call(&app, Method::PUT, "/db/doc", Some(json!({}))).await;
+    let rev = resp.json()["rev"].as_str().unwrap().to_string();
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri(format!("/db/doc/page.txt?rev={rev}"))
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(Body::from("<script>alert(1)</script>"))
+        .unwrap();
+    assert_eq!(send(&app, req).await.status, StatusCode::CREATED);
+
+    let resp = get(&app, "/db/doc/page.txt").await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(resp.header("content-type"), Some("text/plain"));
+    assert_eq!(resp.header("content-security-policy"), Some("sandbox"));
+    assert_eq!(resp.header("x-content-type-options"), Some("nosniff"));
+
+    for uri in [
+        "/_utils",
+        "/_utils/",
+        "/_utils/index.html",
+        "/_utils/dashboard.assets/js/missing.js",
+        "/",
+        "/db",
+        "/db/missing",
+        "/nope/x/y",
+    ] {
+        let resp = get(&app, uri).await;
+        assert_eq!(
+            resp.header("x-content-type-options"),
+            Some("nosniff"),
+            "{uri}: {}",
+            resp.status
+        );
+    }
+    let resp = preflight(&app, "/db", EVIL).await;
+    assert_eq!(resp.header("x-content-type-options"), Some("nosniff"));
+}
+
+// ─── Secure cookie behind a trusted proxy ───────────────────────────────────
+
+async fn login_with(app: &axum::Router, headers: &[(&str, &str)]) -> Resp {
+    let mut req = Request::builder()
+        .method(Method::POST)
+        .uri("/_session")
+        .header(header::CONTENT_TYPE, "application/json");
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let body = Body::from(r#"{"name": "admin", "password": "s3cret"}"#);
+    send(app, req.body(body).unwrap()).await
+}
+
+const SESSION_ATTRS: &str = "; Version=1; Max-Age=600; Path=/; HttpOnly; SameSite=Strict";
+
+#[tokio::test]
+async fn session_cookie_is_secure_only_behind_a_trusted_https_proxy() {
+    let https = [("x-forwarded-proto", "https")];
+
+    // Without --trust-proxy the header is ignored: login over plain HTTP
+    // must keep working.
+    let app = app_with(Arc::new(Database::memory(DB)), &with_admin());
+    for headers in [&https[..], &[]] {
+        let resp = login_with(&app, headers).await;
+        let set_cookie = resp.header("set-cookie").unwrap();
+        assert!(set_cookie.ends_with(SESSION_ATTRS), "{set_cookie}");
+    }
+
+    let config = ServerConfig {
+        trust_proxy: true,
+        ..with_admin()
+    };
+    let app = app_with(Arc::new(Database::memory(DB)), &config);
+    let resp = login_with(&app, &[("x-forwarded-proto", "http")]).await;
+    let set_cookie = resp.header("set-cookie").unwrap();
+    assert!(set_cookie.ends_with(SESSION_ATTRS), "{set_cookie}");
+
+    let resp = login_with(&app, &https).await;
+    let set_cookie = resp.header("set-cookie").unwrap().to_string();
+    assert!(
+        set_cookie.ends_with(&format!("{SESSION_ATTRS}; Secure")),
+        "{set_cookie}"
+    );
+    let cookie = set_cookie.split(';').next().unwrap().to_string();
+
+    // The cookie refreshed on a cookie-authenticated request keeps `Secure`.
+    let resp = get_with(
+        &app,
+        "/db",
+        &[("cookie", &cookie), ("x-forwarded-proto", "https")],
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(
+        resp.header("set-cookie"),
+        Some(format!("{cookie}{SESSION_ATTRS}; Secure").as_str())
+    );
+    let resp = get_with(&app, "/db", &[("cookie", &cookie)]).await;
+    assert_eq!(
+        resp.header("set-cookie"),
+        Some(format!("{cookie}{SESSION_ATTRS}").as_str())
+    );
+}

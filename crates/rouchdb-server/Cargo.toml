@@ -27,6 +27,7 @@ uuid = { version = "1", features = ["v4"] }
 base64 = "0.22.1"
 serde_urlencoded = "0.7.1"
 futures-util = { version = "0.3", default-features = false }
+md-5 = "0.10"
 
 [dev-dependencies]
 http-body-util = "0.1"

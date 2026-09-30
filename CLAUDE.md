@@ -104,7 +104,7 @@ All documents are `serde_json::Value` (dynamic JSON). `Document` struct holds `i
 
 ### Server Architecture (`rouchdb-server/src/`)
 
-Axum 0.8 HTTP server. Single-db mode: one `.redb` file = one database. Route order matters — specific `_`-prefixed routes before `/{db}/{docid}` catch-all. State: `AppState { db: Arc<Database>, db_name: String }`. CORS is off unless `ServerConfig::cors_origins` / `--cors-origin` lists origins; optional admin auth via `ServerConfig::admin` / `--admin`. Error mapping: `RouchError` → CouchDB JSON `{"error": "...", "reason": "..."}`.
+Axum 0.8 HTTP server. Single-db mode: one `.redb` file = one database. Route order matters — specific `_`-prefixed routes before `/{db}/{docid}` catch-all. State: `AppState { db: Arc<Database>, db_name: String }`. CORS is off unless `ServerConfig::cors_origins` / `--cors-origin` lists origins; optional admin auth via `ServerConfig::admin` / `--admin`, required on a non-loopback `--host` unless `--allow-unauthenticated`. On a loopback `--host` (or with `--allowed-host`) the `Host` check (`host.rs`) answers 400, before auth, CORS and routing, to a `Host` that is not a loopback name, the bind address or an allowed host; every response gets `X-Content-Type-Options: nosniff`. Error mapping: `RouchError` → CouchDB JSON `{"error": "...", "reason": "..."}`.
 
 Reports CouchDB 3.3.3 at `GET /` so Fauxton enables all UI panels. `POST /_session` accepts both JSON and form-encoded data (Fauxton sends form data). Sets `AuthSession` cookie for browser-based auth flow.
 

@@ -168,19 +168,99 @@ Options:
       --db-name <NAME>             Database name [default: filename without extension]
       --admin <USER:PASSWORD>      Require admin credentials [env: ROUCHDB_ADMIN]
       --cors-origin <ORIGIN>       Allow CORS from this origin (repeatable) [env: ROUCHDB_CORS_ORIGINS]
+      --allowed-host <HOST>        Also accept this name in the Host header (repeatable) [env: ROUCHDB_ALLOWED_HOSTS]
+      --allow-unauthenticated      Serve on a non-loopback --host without --admin [env: ROUCHDB_ALLOW_UNAUTHENTICATED]
+      --trust-proxy                Trust X-Forwarded-Proto from a reverse proxy [env: ROUCHDB_TRUST_PROXY]
       --max-request-size <BYTES>   Largest accepted request body [default: 67108864]
       --session-timeout <SECONDS>  Idle lifetime of a _session cookie [default: 600]
+      --upgrade                    Upgrade a file written by rouchdb 0.4 (after a verified backup)
 ```
 
-By default the server listens on `127.0.0.1` with CORS disabled and no
-authentication. Set `ROUCHDB_ADMIN=user:password` to require credentials
-(HTTP Basic auth or a `_session` cookie, which expires after
-`--session-timeout` seconds without use), and allow browser apps on other
-origins explicitly with `--cors-origin`.
+`rouchdb-server --help` describes every option. Switches set through the
+environment take `1`, `true`, `yes`, `on` (or `0`, `false`, `no`, `off`).
 
 The server serves a single database. `DELETE /{db}` destroys its data and the
 database answers 404 until `PUT /{db}` creates it again (a restart also brings
 it back, empty).
+
+`GET /` and `GET /{db}` report a `uuid` (32 hex digits, like CouchDB's)
+derived from the served database's identity (`Adapter::id()`): it is stable
+across restarts on the same file, different for every file, and renewed when
+`DELETE /{db}` destroys the database. HTTP clients (`Database::http`, PouchDB)
+identify a database by this uuid plus its name, so two servers that serve
+same-named databases are two databases to them, and replication between them
+resumes from its checkpoints.
+
+### Server security
+
+The defaults are meant for local development: the server listens on
+`127.0.0.1`, CORS is disabled and authentication is off.
+
+- **Authentication.** Set `ROUCHDB_ADMIN=user:password` (or `--admin`) to
+  require credentials: HTTP Basic auth or a `_session` cookie (`HttpOnly`,
+  `SameSite=Strict`), which expires after `--session-timeout` seconds without
+  use. Only `/`, `/_session`, `/_uuids` and `/_utils` stay public. Prefer the
+  environment variable, so the password does not show up in the shell history
+  or `ps`.
+- **Listening on the network.** On an address other than loopback
+  (`--host 0.0.0.0`, `::`, a LAN address or a host name other than
+  `localhost`) the server **refuses to start without `--admin`**, since anyone
+  who can reach the address could read, write and delete the database:
+
+  ```bash
+  ROUCHDB_ADMIN=admin:secret rouchdb-server mydb.redb --host 0.0.0.0
+  ```
+
+  If every client that can reach the address is trusted (an isolated
+  container network, for example), serve without authentication explicitly
+  with `--allow-unauthenticated` (or `ROUCHDB_ALLOW_UNAUTHENTICATED=1`); the
+  server then prints a warning at startup.
+- **CORS.** Allow browser apps on other origins explicitly with
+  `--cors-origin http://localhost:3000` (repeatable). Credentials are allowed
+  for listed origins; `*` allows any origin without credentials.
+- **Host header (DNS rebinding).** A web page can point its own domain name at
+  `127.0.0.1` after it has loaded, and then talk to a local server with
+  same-origin requests, which CORS does not stop; the browser still sends the
+  page's domain in the `Host` header. On a loopback `--host` the server
+  therefore only answers requests addressed to `localhost`, `127.0.0.1`,
+  `[::1]` or the `--host` address (with any port, in any case), and answers
+  any other `Host` with a `400 bad_request`, before authentication, CORS and
+  routing (`/_utils` included). A request without `Host` (HTTP/1.0) is
+  served: browsers always send it. `--allowed-host` (repeatable, or
+  comma-separated in `ROUCHDB_ALLOWED_HOSTS`) adds names or IP addresses,
+  without port. On any other `--host` the header is checked only when
+  `--allowed-host` is given, and the loopback names and the `--host` address
+  are then accepted too.
+- **Response headers.** Every response carries
+  `X-Content-Type-Options: nosniff`, and attachments are served with
+  `Content-Security-Policy: sandbox`, so an uploaded HTML page or script
+  cannot run on the server's origin.
+- **Not covered.** Per-database `_security` members and admins are stored but
+  not enforced: with `--admin`, the admin is the only user.
+
+#### Behind a reverse proxy
+
+A reverse proxy (nginx, Caddy, Traefik, ...) in front of a server on loopback
+usually forwards the client's `Host`, its public name. Declare that name, or
+the server answers 400:
+
+```bash
+ROUCHDB_ADMIN=admin:secret rouchdb-server mydb.redb \
+  --allowed-host db.example.com --trust-proxy
+```
+
+- `--trust-proxy` (`ROUCHDB_TRUST_PROXY=1`) tells the server that
+  `X-Forwarded-Proto` comes from the proxy: when it says `https`, the
+  `_session` cookie gets the `Secure` attribute. Without the flag the header
+  does not change the cookie (a `Secure` cookie never comes back over plain
+  HTTP, which would break logging in on `http://localhost`). Only use it when
+  the proxy sets that header, since a client that reaches the server directly
+  could send any value.
+- As in CouchDB, the `Location` header of `201 Created` responses is an
+  absolute URL built from `X-Forwarded-Host` and `X-Forwarded-Proto` when the
+  request has them (with or without `--trust-proxy`), else from `Host`. Only
+  `Host` is checked against the allowed names, so if your clients follow
+  `Location`, have the proxy set `X-Forwarded-Host` (or drop the client's).
 
 ## Async Runtime
 

@@ -156,7 +156,7 @@ any CouchDB client can connect to. Serves the Fauxton web dashboard via
 `rust-embed` for embedded static files.
 
 Dependencies: `rouchdb`, `rouchdb-core`, `axum`, `tower-http`, `rust-embed`,
-`clap`, `serde`, `serde_json`, `tokio`, `uuid`.
+`clap`, `serde`, `serde_json`, `tokio`, `uuid`, `md-5`.
 
 ### 11. `rouchdb-cli`
 
