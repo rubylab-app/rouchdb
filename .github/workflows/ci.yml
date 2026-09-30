@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -73,7 +73,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -92,14 +92,16 @@ jobs:
 
   # The redb upgrade, its backup (create, sync, rename) and the CLI touch the
   # filesystem in ways that differ on Windows (a file opened read-only
-  # cannot be flushed, open files cannot be renamed over). The CouchDB tests
-  # are #[ignore]d, so none of this needs a server.
+  # cannot be flushed, open files cannot be renamed over). Windows also has
+  # the smallest thread stacks (a 1 MiB main thread), which documents nested
+  # MAX_NESTING_DEPTH levels deep test in the CLI and the server binaries.
+  # The CouchDB tests are #[ignore]d, so none of this needs a CouchDB.
   windows:
-    name: Tests (Windows, redb + CLI)
+    name: Tests (Windows, redb + CLI + server)
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -113,6 +115,11 @@ jobs:
 
       - name: Run the CLI and 0.4 compatibility tests
         run: cargo test -p rouchdb-cli -p rouchdb-compat-tests --locked --no-fail-fast
+
+      # deep_json_binary runs the rouchdb-server binary itself, so the
+      # stacks of its own threads are the ones under test.
+      - name: Run the server's deep-document tests
+        run: cargo test -p rouchdb-server --locked --no-fail-fast --test deep_json_binary --test deep_json
 
   couchdb:
     name: CouchDB integration tests
@@ -135,7 +142,7 @@ jobs:
     env:
       COUCHDB_URL: http://admin:password@localhost:15984
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -190,7 +197,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -218,7 +225,7 @@ jobs:
       # the root Cargo.toml.
       RUSTUP_TOOLCHAIN: "1.88.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -243,7 +250,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@master
         with:

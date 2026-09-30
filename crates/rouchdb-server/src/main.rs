@@ -87,10 +87,40 @@ fn infer_db_name(path: &str) -> String {
         .to_string()
 }
 
-#[tokio::main]
-async fn main() {
+/// Stack of the thread that starts the server (it rebuilds the Mango
+/// indexes) and of the runtime's worker and blocking threads (they serve
+/// the requests). Documents, selectors and index keys may be nested up to
+/// `MAX_NESTING_DEPTH` levels, which parsing, matching, sorting and
+/// serializing walk recursively: more than the 1 MiB main thread of Windows
+/// or tokio's 2 MiB threads hold (a debug build needs about 3 MiB for a
+/// selector of 1000 nested objects). The memory is reserved, not committed,
+/// until used; less than the CLI's 64 MiB because a server may run many
+/// threads.
+const STACK_SIZE: usize = 16 * 1024 * 1024;
+
+fn main() {
     let cli = Cli::parse();
 
+    std::thread::Builder::new()
+        .name("rouchdb-server".into())
+        .stack_size(STACK_SIZE)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(STACK_SIZE)
+                .build()
+                .unwrap_or_else(|e| {
+                    eprintln!("Server error: {e}");
+                    process::exit(1);
+                });
+            runtime.block_on(run(cli));
+        })
+        .expect("cannot start the server thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+async fn run(cli: Cli) {
     let db_name = cli.db_name.unwrap_or_else(|| infer_db_name(&cli.path));
 
     let options = if cli.upgrade {

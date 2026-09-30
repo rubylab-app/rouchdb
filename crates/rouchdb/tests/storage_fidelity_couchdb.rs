@@ -296,6 +296,48 @@ async fn local_documents_design_conflicts_and_destroy_over_http() {
     delete_remote_db(&url).await;
 }
 
+/// Destroying a database that other clients are reading. Their reads can
+/// put the database's shards back into CouchDB's shard map cache while it
+/// is being deleted; until CouchDB notices, it answers another `DELETE`
+/// with a 500 `badarg` (instead of a 404) and other requests with a 500
+/// "No DB shards could be opened.". `destroy` and the re-creation on next
+/// use wait that out instead of failing.
+#[tokio::test]
+#[ignore = "requires CouchDB"]
+async fn destroy_and_reuse_while_other_clients_read() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let url = fresh_remote_db("sfid_race").await;
+    let db = Database::http(&url);
+    for round in 0..10 {
+        db.put("doc", serde_json::json!({"round": round}))
+            .await
+            .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let (stop, doc_url) = (stop.clone(), format!("{}/doc", &*url));
+                tokio::spawn(async move {
+                    let client = reqwest::Client::new();
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = client.get(&doc_url).send().await;
+                    }
+                })
+            })
+            .collect();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        db.destroy().await.unwrap();
+        db.destroy().await.unwrap();
+        stop.store(true, Ordering::Relaxed);
+        for reader in readers {
+            reader.await.unwrap();
+        }
+        let info = db.info().await.unwrap();
+        assert_eq!(info.doc_count, 0, "round {round}");
+    }
+}
+
 /// Q-CORE-10 / Q-CORE-11: `revs_diff` and stub handling give the same
 /// answers on memory as on CouchDB.
 #[tokio::test]

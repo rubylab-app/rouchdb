@@ -39,7 +39,7 @@ jobs:
     env:
       COUCHDB_URL: http://admin:password@localhost:15984
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install pinned toolchain
         run: |
@@ -76,7 +76,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: coverage-lcov-${{ github.sha }}
           path: lcov.info
