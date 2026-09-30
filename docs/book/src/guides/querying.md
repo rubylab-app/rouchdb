@@ -161,6 +161,10 @@ Use dot notation to query nested objects:
 let selector = json!({"address.city": "NYC"});
 ```
 
+### Deeply Nested Selectors
+
+Compiling and matching a selector recurse once per nested object, and `find` does not limit how deep a selector is. On a 2 MiB thread (the default for Tokio workers), a debug build overflows the stack, aborting the process, at around 700 levels of nested objects; a release build handles a few thousand. Selectors parsed with `serde_json::from_str` are safe, because serde_json stops at 127 levels. If your application accepts selectors that may be deeper (from `rouchdb_core::json::from_slice`, another parser, or built in code), check their depth first with `rouchdb_core::json::value_depth`, or run queries on threads with a larger stack (`tokio::runtime::Builder::thread_stack_size`). `rouchdb-server` runs on 16 MiB threads for this reason.
+
 ## Map/Reduce Views
 
 Map/reduce gives you full programmatic control. You provide a **map function** (a Rust closure) that receives each document and emits key-value pairs. An optional **reduce function** aggregates the emitted values.
