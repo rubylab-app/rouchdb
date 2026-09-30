@@ -72,7 +72,13 @@ async fn attachment_put_on_missing_doc_creates_the_first_revision() {
 
 #[tokio::test]
 async fn write_responses_carry_location_and_etag() {
-    let app = app();
+    // The server listens on loopback, so it answers these names only once
+    // they are declared (as for a reverse proxy that forwards its Host).
+    let config = ServerConfig {
+        allowed_hosts: vec!["example.com".into(), "internal".into()],
+        ..config()
+    };
+    let app = app_with(Arc::new(Database::memory(DB)), &config);
     let host = [("host", "example.com:5984")];
 
     let resp = request(&app, Method::PUT, "/db/a%20b", &host, Some("{}")).await;

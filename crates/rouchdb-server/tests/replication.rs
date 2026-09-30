@@ -763,3 +763,119 @@ async fn replication_through_the_server_keeps_full_revision_state() {
     assert_eq!(local.replicate_from(&remote).await.unwrap().docs_written, 0);
     assert_eq!(full_snapshot(&server_db).await, on_server);
 }
+
+// ─── Server uuid ────────────────────────────────────────────────────────────
+
+/// The uuids `GET /` and `GET /{db}` report for the database in `path`.
+async fn uuids_of(path: &std::path::Path) -> (String, String) {
+    let app = app_with(Arc::new(Database::open(path, DB).unwrap()), &config());
+    let root = get(&app, "/").await.json()["uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let info = get(&app, "/db").await.json()["uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    (root, info)
+}
+
+fn assert_couchdb_uuid(uuid: &str) {
+    assert_eq!(uuid.len(), 32, "{uuid}");
+    assert!(
+        uuid.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "{uuid}"
+    );
+}
+
+/// The uuid is derived from the served database's persistent identity:
+/// stable across restarts on the same file, different for another file
+/// holding a database of the same name.
+#[tokio::test]
+async fn server_uuid_is_the_identity_of_the_served_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a.redb"), dir.path().join("b.redb"));
+
+    let (root_a, info_a) = uuids_of(&a).await;
+    assert_couchdb_uuid(&root_a);
+    assert_eq!(info_a, root_a);
+    let (root_b, info_b) = uuids_of(&b).await;
+    assert_couchdb_uuid(&root_b);
+    assert_eq!(info_b, root_b);
+    assert_ne!(root_a, root_b, "same-named databases in different files");
+
+    // Reopening the file (a server restart) keeps the uuid.
+    assert_eq!(uuids_of(&a).await, (root_a.clone(), root_a.clone()));
+
+    // Destroying the database (`DELETE /{db}`) renews its identity, and so
+    // the uuid.
+    let app = app_with(Arc::new(Database::open(&a, DB).unwrap()), &config());
+    assert_eq!(delete(&app, "/db").await.status, StatusCode::OK);
+    assert_eq!(
+        call(&app, axum::http::Method::PUT, "/db", None)
+            .await
+            .status,
+        StatusCode::CREATED
+    );
+    let renewed = get(&app, "/").await.json()["uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_couchdb_uuid(&renewed);
+    assert_ne!(renewed, root_a);
+    drop(app);
+    assert_eq!(uuids_of(&a).await.0, renewed);
+
+    // In memory every database has its own identity too.
+    let one = get(&app_with(Arc::new(Database::memory(DB)), &config()), "/").await;
+    let two = get(&app_with(Arc::new(Database::memory(DB)), &config()), "/").await;
+    assert_couchdb_uuid(one.json()["uuid"].as_str().unwrap());
+    assert_ne!(one.json()["uuid"], two.json()["uuid"]);
+}
+
+/// Two servers that serve a database of the same name used to report the
+/// same uuid, so `rouchdb-adapter-http` gave both databases the same
+/// identity: replication between them ran without checkpoints (with a
+/// warning) and rescanned everything on every run.
+#[tokio::test]
+async fn replication_between_same_named_servers_resumes_from_checkpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = Arc::new(Database::open(dir.path().join("a.redb"), DB).unwrap());
+    let target = Arc::new(Database::open(dir.path().join("b.redb"), DB).unwrap());
+    seed(&source).await;
+    let source_addr = serve(app_with(source.clone(), &config())).await;
+    let target_addr = serve(app_with(target.clone(), &config())).await;
+    let remotes = || {
+        (
+            Database::http(&format!("http://{source_addr}/{DB}")),
+            Database::http(&format!("http://{target_addr}/{DB}")),
+        )
+    };
+
+    let (from, to) = remotes();
+    let first = from
+        .replicate_to_with_opts(&to, small_batches())
+        .await
+        .unwrap();
+    assert!(first.ok, "{:?}", first.errors);
+    assert!(first.warnings.is_empty(), "{:?}", first.warnings);
+    assert_eq!(first.docs_written, 30);
+    assert_same_docs(&source, &target).await;
+
+    // A later run, with new handles as after a restart of the client,
+    // resumes from the checkpoint instead of rescanning.
+    let (from, to) = remotes();
+    let again = from
+        .replicate_to_with_opts(&to, small_batches())
+        .await
+        .unwrap();
+    assert!(again.ok, "{:?}", again.errors);
+    assert!(again.warnings.is_empty(), "{:?}", again.warnings);
+    assert_eq!(again.docs_read, 0);
+    assert_eq!(again.docs_written, 0);
+    assert_ne!(
+        from.adapter().id().await.unwrap(),
+        to.adapter().id().await.unwrap()
+    );
+}

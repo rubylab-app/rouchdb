@@ -86,7 +86,7 @@ pub async fn post_session(
     match (field("name"), field("password")) {
         (Some(name), Some(password)) if auth.check_password(name, password) => {
             let token = auth.create_session();
-            let cookie = auth.session_cookie(&token);
+            let cookie = auth.session_cookie(&token, &headers);
             (
                 StatusCode::OK,
                 [(header::SET_COOKIE, cookie)],

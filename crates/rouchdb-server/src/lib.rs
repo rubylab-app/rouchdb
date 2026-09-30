@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod error;
 pub mod extract;
+pub mod host;
 pub mod routes;
 pub mod state;
 
@@ -10,11 +11,14 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, Method, header};
+use axum::response::Response;
 use rouchdb::Database;
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 
 pub use crate::auth::AdminCredentials;
 use crate::auth::Auth;
+pub use crate::host::parse_allowed_host;
+use crate::host::{HostAllowlist, is_loopback};
 pub use crate::routes::query::restore_indexes;
 use crate::state::AppState;
 
@@ -22,10 +26,15 @@ use crate::state::AppState;
 ///
 /// The defaults are meant for local development: bind to loopback, no
 /// authentication and no CORS, so web pages from other origins cannot read or
-/// write the database through the user's browser.
+/// write the database through the user's browser, and only requests
+/// addressed to a loopback name (`Host` header) are served, so a web page
+/// cannot reach the server through DNS rebinding either.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub port: u16,
+    /// Address to listen on. On a non-loopback address the server refuses
+    /// to start without `admin` unless `allow_unauthenticated` is set (see
+    /// [`ServerConfig::validate`]).
     pub host: String,
     pub db_name: String,
     /// Origins allowed to make cross-origin (CORS) requests, e.g.
@@ -42,6 +51,23 @@ pub struct ServerConfig {
     /// How long a `_session` cookie stays valid without being used; it is
     /// also the cookie's `Max-Age`. Defaults to CouchDB's 10 minutes.
     pub session_timeout: Duration,
+    /// More host names (or IP addresses, without port) accepted in the
+    /// `Host` header, e.g. the public name a reverse proxy forwards (checked
+    /// by [`ServerConfig::validate`]). On a loopback `host` the
+    /// server always checks the `Host` header and accepts `localhost`,
+    /// `127.0.0.1`, `[::1]`, `host` and these names (any port), answering 400
+    /// to anything else; on any other `host` it checks the header only when
+    /// this list is not empty (and then also accepts the loopback names and
+    /// `host`).
+    pub allowed_hosts: Vec<String>,
+    /// Serve on a non-loopback `host` without `admin`, where anyone who can
+    /// reach the address can read, write and delete the database. Without
+    /// it, [`start_server`] refuses such a configuration.
+    pub allow_unauthenticated: bool,
+    /// Trust the `X-Forwarded-Proto` header set by a reverse proxy: when it
+    /// says `https`, session cookies get the `Secure` attribute. Only enable
+    /// it behind a proxy that sets this header.
+    pub trust_proxy: bool,
 }
 
 /// Default request body limit: 64 MiB.
@@ -60,7 +86,34 @@ impl Default for ServerConfig {
             admin: None,
             max_request_size: DEFAULT_MAX_REQUEST_SIZE,
             session_timeout: DEFAULT_SESSION_TIMEOUT,
+            allowed_hosts: Vec::new(),
+            allow_unauthenticated: false,
+            trust_proxy: false,
         }
+    }
+}
+
+impl ServerConfig {
+    /// Check the configuration before serving it: every `allowed_hosts`
+    /// entry must be a host name or an IP address, and a non-loopback
+    /// `host` needs `admin` (or an explicit `allow_unauthenticated`).
+    /// [`start_server`] calls it before binding.
+    pub fn validate(&self) -> Result<(), String> {
+        for host in &self.allowed_hosts {
+            parse_allowed_host(host)?;
+        }
+        if self.admin.is_none() && !self.allow_unauthenticated && !is_loopback(&self.host) {
+            return Err(format!(
+                "refusing to serve without authentication on the non-loopback address {:?}: \
+                 anyone who can reach it could read, write and delete the database.\n\
+                 Either require credentials with --admin user:password (or \
+                 ROUCHDB_ADMIN=user:password), or, if every client that can reach this \
+                 address is trusted, pass --allow-unauthenticated (or \
+                 ROUCHDB_ALLOW_UNAUTHENTICATED=1).",
+                self.host
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -118,12 +171,24 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
     )
 }
 
+/// Response middleware: `X-Content-Type-Options: nosniff` on every
+/// response, so browsers never run an attachment or a Fauxton file as
+/// another type than the one it is served with.
+async fn nosniff(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
 /// Build the Axum router with all routes and middleware.
+///
+/// It does not call [`ServerConfig::validate`]; [`start_server`] does.
 pub fn build_router(db: Arc<Database>, config: &ServerConfig) -> Router {
-    let auth = config
-        .admin
-        .clone()
-        .map(|admin| Arc::new(Auth::with_timeout(admin, config.session_timeout)));
+    let auth = config.admin.clone().map(|admin| {
+        Arc::new(Auth::with_timeout(admin, config.session_timeout).trust_proxy(config.trust_proxy))
+    });
     let state = AppState::new(db, config.db_name.clone(), auth);
 
     let routes = routes::build_routes(state.clone())
@@ -142,24 +207,33 @@ pub fn build_router(db: Arc<Database>, config: &ServerConfig) -> Router {
             auth::require_auth,
         ));
 
-    // CORS goes outermost so preflights are answered before authentication
+    // CORS goes around authentication so preflights are answered before it
     // and error responses still carry the CORS headers.
-    match cors_layer(&config.cors_origins) {
+    let router = match cors_layer(&config.cors_origins) {
         Some(cors) => router.layer(cors),
         None => router,
-    }
-}
-
-fn is_loopback(host: &str) -> bool {
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+    };
+    // The Host check goes around everything else: a request addressed to an
+    // unknown name reaches no route (not even `/_utils`), no CORS and no
+    // authentication.
+    let router = match HostAllowlist::from_config(config) {
+        Some(allowlist) => router.layer(axum::middleware::from_fn_with_state(
+            Arc::new(allowlist),
+            host::check_host,
+        )),
+        None => router,
+    };
+    router.layer(axum::middleware::map_response(nosniff))
 }
 
 /// Start the HTTP server and block until shutdown.
+///
+/// Fails with [`std::io::ErrorKind::InvalidInput`], before binding, when
+/// [`ServerConfig::validate`] rejects the configuration.
 pub async fn start_server(db: Arc<Database>, config: ServerConfig) -> std::io::Result<()> {
+    config
+        .validate()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     // Mango indexes live in memory; rebuild them from their design documents.
     if let Err(e) = restore_indexes(&db).await {
         eprintln!("WARNING: could not rebuild Mango indexes: {e}");
@@ -180,6 +254,7 @@ pub async fn start_server(db: Arc<Database>, config: ServerConfig) -> std::io::R
         None if is_loopback(&config.host) => {
             println!("Auth:       disabled (set --admin or ROUCHDB_ADMIN to require credentials)")
         }
+        // Only reached with `allow_unauthenticated` (see `validate`).
         None => eprintln!(
             "WARNING: authentication is disabled and the server listens on a non-loopback \
              address ({}); anyone who can reach it can read, write and delete the database. \
@@ -191,6 +266,13 @@ pub async fn start_server(db: Arc<Database>, config: ServerConfig) -> std::io::R
         println!("CORS:       disabled");
     } else {
         println!("CORS:       {}", config.cors_origins.join(", "));
+    }
+    match HostAllowlist::from_config(&config) {
+        Some(allowlist) => println!("Hosts:      {}", allowlist.hosts().join(", ")),
+        None => println!("Hosts:      any (set --allowed-host to check the Host header)"),
+    }
+    if config.trust_proxy {
+        println!("Proxy:      trusted (X-Forwarded-Proto: https makes session cookies Secure)");
     }
 
     axum::serve(listener, router)

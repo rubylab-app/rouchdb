@@ -1783,6 +1783,7 @@ dependencies = [
  "clap",
  "futures-util",
  "http-body-util",
+ "md-5",
  "mime_guess",
  "reqwest",
  "rouchdb",

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use rouchdb::{Database, OpenOptions, RedbAdapter, RouchError, UpgradePolicy};
-use rouchdb_server::{AdminCredentials, parse_cors_origin};
+use rouchdb_server::{AdminCredentials, parse_allowed_host, parse_cors_origin};
 
 #[derive(Parser)]
 #[command(
@@ -18,7 +18,9 @@ struct Cli {
     #[arg(short, long, default_value = "5984")]
     port: u16,
 
-    /// Host to bind to
+    /// Host to bind to. On an address other than loopback (e.g. 0.0.0.0)
+    /// the server refuses to start without --admin, unless
+    /// --allow-unauthenticated is given
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
@@ -53,6 +55,44 @@ struct Cli {
     )]
     cors_origins: Vec<String>,
 
+    /// Also answer requests whose `Host` header names this host (a name or
+    /// an IP address, without port), e.g. the public name a reverse proxy
+    /// forwards. Repeat the flag (or comma-separate) for several hosts. On a
+    /// loopback --host the server only answers `localhost`, `127.0.0.1`,
+    /// `[::1]` and the --host address (any port), so web pages cannot reach
+    /// it through DNS rebinding; a reverse proxy that forwards its public
+    /// `Host` must be listed here. On any other --host the `Host` header is
+    /// only checked when this is given.
+    #[arg(
+        long = "allowed-host",
+        value_name = "HOST",
+        env = "ROUCHDB_ALLOWED_HOSTS",
+        value_delimiter = ',',
+        value_parser = parse_allowed_host
+    )]
+    allowed_hosts: Vec<String>,
+
+    /// Serve without authentication on a non-loopback --host. Without
+    /// --admin the server refuses to start on such an address, since anyone
+    /// who can reach it could read, write and delete the database; only use
+    /// this when every client that can reach the address is trusted
+    #[arg(
+        long,
+        env = "ROUCHDB_ALLOW_UNAUTHENTICATED",
+        value_parser = parse_switch
+    )]
+    allow_unauthenticated: bool,
+
+    /// Trust the `X-Forwarded-Proto` header of a reverse proxy that
+    /// terminates TLS: when it is `https`, session cookies get the `Secure`
+    /// attribute. Only use it behind a proxy that sets this header
+    #[arg(
+        long,
+        env = "ROUCHDB_TRUST_PROXY",
+        value_parser = parse_switch
+    )]
+    trust_proxy: bool,
+
     /// Largest accepted request body in bytes (documents, `_bulk_docs`
     /// batches, attachments)
     #[arg(long, value_name = "BYTES", default_value_t = rouchdb_server::DEFAULT_MAX_REQUEST_SIZE)]
@@ -77,6 +117,16 @@ struct Cli {
     /// `<path>.rouchdb-0.5-pre.bak`.)
     #[arg(long)]
     upgrade: bool,
+}
+
+/// The value of a switch set through its environment variable: `1`, `true`,
+/// `yes`, `on` or `0`, `false`, `no`, `off` (any case), and empty for off.
+fn parse_switch(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err("expected 1, true, yes, on or 0, false, no, off".to_string()),
+    }
 }
 
 fn infer_db_name(path: &str) -> String {
@@ -123,6 +173,24 @@ fn main() {
 async fn run(cli: Cli) {
     let db_name = cli.db_name.unwrap_or_else(|| infer_db_name(&cli.path));
 
+    let config = rouchdb_server::ServerConfig {
+        port: cli.port,
+        host: cli.host,
+        db_name: db_name.clone(),
+        cors_origins: cli.cors_origins,
+        admin: cli.admin,
+        max_request_size: cli.max_request_size,
+        session_timeout: std::time::Duration::from_secs(cli.session_timeout),
+        allowed_hosts: cli.allowed_hosts,
+        allow_unauthenticated: cli.allow_unauthenticated,
+        trust_proxy: cli.trust_proxy,
+    };
+    // Before touching the database file (which `--upgrade` rewrites).
+    if let Err(e) = config.validate() {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    }
+
     let options = if cli.upgrade {
         OpenOptions::new().upgrade(UpgradePolicy::WithBackup(None))
     } else {
@@ -147,16 +215,6 @@ async fn run(cli: Cli) {
             }
             process::exit(1);
         }
-    };
-
-    let config = rouchdb_server::ServerConfig {
-        port: cli.port,
-        host: cli.host,
-        db_name,
-        cors_origins: cli.cors_origins,
-        admin: cli.admin,
-        max_request_size: cli.max_request_size,
-        session_timeout: std::time::Duration::from_secs(cli.session_timeout),
     };
 
     if let Err(e) = rouchdb_server::start_server(Arc::new(db), config).await {
