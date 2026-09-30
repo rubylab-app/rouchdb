@@ -363,6 +363,8 @@ let (rx, handle) = local.replicate_to_live(&remote, ReplicationOptions {
 
 The HTTP adapter identifies a remote database by the server's uuid and the database name. A remote database that is deleted and re-created under the same name therefore looks like the same database: a running live replication keeps its position, and a new replication resumes from the existing checkpoints. Neither copies the documents the re-created database lost, and simply retrying does not help.
 
+(`rouchdb-server` derives its uuid from the served database's identity, which `DELETE /{db}` renews, so a replication set up with a new `Database::http` after the database is re-created there starts over by itself. A running replication, or a `Database::http` that already replicated before the re-creation (it keeps the uuid it read), still needs the steps below.)
+
 When you delete and re-create a remote database that takes part in a replication:
 
 1. Cancel every live replication to or from it (`handle.cancel()`).

@@ -129,6 +129,8 @@ The foundation crate. Everything else depends on it.
 - `src/lib.rs` -- Public API: `build_router()`, `start_server()`, `ServerConfig`.
 - `src/main.rs` -- Standalone binary entry point with clap CLI.
 - `src/state.rs` -- `AppState` shared across all route handlers.
+- `src/auth.rs` -- Admin authentication (Basic auth and `_session` cookies).
+- `src/host.rs` -- `Host` header check against DNS rebinding (`--allowed-host`).
 - `src/error.rs` -- Maps `RouchError` to CouchDB-style JSON error responses.
 - `src/routes/*.rs` -- Route handlers for each CouchDB endpoint (root, session, all_dbs, database, document, all_docs, bulk_docs, find, index, explain, compact, design, fauxton).
 - `fauxton/` -- Embedded Fauxton static files (downloaded via `scripts/download-fauxton.sh`, gitignored).

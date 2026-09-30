@@ -220,6 +220,9 @@ Options:
       --db-name <NAME>             Database name [default: filename without extension]
       --admin <USER:PASSWORD>      Require admin credentials [env: ROUCHDB_ADMIN]
       --cors-origin <ORIGIN>       Allow CORS from this origin (repeatable) [env: ROUCHDB_CORS_ORIGINS]
+      --allowed-host <HOST>        Also accept this name in the Host header (repeatable) [env: ROUCHDB_ALLOWED_HOSTS]
+      --allow-unauthenticated      Serve on a non-loopback --host without --admin [env: ROUCHDB_ALLOW_UNAUTHENTICATED]
+      --trust-proxy                Trust X-Forwarded-Proto from a reverse proxy [env: ROUCHDB_TRUST_PROXY]
       --max-request-size <BYTES>   Largest accepted request body [default: 67108864]
       --session-timeout <SECONDS>  Idle lifetime of a _session cookie [default: 600]
 ```
@@ -234,9 +237,19 @@ public (wrong Basic credentials are rejected even there, as in CouchDB). As in
 CouchDB, a session cookie expires after 10 minutes without use
 (`--session-timeout`). To let a browser app on another origin talk to the server, allow its
 origin explicitly, e.g. `--cors-origin http://localhost:3000` (credentials are
-allowed for listed origins; `*` allows any origin without credentials). The
-server warns at startup when it listens on a non-loopback address without
-authentication.
+allowed for listed origins; `*` allows any origin without credentials).
+
+On a non-loopback address (`--host 0.0.0.0`) the server **refuses to start
+without `--admin`**, unless you opt in explicitly with
+`--allow-unauthenticated` (`ROUCHDB_ALLOW_UNAUTHENTICATED=1`). On loopback it
+answers only requests whose `Host` header is `localhost`, `127.0.0.1`,
+`[::1]` or the `--host` address (a 400 otherwise), so web pages cannot reach
+it through DNS rebinding; declare the public name a reverse proxy forwards
+with `--allowed-host`, and pass `--trust-proxy` so that session cookies are
+`Secure` when the proxy says `X-Forwarded-Proto: https`. Every response
+carries `X-Content-Type-Options: nosniff`. See
+[Server security](https://rubylab-app.github.io/rouchdb/getting-started/installation.html#server-security)
+in the book.
 
 ## CLI Tool
 
