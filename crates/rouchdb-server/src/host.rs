@@ -63,13 +63,12 @@ impl HostName {
             }
         } else {
             match value.split_once(':') {
-                // An IPv6 address must be in brackets.
-                Some((_, port)) if port.contains(':') => return None,
                 Some((host, port)) => (host, Some(port)),
                 None => (value, None),
             }
         };
-        // RFC 3986 `port = *DIGIT` (possibly empty).
+        // RFC 3986 `port = *DIGIT` (possibly empty). This also rejects an
+        // IPv6 address without brackets: its "port" holds more colons.
         if port.is_some_and(|p| !p.bytes().all(|b| b.is_ascii_digit())) {
             return None;
         }
