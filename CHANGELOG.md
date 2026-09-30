@@ -6,6 +6,17 @@ This project follows [Semantic Versioning](https://semver.org/). Since we are pr
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **`destroy()` on an HTTP database, and its re-creation on next use, no longer fail at random against CouchDB.** For a moment after a database is deleted (milliseconds, longer on a busy server), CouchDB 3.5.1 can still find its shards in its shard map cache when a read raced with the deletion. Until it notices, a second `destroy()` got a 500 `unknown_error` / `badarg` instead of the 404 that counts as success (the CouchDB branch that should answer 404 crashes formatting its log message), and the first request after `destroy()` could get a 500 "No DB shards could be opened.". `rouchdb-adapter-http` now retries a 500 on requests to the database itself (`destroy`'s `DELETE`, and the `GET` / `PUT` that create the database on first use) for about a second before reporting it.
+
+### CI and tooling
+
+- GitHub Actions moved off the deprecated Node 20 runtime: `actions/checkout` v5, `actions/upload-artifact` v6, `actions/configure-pages` v6, `actions/deploy-pages` v5 and `actions/upload-pages-artifact` v5.
+- The CouchDB test helper retries a 500 when it deletes a test database, for the same CouchDB race.
+
 ## [0.5.0] - 2026-09-29
 
 > **Upgrading from 0.4 with redb (`Database::open`) files? Read this first.**

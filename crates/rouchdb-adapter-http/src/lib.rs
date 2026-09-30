@@ -167,6 +167,23 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default time a response may stay silent before the request fails.
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How many times a request on the database itself (`GET`, `PUT` or
+/// `DELETE /{db}`, made by [`HttpAdapter`]'s `destroy` and by the creation
+/// of the database on first use) is retried while CouchDB answers it with a
+/// 500, and the delay before the first retry, doubled after each one (1.27 s
+/// in all).
+///
+/// For a moment after a database is deleted, CouchDB (as of 3.5.1) can
+/// still find its shards in its shard map cache: a read that raced with
+/// the deletion put them back, and they stay until CouchDB processes the
+/// deletion (milliseconds, longer on a busy server). Meanwhile a `DELETE`
+/// of the database fails with 500 `unknown_error` / `badarg` instead of 404
+/// (the branch that should answer 404 crashes formatting its log message,
+/// in `fabric_db_delete:maybe_stop/2`), and other requests on it with 500
+/// "No DB shards could be opened.".
+const DB_REQUEST_RETRIES: u32 = 7;
+const DB_REQUEST_RETRY_DELAY: Duration = Duration::from_millis(10);
+
 /// Options for [`HttpAdapter::with_options`].
 ///
 /// Set the options you need and fill the rest with `..Default::default()`:
@@ -285,22 +302,12 @@ impl HttpAdapter {
             .clone();
         setup
             .get_or_try_init(|| async {
-                let resp = self
-                    .client
-                    .get(&self.base_url)
-                    .send()
-                    .await
-                    .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+                let resp = self.send_db_request(reqwest::Method::GET).await?;
                 if resp.status() != reqwest::StatusCode::NOT_FOUND {
                     self.check_error(resp).await?;
                     return Ok(());
                 }
-                let resp = self
-                    .client
-                    .put(&self.base_url)
-                    .send()
-                    .await
-                    .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+                let resp = self.send_db_request(reqwest::Method::PUT).await?;
                 // 412: created concurrently by someone else.
                 if resp.status() != reqwest::StatusCode::PRECONDITION_FAILED {
                     self.check_error(resp).await?;
@@ -309,6 +316,29 @@ impl HttpAdapter {
             })
             .await
             .map(|_| ())
+    }
+
+    /// Send `method` to the database URL itself, retrying while CouchDB
+    /// answers 500: right after the database is deleted, such errors come
+    /// and go (see [`DB_REQUEST_RETRIES`]). The last response is returned
+    /// whatever its status.
+    async fn send_db_request(&self, method: reqwest::Method) -> Result<reqwest::Response> {
+        let mut delay = DB_REQUEST_RETRY_DELAY;
+        let mut retries = DB_REQUEST_RETRIES;
+        loop {
+            let resp = self
+                .client
+                .request(method.clone(), &self.base_url)
+                .send()
+                .await
+                .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+            if resp.status() != reqwest::StatusCode::INTERNAL_SERVER_ERROR || retries == 0 {
+                return Ok(resp);
+            }
+            retries -= 1;
+            tokio::time::sleep(delay).await;
+            delay *= 2;
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -951,13 +981,12 @@ impl Adapter for HttpAdapter {
     /// Delete the remote database. Like PouchDB, a database that does not
     /// exist is not an error, and (unless `skip_setup` is set) the next
     /// operation creates it again, empty, as the local adapters behave.
+    ///
+    /// A 500 from CouchDB is retried for about a second before it is
+    /// reported: CouchDB answers a `DELETE` of a database that was deleted
+    /// a moment ago with a 500 (`badarg`) instead of a 404.
     async fn destroy(&self) -> Result<()> {
-        let resp = self
-            .client
-            .delete(&self.base_url)
-            .send()
-            .await
-            .map_err(|e| RouchError::DatabaseError(e.to_string()))?;
+        let resp = self.send_db_request(reqwest::Method::DELETE).await?;
         if resp.status() != reqwest::StatusCode::NOT_FOUND {
             self.check_error(resp).await?;
         }
@@ -2127,6 +2156,77 @@ mod tests {
             .map(Captured::line)
             .collect();
         assert_eq!(lines, vec!["DELETE /db", "DELETE /db", "DELETE /db"]);
+    }
+
+    /// What CouchDB 3.5.1 answers, for a moment, to a `DELETE` of a
+    /// database that was just deleted.
+    const DELETE_BADARG: &str = r#"{"error":"unknown_error","reason":"badarg","ref":17476293}"#;
+
+    #[tokio::test]
+    async fn destroy_retries_a_500_until_couchdb_answers() {
+        let not_found = r#"{"error":"not_found","reason":"Database does not exist."}"#;
+        let (url, requests) = scripted_server(vec![
+            ("500 Internal Server Error", DELETE_BADARG.into()),
+            ("500 Internal Server Error", DELETE_BADARG.into()),
+            ("404 Object Not Found", not_found.into()),
+        ])
+        .await;
+        adapter_at(&url).destroy().await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 3);
+
+        // A 500 that does not go away is reported, after 1 + 7 attempts.
+        let (url, requests) =
+            scripted_server(vec![
+                ("500 Internal Server Error", DELETE_BADARG.into());
+                1 + super::DB_REQUEST_RETRIES as usize
+            ])
+            .await;
+        let started = std::time::Instant::now();
+        let err = adapter_at(&url).destroy().await.unwrap_err();
+        assert!(
+            matches!(err, RouchError::DatabaseError(ref r) if r.contains("badarg")),
+            "{err:?}"
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(1270));
+        let lines: Vec<_> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(Captured::line)
+            .collect();
+        assert_eq!(lines, vec!["DELETE /db"; 8]);
+    }
+
+    #[tokio::test]
+    async fn database_setup_retries_a_500_until_couchdb_answers() {
+        let no_shards = r#"{"error":"internal_server_error","reason":"No DB shards could be opened.","ref":1963847755}"#;
+        let (url, requests) = scripted_server(vec![
+            ("500 Internal Server Error", no_shards.into()),
+            (
+                "404 Object Not Found",
+                r#"{"error":"not_found","reason":"Database does not exist."}"#.into(),
+            ),
+            ("500 Internal Server Error", no_shards.into()),
+            ("201 Created", r#"{"ok":true}"#.into()),
+            (
+                "200 OK",
+                r#"{"db_name":"db","doc_count":0,"doc_del_count":0,"update_seq":"0-g1AAAA"}"#
+                    .into(),
+            ),
+        ])
+        .await;
+        let info = HttpAdapter::new(&format!("{url}/db")).info().await.unwrap();
+        assert_eq!(info.doc_count, 0);
+        let lines: Vec<_> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(Captured::line)
+            .collect();
+        assert_eq!(
+            lines,
+            ["GET /db", "GET /db", "PUT /db", "PUT /db", "GET /db"]
+        );
     }
 
     #[tokio::test]

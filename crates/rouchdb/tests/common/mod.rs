@@ -185,18 +185,35 @@ pub async fn delete_remote_db(url: &str) {
 }
 
 /// DELETE a database; a database that does not exist counts as deleted.
+///
+/// A 500 is retried for about a second, as `HttpAdapter::destroy` does:
+/// for a moment after a database is deleted (by `delete_remote_db` before
+/// the guard's drop, or by `destroy()` in the test), CouchDB can answer
+/// another `DELETE` of it with a 500 `badarg` instead of a 404.
 async fn delete_db(url: &str) -> Result<(), String> {
-    let resp = reqwest::Client::new()
-        .delete(url)
-        .send()
-        .await
-        .map_err(|e| format!("DELETE failed: {e}"))?;
-    match resp.status().as_u16() {
-        200 | 202 | 404 => Ok(()),
-        status => Err(format!(
-            "DELETE returned {status}: {}",
-            resp.text().await.unwrap_or_default()
-        )),
+    let client = reqwest::Client::new();
+    let mut delay = std::time::Duration::from_millis(10);
+    let mut retries = 7;
+    loop {
+        let resp = client
+            .delete(url)
+            .send()
+            .await
+            .map_err(|e| format!("DELETE failed: {e}"))?;
+        match resp.status().as_u16() {
+            200 | 202 | 404 => return Ok(()),
+            500 if retries > 0 => {
+                retries -= 1;
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+            status => {
+                return Err(format!(
+                    "DELETE returned {status}: {}",
+                    resp.text().await.unwrap_or_default()
+                ));
+            }
+        }
     }
 }
 
