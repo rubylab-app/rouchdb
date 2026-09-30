@@ -166,8 +166,10 @@ pub async fn start_server(db: Arc<Database>, config: ServerConfig) -> std::io::R
     }
     let router = build_router(db, &config);
 
-    let addr = format!("{}:{}", config.host, config.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener =
+        tokio::net::TcpListener::bind(format!("{}:{}", config.host, config.port)).await?;
+    // The bound address: the port the system picked for `--port 0`.
+    let addr = listener.local_addr()?;
 
     println!("RouchDB server listening on http://{addr}");
     println!("Fauxton UI: http://{addr}/_utils/");

@@ -92,10 +92,12 @@ jobs:
 
   # The redb upgrade, its backup (create, sync, rename) and the CLI touch the
   # filesystem in ways that differ on Windows (a file opened read-only
-  # cannot be flushed, open files cannot be renamed over). The CouchDB tests
-  # are #[ignore]d, so none of this needs a server.
+  # cannot be flushed, open files cannot be renamed over). Windows also has
+  # the smallest thread stacks (a 1 MiB main thread), which documents nested
+  # MAX_NESTING_DEPTH levels deep test in the CLI and the server binaries.
+  # The CouchDB tests are #[ignore]d, so none of this needs a CouchDB.
   windows:
-    name: Tests (Windows, redb + CLI)
+    name: Tests (Windows, redb + CLI + server)
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -113,6 +115,11 @@ jobs:
 
       - name: Run the CLI and 0.4 compatibility tests
         run: cargo test -p rouchdb-cli -p rouchdb-compat-tests --locked --no-fail-fast
+
+      # deep_json_binary runs the rouchdb-server binary itself, so the
+      # stacks of its own threads are the ones under test.
+      - name: Run the server's deep-document tests
+        run: cargo test -p rouchdb-server --locked --no-fail-fast --test deep_json_binary --test deep_json
 
   couchdb:
     name: CouchDB integration tests
