@@ -57,10 +57,11 @@ rouchdb                     <- umbrella: Database struct + re-exports + Plugin t
 ├── rouchdb-changes         -> core, query  (changes feed + live streaming + events)
 ├── rouchdb-replication     -> core, query  (CouchDB replication protocol)
 ├── rouchdb-query           -> core         (Mango selectors + map/reduce)
-├── rouchdb-views           -> core         (design documents + view engine)
+├── rouchdb-views           -> core, query  (design documents + view engine)
 ├── rouchdb-server          -> rouchdb, core (Axum HTTP server + Fauxton UI)
-├── rouchdb-cli             -> rouchdb      (CLI tool for database inspection + CRUD)
-└── rouchdb-bench           -> rouchdb, core (criterion benchmarks)
+├── rouchdb-cli             -> rouchdb, core (CLI tool for database inspection + CRUD)
+├── rouchdb-bench           -> rouchdb, core (criterion benchmarks)
+└── rouchdb-compat-tests    -> core, adapter-redb + rouchdb 0.4.0 from crates.io (cross-version tests)
 ```
 
 ### The Adapter Trait (`rouchdb-core/src/adapter.rs`)

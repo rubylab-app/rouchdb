@@ -296,7 +296,7 @@ Add `--pretty` (or `-p`) to any command for formatted JSON output.
 
 ## Crate Structure
 
-RouchDB is a workspace of 12 crates:
+RouchDB is a workspace of 13 crates. The first nine are published on crates.io; the last four are not:
 
 | Crate | Description |
 |-------|-------------|
@@ -309,9 +309,10 @@ RouchDB is a workspace of 12 crates:
 | `rouchdb-replication` | CouchDB replication protocol |
 | `rouchdb-query` | Mango queries and map/reduce views |
 | `rouchdb-views` | Design documents and persistent view engine |
-| `rouchdb-server` | CouchDB-compatible HTTP server with Fauxton |
-| `rouchdb-cli` | Command-line tool for database inspection and CRUD |
+| `rouchdb-server` | CouchDB-compatible HTTP server with Fauxton (not published) |
+| `rouchdb-cli` | Command-line tool for database inspection and CRUD (not published) |
 | `rouchdb-bench` | Criterion benchmarks (not published) |
+| `rouchdb-compat-tests` | Cross-version tests against rouchdb 0.4.0 from crates.io (not published) |
 
 ## Documentation
 
