@@ -808,6 +808,19 @@ impl Database {
     /// On an `http()` database the query runs on the server (`_find`); only
     /// when the server has no index for the requested sort are the
     /// documents fetched and queried locally.
+    ///
+    /// # Stack usage
+    ///
+    /// Compiling and matching a selector recurse once per nested object, and
+    /// the selector's depth is not limited. On a 2 MiB thread (the default
+    /// for Tokio workers) a debug build overflows the stack, aborting the
+    /// process, at around 700 levels of nested objects; a release build
+    /// handles a few thousand. Selectors parsed with `serde_json::from_str`
+    /// are safe, because serde_json stops at 127 levels. If you accept
+    /// selectors that may be deeper (from `rouchdb_core::json::from_slice`,
+    /// another parser, or built in code), check their depth first with
+    /// `rouchdb_core::json::value_depth`, or run `find` on threads with a
+    /// larger stack, as `rouchdb-server` does (16 MiB).
     pub async fn find(&self, opts: FindOptions) -> Result<FindResponse> {
         if let Some(ref remote) = self.remote
             && let Some(response) = remote_find(remote, &opts).await?

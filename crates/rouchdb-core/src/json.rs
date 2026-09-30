@@ -8,8 +8,10 @@
 //! limit for input within the allowed depth.
 //!
 //! The limit exists because serializing, cloning, comparing and dropping a
-//! `serde_json::Value` recurse once per level: 1000 levels stay well within
-//! a 2 MiB thread stack (Tokio's default) even in debug builds.
+//! `serde_json::Value` recurse once per level: 1000 levels of a document
+//! fit in a 2 MiB thread stack (Tokio's default) even in debug builds.
+//! Mango selectors are not bounded by this limit and need more stack per
+//! level: see the stack notes on `Database::find`.
 
 use serde::de::DeserializeOwned;
 
