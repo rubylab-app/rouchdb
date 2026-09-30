@@ -1585,16 +1585,16 @@ dependencies = [
 
 [[package]]
 name = "rouchdb"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "base64",
  "reqwest",
  "rouchdb-adapter-http",
  "rouchdb-adapter-memory",
- "rouchdb-adapter-redb 0.5.0",
+ "rouchdb-adapter-redb 0.5.1",
  "rouchdb-changes",
- "rouchdb-core 0.5.0",
+ "rouchdb-core 0.5.1",
  "rouchdb-query",
  "rouchdb-replication",
  "rouchdb-views",
@@ -1606,12 +1606,12 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-adapter-http"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "percent-encoding",
  "reqwest",
- "rouchdb-core 0.5.0",
+ "rouchdb-core 0.5.1",
  "serde",
  "serde_json",
  "tokio",
@@ -1619,11 +1619,11 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-adapter-memory"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "base64",
- "rouchdb-core 0.5.0",
+ "rouchdb-core 0.5.1",
  "serde_json",
  "tokio",
  "uuid",
@@ -1648,13 +1648,13 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-adapter-redb"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "base64",
  "md-5",
  "redb",
- "rouchdb-core 0.5.0",
+ "rouchdb-core 0.5.1",
  "serde",
  "serde_json",
  "tempfile",
@@ -1664,11 +1664,11 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-bench"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "criterion",
  "rouchdb",
- "rouchdb-core 0.5.0",
+ "rouchdb-core 0.5.1",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1676,11 +1676,11 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-changes"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "rouchdb-adapter-memory",
- "rouchdb-core 0.5.0",
+ "rouchdb-core 0.5.1",
  "rouchdb-query",
  "serde_json",
  "tokio",
@@ -1689,7 +1689,7 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-cli"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "assert_cmd",
  "base64",
@@ -1698,7 +1698,7 @@ dependencies = [
  "redb",
  "reqwest",
  "rouchdb",
- "rouchdb-core 0.5.0",
+ "rouchdb-core 0.5.1",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1707,13 +1707,13 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-compat-tests"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "redb",
  "rouchdb-adapter-redb 0.4.0",
- "rouchdb-adapter-redb 0.5.0",
+ "rouchdb-adapter-redb 0.5.1",
  "rouchdb-core 0.4.0",
- "rouchdb-core 0.5.0",
+ "rouchdb-core 0.5.1",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1734,7 +1734,7 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -1748,11 +1748,11 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-query"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "fancy-regex",
  "rouchdb-adapter-memory",
- "rouchdb-core 0.5.0",
+ "rouchdb-core 0.5.1",
  "serde",
  "serde_json",
  "tokio",
@@ -1760,12 +1760,12 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-replication"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "md-5",
  "rouchdb-adapter-memory",
- "rouchdb-core 0.5.0",
+ "rouchdb-core 0.5.1",
  "rouchdb-query",
  "serde",
  "serde_json",
@@ -1776,7 +1776,7 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-server"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "axum",
  "base64",
@@ -1787,7 +1787,7 @@ dependencies = [
  "mime_guess",
  "reqwest",
  "rouchdb",
- "rouchdb-core 0.5.0",
+ "rouchdb-core 0.5.1",
  "rouchdb-replication",
  "rust-embed",
  "serde",
@@ -1802,10 +1802,10 @@ dependencies = [
 
 [[package]]
 name = "rouchdb-views"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "rouchdb-adapter-memory",
- "rouchdb-core 0.5.0",
+ "rouchdb-core 0.5.1",
  "rouchdb-query",
  "serde",
  "serde_json",
