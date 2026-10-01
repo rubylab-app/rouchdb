@@ -76,11 +76,13 @@ Pick exactly what you need:
 
 ## CLI Tool
 
-RouchDB includes a command-line tool for inspecting and querying redb database files. Install it from source:
+RouchDB includes a command-line tool for inspecting and querying redb database files, published on crates.io as `rouchdb-cli`:
 
 ```bash
-cargo install --path crates/rouchdb-cli
+cargo install rouchdb-cli
 ```
+
+From a checkout of the repository, `cargo install --path crates/rouchdb-cli` installs the same tool.
 
 This installs the `rouchdb` binary. Usage examples:
 
