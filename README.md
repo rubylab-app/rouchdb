@@ -253,10 +253,10 @@ in the book.
 
 ## CLI Tool
 
-A command-line tool for inspecting, querying, and modifying redb database files:
+A command-line tool for inspecting, querying, and modifying redb database files, published as [`rouchdb-cli`](https://crates.io/crates/rouchdb-cli) (it installs the `rouchdb` binary):
 
 ```bash
-cargo install --path crates/rouchdb-cli
+cargo install rouchdb-cli
 ```
 
 ### Reading
@@ -309,7 +309,7 @@ Add `--pretty` (or `-p`) to any command for formatted JSON output.
 
 ## Crate Structure
 
-RouchDB is a workspace of 13 crates. The first nine are published on crates.io; the last four are not:
+RouchDB is a workspace of 13 crates. The first nine and `rouchdb-cli` are published on crates.io; the other three are not:
 
 | Crate | Description |
 |-------|-------------|
@@ -323,7 +323,7 @@ RouchDB is a workspace of 13 crates. The first nine are published on crates.io; 
 | `rouchdb-query` | Mango queries and map/reduce views |
 | `rouchdb-views` | Design documents and persistent view engine |
 | `rouchdb-server` | CouchDB-compatible HTTP server with Fauxton (not published) |
-| `rouchdb-cli` | Command-line tool for database inspection and CRUD (not published) |
+| `rouchdb-cli` | Command-line tool for database inspection and CRUD |
 | `rouchdb-bench` | Criterion benchmarks (not published) |
 | `rouchdb-compat-tests` | Cross-version tests against rouchdb 0.4.0 from crates.io (not published) |
 
